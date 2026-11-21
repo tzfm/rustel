@@ -4492,7 +4492,7 @@ mod tests {
         let ott = Value::object(vec![("name".into(), Value::Str("ott".into()))]);
         let note = vec![
             ("s".into(), Value::Str("sine".into())),
-            ("vst".into(), Value::List(vec![ott])),
+            ("vst".into(), Value::list(vec![ott])),
         ];
         session
             .set_pattern(rustel_core::pure(Value::object(note)))

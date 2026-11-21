@@ -13,7 +13,9 @@ const MAX_REPL_CODE_BYTES: usize = 1024 * 1024;
 impl JsRuntime {
     /// Whether this realm has run the script that `specifier` names.
     pub fn import_loaded(&self, specifier: &str) -> bool {
-        self.loaded_imports.borrow().contains(specifier)
+        self.loaded_imports
+            .get()
+            .is_some_and(|loaded| loaded.borrow().contains(specifier))
     }
 
     /// Run a fetched script as setup code. From then on `import(specifier)`
@@ -38,6 +40,7 @@ impl JsRuntime {
         cancellation: &std::sync::atomic::AtomicBool,
         scope: ImportScope,
     ) -> Result<Vec<ScoreEffects>, QueryError> {
+        self.ensure_surface().map_err(QueryError::Message)?;
         let queued = Rc::new(RefCell::new(Vec::<String>::new()));
         let setup = |source: &str| {
             self.evaluate_prelude_with_effects_cancellable(source, options, budget, cancellation)
@@ -90,6 +93,7 @@ impl JsRuntime {
             effects
         })?;
         self.loaded_imports
+            .get_or_init(LoadedImports::default)
             .borrow_mut()
             .insert(specifier.to_owned());
         Ok(effects)

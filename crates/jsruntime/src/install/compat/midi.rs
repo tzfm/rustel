@@ -5,7 +5,7 @@ use std::{cell::RefCell, rc::Rc, sync::Arc};
 struct InputOpener {
     bus: Arc<rustel_core::midi_in::InputBus>,
     handles: Rc<RefCell<MidiInputHandles>>,
-    transaction: Rc<RefCell<Option<ScoreEffects>>>,
+    transaction: Rc<RefCell<EffectTransaction>>,
     policy: Rc<Cell<EffectPolicy>>,
     refusal: Rc<RefCell<Option<String>>>,
 }
@@ -13,11 +13,11 @@ struct InputOpener {
 impl InputOpener {
     fn new(runtime: &JsRuntime) -> Self {
         Self {
-            bus: Arc::clone(&runtime.midi_in_bus),
-            handles: Rc::clone(&runtime.midi_in_handles),
-            transaction: Rc::clone(&runtime.effect_transaction),
-            policy: Rc::clone(&runtime.effect_policy),
-            refusal: Rc::clone(&runtime.effect_policy_refusal),
+            bus: runtime.midi_input_bus(),
+            handles: Rc::clone(runtime.midi_handles()),
+            transaction: Rc::clone(&runtime.bridge().effect_transaction),
+            policy: Rc::clone(&runtime.bridge().effect_policy),
+            refusal: Rc::clone(&runtime.bridge().effect_policy_refusal),
         }
     }
 

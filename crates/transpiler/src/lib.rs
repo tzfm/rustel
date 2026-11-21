@@ -35,13 +35,19 @@ mod arrange_marks;
 mod callback_ir;
 mod frequency_sliders;
 mod live_numbers;
+mod score_program;
 mod surface_writes;
 pub use callback_ir::{
-    CallbackArgument, CallbackMethodCall, MAX_CALLBACK_IR_SOURCE_BYTES, PatternTransformCandidate,
-    PatternTransformFallbackReason, lower_pattern_transform_callback,
+    CallbackArgument, CallbackMethodCall, MAX_CALLBACK_IR_SOURCE_BYTES,
+    MAX_CALLBACK_TRANSFORM_DEPTH, PatternTransformCandidate, PatternTransformFallbackReason,
+    lower_pattern_transform_callback,
 };
 pub use frequency_sliders::is_frequency_control;
 pub use live_numbers::{LIVE_NUMBER_WIDGET, live_number_id, live_number_range};
+pub use rustel_score::{
+    At, CallForm, Held, LaneStatement, Row, ScoreExpr, ScoreFunction, ScoreProgram, ScoreProperty,
+    ScoreStatement, Written,
+};
 pub use surface_writes::{SurfaceWrites, surface_writes};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -51,11 +57,14 @@ pub struct ParseDiagnostic {
     pub offset: Option<usize>,
 }
 
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct ParseOutput {
     pub code: String,
     pub diagnostics: Vec<ParseDiagnostic>,
     pub panicked: bool,
+    /// The printed program as a plain score, when the caller asked for it
+    /// and the program is one. See [`TranspileOutput::program`].
+    pub program: Option<ScoreProgram<'static>>,
     /// Static names published by score-level `register(...)` calls.
     pub registrations: RegistrationHints,
     /// What the program can write on the surface compiled callbacks read.
@@ -117,8 +126,9 @@ pub const MAX_STRUCTURAL_BYTES: usize = 64 * 1024;
 
 /// The bytes that buy a level of recursion, counted without tokenizing.
 fn structural_bytes(source: &str) -> usize {
-    let punctuation = source
-        .bytes()
+    let bytes = source.as_bytes();
+    let punctuation = bytes
+        .iter()
         .filter(|byte| {
             matches!(
                 byte,
@@ -145,15 +155,26 @@ fn structural_bytes(source: &str) -> usize {
         .count();
     // These word operators can also recurse without spending punctuation.
     // Count raw occurrences: a mistaken lexical classification must not let
-    // one of them hide from this backstop.
-    punctuation
-        + word_operators()
-            .iter()
-            .map(|(word, _)| source.matches(*word).count())
-            .sum::<usize>()
-        // A keyword spelled with an escape, `\u0076oid`, matches no word
-        // above but parses as one, and every such spelling contains `\u`.
-        + source.matches("\\u").count()
+    // one of them hide from this backstop. A keyword spelled with an escape,
+    // `\u0076oid`, matches no word but parses as one, and every such
+    // spelling contains `\u`.
+    let spellings = RawSpellings::get();
+    // Where the next occurrence of each spelling may begin: occurrences of
+    // one spelling are counted where they do not overlap.
+    let mut free = vec![0usize; spellings.all.len()];
+    let mut words = 0;
+    for (index, pair) in bytes.windows(2).enumerate() {
+        if spellings.may_start(pair[0], pair[1]) {
+            let rest = &bytes[index..];
+            for (free, spelling) in free.iter_mut().zip(&spellings.all) {
+                if index >= *free && rest.starts_with(spelling) {
+                    words += 1;
+                    *free = index + spelling.len();
+                }
+            }
+        }
+    }
+    punctuation + words
 }
 
 /// The stack given to the thread this crate parses on.
@@ -632,6 +653,41 @@ fn word_operators() -> &'static [(&'static str, bool)] {
     &WORDS
 }
 
+/// The word operators and the `\u` of an escape, with the two bytes each
+/// begins with, so a scan asks about a place only where one can begin.
+struct RawSpellings {
+    all: Vec<&'static [u8]>,
+    /// For each first byte, the set of second bytes that follow it in a
+    /// spelling.
+    seconds: [[u64; 4]; 256],
+}
+
+impl RawSpellings {
+    fn get() -> &'static Self {
+        static SPELLINGS: std::sync::LazyLock<RawSpellings> = std::sync::LazyLock::new(|| {
+            let all: Vec<&'static [u8]> = word_operators()
+                .iter()
+                .map(|(word, _)| word.as_bytes())
+                .chain([b"\\u".as_slice()])
+                .collect();
+            let mut seconds = [[0u64; 4]; 256];
+            for spelling in &all {
+                let [first, second, ..] = **spelling else {
+                    unreachable!("a keyword or an escape has two bytes or more");
+                };
+                seconds[usize::from(first)][usize::from(second >> 6)] |= 1 << (second & 63);
+            }
+            RawSpellings { all, seconds }
+        });
+        &SPELLINGS
+    }
+
+    /// Whether a spelling begins with these two bytes.
+    fn may_start(&self, first: u8, second: u8) -> bool {
+        self.seconds[usize::from(first)][usize::from(second >> 6)] >> (second & 63) & 1 == 1
+    }
+}
+
 /// Return the width and binary status of a word operator without mistaking part of
 /// an identifier for a token. Strings, comments, and regexes are skipped by
 /// the caller before it asks this question.
@@ -641,6 +697,10 @@ fn word_operator_at(bytes: &[u8], index: usize) -> Option<(usize, bool)> {
     }
 
     if index > 0 && identifier_byte(bytes[index - 1]) {
+        return None;
+    }
+    let (&first, &second) = (bytes.get(index)?, bytes.get(index + 1)?);
+    if !RawSpellings::get().may_start(first, second) {
         return None;
     }
     word_operators().iter().find_map(|(word, binary)| {
@@ -681,7 +741,16 @@ fn measure_nesting(source: &str) -> SourceNesting {
         let byte = bytes[index];
 
         if matches!(stack.last(), Some(Frame::Template)) {
-            match byte {
+            // Template text is scanned in one run to its next escape,
+            // substitution or end.
+            let Some(run) = bytes[index..]
+                .iter()
+                .position(|byte| matches!(byte, b'\\' | b'`' | b'$'))
+            else {
+                break;
+            };
+            index += run;
+            match bytes[index] {
                 b'\\' => index += 1,
                 b'`' => {
                     stack.pop();
@@ -933,7 +1002,7 @@ thread_local! {
 /// Run `work` with every parse of this crate on the calling thread.
 ///
 /// `transpile` and the other entries parse on a thread with
-/// `PARSE_STACK_BYTES` of stack. During this call they spawn no thread. A
+/// `PARSE_STACK_BYTES` of stack. During this call they use no thread. A
 /// host with no threads, or with a large stack of its own, wraps its calls in
 /// this function. The nesting checks still run first. A source which defeats
 /// the lexical scan overflows the stack of the caller, so the caller owns the
@@ -952,29 +1021,95 @@ pub fn on_caller_stack<T>(work: impl FnOnce() -> T) -> T {
     work()
 }
 
-/// Run `work` on a thread with `PARSE_STACK_BYTES` of stack, or on the calling
-/// thread inside [`on_caller_stack`].
+/// One parse and the send of its answer.
+type ParseJob = Box<dyn FnOnce() + Send>;
+
+/// The thread that parses for one calling thread, with `PARSE_STACK_BYTES`
+/// of stack. It takes one job at a time: the caller waits for each answer.
+struct ParseStack {
+    jobs: std::sync::mpsc::SyncSender<ParseJob>,
+}
+
+impl ParseStack {
+    /// Start the thread. `None` when the host gives none.
+    ///
+    /// The thread runs each job inside [`on_caller_stack`]: a parse that a
+    /// job starts from its own top level, as `transpile` does, is already
+    /// on this stack and runs in place. The thread ends when the thread it
+    /// parses for drops this handle.
+    fn start() -> Option<Self> {
+        let (jobs, taken) = std::sync::mpsc::sync_channel::<ParseJob>(0);
+        std::thread::Builder::new()
+            .name("rustel-parse".into())
+            .stack_size(PARSE_STACK_BYTES)
+            .spawn(move || {
+                on_caller_stack(|| {
+                    for job in taken {
+                        job();
+                    }
+                });
+            })
+            .ok()?;
+        Some(Self { jobs })
+    }
+}
+
+thread_local! {
+    /// The parse stack of this thread, started at its first parse.
+    static PARSE_STACK: std::cell::RefCell<Option<ParseStack>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Run `work` on `source` on the parse stack of this thread, or on the
+/// calling thread inside [`on_caller_stack`]. `None` when the host gives no
+/// thread to parse on.
 ///
 /// Every parse in this crate goes through here, except `callback_ir`. That
 /// module parses on the caller's stack and bounds its input with
 /// `MAX_CALLBACK_IR_SOURCE_BYTES`. The lexical nesting limit stops deep
 /// ordinary expressions; the raw size limit also bounds recursion when the
-/// lexical scan is defeated. This stack covers the bounded depth.
-fn on_parse_stack<T: Send>(work: impl FnOnce() -> T + Send) -> Option<T> {
+/// lexical scan is defeated. The stack covers the bounded depth.
+///
+/// The parse stack is one thread for each calling thread, kept from parse
+/// to parse: a new thread and its stack for each parse cost more than a
+/// small score takes to parse. The text goes to it as a copy and the answer
+/// comes back as a value, so `work` holds nothing of the caller. A panic of
+/// `work` continues on the calling thread.
+fn on_parse_stack<T: Send + 'static>(
+    source: &str,
+    work: impl FnOnce(&str) -> T + Send + 'static,
+) -> Option<T> {
     if ON_CALLER_STACK.get() {
-        return Some(work());
+        return Some(work(source));
     }
-    std::thread::scope(|scope| {
-        std::thread::Builder::new()
-            .stack_size(PARSE_STACK_BYTES)
-            .spawn_scoped(scope, work)
-            .ok()
-            .map(|handle| {
-                handle
-                    .join()
-                    .unwrap_or_else(|payload| std::panic::resume_unwind(payload))
-            })
-    })
+    let text = source.to_owned();
+    let (answer, answered) = std::sync::mpsc::sync_channel(1);
+    let job: ParseJob = Box::new(move || {
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| work(&text)));
+        // The caller waits for the answer. One that is gone wants none.
+        let _ = answer.send(outcome);
+    });
+    let sent = PARSE_STACK.with(|stack| {
+        let mut stack = stack.borrow_mut();
+        if stack.is_none() {
+            *stack = ParseStack::start();
+        }
+        let sent = stack
+            .as_ref()
+            .is_some_and(|stack| stack.jobs.send(job).is_ok());
+        if !sent {
+            // A thread that takes no job is replaced at the next parse.
+            *stack = None;
+        }
+        sent
+    });
+    if !sent {
+        return None;
+    }
+    match answered.recv().ok()? {
+        Ok(answer) => Some(answer),
+        Err(panic) => std::panic::resume_unwind(panic),
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -982,9 +1117,17 @@ pub struct TranspileOptions {
     pub wrap_async: bool,
     pub add_return: bool,
     pub emit_mini_locations: bool,
+    /// Whether [`TranspileOutput::mini_locations`] lists the leaves of each
+    /// mini-notation literal, for a host that marks them in the editor.
+    /// Listing them parses each literal one more time, so a host that only
+    /// evaluates the output turns it off.
+    pub list_mini_leaves: bool,
     pub block_offset: usize,
     pub registered_languages: Vec<String>,
     pub widget_methods: Vec<String>,
+    /// Whether [`VISUAL_WIDGET_METHODS`] are recognized in addition to
+    /// [`Self::widget_methods`], without cloning their static names.
+    pub default_widget_methods: bool,
     pub emit_widgets: bool,
     pub id: Option<String>,
     /// Whether ECMAScript module syntax is accepted by the output parser.
@@ -1010,15 +1153,24 @@ pub struct TranspileOptions {
     pub live_numbers: Vec<std::ops::Range<usize>>,
 }
 
+impl TranspileOptions {
+    fn has_widget_method(&self, name: &str) -> bool {
+        (self.default_widget_methods && VISUAL_WIDGET_METHODS.contains(&name))
+            || self.widget_methods.iter().any(|method| method == name)
+    }
+}
+
 impl Default for TranspileOptions {
     fn default() -> Self {
         Self {
             wrap_async: false,
             add_return: true,
             emit_mini_locations: true,
+            list_mini_leaves: true,
             block_offset: 0,
             registered_languages: Vec::new(),
             widget_methods: Vec::new(),
+            default_widget_methods: false,
             emit_widgets: true,
             id: None,
             allow_module_syntax: true,
@@ -1089,7 +1241,7 @@ pub fn script_imports(source: &str) -> Vec<String> {
     if !source.contains("import") || check_nesting(source).is_err() {
         return Vec::new();
     }
-    on_parse_stack(|| {
+    on_parse_stack(source, move |source| {
         let allocator = Allocator::default();
         let parsed = Parser::new(&allocator, source, SourceType::mjs()).parse();
         let mut imports = Imports::default();
@@ -1163,6 +1315,66 @@ pub const VISUAL_WIDGET_METHODS: &[&str] = &[
     "markcss",
 ];
 
+/// What [`transpile`] does with a call of `name`, for a host that passes
+/// [`VISUAL_WIDGET_METHODS`]. A reader of a score as written asks this. It
+/// leaves to the transpiler each text with a call that gets another form: a
+/// slider, a KabelSalat graph, a fetch of samples, sections with play marks,
+/// or a call whose string names a device or a file.
+pub fn call_form(name: &str) -> CallForm {
+    /// The names with a form of their own, in order, and for each first
+    /// byte the lengths of the names that begin with it, one bit for each
+    /// length. Most names of a score have no form of their own, and the
+    /// lengths say so with no comparison of text.
+    struct Forms {
+        named: Box<[(&'static str, CallForm)]>,
+        lengths: [u64; 256],
+    }
+    fn length_bit(name: &str) -> u64 {
+        1 << name.len().min(63)
+    }
+    static FORMS: std::sync::OnceLock<Forms> = std::sync::OnceLock::new();
+    let forms = FORMS.get_or_init(|| {
+        let other = ["K", "slider", "arrange", "samples", "talkit"]
+            .into_iter()
+            .chain(["initImage", "initVideo"])
+            .chain(PORT_NAMED_CALLS.iter().map(|(call, _)| *call))
+            .chain(ERROR_MESSAGE_CALLS.iter().map(|(call, _)| *call))
+            .map(|name| (name, CallForm::Other));
+        // `markcss` styles the text and draws in no slot.
+        let widgets = VISUAL_WIDGET_METHODS.iter().map(|name| {
+            let slot = *name != "markcss";
+            (*name, CallForm::Widget { slot })
+        });
+        let mut named: Vec<_> = other
+            .chain(widgets)
+            .chain([("all", CallForm::Page)])
+            .collect();
+        named.sort_unstable_by_key(|(name, _)| *name);
+        named.dedup_by_key(|(name, _)| *name);
+        let mut lengths = [0; 256];
+        for (name, _) in &named {
+            if let Some(first) = name.bytes().next() {
+                lengths[usize::from(first)] |= length_bit(name);
+            }
+        }
+        Forms {
+            named: named.into(),
+            lengths,
+        }
+    });
+    let known = name
+        .bytes()
+        .next()
+        .is_some_and(|first| forms.lengths[usize::from(first)] & length_bit(name) != 0);
+    if !known {
+        return CallForm::Written;
+    }
+    forms
+        .named
+        .binary_search_by_key(&name, |(name, _)| name)
+        .map_or(CallForm::Written, |at| forms.named[at].1)
+}
+
 /// Synthetic widget kind used for the `all(pianoroll)` spelling. It is
 /// layout metadata only and is never rewritten into a method invocation.
 pub const ALL_VISUAL_WIDGET_PREFIX: &str = "all:";
@@ -1170,6 +1382,12 @@ pub const ALL_VISUAL_WIDGET_PREFIX: &str = "all:";
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct TranspileOutput {
     pub output: String,
+    /// The output as a plain score, when it is made only of the shapes a
+    /// [`ScoreProgram`] holds: a host can then evaluate it without
+    /// JavaScript. `None` for any other program, and when the output is not
+    /// the program alone, under [`TranspileOptions::add_return`] or
+    /// [`TranspileOptions::wrap_async`].
+    pub program: Option<ScoreProgram<'static>>,
     pub mini_locations: Vec<(usize, usize)>,
     pub diagnostics: Vec<ParseDiagnostic>,
     pub widgets: Vec<WidgetRecord>,
@@ -1189,21 +1407,6 @@ pub struct TranspileOutput {
     pub lanes_by_place: bool,
 }
 
-/// A lane of a score, as [`lane_statements`] reads it.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct LaneStatement {
-    /// The label as written: `$`, `_$`, `lead`, `Slead`. Empty for a score
-    /// with no label.
-    pub label: String,
-    /// The code of the statement after its label, with no comment before or
-    /// after it. Each line end is `\n` and no line has whitespace at its
-    /// end, so a score saved with different line ends has the same body.
-    pub body: String,
-    /// The line of the label, counted from 1. With no label, the line where
-    /// the body starts.
-    pub line: usize,
-}
-
 /// Where a KabelSalat call sits in the score, offset by `block_offset`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct KabelsalatSpan {
@@ -1221,12 +1424,12 @@ pub struct KabelsalatSpan {
 /// comments, ASI, precedence and source spans. Parse diagnostics are never
 /// discarded; callers decide whether recovery is acceptable.
 pub fn parse_and_print(source: &str) -> ParseOutput {
-    parse_and_print_as(source, SourceType::mjs(), ModuleSyntax::Allowed)
+    parse_and_print_as(source, SourceType::mjs())
 }
 
 pub fn parse_and_print_path(source: &str, path: impl AsRef<Path>) -> ParseOutput {
     match SourceType::from_path(path) {
-        Ok(source_type) => parse_and_print_as(source, source_type, ModuleSyntax::Allowed),
+        Ok(source_type) => parse_and_print_as(source, source_type),
         Err(error) => ParseOutput {
             diagnostics: vec![ParseDiagnostic {
                 message: error.to_string(),
@@ -1237,11 +1440,7 @@ pub fn parse_and_print_path(source: &str, path: impl AsRef<Path>) -> ParseOutput
     }
 }
 
-fn parse_and_print_as(
-    source: &str,
-    source_type: SourceType,
-    modules: ModuleSyntax<'_>,
-) -> ParseOutput {
+fn parse_and_print_as(source: &str, source_type: SourceType) -> ParseOutput {
     // Before the allocator, before the parser: the recursion this refuses
     // would abort the process rather than return a diagnostic.
     if let Err(diagnostic) = check_nesting(source) {
@@ -1250,7 +1449,9 @@ fn parse_and_print_as(
             ..ParseOutput::default()
         };
     }
-    let Some(output) = on_parse_stack(|| parse_and_print_here(source, source_type, modules)) else {
+    let Some(output) = on_parse_stack(source, move |source| {
+        parse_and_print_here(source, source_type, ModuleSyntax::Allowed, false)
+    }) else {
         return ParseOutput {
             diagnostics: vec![ParseDiagnostic {
                 message: "could not reserve a stack to parse on".into(),
@@ -1311,11 +1512,14 @@ impl<'a> Visit<'a> for StatementNesting {
     }
 }
 
-/// The body of `parse_and_print_as`, always called on a parse stack.
+/// The body of `parse_and_print_as`, always called on a parse stack. With
+/// `read_score`, a program with no error is also read as a [`ScoreProgram`],
+/// from the tree that is printed.
 fn parse_and_print_here(
     source: &str,
     source_type: SourceType,
     modules: ModuleSyntax<'_>,
+    read_score: bool,
 ) -> ParseOutput {
     let allocator = Allocator::default();
     let parsed = Parser::new(&allocator, source, source_type).parse();
@@ -1387,6 +1591,9 @@ fn parse_and_print_here(
     if !normalized_jsx_values.is_empty() {
         encode_jsx_values_for_codegen(&allocator, &mut program, &normalized_jsx_values);
     }
+    let score = (read_score && diagnostics.is_empty() && !parsed.panicked)
+        .then(|| score_program::read(&program))
+        .flatten();
     let printed = Codegen::new()
         .with_options(CodegenOptions {
             single_quote: true,
@@ -1419,6 +1626,7 @@ fn parse_and_print_here(
         code,
         diagnostics,
         panicked: parsed.panicked,
+        program: score,
         registrations,
         surface_writes,
         line_map,
@@ -1440,7 +1648,7 @@ pub fn unresolved_reads(source: &str) -> Vec<(String, std::ops::Range<usize>)> {
     if check_nesting(source).is_err() {
         return Vec::new();
     }
-    on_parse_stack(|| {
+    on_parse_stack(source, move |source| {
         let allocator = Allocator::default();
         let parsed = Parser::new(&allocator, source, SourceType::mjs()).parse();
         if parsed.panicked || !parsed.diagnostics.is_empty() {
@@ -1508,7 +1716,9 @@ pub fn running_calls(source: &str, names: &[&str]) -> Vec<(String, std::ops::Ran
     if check_nesting(source).is_err() {
         return Vec::new();
     }
-    on_parse_stack(|| {
+    // The parse stack takes the names as its own.
+    let names: Vec<String> = names.iter().map(|name| (*name).to_owned()).collect();
+    on_parse_stack(source, move |source| {
         let allocator = Allocator::default();
         let parsed = Parser::new(&allocator, source, SourceType::mjs()).parse();
         if parsed.panicked || !parsed.diagnostics.is_empty() {
@@ -1517,7 +1727,7 @@ pub fn running_calls(source: &str, names: &[&str]) -> Vec<(String, std::ops::Ran
         let built = SemanticBuilder::new().build(&parsed.program);
         let mut calls = RunningCalls {
             scoping: built.semantic.scoping(),
-            watched: names.iter().copied().collect(),
+            watched: names.iter().map(String::as_str).collect(),
             deferred: 0,
             immediate: HashSet::new(),
             found: Vec::new(),
@@ -1638,7 +1848,7 @@ pub fn setup_definitions(source: &str) -> SetupDefinitions {
     if check_nesting(source).is_err() {
         return SetupDefinitions::default();
     }
-    on_parse_stack(|| {
+    on_parse_stack(source, move |source| {
         let allocator = Allocator::default();
         let parsed = Parser::new(&allocator, source, SourceType::mjs()).parse();
         if parsed.panicked {
@@ -1811,7 +2021,7 @@ pub fn global_writes(source: &str) -> Vec<(String, std::ops::Range<usize>)> {
     if check_nesting(source).is_err() {
         return Vec::new();
     }
-    on_parse_stack(|| {
+    on_parse_stack(source, move |source| {
         let allocator = Allocator::default();
         let parsed = Parser::new(&allocator, source, SourceType::mjs()).parse();
         if parsed.panicked {
@@ -2077,7 +2287,7 @@ pub fn awaits_in_code(source: &str) -> bool {
         // does is never sent to a wrapper that cannot compile it.
         return true;
     }
-    on_parse_stack(|| {
+    on_parse_stack(source, move |source| {
         let allocator = Allocator::default();
         let parsed = Parser::new(&allocator, source, SourceType::mjs()).parse();
         if parsed.panicked {
@@ -2523,7 +2733,9 @@ pub fn transpile(source: &str, options: &TranspileOptions) -> TranspileOutput {
     if let Err(diagnostic) = check_nesting(source) {
         return refuse(diagnostic.message);
     }
-    let Some(output) = on_parse_stack(|| transpile_here(source, options)) else {
+    let options = options.clone();
+    let Some(output) = on_parse_stack(source, move |source| transpile_here(source, &options))
+    else {
         return refuse("could not reserve a stack to parse on".into());
     };
     output
@@ -2598,7 +2810,18 @@ fn transpile_here(source: &str, options: &TranspileOptions) -> TranspileOutput {
     let (labels, lanes_by_place) =
         rewrite_labels(&kabel, regexes_are_present, &options.lane_numbers);
     let samples = rewrite_bare_samples(&labels);
-    let mut parsed = parse_and_print_as(&samples, SourceType::mjs(), ModuleSyntax::of(options));
+    // The output is the printed program alone when nothing is added to it.
+    let read_score = !options.add_return && !options.wrap_async;
+    // `transpile` checked the nesting of the score as written. The rewrites
+    // above put each literal and each labeled statement inside one call, so
+    // they add a level or two, which the parse stack holds with room to
+    // spare: the rewritten text is not measured again.
+    let mut parsed = parse_and_print_here(
+        &samples,
+        SourceType::mjs(),
+        ModuleSyntax::of(options),
+        read_score,
+    );
     // The parser read the rewritten text; the score is what the reader sees.
     for diagnostic in &mut parsed.diagnostics {
         if let Some(offset) = diagnostic.offset {
@@ -2615,6 +2838,7 @@ fn transpile_here(source: &str, options: &TranspileOptions) -> TranspileOutput {
     }
     TranspileOutput {
         output,
+        program: parsed.program,
         mini_locations,
         diagnostics,
         line_map: parsed.line_map,
@@ -2912,7 +3136,7 @@ fn rewrite_mini_literals(
                 && !ordinary_strings.contains(index)
                 && (quote == b'"' || (quote == b'`' && !tagged && !interpolated))
             {
-                let value = match decode_js_string(raw, quote == b'`') {
+                let value = match rustel_score::decode(raw, quote == b'`') {
                     Ok(value) => value,
                     Err(error) => {
                         diagnostics.push(ParseDiagnostic {
@@ -2925,6 +3149,7 @@ fn rewrite_mini_literals(
                     }
                 };
                 if options.emit_mini_locations
+                    && options.list_mini_leaves
                     && let Ok(mut spans) =
                         rustel_mini::leaf_locations(&value, index + 1 + options.block_offset)
                 {
@@ -3464,10 +3689,7 @@ fn collect_widgets(
                 && painter != "markcss"
                 && painter.bytes().all(|byte| is_identifier_byte(&byte))
                 && !painter.starts_with('_')
-                && options
-                    .widget_methods
-                    .iter()
-                    .any(|method| method == painter);
+                && options.has_widget_method(painter);
             recognized.then_some((painter, painter_options))
         } else {
             None
@@ -3523,7 +3745,7 @@ fn collect_widgets(
                 label: None,
             };
             Some((record, CallSite::Slider { name_end, open }))
-        } else if member && options.widget_methods.iter().any(|method| method == name) {
+        } else if member && options.has_widget_method(name) {
             let call_start = find_member_expression_start(bytes, name_start - 1, regexes);
             let record = visual_record(
                 &widgets,
@@ -3804,7 +4026,8 @@ fn identifier_char_before(source: &str, end: usize) -> Option<(usize, char)> {
     let bytes = source.as_bytes();
     if end >= 6
         && &bytes[end - 6..end - 4] == b"\\u"
-        && let Some(value) = take_hex(&mut source[end - 4..end].char_indices().peekable(), 4)
+        && let Some(value) =
+            rustel_score::take_hex(&mut source[end - 4..end].char_indices().peekable(), 4)
     {
         return char::from_u32(value).map(|ch| (end - 6, ch));
     }
@@ -3814,7 +4037,7 @@ fn identifier_char_before(source: &str, end: usize) -> Option<(usize, char)> {
                 break;
             };
             if &bytes[start..start + 3] == b"\\u{"
-                && let Some(value) = take_hex(
+                && let Some(value) = rustel_score::take_hex(
                     &mut source[start + 3..end - 1].char_indices().peekable(),
                     digits_len,
                 )
@@ -3932,172 +4155,6 @@ fn regex_literal_end(bytes: &[u8], start: usize) -> usize {
 }
 
 /// Read `count` hex digits, or nothing if any of them is not hex.
-fn take_hex(
-    chars: &mut std::iter::Peekable<std::str::CharIndices<'_>>,
-    count: usize,
-) -> Option<u32> {
-    let mut probe = chars.clone();
-    let mut value = 0u32;
-    for _ in 0..count {
-        let digit = probe.next()?.1.to_digit(16)?;
-        value = value * 16 + digit;
-    }
-    *chars = probe;
-    Some(value)
-}
-
-/// Read the `{...}` form of a `\u` escape, positioned just after the `u`.
-fn take_braced_hex(chars: &mut std::iter::Peekable<std::str::CharIndices<'_>>) -> Option<u32> {
-    let mut probe = chars.clone();
-    if probe.next()?.1 != '{' {
-        return None;
-    }
-    let mut value = 0u32;
-    let mut digits = 0;
-    loop {
-        match probe.next().map(|(_, ch)| ch) {
-            Some('}') if digits > 0 => break,
-            Some(ch) => {
-                value = value.checked_mul(16)?.checked_add(ch.to_digit(16)?)?;
-                digits += 1;
-                if digits > 6 {
-                    return None;
-                }
-            }
-            None => return None,
-        }
-    }
-    *chars = probe;
-    Some(value)
-}
-
-fn is_high_surrogate(value: u32) -> bool {
-    (0xD800..=0xDBFF).contains(&value)
-}
-
-fn is_low_surrogate(value: u32) -> bool {
-    (0xDC00..=0xDFFF).contains(&value)
-}
-
-/// Decode JavaScript string escapes for a mini-notation literal.
-#[derive(Debug, PartialEq, Eq)]
-struct JsStringDecodeError {
-    message: String,
-    offset: usize,
-}
-
-fn decode_js_string(raw: &str, allow_line_breaks: bool) -> Result<String, JsStringDecodeError> {
-    let mut output = String::new();
-    let mut chars = raw.char_indices().peekable();
-    while let Some((offset, ch)) = chars.next() {
-        if ch != '\\' {
-            if matches!(ch, '\n' | '\r') {
-                // A raw line break is a syntax error inside '' or "", but a
-                // template literal keeps it - and real scores rely on that to
-                // lay a long phrase out over several lines.
-                if !allow_line_breaks {
-                    return Err(JsStringDecodeError {
-                        message: "unescaped line break in mini string".into(),
-                        offset,
-                    });
-                }
-                // JavaScript normalises CRLF and lone CR to LF in template
-                // literal values; mini treats any of them as whitespace, but
-                // matching the spec keeps offsets and values predictable.
-                if ch == '\r' {
-                    if chars.peek().map(|(_, next)| *next) == Some('\n') {
-                        chars.next();
-                    }
-                    output.push('\n');
-                } else {
-                    output.push(ch);
-                }
-                continue;
-            }
-            output.push(ch);
-            continue;
-        }
-        match chars.next().map(|(_, ch)| ch) {
-            Some('n') => output.push('\n'),
-            Some('r') => output.push('\r'),
-            Some('t') => output.push('\t'),
-            Some('b') => output.push('\u{0008}'),
-            Some('f') => output.push('\u{000c}'),
-            Some('v') => output.push('\u{000b}'),
-            // `\0` is NUL only when no decimal digit follows.
-            Some('0') if !chars.peek().is_some_and(|(_, ch)| ch.is_ascii_digit()) => {
-                output.push('\0');
-            }
-            Some('0'..='9') => {
-                return Err(JsStringDecodeError {
-                    message: "legacy numeric escape is not allowed in mini string".into(),
-                    offset,
-                });
-            }
-            // A backslash before a line terminator is a line continuation: the
-            // break is removed and contributes nothing.
-            Some('\n') | Some('\u{2028}') | Some('\u{2029}') => {}
-            Some('\r') => {
-                if chars.peek().is_some_and(|(_, ch)| *ch == '\n') {
-                    chars.next();
-                }
-            }
-            Some('x') => {
-                let value = take_hex(&mut chars, 2).ok_or_else(|| JsStringDecodeError {
-                    message: "invalid hexadecimal escape in mini string".into(),
-                    offset,
-                })?;
-                output.push(char::from_u32(value).expect("two hex digits form a scalar value"));
-            }
-            Some('u') => decode_unicode_escape(&mut chars, &mut output)
-                .map_err(|message| JsStringDecodeError { message, offset })?,
-            Some(ch) => output.push(ch),
-            None => {
-                return Err(JsStringDecodeError {
-                    message: "unterminated escape in mini string".into(),
-                    offset,
-                });
-            }
-        }
-    }
-    Ok(output)
-}
-
-/// Decode one `\u` escape, positioned just after the `u`.
-///
-/// Surrogate pairs become one scalar value. A lone surrogate is refused
-/// because it has no UTF-8 representation for the native mini parser.
-fn decode_unicode_escape(
-    chars: &mut std::iter::Peekable<std::str::CharIndices<'_>>,
-    output: &mut String,
-) -> Result<(), String> {
-    let value = take_braced_hex(chars)
-        .or_else(|| take_hex(chars, 4))
-        .ok_or_else(|| "invalid Unicode escape in mini string".to_string())?;
-    if let Some(decoded) = char::from_u32(value) {
-        output.push(decoded);
-        return Ok(());
-    }
-    if is_high_surrogate(value) {
-        let mut probe = chars.clone();
-        if probe.next().map(|(_, ch)| ch) == Some('\\')
-            && probe.next().map(|(_, ch)| ch) == Some('u')
-            && let Some(low) = take_hex(&mut probe, 4).filter(|low| is_low_surrogate(*low))
-            && let Some(decoded) =
-                char::from_u32(0x10000 + ((value - 0xD800) << 10) + (low - 0xDC00))
-        {
-            output.push(decoded);
-            *chars = probe;
-            return Ok(());
-        }
-    }
-    if is_high_surrogate(value) || is_low_surrogate(value) {
-        Err("lone UTF-16 surrogate in mini string".into())
-    } else {
-        Err("Unicode escape is outside the valid code-point range".into())
-    }
-}
-
 fn quote_single(value: &str) -> String {
     let escaped = value
         .replace('\\', "\\\\")
@@ -4459,7 +4516,13 @@ pub fn lane_statements(source: &str) -> Option<Vec<LaneStatement>> {
     if check_nesting(source).is_err() {
         return None;
     }
-    let mut lanes = on_parse_stack(|| lane_statements_here(source))?;
+    // A text with no slash in its code holds no regular expression. The
+    // scan then parses nothing and nests no call, so it runs where it is.
+    let mut lanes = if has_code_slash(source) {
+        on_parse_stack(source, lane_statements_here)?
+    } else {
+        lane_statements_here(source)
+    };
     if lanes.is_empty() {
         lanes.push(LaneStatement {
             label: String::new(),
@@ -4495,8 +4558,8 @@ pub fn same_instructions(playing: &str, typed: &str) -> bool {
     }
 }
 
-/// The body of `lane_statements`, always called on a parse stack. Empty when
-/// the score has no code.
+/// The body of `lane_statements`, called on a parse stack for a text that
+/// the scan parses. Empty when the score has no code.
 fn lane_statements_here(source: &str) -> Vec<LaneStatement> {
     let bytes = source.as_bytes();
     let regexes_are_present = !RegexLiteralRanges::parse(source).is_empty();
@@ -4543,21 +4606,11 @@ fn lane_statements_here(source: &str) -> Vec<LaneStatement> {
             counted = at;
             LaneStatement {
                 label: label.to_owned(),
-                body: normal_body(code),
+                body: LaneStatement::body_of(code),
                 line,
             }
         })
         .collect()
-}
-
-/// `code` with `\n` for each line end and no whitespace at the end of a line.
-fn normal_body(code: &str) -> String {
-    code.replace("\r\n", "\n")
-        .replace(['\r', '\u{2028}', '\u{2029}'], "\n")
-        .split('\n')
-        .map(str::trim_end)
-        .collect::<Vec<_>>()
-        .join("\n")
 }
 
 /// Append `return` to the final top-level expression statement. Public so a
@@ -4575,8 +4628,10 @@ fn add_final_return_on_parse_stack(code: &str, empty_is_undefined: bool) -> Stri
     if check_nesting(code).is_err() {
         return code.to_string();
     }
-    on_parse_stack(|| add_final_return_here(code, empty_is_undefined))
-        .unwrap_or_else(|| code.to_string())
+    on_parse_stack(code, move |code| {
+        add_final_return_here(code, empty_is_undefined)
+    })
+    .unwrap_or_else(|| code.to_string())
 }
 
 fn add_final_return_here(code: &str, empty_is_undefined: bool) -> String {
@@ -5406,9 +5461,9 @@ mod tests {
         ] {
             let opener = worst.chars().next().unwrap();
             assert!(structural_bytes(&worst) <= MAX_STRUCTURAL_BYTES);
-            let parsed = on_parse_stack(|| {
+            let parsed = on_parse_stack(&worst, |worst| {
                 let allocator = Allocator::default();
-                Parser::new(&allocator, &worst, SourceType::mjs())
+                Parser::new(&allocator, worst, SourceType::mjs())
                     .parse()
                     .diagnostics
                     .len()
@@ -5811,6 +5866,75 @@ mod tests {
             transpile("s1.initVideo(\"clips/loop.webm\")", &options).output,
             "s1.initVideo('clips/loop.webm');"
         );
+    }
+
+    #[test]
+    fn a_host_that_only_evaluates_keeps_the_offsets_and_lists_no_leaf() {
+        let output = transpile(
+            r#"note("c4 e4")"#,
+            &TranspileOptions {
+                add_return: false,
+                list_mini_leaves: false,
+                ..TranspileOptions::default()
+            },
+        );
+        assert_eq!(output.output, "note(m('c4 e4', 5));");
+        assert!(output.mini_locations.is_empty());
+    }
+
+    #[test]
+    fn the_printed_program_is_read_as_a_score_when_nothing_is_added_to_it() {
+        let read = |source: &str, add_return: bool| {
+            transpile(
+                source,
+                &TranspileOptions {
+                    add_return,
+                    ..TranspileOptions::default()
+                },
+            )
+            .program
+        };
+        let mut held = Held::default();
+        let mut row = |exprs: Vec<ScoreExpr<'static>>| held.hold_row(exprs).expect("a row");
+        let mini = ScoreExpr::Call {
+            callee: "m".into(),
+            arguments: row(vec![ScoreExpr::String("bd".into()), ScoreExpr::Number(9.0)]),
+            written: Written::default(),
+        };
+        let sound = ScoreExpr::Call {
+            callee: "sound".into(),
+            arguments: row(vec![mini]),
+            written: Written::default(),
+        };
+        let lane = row(vec![ScoreExpr::String("$".into()), ScoreExpr::Number(0.0)]);
+        let statements = vec![ScoreStatement::Expression(ScoreExpr::Method {
+            receiver: held.hold(sound).expect("a place"),
+            method: "p".into(),
+            arguments: lane,
+            written: Written::default(),
+        })];
+        assert_eq!(
+            read(r#"$: sound("bd")"#, false),
+            Some(ScoreProgram { statements, held })
+        );
+        assert_eq!(read(r#"$: sound("bd")"#, true), None);
+        assert_eq!(read("if (a) b()", false), None);
+        assert_eq!(read("const a = 1; const a = 2;", false), None);
+    }
+
+    #[test]
+    fn the_raw_budget_counts_each_word_where_it_does_not_overlap() {
+        for (source, count) in [
+            ("item in first", 1),
+            ("a instanceof B", 2),
+            ("typeof typeof x", 2),
+            ("new.target", 2),
+            ("\\u0076oid 0", 1),
+            ("f(a)[b]{c}", 3),
+            ("", 0),
+        ] {
+            assert_eq!(structural_bytes(source), count, "{source}");
+        }
     }
 
     #[test]
@@ -7444,48 +7568,6 @@ p._scope({ text: "/* not a comment */" });"#;
     }
 
     #[test]
-    fn string_escapes_decode_the_way_javascript_reads_them() {
-        for (escaped, decoded) in [
-            (r"bdd x", "bdd x"),
-            (r"bd\x64 x", "bdd x"),
-            (r"bd\u0064 x", "bdd x"),
-            // JavaScript strings are UTF-16, so an astral character is written
-            // as a surrogate PAIR and only means anything combined.
-            (r"a\ud83d\ude00b", "a\u{1F600}b"),
-            (r"a\u{1F600}b", "a\u{1F600}b"),
-            (r"a\vb", "a\u{000b}b"),
-            (r"a\0b", "a\0b"),
-            (r"a\nb", "a\nb"),
-            (r"a\tb", "a\tb"),
-            // An unrecognised escape really does just drop the backslash.
-            (r"a\qb", "aqb"),
-        ] {
-            assert_eq!(
-                decode_js_string(escaped, false).expect("valid JavaScript escape"),
-                decoded,
-                "{escaped:?} did not decode as JavaScript reads it"
-            );
-        }
-
-        // A backslash before a line terminator is a continuation: it and the
-        // break contribute nothing.
-        assert_eq!(decode_js_string("a\\\nb", false).unwrap(), "ab");
-
-        // A raw line break is a syntax error in '' and "", but a template
-        // literal keeps it, and real scores lay long phrases out over several
-        // lines.
-        assert!(decode_js_string("c3 e3\ng3 b3", false).is_err());
-        assert_eq!(
-            decode_js_string("c3 e3\ng3 b3", true).unwrap(),
-            "c3 e3\ng3 b3"
-        );
-        // JavaScript normalises CRLF and lone CR to LF in a template literal.
-        assert_eq!(decode_js_string("a\r\nb", true).unwrap(), "a\nb");
-        assert_eq!(decode_js_string("a\rb", true).unwrap(), "a\nb");
-        assert_eq!(decode_js_string("a\\\r\nb", false).unwrap(), "ab");
-    }
-
-    #[test]
     fn malformed_or_unrepresentable_mini_escapes_are_diagnostics() {
         for source in [
             r#"s("a\x6Zb")"#,
@@ -7614,7 +7696,26 @@ p._scope({ text: "/* not a comment */" });"#;
 
     /// The thread `on_parse_stack` runs its work on.
     fn parse_thread() -> Option<std::thread::ThreadId> {
-        on_parse_stack(|| std::thread::current().id())
+        on_parse_stack("", |_| std::thread::current().id())
+    }
+
+    #[test]
+    fn one_parse_stack_serves_each_parse_of_a_thread() {
+        let first = parse_thread().expect("a thread to parse on");
+        assert_ne!(first, std::thread::current().id());
+        assert_eq!(parse_thread(), Some(first));
+        // A panic of the work continues on the caller, and the same stack
+        // parses again.
+        let panicked = std::panic::catch_unwind(|| {
+            on_parse_stack("", |_| -> () { panic!("a parse that fails") })
+        });
+        assert!(panicked.is_err());
+        assert_eq!(parse_thread(), Some(first));
+        // Another calling thread has a parse stack of its own.
+        let other = std::thread::spawn(parse_thread)
+            .join()
+            .expect("the other thread");
+        assert!(other.is_some_and(|other| other != first));
     }
 
     #[test]
@@ -7659,7 +7760,7 @@ p._scope({ text: "/* not a comment */" });"#;
     fn on_caller_stack_restores_the_previous_setting() {
         let caller = std::thread::current().id();
         let spawns = || parse_thread().is_some_and(|thread| thread != caller);
-        assert!(spawns(), "a parse outside the call spawns its thread");
+        assert!(spawns(), "a parse outside the call runs on its thread");
         on_caller_stack(|| {
             on_caller_stack(|| ());
             assert_eq!(

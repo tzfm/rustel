@@ -325,7 +325,7 @@ pub(super) fn copy_steps<'js>(
     let source_steps = source
         .as_object()
         .and_then(rquickjs::Class::<NativePatternWrapper>::from_object)
-        .and_then(|wrapper| wrapper.borrow().pattern.steps);
+        .and_then(|wrapper| wrapper.borrow().pattern.steps());
     let object = target
         .as_object()
         .ok_or_else(|| throw_type_error(ctx, "registered result is not a Pattern"))?;

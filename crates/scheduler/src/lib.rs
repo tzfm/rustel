@@ -192,7 +192,7 @@ fn trace_edo_scale(value: &Value) -> Option<TraceEdoScale> {
         return None;
     }
     let mut degree_indexes = Vec::with_capacity(indexes.len());
-    for index in indexes {
+    for index in indexes.iter() {
         let Value::F64(index) = index else {
             return None;
         };
@@ -203,14 +203,14 @@ fn trace_edo_scale(value: &Value) -> Option<TraceEdoScale> {
     }
     // `intLabels` is one-based: degree `i` is named at `i + 1`.
     // Missing entries leave the corresponding degree unnamed.
-    let labels = match value.get("intLabels") {
-        Some(Value::List(labels)) => labels.as_slice(),
+    let labels: &[Value] = match value.get("intLabels") {
+        Some(Value::List(labels)) => labels,
         _ => &[],
     };
     let interval_labels = (0..degree_indexes.len())
         .map(|degree| match labels.get(degree + 1) {
             Some(Value::Str(label)) if label.len() <= MAX_TRACE_INTERVAL_LABEL_BYTES => {
-                label.clone()
+                label.to_string()
             }
             _ => String::new(),
         })
@@ -2182,8 +2182,8 @@ impl Scheduler {
                 duration,
                 target_time,
                 cps: self.tempo.pattern_cps_at(whole.begin),
+                live_controls: hap.live_controls(),
                 value: hap.value,
-                live_controls: hap.live_controls,
                 ui_visuals,
                 log_line,
             });
@@ -2375,11 +2375,11 @@ mod tests {
                 ("root", Value::Str("130.8128".into())),
                 (
                     "degreeIndexes",
-                    Value::List(indexes.iter().copied().map(Value::F64).collect()),
+                    Value::list(indexes.iter().copied().map(Value::F64).collect()),
                 ),
                 (
                     "intLabels",
-                    Value::List(vec![
+                    Value::list(vec![
                         Value::Null,
                         Value::Str("P1".into()),
                         Value::Str("M2".into()),

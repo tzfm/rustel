@@ -18,14 +18,35 @@
 //! being the same walk that computes purity.
 
 use crate::CallbackId;
+use std::sync::Arc;
+
+/// Whether the answer of a graph depends on the span that asks, beyond the
+/// cut of each hap's part. The order is from the least to the most, so the
+/// most of some graphs is the answer for a node that asks each of them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum SpanRead {
+    /// A graph of discrete haps: its answer for a part of a span is its
+    /// answer for the span, with each hap cut to the part and in the same
+    /// order.
+    No,
+    /// As [`SpanRead::No`], when each pattern that a join of the graph
+    /// makes in a query answers so. The join knows at the query. See
+    /// [`crate::Pattern::query_restarted`].
+    Made,
+    /// A signal is read at the span, and a node that this classification
+    /// does not know may read it.
+    Yes,
+}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Purity {
     /// True if any JS-owned identity is reachable from this pattern.
     pub impure: bool,
-    /// Every callback reachable from this subtree. Precomputed so `gc_mark`
-    /// is O(k) and allocation-free.
-    pub reachable: Vec<CallbackId>,
+    /// Every callback reachable from this subtree, in order and each one
+    /// time. Precomputed so `gc_mark` is O(k) and allocation-free. Most
+    /// graphs hold no callback, so the list is kept apart: a copy of the
+    /// purity is a handle of it. See [`Self::reachable`].
+    reachable: Option<Arc<Vec<CallbackId>>>,
     /// True when the reachable set is **incomplete** - the graph contains an
     /// opaque closure that materialises patterns at query time, so which
     /// callbacks it will touch cannot be enumerated statically.
@@ -46,16 +67,30 @@ pub struct Purity {
     /// dictionary in place, so the graph is volatile exactly then. See
     /// [`crate::Pattern::is_cacheable`]. Monotonic like `volatile`.
     pub host_voicings: bool,
+    /// Whether an answer may depend on the span that asks beyond the cut of
+    /// each hap's part.
+    ///
+    /// Not monotonic: a node can ask a child that reads the span over each
+    /// whole of its own haps. Each node sets it from its own kind, and any
+    /// other source of a `Purity` says [`SpanRead::Yes`].
+    pub span_read: SpanRead,
+    /// True when a query of this graph answers from the graph alone: no
+    /// node of it builds or reads a table. See
+    /// [`crate::Pattern::mark_walked`]. Monotonic like `volatile`: a node
+    /// over a graph that walks is walked too.
+    pub walked: bool,
 }
 
 impl Purity {
     pub fn pure() -> Self {
         Purity {
             impure: false,
-            reachable: Vec::new(),
+            reachable: None,
             opaque: false,
             volatile: false,
             host_voicings: false,
+            span_read: SpanRead::Yes,
+            walked: false,
         }
     }
 
@@ -64,10 +99,12 @@ impl Purity {
     pub fn with_callback(id: CallbackId) -> Self {
         Purity {
             impure: true,
-            reachable: vec![id],
+            reachable: Some(Arc::new(vec![id])),
             opaque: false,
             volatile: true,
             host_voicings: false,
+            span_read: SpanRead::Yes,
+            walked: false,
         }
     }
 
@@ -77,10 +114,12 @@ impl Purity {
     pub fn volatile() -> Self {
         Purity {
             impure: false,
-            reachable: Vec::new(),
+            reachable: None,
             opaque: false,
             volatile: true,
             host_voicings: false,
+            span_read: SpanRead::Yes,
+            walked: false,
         }
     }
 
@@ -93,40 +132,120 @@ impl Purity {
     pub fn opaque() -> Self {
         Purity {
             impure: true,
-            reachable: Vec::new(),
+            reachable: None,
             opaque: true,
             volatile: true,
             host_voicings: false,
+            span_read: SpanRead::Yes,
+            walked: false,
         }
+    }
+
+    /// Every callback reachable from this subtree - what L2's `gc_mark`
+    /// marks.
+    pub fn reachable(&self) -> &[CallbackId] {
+        self.reachable.as_deref().map_or(&[], Vec::as_slice)
+    }
+
+    pub(crate) fn take_reachable(&mut self) -> Option<Arc<Vec<CallbackId>>> {
+        self.reachable.take()
+    }
+
+    pub(crate) fn from_packed(
+        impure: bool,
+        opaque: bool,
+        volatile: bool,
+        host_voicings: bool,
+        span_read: SpanRead,
+        reachable: Option<Arc<Vec<CallbackId>>>,
+    ) -> Self {
+        Self {
+            impure,
+            reachable,
+            opaque,
+            volatile,
+            host_voicings,
+            span_read,
+            walked: false,
+        }
+    }
+
+    /// Add `ids` to the callbacks that this subtree reaches.
+    pub(crate) fn reach(&mut self, ids: impl IntoIterator<Item = CallbackId>) {
+        let mut reached = Reached::default();
+        reached.add(&self.reachable);
+        reached.more.extend(ids);
+        self.reachable = reached.finish();
     }
 
     /// Monotonic union. Impurity propagates upward and is never dropped.
     pub fn merge(parts: impl IntoIterator<Item = Purity>) -> Self {
         let mut out = Purity::pure();
+        let mut reached = Reached::default();
         for p in parts {
-            out.impure |= p.impure;
-            out.opaque |= p.opaque;
-            out.volatile |= p.volatile;
-            out.host_voicings |= p.host_voicings;
-            out.reachable.extend(p.reachable);
+            out.join(&p);
+            reached.add(&p.reachable);
         }
-        out.reachable.sort_unstable();
-        out.reachable.dedup();
+        out.reachable = reached.finish();
         out
     }
 
     pub fn merge_refs<'a>(parts: impl IntoIterator<Item = &'a Purity>) -> Self {
         let mut out = Purity::pure();
+        let mut reached = Reached::default();
         for p in parts {
-            out.impure |= p.impure;
-            out.opaque |= p.opaque;
-            out.volatile |= p.volatile;
-            out.host_voicings |= p.host_voicings;
-            out.reachable.extend_from_slice(&p.reachable);
+            out.join(p);
+            reached.add(&p.reachable);
         }
-        out.reachable.sort_unstable();
-        out.reachable.dedup();
+        out.reachable = reached.finish();
         out
+    }
+
+    /// Take each flag of `part` into this union.
+    fn join(&mut self, part: &Purity) {
+        self.impure |= part.impure;
+        self.opaque |= part.opaque;
+        self.volatile |= part.volatile;
+        self.host_voicings |= part.host_voicings;
+        self.span_read = self.span_read.max(part.span_read);
+        self.walked |= part.walked;
+    }
+}
+
+/// A union of lists of callbacks. A union of one list is a handle of that
+/// list, and a union of none is no list.
+#[derive(Default)]
+struct Reached {
+    one: Option<Arc<Vec<CallbackId>>>,
+    more: Vec<CallbackId>,
+}
+
+impl Reached {
+    fn add(&mut self, list: &Option<Arc<Vec<CallbackId>>>) {
+        let Some(list) = list else {
+            return;
+        };
+        if self.one.is_none() && self.more.is_empty() {
+            // A handle of the list, which is in order already.
+            self.one = Some(Arc::clone(list));
+            return;
+        }
+        if let Some(one) = self.one.take() {
+            self.more.extend_from_slice(&one);
+        }
+        self.more.extend_from_slice(list);
+    }
+
+    fn finish(mut self) -> Option<Arc<Vec<CallbackId>>> {
+        if let Some(one) = self.one.take() {
+            if self.more.is_empty() {
+                return Some(one);
+            }
+            self.more.extend_from_slice(&one);
+        }
+        self.more.sort_unstable();
+        self.more.dedup();
+        (!self.more.is_empty()).then(|| Arc::new(self.more))
     }
 }
 
@@ -169,7 +288,7 @@ impl PurePattern {
     /// callbacks it reaches and is volatile, so no memo or table keeps it.
     pub(crate) fn host_built(pattern: crate::Pattern) -> Self {
         let mut pattern = pattern.mark_volatile();
-        pattern.purity.impure = false;
+        pattern.clear_impure();
         PurePattern(pattern)
     }
 }

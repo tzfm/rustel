@@ -1,0 +1,19 @@
+[package]
+name = "rustel-bench"
+description = "Every seam of every score, in time and memory, with a regression gate"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+rustel-core = { path = "../core" }
+rustel-fraction = { path = "../fraction" }
+rustel-runtime = { path = "../runtime" }
+serde_json = "1"
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[lints]
+workspace = true

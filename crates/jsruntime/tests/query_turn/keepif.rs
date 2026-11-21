@@ -686,7 +686,7 @@ fn raw_keepif_retains_controls_prunes_transients_and_keeps_nested_accounting() {
         owned
             .active_pattern()
             .expect("raw keepif owned graph")
-            .steps,
+            .steps(),
         Some(Fraction::int(5))
     );
     for _ in 0..3 {

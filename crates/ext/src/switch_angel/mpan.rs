@@ -28,7 +28,7 @@ pub(super) const REFERENCE: ReferenceEntry = simple_reference!(
 
 fn apply<P: PatOps>(args: &[Value], pattern: P) -> P {
     let orbits = match rustel_core::materialize_js_value(&value(args, 0)) {
-        Value::List(values) => values,
+        Value::List(values) => values.to_vec(),
         value => vec![value],
     };
     if orbits.is_empty() {

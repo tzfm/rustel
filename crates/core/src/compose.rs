@@ -27,6 +27,7 @@ later version.
 use crate::ops::PatOps;
 use crate::util;
 use crate::value::{OrderedMap, Value};
+use std::sync::Arc;
 
 /// The eight alignments an operator can compose under.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -100,7 +101,7 @@ impl Alignment {
 }
 
 /// One entry of the COMPOSERS table.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, std::hash::Hash)]
 pub enum ComposeOp {
     /// The right operand wins.
     Set,
@@ -218,6 +219,37 @@ impl ComposeOp {
         }
     }
 
+    /// How a composition by this op carries a pick lookup.
+    pub(crate) fn lookup_flow(self) -> crate::LookupFlow {
+        match self {
+            ComposeOp::Set => crate::LookupFlow::Set,
+            ComposeOp::Keep | ComposeOp::KeepIf => crate::LookupFlow::Left,
+            ComposeOp::Add => crate::LookupFlow::Add,
+            _ => crate::LookupFlow::Infer,
+        }
+    }
+
+    /// The number that this op makes of two numbers, when it is one of
+    /// arithmetic: what [`Self::apply_scalar`] gives for them.
+    pub(crate) fn of_numbers(self, x: f64, y: f64) -> Option<f64> {
+        use ComposeOp::*;
+        Some(match self {
+            Add => x + y,
+            Sub => x - y,
+            Mul => x * y,
+            Div => x / y,
+            // Floor-mod, not the truncating remainder.
+            Mod => util::modulo_f64(x, y),
+            Pow => x.powf(y),
+            Band => f64::from(to_int32(x) & to_int32(y)),
+            Bor => f64::from(to_int32(x) | to_int32(y)),
+            Bxor => f64::from(to_int32(x) ^ to_int32(y)),
+            Blshift => f64::from(to_int32(x) << (to_uint32(y) & 31)),
+            Brshift => f64::from(to_int32(x) >> (to_uint32(y) & 31)),
+            _ => return None,
+        })
+    }
+
     /// The scalar body, applied to two **non-object** values.
     ///
     /// The arithmetic ops coerce both sides through `parse_numeral` first -
@@ -248,21 +280,10 @@ impl ComposeOp {
                         (f64::NAN, f64::NAN)
                     }
                 };
-                Value::F64(match self {
-                    Add => x + y,
-                    Sub => x - y,
-                    Mul => x * y,
-                    Div => x / y,
-                    // Floor-mod, not the truncating remainder.
-                    Mod => util::modulo_f64(x, y),
-                    Pow => x.powf(y),
-                    Band => f64::from(to_int32(x) & to_int32(y)),
-                    Bor => f64::from(to_int32(x) | to_int32(y)),
-                    Bxor => f64::from(to_int32(x) ^ to_int32(y)),
-                    Blshift => f64::from(to_int32(x) << (to_uint32(y) & 31)),
-                    Brshift => f64::from(to_int32(x) >> (to_uint32(y) & 31)),
-                    _ => unreachable!(),
-                })
+                Value::F64(
+                    self.of_numbers(x, y)
+                        .expect("an op of arithmetic gives a number"),
+                )
             }
             // Relational comparison is tri-state: NaN on either side makes
             // all four operators false. Defining `>=` as `!(<)` is therefore
@@ -294,11 +315,6 @@ impl ComposeOp {
     }
 }
 
-/// A plain control object - not an array, not a Fraction.
-fn non_array_object(v: &Value) -> bool {
-    matches!(v, Value::Object(_))
-}
-
 /// Composes two values: when either side is a control object both are
 /// promoted to objects and unioned key-wise; otherwise the scalar op runs.
 pub fn compose_op(op: ComposeOp, a: &Value, b: &Value) -> Value {
@@ -314,20 +330,26 @@ pub fn compose_op(op: ComposeOp, a: &Value, b: &Value) -> Value {
         .then(|| crate::materialize_js_value(b));
     let a = materialized_a.as_ref().unwrap_or(a);
     let b = materialized_b.as_ref().unwrap_or(b);
-    if non_array_object(a) || non_array_object(b) {
-        let a_obj = as_object(a);
-        let b_obj = as_object(b);
-        union_with_obj(op, &a_obj, &b_obj)
-    } else {
-        op.apply_scalar(a, b)
+    match (a, b) {
+        (Value::Object(a), Value::Object(b)) => union_with_obj(op, a, b),
+        // A value that is no object is `{value: …}` in a union, and the
+        // union keeps the object as it is. See [`union_with_obj`].
+        (Value::Object(kept), value) if !matches!(value, Value::Undefined) => {
+            Value::Object(kept.clone())
+        }
+        (Value::Object(a), b) => union_with_obj(op, a, &as_object(b)),
+        (a, Value::Object(b)) => union_with_obj(op, &as_object(a), b),
+        (a, b) => op.apply_scalar(a, b),
     }
 }
 
-fn as_object(v: &Value) -> OrderedMap {
-    match v {
-        Value::Object(o) => o.clone(),
-        other => OrderedMap::from_entries([("value".to_string(), other.clone())]),
-    }
+/// The key of a value that is no object, in its union with an object.
+static VALUE: std::sync::LazyLock<crate::Key> =
+    std::sync::LazyLock::new(|| crate::Key::from("value"));
+
+/// `value`, which is no object, as the object that a union reads.
+fn as_object(value: &Value) -> OrderedMap {
+    OrderedMap::of_one(VALUE.clone(), value.clone())
 }
 
 /// Key-wise union: `a`'s key order, then `b`'s new keys, common keys
@@ -356,24 +378,50 @@ pub(crate) fn union_drops(b: &OrderedMap) -> bool {
 /// `b`'s keys added to `out`: common keys replaced where they are by the
 /// combined value, then `b`'s new keys in `b`'s order.
 fn union_into(op: ComposeOp, out: &mut OrderedMap, b: &OrderedMap) {
-    out.reserve(b.len());
-    for (key, b_value) in b {
-        out.upsert(key, |a_value| match a_value {
-            Some(a_value) => op.apply_scalar(a_value, b_value),
-            None => b_value.clone(),
-        });
-    }
+    out.merge(b, |current, value| op.apply_scalar(current, value));
 }
 
 /// [`compose_op`] of two data values, which hold no script object, made
 /// where `a` is. A union of two maps adds `b`'s keys to `a`'s map, which it
-/// copies only when it is shared.
+/// copies only when it is shared. Data made of data is data, so the union's
+/// map is marked as holding data only, and the next compose of it does not
+/// walk its entries to learn that again.
 pub(crate) fn compose_data_in_place(op: ComposeOp, a: &mut Value, b: &Value) {
+    compose_data_in_place_cached(op, a, b, None);
+}
+
+/// [`compose_data_in_place`] writing flat `Entries::Made` directly without
+/// allocating an intermediate `Patched` overlay (used by build-time folds).
+pub(crate) fn compose_data_flat(op: ComposeOp, a: &mut Value, b: &Value) {
     debug_assert!(a.is_data(0) && b.is_data(0));
     if let (Value::Object(map), Value::Object(other)) = (&mut *a, b)
         && !union_drops(other)
     {
+        map.merge_flat(other, |current, value| op.apply_scalar(current, value));
+        map.mark_made_of_data();
+        return;
+    }
+    *a = compose_op(op, a, b);
+}
+
+/// [`compose_data_in_place`] with an optional shared overlay cache for chord
+/// haps meeting the same constant control map.
+pub(crate) fn compose_data_in_place_cached(
+    op: ComposeOp,
+    a: &mut Value,
+    b: &Value,
+    cache: Option<&mut crate::value::SharedWaveCache>,
+) {
+    debug_assert!(a.is_data(0) && b.is_data(0));
+    if let (Value::Object(map), Value::Object(other)) = (&mut *a, b)
+        && !union_drops(other)
+    {
+        if op == ComposeOp::Set {
+            map.merge_set_data_cached(other, cache);
+            return;
+        }
         union_into(op, map, other);
+        map.mark_made_of_data();
         return;
     }
     *a = compose_op(op, a, b);
@@ -394,23 +442,12 @@ pub fn compose<P: PatOps>(pat: &P, other: &P, op: ComposeOp, how: Alignment) -> 
 }
 
 fn compose_inner<P: PatOps>(pat: &P, other: &P, op: ComposeOp, how: Alignment) -> P {
-    let lookup_flow = match op {
-        ComposeOp::Set => crate::LookupFlow::Set,
-        ComposeOp::Keep | ComposeOp::KeepIf => crate::LookupFlow::Left,
-        ComposeOp::Add => crate::LookupFlow::Add,
-        _ => crate::LookupFlow::Infer,
-    };
+    let lookup_flow = op.lookup_flow();
     // `keepif` bypasses `_composeOp` so that `b`'s value is discarded rather
     // than unioned, then strips the undefineds the falsy branch produced.
     if op == ComposeOp::KeepIf {
-        apply_alignment(
-            pat,
-            other,
-            how,
-            move |a, b| op.apply_scalar(a, b),
-            lookup_flow,
-        )
-        .remove_undefineds()
+        apply_alignment(pat, other, how, interned_combine(op, true), lookup_flow)
+            .remove_undefineds()
     } else {
         // A direct alignment names its op, so that a precomputed table can
         // run it on the structure hap's value where that value is.
@@ -418,15 +455,62 @@ fn compose_inner<P: PatOps>(pat: &P, other: &P, op: ComposeOp, how: Alignment) -
             Alignment::In => pat.app_left_composed(other.clone(), op, lookup_flow),
             Alignment::Out => pat.app_right_composed(other.clone(), op, lookup_flow),
             Alignment::Mix => pat.app_both_composed(other.clone(), op, lookup_flow),
-            _ => apply_alignment(
-                pat,
-                other,
-                how,
-                move |a, b| compose_op(op, a, b),
-                lookup_flow,
-            ),
+            _ => apply_alignment(pat, other, how, interned_combine(op, false), lookup_flow),
         }
     }
+}
+
+/// The closure of each compose op that a pattern was built with. See
+/// [`interned_combine`].
+static OP_CLOSURES: std::sync::OnceLock<
+    std::sync::Mutex<std::collections::HashMap<(ComposeOp, bool), crate::CombineFn>>,
+> = std::sync::OnceLock::new();
+
+/// Whether `combine` is the closure of a compose op: a function of its two
+/// values and nothing more, which a fold may run when a pattern is built.
+pub(crate) fn is_op_closure(combine: &crate::CombineFn) -> bool {
+    OP_CLOSURES.get().is_some_and(|closures| {
+        closures
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .values()
+            .any(|closure| Arc::ptr_eq(closure, combine))
+    })
+}
+
+/// Whether `combine` is the closure of `keepif`, which gives the left value
+/// where the right one is set, and no value elsewhere.
+pub(crate) fn is_keep_if(combine: &crate::CombineFn) -> bool {
+    OP_CLOSURES.get().is_some_and(|closures| {
+        closures
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(&(ComposeOp::KeepIf, true))
+            .is_some_and(|closure| Arc::ptr_eq(closure, combine))
+    })
+}
+
+/// The combine closure one compose op builds, interned: the same op built
+/// by a later evaluation is the same closure object, so that node agrees
+/// with its counterpart by pointer and the answers of the unchanged
+/// subtree carry across evaluations and edits. `scalar_only` is the
+/// `keepif` body, which discards `b`'s value rather than unioning it.
+/// See [`crate::interned_closure`].
+fn interned_combine(op: ComposeOp, scalar_only: bool) -> crate::CombineFn {
+    crate::interned_closure(
+        OP_CLOSURES.get_or_init(Default::default),
+        (op, scalar_only),
+        || {
+            let combine: crate::CombineFn = Arc::new(move |a: &Value, b: &Value| {
+                if scalar_only {
+                    op.apply_scalar(a, b)
+                } else {
+                    compose_op(op, a, b)
+                }
+            });
+            combine
+        },
+    )
 }
 
 /// The `_op*` family. `combine(a, b)` receives the LEFT pattern's value first,
@@ -440,13 +524,13 @@ fn apply_alignment<P: PatOps>(
     pat: &P,
     other: &P,
     how: Alignment,
-    combine: impl Fn(&Value, &Value) -> Value + Send + Sync + Clone + 'static,
+    combine: crate::CombineFn,
     lookup_flow: crate::LookupFlow,
 ) -> P {
     match how {
-        Alignment::In => pat.app_left_with_lookup(other.clone(), combine, lookup_flow),
-        Alignment::Out => pat.app_right_with_lookup(other.clone(), combine, lookup_flow),
-        Alignment::Mix => pat.app_both_with_lookup(other.clone(), combine, lookup_flow),
+        Alignment::In => pat.app_left_interned(other.clone(), combine, lookup_flow),
+        Alignment::Out => pat.app_right_interned(other.clone(), combine, lookup_flow),
+        Alignment::Mix => pat.app_both_interned(other.clone(), combine, lookup_flow),
 
         Alignment::Squeeze => {
             let other = other.clone();
@@ -576,7 +660,7 @@ fn js_strict_eq(a: &Value, b: &Value) -> bool {
         (F64(x), F64(y)) => x == y,
         (Str(x), Str(y)) => x == y,
         (List(x), List(y)) => {
-            x.len() == y.len() && x.iter().zip(y).all(|(p, q)| js_strict_eq(p, q))
+            x.len() == y.len() && x.iter().zip(y.iter()).all(|(p, q)| js_strict_eq(p, q))
         }
         (Object(x), Object(y)) => {
             x.len() == y.len()
@@ -623,6 +707,22 @@ mod tests {
         // union bail-out, so the left operand survives unchanged.
         let left = Value::object([("note".into(), Value::Str("c".into()))]);
         assert_eq!(compose_op(ComposeOp::Add, &left, &Value::F64(1.0)), left);
+        // `undefined` promotes to a value that the union keeps.
+        assert_eq!(
+            compose_op(ComposeOp::Add, &left, &Value::Undefined),
+            Value::object([
+                ("note".into(), Value::Str("c".into())),
+                ("value".into(), Value::Undefined),
+            ])
+        );
+        // A number on the left is the object that the control joins.
+        assert_eq!(
+            compose_op(ComposeOp::Add, &Value::F64(1.0), &left),
+            Value::object([
+                ("value".into(), Value::F64(1.0)),
+                ("note".into(), Value::Str("c".into())),
+            ])
+        );
     }
 
     #[test]

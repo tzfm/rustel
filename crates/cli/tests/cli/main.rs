@@ -8842,11 +8842,13 @@ fn no_save_session_conflicts_with_asking_for_one() {
 /// A deep pattern graph is refused with a resource-limit error. A stack overflow
 /// aborts the process and no recovery catches it. A debug frame is larger, so
 /// this test runs in debug too. A signal or exit 134 means the abort is back.
+/// Each shift is a node of its own: a change of speed folds into the node of
+/// the values.
 #[test]
 fn a_deep_pattern_graph_is_refused_instead_of_aborting_the_process() {
     for wrappers in [8_192, 20_000] {
         let source = format!(
-            "let p = s('bd'); for (let i = 0; i < {wrappers}; i++) p = p.fast(2).slow(2); p"
+            "let p = s('bd'); for (let i = 0; i < {wrappers}; i++) p = p.late(1).early(1); p"
         );
         let out = run(&["query", "--json", "-e", &source, "--end", "1/64"]);
         let code = out.status.code();
@@ -8873,7 +8875,7 @@ fn a_deep_pattern_graph_is_refused_instead_of_aborting_the_process() {
 /// combinators well under the ceiling is what real sources look like.
 #[test]
 fn a_graph_below_the_depth_limit_still_queries() {
-    let source = "let p = s('bd'); for (let i = 0; i < 100; i++) p = p.fast(2).slow(2); p";
+    let source = "let p = s('bd'); for (let i = 0; i < 100; i++) p = p.late(1).early(1); p";
     let out = run(&["query", "--json", "-e", source, "--end", "1/4"]);
     assert!(
         out.status.success(),
@@ -9815,7 +9817,7 @@ fn an_unreadable_scale_is_reported_when_its_notes_drop() {
             "-o",
             path.to_str().expect("utf-8 path"),
         ],
-        "Scale name raga is incomplete",
+        "Invalid scale name",
     );
     let _ = std::fs::remove_file(&path);
     // Half of the cycles read their scale: the bounce plays those, and says

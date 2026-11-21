@@ -121,16 +121,19 @@ pub(super) fn install<'js>(
     let proto = rquickjs::Class::<NativePatternWrapper>::prototype(ctx)
         .map_err(|error| error.to_string())?
         .ok_or("NativePatternWrapper has no prototype")?;
+    let timeline_state = runtime
+        .timeline_state
+        .get_or_init(rustel_core::TimelineState::default);
     proto
         .set(
             "timeline",
-            method(ctx, runtime.timeline_state.clone()).map_err(|error| error.to_string())?,
+            method(ctx, timeline_state.clone()).map_err(|error| error.to_string())?,
         )
         .map_err(|error| error.to_string())?;
     proto
         .set(
             "_timeline",
-            raw_method(ctx, runtime.timeline_state.clone()).map_err(|error| error.to_string())?,
+            raw_method(ctx, timeline_state.clone()).map_err(|error| error.to_string())?,
         )
         .map_err(|error| error.to_string())?;
     let scope: rquickjs::Object = globals

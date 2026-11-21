@@ -30,7 +30,7 @@ fn map<const N: usize>(entries: [(&str, Value); N]) -> Value {
 }
 
 fn text(value: &str) -> Value {
-    Value::Str(value.to_owned())
+    Value::Str(value.into())
 }
 
 type Resolved = Result<OnsetEvent, VoiceError>;
@@ -128,7 +128,7 @@ fn an_invalid_value_is_refused_as_its_json_is() {
         ),
         (map([("s", text("nosuch"))]), json!({"s": "nosuch"})),
         (
-            map([("s", text("bd")), ("bank", Value::List(Vec::new()))]),
+            map([("s", text("bd")), ("bank", Value::list(Vec::new()))]),
             json!({"s": "bd", "bank": []}),
         ),
         (text("c4"), json!("c4")),

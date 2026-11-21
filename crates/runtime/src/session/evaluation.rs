@@ -86,10 +86,6 @@ impl Session {
         if crate::sounds::variant_selection(source).is_some() {
             self.prebake_selects_variants = true;
         }
-        // Setup/prebake is the canonical home for voicing dictionaries and
-        // MIDI maps. Install those configuration globals before executing it,
-        // just as ordinary score evaluation does.
-        self.ensure_voicings()?;
         self.js.set_cps(self.scheduler.cps());
         self.js.set_cycle_time(self.evaluation_cycle());
         // The setup and its imports keep what they register for every
@@ -141,10 +137,8 @@ impl Session {
         // before the score, which is exactly when the files should start
         // arriving. Registrations and preloads enter one ordered loader job
         // so an override is visible before its preload resolves.
-        let csound = self
-            .csound
-            .stage(&effects.csound, &self.config.score_import_access)?;
-        self.csound.commit(csound);
+        let csound = self.csound_stage(&effects.csound)?;
+        self.csound_commit(csound);
         self.apply_sample_effects(effects.samples, effects.preload);
         self.retain_recovery_prebake(source, None);
         Ok(())
@@ -241,10 +235,7 @@ impl Session {
                 Err(other) => return Err(other),
             };
             for effects in effects {
-                let csound = match self
-                    .csound
-                    .stage(&effects.csound, &self.config.score_import_access)
-                {
+                let csound = match self.csound_stage(&effects.csound) {
                     Ok(csound) => csound,
                     Err(error) => {
                         self.import_errors
@@ -252,7 +243,7 @@ impl Session {
                         return Err(error);
                     }
                 };
-                self.csound.commit(csound);
+                self.csound_commit(csound);
                 self.apply_sample_effects(effects.samples, effects.preload);
             }
         }
@@ -262,7 +253,7 @@ impl Session {
 
     fn retain_recovery_prebake(&mut self, source: &str, error: Option<Arc<str>>) {
         // Keep completed mutations before an ordinary throw. Limits are not replayed.
-        let prebakes = Arc::make_mut(&mut self.recovery_prebakes);
+        let prebakes = Arc::make_mut(self.recovery_prebakes.get_or_insert_with(Arc::default));
         prebakes.retain(|earlier| &*earlier.source != source);
         prebakes.push(recovery::RecoveryPrebake {
             source: Arc::from(source),
@@ -661,11 +652,8 @@ impl Session {
         #[cfg(any(test, feature = "test-support"))]
         self.panic_if_injected(SessionPanicPoint::Evaluation);
         self.claim_core_settings();
-        // scale/transpose/scaleTranspose are native registry combinators in
-        // rustel-core. The voicings bundle still installs because chord and
-        // voicing do not yet have complete native implementations.
-        self.ensure_bindings()?;
-        self.ensure_voicings()?;
+        // The score surface installs when JavaScript first runs: a score the
+        // native tier evaluates needs none.
         self.js.set_cps(self.scheduler.cps());
         let cycle = seed.map_or_else(|| self.evaluation_cycle(), |(_, _, cycle)| cycle);
         self.js.set_cycle_time(cycle);
@@ -708,27 +696,88 @@ impl Session {
         if self.generation() == 0 {
             self.js.snapshot_active_as_last_good();
         }
+        // A score with no form of JavaScript alone is read as written, with
+        // no JavaScript parser. Any other text is the transpiler's.
+        // A number the host made live becomes a cell in the transpiler's
+        // output, so a text with live numbers takes the transpiler.
         let live_numbers = self.live_numbers(source);
-        let options = TranspileOptions {
-            widget_methods: rustel_transpiler::VISUAL_WIDGET_METHODS
-                .iter()
-                .map(|method| (*method).to_owned())
-                .collect(),
-            // Each lane of the text gets its number before the evaluation,
-            // so a plugin note names the same lane after an edit.
+        // Identical pure native re-evaluation: when the source text matches
+        // the installed native score and no plugin, live-number, or recovery
+        // state differs, reuse the active native graph and its tempo directly.
+        #[cfg(feature = "vst")]
+        let same_vst_state = !self.plugins_live()
+            && self.plugin_chains.get().is_none()
+            && self.lanes.same_document();
+        #[cfg(not(feature = "vst"))]
+        let same_vst_state = true;
+        if self.score_engine == Some(ScoreEngine::Native)
+            && self.last_source.as_deref() == Some(source)
+            && live_numbers.is_empty()
+            && seed.is_none()
+            && same_vst_state
+            && !self.csound_made()
+            && !budget.is_zero()
+            && !cancellation.load(std::sync::atomic::Ordering::Relaxed)
+            && let Some((pattern, cps, settings)) = self.js.try_reuse_identical_native_score(source)
+        {
+            #[cfg(feature = "hydra")]
+            {
+                self.staged_hydra = PendingHydra::Clear;
+            }
             #[cfg(feature = "vst")]
-            lane_numbers: self.lanes.read(source),
+            self.keep_ran_plugins(&[]);
+            let csound = self.csound_stage(&[])?;
+            let mut effects = rustel_jsruntime::ScoreEffects::default();
+            effects.cps = cps;
+            return Ok(EvaluatedScore::JavaScript {
+                pattern,
+                effects: Box::new(effects),
+                settings,
+                csound,
+            });
+        }
+        #[cfg_attr(not(feature = "vst"), allow(unused_mut))]
+        let mut read = if live_numbers.is_empty() {
+            rustel_score::read(source, rustel_transpiler::call_form)
+        } else {
+            None
+        };
+        // Each lane of the text gets its number before the evaluation, so a
+        // plugin note names the same lane after an edit.
+        #[cfg(feature = "vst")]
+        let lane_numbers = match &mut read {
+            Some(read) => {
+                let lanes = std::mem::take(&mut read.lanes);
+                let shared = self.js.share_source_text(source);
+                self.lanes.read_read_lanes_shared(&shared, lanes)
+            }
+            None => self.lanes.read(source),
+        };
+        // A read whose lane calls keep their places, as the transpiler
+        // writes them for a list of numbers with another count.
+        #[cfg(feature = "vst")]
+        let read_by_place = read
+            .as_mut()
+            .is_some_and(|read| !read.number_lanes(&lane_numbers));
+        let options = TranspileOptions {
+            // The editor lists the leaves with its own layout pass.
+            list_mini_leaves: false,
+            default_widget_methods: true,
+            #[cfg(feature = "vst")]
+            lane_numbers,
             live_numbers: live_numbers
                 .iter()
                 .map(|number| number.literal.clone())
                 .collect(),
             ..TranspileOptions::default()
         };
+        let program = read.as_ref().map(|read| &read.program);
         let evaluated = match seed {
             Some((settings, _, _)) => self
                 .js
                 .evaluate_score_candidate_with_effects_cancellable_seeded(
                     source,
+                    program,
                     &options,
                     budget,
                     cancellation,
@@ -736,16 +785,37 @@ impl Session {
                 ),
             None => self.js.evaluate_score_candidate_with_effects_cancellable(
                 source,
+                program,
                 &options,
                 budget,
                 cancellation,
             ),
         };
-        // The label rewrite found a different count of labeled statements
-        // and wrote places. The notes of this text carry places, and not
-        // the lane numbers of this read.
+        if evaluated.is_ok() {
+            self.score_engine = Some(if self.js.evaluated_natively() {
+                ScoreEngine::Native
+            } else {
+                // Where the reader stopped, or the native tier after it.
+                let line_of = |at: u32| {
+                    let before = source.as_bytes().iter().take(at as usize);
+                    before.filter(|byte| **byte == b'\n').count() + 1
+                };
+                let line = match &read {
+                    None => rustel_score::left_at(source, rustel_transpiler::call_form),
+                    Some(_) => self.js.native_left().map(line_of),
+                };
+                ScoreEngine::Script { line }
+            });
+        }
+        // The lane calls of this text hold places, and not the lane numbers
+        // of this read: the label rewrite, or the reader, found a different
+        // count of labeled statements.
         #[cfg(feature = "vst")]
-        if matches!(&evaluated, Ok((output, ..)) if output.lanes_by_place) {
+        if let Ok((output, ..)) = &evaluated
+            && output
+                .as_ref()
+                .map_or(read_by_place, |output| output.lanes_by_place)
+        {
             self.lanes.wrote_places();
         }
         match evaluated {
@@ -773,7 +843,10 @@ impl Session {
                 // score either never mentioned Hydra or called `clearHydra()`.
                 #[cfg(feature = "hydra")]
                 {
-                    self.staged_hydra = Some(effects.hydra.take().unwrap_or_default());
+                    self.staged_hydra = match effects.hydra.take() {
+                        Some(candidate) => PendingHydra::Ready(candidate),
+                        None => PendingHydra::Clear,
+                    };
                 }
                 // Each door that evaluates a text comes here. The plugins of
                 // the calls the score ran load at the next look at the plugin
@@ -781,14 +854,8 @@ impl Session {
                 #[cfg(feature = "vst")]
                 self.keep_ran_plugins(&effects.plugins);
                 let csound = match seed {
-                    Some((_, snapshot, _)) => self.csound.stage_from_snapshot(
-                        snapshot,
-                        &effects.csound,
-                        &self.config.score_import_access,
-                    ),
-                    None => self
-                        .csound
-                        .stage(&effects.csound, &self.config.score_import_access),
+                    Some((_, snapshot, _)) => self.csound_stage_from(snapshot, &effects.csound),
+                    None => self.csound_stage(&effects.csound),
                 };
                 // The evaluation put this score in the active slot. A refused
                 // orchestra puts the score in play there again, so each query
@@ -799,7 +866,7 @@ impl Session {
                     Err(error) => {
                         #[cfg(feature = "hydra")]
                         {
-                            self.staged_hydra = None;
+                            self.staged_hydra = PendingHydra::None;
                         }
                         self.js
                             .restore_last_good_active()
@@ -954,7 +1021,7 @@ impl Session {
         );
         #[cfg(feature = "hydra")]
         if probe.is_err() {
-            self.staged_hydra = None;
+            self.staged_hydra = PendingHydra::None;
         }
         probe?;
         self.commit_evaluated_score(
@@ -1000,7 +1067,7 @@ impl Session {
         self.record_producer_phase(ProducerPhase::ReplacementProbe, probe_elapsed);
         #[cfg(feature = "hydra")]
         if probe.is_err() {
-            self.staged_hydra = None;
+            self.staged_hydra = PendingHydra::None;
         }
         probe?;
         // The seam plans the plugin chains of the candidate. It runs before
@@ -1284,7 +1351,7 @@ impl Session {
                     .commit_midi_input_effects(&mut effects, expected_generation)
                     .map_err(RuntimeError::Js)?;
                 self.js.adopt_runtime_settings(&settings);
-                self.csound.commit(csound);
+                self.csound_commit(csound);
                 // Named rather than elided: a field added to `ScoreEffects`
                 // and forgotten here compiles clean and simply never happens,
                 // which is the quietest bug this seam can produce.
@@ -1331,7 +1398,7 @@ impl Session {
                 // A query of the new score reads the new tempo from `getCps()`.
                 self.js.set_cps(self.scheduler.cps());
                 if restart_transport {
-                    self.js.midi_input_bus().clear_keys();
+                    self.js.clear_midi_keys();
                     self.transport.start();
                 } else if !self.transport.is_stopped() {
                     // An evaluate over a running transport retires the key
@@ -1347,9 +1414,7 @@ impl Session {
                     // arms claims them at its takeover. A pin at or after
                     // the takeover names audio the device swap drops, so it
                     // is forgotten and claimed again by the incoming graph.
-                    self.js
-                        .midi_input_bus()
-                        .retire_key_backlog(key_takeover_cycle);
+                    self.js.retire_midi_key_backlog(key_takeover_cycle);
                 }
                 self.last_path = EvaluateSource::JavaScript;
                 #[cfg(feature = "hydra")]
@@ -1381,7 +1446,9 @@ impl Session {
                 None
             }
         };
-        self.csound.score_changed();
+        // The score in play changed: the chains of its orchestra, if a
+        // session ever made one, end with it.
+        self.csound_score_changed();
         // The replacement is installed: only now does it own the takeover
         // and its cut. If they were set before the fallible install above,
         // a failed commit would leave a rewind's AtFlip/AtTakeover for the
@@ -1459,7 +1526,14 @@ impl Session {
                 self.osc_output_limit_reported = false;
             }
         }
-        self.last_source = Some(Arc::from(source));
+        // One handle of the text serves the replay of this session and the
+        // memo of the next native build of it.
+        self.last_source = Some(
+            self.js
+                .native_source_text()
+                .filter(|kept| kept.as_ref() == source)
+                .unwrap_or_else(|| Arc::from(source)),
+        );
         #[cfg(feature = "device-audio")]
         {
             self.installed_cycle = self.evaluated_cycle;
@@ -1475,10 +1549,23 @@ impl Session {
         // a first score starts with no lead.
         #[cfg(feature = "vst")]
         {
-            self.lanes.install(source);
+            if let Some(shared) = self.last_source.as_ref() {
+                self.lanes.install_shared(shared);
+            } else {
+                self.lanes.install(source);
+            }
             let live = self.plugins_live();
-            crate::vst::score_changed(&self.chains, &self.lanes, Some(source), live);
-            crate::vst::forget_lanes_away(&self.chains, &mut self.lanes);
+            if let Some(plugins) = self.plugin_chains.get() {
+                crate::vst::score_changed(&plugins.chains, &self.lanes, Some(source), live);
+                crate::vst::forget_lanes_away(&plugins.chains, &mut self.lanes);
+            } else if live || self.lanes.has_plugins() {
+                let chains = &self.plugin_chains.get_or_init(PluginChains::new).chains;
+                crate::vst::score_changed(chains, &self.lanes, Some(source), live);
+                crate::vst::forget_lanes_away(chains, &mut self.lanes);
+            } else {
+                // No plugin chains exist yet, so no away lane is held by a chain.
+                self.lanes.forget_away(|_| false);
+            }
             #[cfg(feature = "device-audio")]
             self.plugin_ahead.restart();
             match plan_lead {
@@ -1813,7 +1900,7 @@ impl Session {
                 };
                 let whole_begin = hap.whole_or_part().begin;
                 let onset = OnsetEventJson {
-                    live_controls: hap.live_controls,
+                    live_controls: hap.live_controls(),
                     onset_id: 0,
                     generation: self.generation().saturating_add(1),
                     whole_begin: whole_begin.show(),
@@ -2078,11 +2165,7 @@ impl Session {
                 return Err(RuntimeError::Cancelled);
             }
             let csound = match seed {
-                Some((_, snapshot, _)) => self.csound.stage_from_snapshot(
-                    snapshot,
-                    &[],
-                    &self.config.score_import_access,
-                )?,
+                Some((_, snapshot, _)) => self.csound_stage_from(snapshot, &[])?,
                 None => None,
             };
             self.install_evaluated_score_with_clock(
@@ -2095,7 +2178,7 @@ impl Session {
                 false,
                 clock,
             )?;
-            self.csound.commit(csound);
+            self.csound_commit(csound);
             return Ok(LiveScoreAttempt::Applied(self.generation()));
         }
 
@@ -2116,9 +2199,9 @@ impl Session {
         self.record_producer_phase(ProducerPhase::Evaluation, evaluation_started.elapsed());
         let evaluated = evaluated?;
         let csound = match (&evaluated, seed) {
-            (EvaluatedScore::MiniFallback(_), Some((_, snapshot, _))) => self
-                .csound
-                .stage_from_snapshot(snapshot, &[], &self.config.score_import_access)?,
+            (EvaluatedScore::MiniFallback(_), Some((_, snapshot, _))) => {
+                self.csound_stage_from(snapshot, &[])?
+            }
             _ => None,
         };
         self.install_evaluated_score_with_clock(
@@ -2136,7 +2219,7 @@ impl Session {
         if self.holds_edit(source) {
             return Ok(LiveScoreAttempt::Waiting);
         }
-        self.csound.commit(csound);
+        self.csound_commit(csound);
         Ok(LiveScoreAttempt::Applied(self.generation()))
     }
 
@@ -4665,5 +4748,131 @@ endin`";
             [40.0],
             "the line passed, so it does not play again"
         );
+    }
+
+    /// A score that asks for no orchestra and names no MIDI input makes
+    /// neither state: each part waits for the score that needs it.
+    #[test]
+    fn a_plain_score_makes_no_csound_state_and_no_midi_bus() {
+        let mut session = Session::new().expect("session");
+        session.evaluate("$: s(\"bd sd\")").expect("score");
+        assert!(
+            !session.csound_made(),
+            "a score with no orchestra made the orchestra state"
+        );
+        assert!(
+            !session.js.midi_bus_made(),
+            "a score with no MIDI input made the input bus"
+        );
+    }
+
+    /// The text the native memo keeps for the next build and the text the
+    /// session keeps for a replay are one handle.
+    #[test]
+    fn the_native_memo_and_the_session_share_one_text_handle() {
+        let mut session = Session::new().expect("session");
+        let source = "$: note(\"c e g\").s(\"sine\")";
+        session.evaluate(source).expect("score");
+        let kept = session.js.native_source_text().expect("a native text");
+        assert!(
+            Arc::ptr_eq(session.last_source.as_ref().expect("kept source"), &kept),
+            "the session and the memo hold the text twice"
+        );
+        assert_eq!(&*kept, source);
+        // A build of the same text keeps the same handle.
+        session.evaluate(source).expect("score again");
+        assert!(Arc::ptr_eq(
+            session.last_source.as_ref().expect("kept source"),
+            &session.js.native_source_text().expect("a native text"),
+        ));
+    }
+
+    /// A seeded evaluation of a session that never made its store gives
+    /// the store the orchestras of the seed, on every path that stages.
+    #[test]
+    fn a_recovery_seed_with_an_orchestra_reaches_a_store_never_made() {
+        let seed_snapshot = crate::CsoundSnapshot::of_source("instr seeded\nendin");
+        // A plain score, a mini text, and a score with no pattern.
+        for (source, mini) in [
+            ("$: s(\"bd sd\")", false),
+            ("bd sd", true),
+            ("// muted", false),
+        ] {
+            let mut session = Session::new().expect("session");
+            assert!(!session.csound_made());
+            let settings = session.js.snapshot_published_runtime_settings();
+            let cancelled = AtomicBool::new(false);
+            session
+                .evaluate_live_score_cancellable_seeded(
+                    source,
+                    mini,
+                    Duration::from_millis(1),
+                    &cancelled,
+                    || 0.0,
+                    Some((&settings, &seed_snapshot, 0.0)),
+                )
+                .expect("a seeded evaluation");
+            assert_eq!(
+                session.csound_snapshot(),
+                seed_snapshot,
+                "the orchestra of the seed was dropped for {source:?} (mini {mini})"
+            );
+        }
+    }
+
+    /// A seed with no orchestra, on a session with no store, makes none.
+    #[test]
+    fn an_empty_recovery_seed_makes_no_store() {
+        let mut session = Session::new().expect("session");
+        let settings = session.js.snapshot_published_runtime_settings();
+        let empty = crate::CsoundSnapshot::default();
+        let cancelled = AtomicBool::new(false);
+        session
+            .evaluate_live_score_cancellable_seeded(
+                "$: s(\"bd sd\")",
+                false,
+                Duration::from_millis(1),
+                &cancelled,
+                || 0.0,
+                Some((&settings, &empty, 0.0)),
+            )
+            .expect("a seeded evaluation");
+        assert!(!session.csound_made(), "an empty seed made the store");
+    }
+
+    /// A read of the orchestra snapshot, a change of the import access and
+    /// the error report make no store. A store made later takes the access.
+    #[test]
+    fn a_read_of_the_orchestra_state_makes_no_store() {
+        let mut session = Session::new().expect("session");
+        assert_eq!(session.csound_snapshot(), crate::CsoundSnapshot::default());
+        assert!(session.csound_take_errors().is_empty());
+        session.restore_csound_snapshot(&crate::CsoundSnapshot::default());
+        let mut access = crate::ScoreImportAccess::default();
+        access.permit_csound();
+        session.set_score_import_access(access);
+        assert!(
+            !session.csound_made(),
+            "a read or a policy change made the store"
+        );
+        // The store made later takes the access that was set before it. A
+        // source stage gets past the permission check, and may fail later
+        // for a missing Csound library.
+        let source = [rustel_jsruntime::CsoundSource::Code(
+            "instr a\nendin".into(),
+        )];
+        let staged = session
+            .csound()
+            .stage(&source, &session.config.score_import_access);
+        assert!(
+            !matches!(staged, Err(RuntimeError::CsoundPermission)),
+            "the store made later refused the access"
+        );
+        // A session that never permitted Csound refuses the same source.
+        let plain = Session::new().expect("session");
+        let refused = plain
+            .csound()
+            .stage(&source, &plain.config.score_import_access);
+        assert!(matches!(refused, Err(RuntimeError::CsoundPermission)));
     }
 }

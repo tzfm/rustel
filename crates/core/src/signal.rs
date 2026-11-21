@@ -14,116 +14,275 @@ later version.
 
 use crate::host_value::{HostValue, Pointer};
 use crate::rng::rand_at_time;
-use crate::{Pattern, Value, signal};
+use crate::{NumberSignal, OrderedMap, Pattern, Value, signal, signal_static};
 use rustel_fraction::Fraction;
+use std::sync::OnceLock;
 
-pub fn saw() -> Pattern {
-    signal(|time, _| Value::F64(time.to_f64().rem_euclid(1.0)))
+fn saw_body(time: Fraction, _: &OrderedMap) -> f64 {
+    time.to_f64().rem_euclid(1.0)
 }
 
-pub fn saw2() -> Pattern {
-    signal(|time, _| Value::F64(time.to_f64().rem_euclid(1.0) * 2.0 - 1.0))
+fn saw2_body(time: Fraction, _: &OrderedMap) -> f64 {
+    time.to_f64().rem_euclid(1.0) * 2.0 - 1.0
 }
 
-pub fn isaw() -> Pattern {
-    signal(|time, _| Value::F64(1.0 - time.to_f64().rem_euclid(1.0)))
+fn isaw_body(time: Fraction, _: &OrderedMap) -> f64 {
+    1.0 - time.to_f64().rem_euclid(1.0)
 }
 
-pub fn isaw2() -> Pattern {
-    signal(|time, _| Value::F64((1.0 - time.to_f64().rem_euclid(1.0)) * 2.0 - 1.0))
+fn isaw2_body(time: Fraction, _: &OrderedMap) -> f64 {
+    (1.0 - time.to_f64().rem_euclid(1.0)) * 2.0 - 1.0
 }
 
 // sine/cosine go through crate::fdlibm rather than the platform libm, so
-// hap values are bit-identical to strudel.cc's.
+// hap values are bit-identical to upstream.
+fn sine2_body(time: Fraction, _: &OrderedMap) -> f64 {
+    crate::fdlibm::sin(std::f64::consts::TAU * time.to_f64())
+}
+
+fn sine_body(time: Fraction, _: &OrderedMap) -> f64 {
+    (crate::fdlibm::sin(std::f64::consts::TAU * time.to_f64()) + 1.0) / 2.0
+}
+
+fn cosine2_body(time: Fraction, _: &OrderedMap) -> f64 {
+    crate::fdlibm::cos(std::f64::consts::TAU * time.to_f64())
+}
+
+fn cosine_body(time: Fraction, _: &OrderedMap) -> f64 {
+    (crate::fdlibm::cos(std::f64::consts::TAU * time.to_f64()) + 1.0) / 2.0
+}
+
+fn square_body(time: Fraction, _: &OrderedMap) -> f64 {
+    (time.to_f64() * 2.0).rem_euclid(2.0).floor()
+}
+
+fn square2_body(time: Fraction, _: &OrderedMap) -> f64 {
+    (time.to_f64() * 2.0).rem_euclid(2.0).floor() * 2.0 - 1.0
+}
+
+fn isquare_body(time: Fraction, _: &OrderedMap) -> f64 {
+    1.0 - (time.to_f64() * 2.0).rem_euclid(2.0).floor()
+}
+
+fn isquare2_body(time: Fraction, _: &OrderedMap) -> f64 {
+    (1.0 - (time.to_f64() * 2.0).rem_euclid(2.0).floor()) * 2.0 - 1.0
+}
+
+fn time_body(time: Fraction, _: &OrderedMap) -> f64 {
+    time.to_f64()
+}
+
+fn open_body(time: Fraction, _: &OrderedMap) -> f64 {
+    time.min(Fraction::ONE).to_f64()
+}
+
+fn close_body(time: Fraction, _: &OrderedMap) -> f64 {
+    (1.0 - time.to_f64()).max(0.0)
+}
+
+fn rand_body(time: Fraction, controls: &OrderedMap) -> f64 {
+    let seed = controls
+        .get("randSeed")
+        .and_then(Value::as_f64)
+        .unwrap_or(0.0);
+    rand_at_time(time.to_f64(), seed)
+}
+
+fn mouse_position_body(_: Fraction, _: &OrderedMap) -> f64 {
+    0.0
+}
+
+fn perlin_body(time: Fraction, controls: &OrderedMap) -> f64 {
+    let seed = controls
+        .get("randSeed")
+        .and_then(Value::as_f64)
+        .unwrap_or(0.0);
+    let t = time.to_f64();
+    let ta = t.floor();
+    let ra = rand_at_time(ta, seed);
+    let rb = rand_at_time(ta + 1.0, seed);
+    let x = t - ta;
+    let smoother = 6.0 * x.powi(5) - 15.0 * x.powi(4) + 10.0 * x.powi(3);
+    ra + smoother * (rb - ra)
+}
+
+fn berlin_body(time: Fraction, controls: &OrderedMap) -> f64 {
+    let seed = controls
+        .get("randSeed")
+        .and_then(Value::as_f64)
+        .unwrap_or(0.0);
+    let t = time.to_f64();
+    let previous = t.floor();
+    let next = previous + 1.0;
+    let bottom = rand_at_time(previous, seed);
+    let height = rand_at_time(next, seed);
+    let top = bottom + height;
+    // The ridge span is always exactly one cycle.
+    let percent = t - previous;
+    (bottom + percent * (top - bottom)) / 2.0
+}
+
+/// Static body function for a built-in scalar signal by global name.
+pub fn static_signal_body(name: &str) -> Option<NumberSignal> {
+    Some(match name {
+        "saw" => saw_body,
+        "saw2" => saw2_body,
+        "isaw" => isaw_body,
+        "isaw2" => isaw2_body,
+        "sine" => sine_body,
+        "sine2" => sine2_body,
+        "cosine" => cosine_body,
+        "cosine2" => cosine2_body,
+        "square" => square_body,
+        "square2" => square2_body,
+        "isquare" => isquare_body,
+        "isquare2" => isquare2_body,
+        "time" => time_body,
+        "open" => open_body,
+        "close" => close_body,
+        "rand" => rand_body,
+        "perlin" => perlin_body,
+        "berlin" => berlin_body,
+        _ => return None,
+    })
+}
+
+pub fn saw() -> Pattern {
+    static PAT: OnceLock<Pattern> = OnceLock::new();
+    PAT.get_or_init(|| signal_static(saw_body)).clone()
+}
+
+pub fn saw2() -> Pattern {
+    static PAT: OnceLock<Pattern> = OnceLock::new();
+    PAT.get_or_init(|| signal_static(saw2_body)).clone()
+}
+
+pub fn isaw() -> Pattern {
+    static PAT: OnceLock<Pattern> = OnceLock::new();
+    PAT.get_or_init(|| signal_static(isaw_body)).clone()
+}
+
+pub fn isaw2() -> Pattern {
+    static PAT: OnceLock<Pattern> = OnceLock::new();
+    PAT.get_or_init(|| signal_static(isaw2_body)).clone()
+}
+
 pub fn sine2() -> Pattern {
-    signal(|time, _| Value::F64(crate::fdlibm::sin(std::f64::consts::TAU * time.to_f64())))
+    static PAT: OnceLock<Pattern> = OnceLock::new();
+    PAT.get_or_init(|| signal_static(sine2_body)).clone()
 }
 
 pub fn sine() -> Pattern {
-    signal(|time, _| {
-        Value::F64((crate::fdlibm::sin(std::f64::consts::TAU * time.to_f64()) + 1.0) / 2.0)
-    })
+    static PAT: OnceLock<Pattern> = OnceLock::new();
+    PAT.get_or_init(|| signal_static(sine_body)).clone()
 }
 
 pub fn cosine2() -> Pattern {
-    signal(|time, _| Value::F64(crate::fdlibm::cos(std::f64::consts::TAU * time.to_f64())))
+    static PAT: OnceLock<Pattern> = OnceLock::new();
+    PAT.get_or_init(|| signal_static(cosine2_body)).clone()
 }
 
 pub fn cosine() -> Pattern {
-    signal(|time, _| {
-        Value::F64((crate::fdlibm::cos(std::f64::consts::TAU * time.to_f64()) + 1.0) / 2.0)
-    })
+    static PAT: OnceLock<Pattern> = OnceLock::new();
+    PAT.get_or_init(|| signal_static(cosine_body)).clone()
 }
 
 pub fn square() -> Pattern {
-    signal(|time, _| Value::F64((time.to_f64() * 2.0).rem_euclid(2.0).floor()))
+    static PAT: OnceLock<Pattern> = OnceLock::new();
+    PAT.get_or_init(|| signal_static(square_body)).clone()
 }
 
 pub fn square2() -> Pattern {
-    signal(|time, _| Value::F64((time.to_f64() * 2.0).rem_euclid(2.0).floor() * 2.0 - 1.0))
+    static PAT: OnceLock<Pattern> = OnceLock::new();
+    PAT.get_or_init(|| signal_static(square2_body)).clone()
 }
 
 /// Flipped squares: high first.
 pub fn isquare() -> Pattern {
-    signal(|time, _| Value::F64(1.0 - (time.to_f64() * 2.0).rem_euclid(2.0).floor()))
+    static PAT: OnceLock<Pattern> = OnceLock::new();
+    PAT.get_or_init(|| signal_static(isquare_body)).clone()
 }
 
 pub fn isquare2() -> Pattern {
-    signal(|time, _| Value::F64((1.0 - (time.to_f64() * 2.0).rem_euclid(2.0).floor()) * 2.0 - 1.0))
+    static PAT: OnceLock<Pattern> = OnceLock::new();
+    PAT.get_or_init(|| signal_static(isquare2_body)).clone()
 }
 
 pub fn time() -> Pattern {
-    signal(|time, _| Value::F64(time.to_f64()))
+    static PAT: OnceLock<Pattern> = OnceLock::new();
+    PAT.get_or_init(|| signal_static(time_body)).clone()
 }
 
 /// Rises from zero to one over one cycle, then stays at one.
 pub fn open() -> Pattern {
-    signal(|time, _| Value::F64(time.min(Fraction::ONE).to_f64()))
+    static PAT: OnceLock<Pattern> = OnceLock::new();
+    PAT.get_or_init(|| signal_static(open_body)).clone()
 }
 
 /// Falls from one to zero over one cycle, then stays at zero.
 pub fn close() -> Pattern {
-    signal(|time, _| Value::F64((1.0 - time.to_f64()).max(0.0)))
+    static PAT: OnceLock<Pattern> = OnceLock::new();
+    PAT.get_or_init(|| signal_static(close_body)).clone()
 }
 
 pub fn rand() -> Pattern {
-    signal(|time, controls| {
+    static PAT: OnceLock<Pattern> = OnceLock::new();
+    PAT.get_or_init(|| signal_static(rand_body)).clone()
+}
+
+/// One less [`rand`]: the coin of `undegradeBy`, which passes what the coin
+/// of `degradeBy` holds back.
+#[cfg(test)]
+pub(crate) fn rand_inverted() -> Pattern {
+    signal_static(|time, controls| {
         let seed = controls
             .get("randSeed")
             .and_then(Value::as_f64)
             .unwrap_or(0.0);
-        Value::F64(rand_at_time(time.to_f64(), seed))
+        1.0 - rand_at_time(time.to_f64(), seed)
     })
 }
 
 /// Triangle: a saw up then a saw down, each half a cycle.
 pub fn tri() -> Pattern {
-    crate::fastcat(vec![saw(), isaw()])
+    static PAT: OnceLock<Pattern> = OnceLock::new();
+    PAT.get_or_init(|| crate::fastcat(vec![saw(), isaw()]))
+        .clone()
 }
 
 pub fn tri2() -> Pattern {
-    crate::fastcat(vec![saw2(), isaw2()])
+    static PAT: OnceLock<Pattern> = OnceLock::new();
+    PAT.get_or_init(|| crate::fastcat(vec![saw2(), isaw2()]))
+        .clone()
 }
 
 /// A triangle that starts high.
 pub fn itri() -> Pattern {
-    crate::fastcat(vec![isaw(), saw()])
+    static PAT: OnceLock<Pattern> = OnceLock::new();
+    PAT.get_or_init(|| crate::fastcat(vec![isaw(), saw()]))
+        .clone()
 }
 
 pub fn itri2() -> Pattern {
-    crate::fastcat(vec![isaw2(), saw2()])
+    static PAT: OnceLock<Pattern> = OnceLock::new();
+    PAT.get_or_init(|| crate::fastcat(vec![isaw2(), saw2()]))
+        .clone()
 }
 
 /// The mouse position when the host gives no [`Pointer`]: the constant 0,
-/// the same constant a headless strudel.cc run settles on. A score that
+/// the same constant a headless run settles on. A score that
 /// reaches for the mouse is not an error, it is a constant.
 pub fn mouse_position() -> Pattern {
-    signal(|_, _| Value::F64(0.0))
+    static PAT: OnceLock<Pattern> = OnceLock::new();
+    PAT.get_or_init(|| signal_static(mouse_position_body))
+        .clone()
 }
 
 /// Bipolar rand.
 pub fn rand2() -> Pattern {
-    crate::combinators::to_bipolar(&rand())
+    static PAT: OnceLock<Pattern> = OnceLock::new();
+    PAT.get_or_init(|| crate::combinators::to_bipolar(&rand()))
+        .clone()
 }
 
 /// `irand(i)`: random integers in `0..i`. The multiply runs through
@@ -182,7 +341,7 @@ pub fn randrun(n: usize) -> Pattern {
 pub fn rand_list_value(count: Value) -> Pattern {
     let count = count.as_f64().unwrap_or(0.0);
     if !count.is_finite() || count < 1.0 {
-        return signal(|_, _| Value::List(Vec::new()));
+        return signal(|_, _| Value::list(Vec::new()));
     }
     let count = count as u64;
     if count > crate::MAX_STEPWISE_ENTRIES {
@@ -201,7 +360,7 @@ pub fn rand_list_value(count: Value) -> Pattern {
             .and_then(Value::as_f64)
             .unwrap_or(0.0);
         let rands = crate::rng::rands_at_time(time.to_f64(), count, seed);
-        Value::List(
+        Value::list(
             rands
                 .into_iter()
                 .map(|value| Value::F64(value.abs()))
@@ -229,25 +388,15 @@ pub fn brand_by(ppat: &Pattern) -> Pattern {
 
 /// A fair coin.
 pub fn brand() -> Pattern {
-    brand_by_value(Value::F64(0.5))
+    static PAT: OnceLock<Pattern> = OnceLock::new();
+    PAT.get_or_init(|| brand_by_value(Value::F64(0.5))).clone()
 }
 
 /// Smoothed value noise: smootherstep between random values at whole-cycle
 /// times.
 pub fn perlin() -> Pattern {
-    signal(|time, controls| {
-        let seed = controls
-            .get("randSeed")
-            .and_then(Value::as_f64)
-            .unwrap_or(0.0);
-        let t = time.to_f64();
-        let ta = t.floor();
-        let ra = rand_at_time(ta, seed);
-        let rb = rand_at_time(ta + 1.0, seed);
-        let x = t - ta;
-        let smoother = 6.0 * x.powi(5) - 15.0 * x.powi(4) + 10.0 * x.powi(3);
-        Value::F64(ra + smoother * (rb - ra))
-    })
+    static PAT: OnceLock<Pattern> = OnceLock::new();
+    PAT.get_or_init(|| signal_static(perlin_body)).clone()
 }
 
 /// `berlin`: perlin's shape with the smoothing taken out.
@@ -256,31 +405,17 @@ pub fn perlin() -> Pattern {
 /// NEXT random value, then drops - sawteeth of random height rather than
 /// perlin's smoothed hills. Halving keeps a sum of two 0..1 values in 0..1.
 pub fn berlin() -> Pattern {
-    signal(|time, controls| {
-        let seed = controls
-            .get("randSeed")
-            .and_then(Value::as_f64)
-            .unwrap_or(0.0);
-        let t = time.to_f64();
-        let previous = t.floor();
-        let next = previous + 1.0;
-        let bottom = rand_at_time(previous, seed);
-        let height = rand_at_time(next, seed);
-        let top = bottom + height;
-        // The ridge span is always exactly one cycle.
-        let percent = t - previous;
-        Value::F64((bottom + percent * (top - bottom)) / 2.0)
-    })
+    static PAT: OnceLock<Pattern> = OnceLock::new();
+    PAT.get_or_init(|| signal_static(berlin_body)).clone()
 }
 
-/// Every signal the score language exposes as a bare global, by name.
+/// Every signal the score language exposes as a bare global, by name, but
+/// the [`pointer_signals`].
 ///
 /// Installed as globals in the QuickJS host: a signal is a *value*, not a
-/// function, so `note(saw.range(0, 7))` is valid. The mouse names read
-/// `pointer` when there is one, and [`mouse_position`] when there is not.
-pub fn signals(pointer: Option<&Pointer>) -> Vec<(&'static str, Pattern)> {
-    let mouse = |axis: Option<&HostValue>| axis.map_or_else(mouse_position, HostValue::signal);
-    let (x, y) = (pointer.map(|p| &p.x), pointer.map(|p| &p.y));
+/// function, so `note(saw.range(0, 7))` is valid. Each reads only the time
+/// it is queried at.
+pub fn signals() -> Vec<(&'static str, Pattern)> {
     vec![
         ("saw", saw()),
         ("saw2", saw2()),
@@ -301,17 +436,25 @@ pub fn signals(pointer: Option<&Pointer>) -> Vec<(&'static str, Pattern)> {
         ("time", time()),
         ("open", open()),
         ("close", close()),
-        // Both spellings of each axis are exposed.
-        ("mousex", mouse(x)),
-        ("mouseX", mouse(x)),
-        ("mousey", mouse(y)),
-        ("mouseY", mouse(y)),
         ("rand", rand()),
         ("rand2", rand2()),
         // `brand` is a bare value like the waves, not a function.
         ("brand", brand()),
         ("perlin", perlin()),
         ("berlin", berlin()),
+    ]
+}
+
+/// The mouse signals, by name: both spellings of each axis. They read
+/// `pointer` when there is one, and [`mouse_position`] when there is not.
+pub fn pointer_signals(pointer: Option<&Pointer>) -> [(&'static str, Pattern); 4] {
+    let mouse = |axis: Option<&HostValue>| axis.map_or_else(mouse_position, HostValue::signal);
+    let (x, y) = (pointer.map(|p| &p.x), pointer.map(|p| &p.y));
+    [
+        ("mousex", mouse(x)),
+        ("mouseX", mouse(x)),
+        ("mousey", mouse(y)),
+        ("mouseY", mouse(y)),
     ]
 }
 

@@ -77,7 +77,7 @@ pub(crate) fn stepcat_items_bridged<'js>(
                 // but that must not retroactively change this raw argument's
                 // weight.
                 let steps = unwrap_pattern(arg)
-                    .and_then(|(raw, _)| raw.steps)
+                    .and_then(|(raw, _)| raw.steps())
                     .or(Some(Fraction::ONE));
                 raw_items.push((steps, arg.clone()));
             }
@@ -221,7 +221,7 @@ pub(crate) fn native_tour<'js>(
     let (items, sidecars) = stepcat_items_bridged(&ctx, &expanded)?;
     let mut pattern = rustel_core::combinators::stepcat(&items);
     if many.is_empty()
-        && unwrap_pattern(&receiver).is_some_and(|(source, _)| source.steps.is_none())
+        && unwrap_pattern(&receiver).is_some_and(|(source, _)| source.steps().is_none())
     {
         // Pinned singleton `stepcat` calls `withSteps`, which deliberately
         // preserves `undefined` when the source Pattern has no step metadata.
@@ -400,7 +400,7 @@ pub(crate) fn native_zip<'js>(
         let Some((pattern, sidecar)) = unwrap_pattern(value) else {
             return Err(throw_type_error(&ctx, "pat._slow is not a function"));
         };
-        if pattern.steps.is_some_and(|steps| steps.numer() == 0) {
+        if pattern.steps().is_some_and(|steps| steps.numer() == 0) {
             return Err(rquickjs::Exception::throw_message(&ctx, "Division by Zero"));
         }
         patterns.push(pattern);

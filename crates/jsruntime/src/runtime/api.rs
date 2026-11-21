@@ -1,179 +1,177 @@
 use super::*;
+use std::sync::Arc;
 
 impl JsRuntime {
+    /// A runtime with its script engine started.
     pub fn new() -> rquickjs::Result<Self> {
-        // The budget is active from CONSTRUCTION, so no allocation is ever
-        // unbounded. QuickJS's own `set_memory_limit` is deliberately NOT used:
-        // it rejects before calling the allocator, so a refusal would never
-        // reach the structural flag and would be indistinguishable from a user
-        // throw once it surfaced as an exception.
-        let budget = std::rc::Rc::new(alloc::HeapBudget::new(DEFAULT_JS_MEMORY_LIMIT));
-        let rt = Runtime::new_with_alloc(alloc::BudgetedAllocator::new(budget.clone()))?;
-        // QuickJS anchored its stack budget on the pointer it recorded in the
-        // line above and never moves it again, so the size has to be set here,
-        // before any query can recurse beneath it. See `MAX_JS_STACK_BYTES`.
-        rt.set_max_stack_size(MAX_JS_STACK_BYTES);
-        // This runtime never reads a module. The explicit resolver is the
-        // enforcement boundary for dynamically constructed imports
-        // (`eval`/`Function`) that cannot be rejected by source inspection.
-        // It also keeps a later QuickJS default change from silently turning
-        // score text into filesystem or network access. A script that the
-        // host has run resolves to an empty module. See `LoadedImports`.
-        let loaded_imports = LoadedImports::default();
-        rt.set_loader(
-            RejectModuleResolver(loaded_imports.clone()),
-            RejectModuleLoader(loaded_imports.clone()),
-        );
-        let ctx = Context::full(&rt)?;
-        let effect_transaction = Rc::new(RefCell::new(None));
-        let effect_policy = Rc::new(Cell::new(EffectPolicy::NONE));
-        #[cfg(feature = "hydra")]
-        let hydra_chains = Rc::new(RefCell::new(crate::install::HydraChains::default()));
-        let effect_policy_refusal = Rc::new(RefCell::new(None));
-        let effect_policy_owner_depth = Rc::new(Cell::new(0));
-        let callback_ir = Rc::new(CallbackIr::new());
-        ctx.with(|ctx| -> rquickjs::Result<()> {
-            let held = rquickjs::Array::new(ctx.clone())?;
-            held.as_object().set_prototype(None)?;
-            let active = rquickjs::Array::new(ctx.clone())?;
-            active.as_object().set_prototype(None)?;
-            active.set(0, rquickjs::Value::new_null(ctx.clone()))?;
-            let stack = rquickjs::Array::new(ctx.clone())?;
-            // This is host-only storage, not a JavaScript Array surface. A
-            // normal Array prototype lets score code install indexed setters
-            // that observe or swallow the temporary owner pushed while a
-            // cross-turn `__pure` value is rematerialised. Keep Array's own
-            // length/index mechanics while removing that mutable prototype
-            // chain before any user code can run.
-            stack.as_object().set_prototype(None)?;
-            let score_candidate = rquickjs::Array::new(ctx.clone())?;
-            score_candidate.as_object().set_prototype(None)?;
-            let repl_tempo_surface = rquickjs::Array::new(ctx.clone())?;
-            repl_tempo_surface.as_object().set_prototype(None)?;
-            let slider_sets = rquickjs::Array::new(ctx.clone())?;
-            slider_sets.as_object().set_prototype(None)?;
-            let slider_values = rquickjs::Object::new(ctx.clone())?;
-            slider_values.set_prototype(None)?;
-            slider_sets.set(0, slider_values.clone())?;
-            slider_sets.set(1, slider_values)?;
-            slider_sets.set(2, rquickjs::Value::new_null(ctx.clone()))?;
-            // Parallel host-only binding maps: active, candidate, last-good.
-            // Decimal strings retain all 64 token bits without JS Number rounding.
-            let bindings = rquickjs::Object::new(ctx.clone())?;
-            bindings.set_prototype(None)?;
-            slider_sets.set(3, bindings.clone())?;
-            slider_sets.set(4, bindings)?;
-            slider_sets.set(5, rquickjs::Value::new_null(ctx.clone()))?;
-            let voicing_sets = rquickjs::Array::new(ctx.clone())?;
-            voicing_sets.as_object().set_prototype(None)?;
-            let previous = ctx.store_userdata(HostRoots {
-                held,
-                active,
-                stack,
-                score_candidate,
-                repl_tempo_surface,
-                slider_sets,
-                voicing_sets,
-                protected_globals: Rc::new(RefCell::new(BTreeSet::new())),
-                callback_ir: callback_ir.clone(),
-                builtin_methods: Rc::new(RefCell::new(BuiltinMethods::default())),
-                effects: EffectBoundaryState {
-                    policy: effect_policy.clone(),
-                    refusal: effect_policy_refusal.clone(),
-                },
-                heap: budget.clone(),
-            })?;
-            debug_assert!(previous.is_none(), "new runtime already had host roots");
-            Ok(())
-        })?;
-        let deadline = std::rc::Rc::new(Cell::new(None::<std::time::Instant>));
-        let interrupted = std::rc::Rc::new(Cell::new(false));
-        let cancel_flag = std::rc::Rc::new(Cell::new(None::<*const std::sync::atomic::AtomicBool>));
-        let cancelled = std::rc::Rc::new(Cell::new(false));
+        Self::started(None)
+    }
 
-        // One evaluation deadline spans the initial setup call
-        // and every runnable QuickJS job it queues. JS_ExecutePendingJob may be
-        // interrupted safely only if its borrowed error-context pointer is
-        // duplicated before Rust owns it and its pending exception is consumed
-        // immediately. rquickjs 0.14 fixes borrowed-context ownership, but
-        // its bool helper consumes job exceptions without reporting them.
-        // A pending root Promise with an empty job
-        // queue still is unsupported: it needs an external host-I/O source,
-        // not more polling.
-        {
-            let d = deadline.clone();
-            let i = interrupted.clone();
-            let flag = cancel_flag.clone();
-            let c = cancelled.clone();
-            rt.set_interrupt_handler(Some(Box::new(move || {
-                let cancellation_requested = flag.get().is_some_and(|pointer| {
-                    // SAFETY: installed only for the duration of the call that
-                    // borrowed the AtomicBool, and cleared by an RAII guard
-                    // before that borrow can end.
-                    unsafe { &*pointer }.load(std::sync::atomic::Ordering::Relaxed)
-                });
-                if cancellation_requested {
-                    c.set(true);
-                    return true;
-                }
-                match d.get() {
-                    Some(t) if std::time::Instant::now() >= t => {
-                        i.set(true);
-                        true // interrupt
-                    }
-                    _ => false,
-                }
-            })));
-        }
-        Ok(Self {
-            rt,
-            ctx,
+    fn started(pointer: Option<rustel_core::host_value::Pointer>) -> rquickjs::Result<Self> {
+        let runtime = Self::deferred(pointer);
+        let realm = Realm::start(&runtime)?;
+        // The cell of a new runtime is empty, so it takes the realm.
+        let _ = runtime.realm.set(realm);
+        Ok(runtime)
+    }
+
+    /// A runtime whose script engine starts at the first use that needs
+    /// it. `pointer` is what `mousex` and `mousey` read at query time, as
+    /// for [`Self::with_pointer`].
+    pub fn deferred(pointer: Option<rustel_core::host_value::Pointer>) -> Self {
+        Self {
+            realm: OnceCell::new(),
             core_settings: rustel_core::settings::RuntimeSettings::default(),
-            ids: std::rc::Rc::new(Cell::new(0)),
-            logs: std::rc::Rc::new(RefCell::new(Vec::new())),
+            ids: OnceCell::new(),
+            logs: OnceCell::new(),
             contained_query_errors_unlogged: Cell::new(false),
-            cycle_time: std::rc::Rc::new(Cell::new(0.0)),
-            cps: std::rc::Rc::new(Cell::new(0.5)),
-            loaded_imports,
+            bridge: OnceCell::new(),
+            cycle_time_init: Cell::new(0.0),
+            cps_init: Cell::new(0.5),
+            heap_limit_init: Cell::new(DEFAULT_JS_MEMORY_LIMIT),
+            effect_policy_init: Cell::new(EffectPolicy::NONE),
+            loaded_imports: OnceCell::new(),
             import_surface: RefCell::default(),
-            timeline_state: rustel_core::TimelineState::default(),
-            midi_in_bus: std::sync::Arc::new(rustel_core::midi_in::InputBus::new()),
-            midi_in_handles: std::rc::Rc::new(RefCell::new(MidiInputHandles::default())),
+            timeline_state: OnceCell::new(),
+            midi_in: OnceCell::new(),
             #[cfg(feature = "hydra")]
-            hydra_chains,
-            effect_transaction,
-            effect_policy,
+            hydra_chains: OnceCell::new(),
             hap_budget: Cell::new(rustel_core::DEFAULT_HAP_BUDGET),
             query_threw: RefCell::new(None),
-            callback_ir,
-            heap: budget,
-            deadline,
-            interrupted,
-            cancel_flag,
-            cancelled,
+            callback_ir: OnceCell::new(),
+            native_tier: Cell::new(true),
+            evaluated_natively: Cell::new(false),
+            bindings_installed: Cell::new(false),
+            voicings_installed: Cell::new(false),
             query_turn_depth: Cell::new(0),
             effect_query_depth: Cell::new(0),
             heap_boundary_depth: Cell::new(0),
             query_limit_millis: Cell::new(None),
-            effect_policy_refusal,
-            effect_policy_owner_depth,
+            native_memo: RefCell::default(),
+            pending_source: RefCell::default(),
+            native_left: Cell::new(None),
+            native_staged: RefCell::new(None),
+            native_active: RefCell::new(None),
+            native_last_good: RefCell::new(None),
             last_good_active: RefCell::new(None),
             last_good_timeline: RefCell::new(None),
-            pointer: None,
+            pointer,
             script_may_have_run: Cell::new(true),
+        }
+    }
+
+    /// The lazy QuickJS bridge cells, initialized on first JavaScript use.
+    pub(crate) fn bridge(&self) -> &JsBridge {
+        self.bridge.get_or_init(|| JsBridge {
+            cycle_time: Rc::new(Cell::new(self.cycle_time_init.get())),
+            cps: Rc::new(Cell::new(self.cps_init.get())),
+            effect_transaction: Rc::default(),
+            effect_policy: Rc::new(Cell::new(self.effect_policy_init.get())),
+            heap: Rc::new(alloc::HeapBudget::new(self.heap_limit_init.get())),
+            deadline: Rc::new(Cell::new(None)),
+            interrupted: Rc::new(Cell::new(false)),
+            cancel_flag: Rc::new(Cell::new(None)),
+            cancelled: Rc::new(Cell::new(false)),
+            effect_policy_refusal: Rc::new(RefCell::new(None)),
+            effect_policy_owner_depth: Rc::new(Cell::new(0)),
         })
+    }
+
+    /// Current effect policy without initializing the QuickJS bridge.
+    pub(super) fn effect_policy(&self) -> EffectPolicy {
+        match self.bridge.get() {
+            Some(bridge) => bridge.effect_policy.get(),
+            None => self.effect_policy_init.get(),
+        }
+    }
+
+    /// Replace the effect policy without initializing the QuickJS bridge.
+    pub(super) fn replace_effect_policy(&self, policy: EffectPolicy) -> EffectPolicy {
+        let previous = self.effect_policy_init.replace(policy);
+        match self.bridge.get() {
+            Some(bridge) => bridge.effect_policy.replace(policy),
+            None => previous,
+        }
     }
 
     /// A realm whose `mousex`/`mouseX` and `mousey`/`mouseY` read `pointer`
     /// at query time.
     pub fn with_pointer(pointer: rustel_core::host_value::Pointer) -> rquickjs::Result<Self> {
-        let mut runtime = Self::new()?;
-        runtime.pointer = Some(pointer);
-        Ok(runtime)
+        Self::started(Some(pointer))
     }
 
+    /// Whether the script engine started. A runtime made with
+    /// [`Self::deferred`] starts it at the first score, prelude or import
+    /// that the native tier does not evaluate.
+    pub fn script_engine_started(&self) -> bool {
+        self.realm.get().is_some()
+    }
+
+    /// Collect the script heap, when the script engine started.
     pub fn run_gc(&self) {
-        self.rt.run_gc();
+        if let Some(realm) = self.realm.get() {
+            realm.rt.run_gc();
+        }
+    }
+
+    /// Install the semantic surface and the voicing globals, once. Every
+    /// entry that runs score text calls this first.
+    pub fn ensure_surface(&self) -> Result<(), String> {
+        if !self.bindings_installed.get() {
+            self.install_semantic_bindings()?;
+        }
+        if !self.voicings_installed.get() {
+            self.install_voicings_prebake()?;
+        }
+        Ok(())
+    }
+
+    /// Let scores the native tier proves skip JavaScript, or send every
+    /// score to JavaScript, for tests and same-machine A/B.
+    #[doc(hidden)]
+    pub fn set_native_tier(&self, enabled: bool) {
+        self.native_tier.set(enabled);
+    }
+
+    /// Whether the last evaluated score ran on the native tier.
+    #[doc(hidden)]
+    pub fn evaluated_natively(&self) -> bool {
+        self.evaluated_natively.get()
+    }
+
+    /// The byte of the text of the last evaluated score where the native
+    /// tier stopped: the end of the innermost call that it does not take.
+    /// `None` for a score that ran on the native tier, for one that its
+    /// reader did not read, and where the tier names no call.
+    pub fn native_left(&self) -> Option<u32> {
+        self.native_left.get()
+    }
+
+    /// The text the memo of the last native build holds, when one kept a
+    /// text. The session that replays the same text shares this handle.
+    #[doc(hidden)]
+    pub fn native_source_text(&self) -> Option<Arc<str>> {
+        self.native_memo.borrow().source.clone()
+    }
+
+    /// Return a shared handle for `source`, reusing the memo's handle when
+    /// byte-identical or allocating one `Arc<str>` for the upcoming build.
+    #[doc(hidden)]
+    pub fn share_source_text(&self, source: &str) -> Arc<str> {
+        if let Some(kept) = &self.native_memo.borrow().source
+            && **kept == *source
+        {
+            return Arc::clone(kept);
+        }
+        let shared: Arc<str> = Arc::from(source);
+        *self.pending_source.borrow_mut() = Some(Arc::clone(&shared));
+        shared
+    }
+
+    /// The callback-IR state, made at the first use. A runtime that lowers
+    /// no callback, and whose realm never started, holds none.
+    pub(super) fn callback_ir(&self) -> &Rc<CallbackIr> {
+        self.callback_ir.get_or_init(|| Rc::new(CallbackIr::new()))
     }
 
     /// Select callback-IR execution policy for tests and same-machine A/B.
@@ -181,50 +179,72 @@ impl JsRuntime {
     /// bridged with. See [`PatternTransformIrMode`].
     #[doc(hidden)]
     pub fn set_pattern_transform_ir_mode(&self, mode: PatternTransformIrMode) {
-        self.callback_ir.mode.set(mode);
+        self.callback_ir().mode.set(mode);
     }
 
     #[doc(hidden)]
     pub fn pattern_transform_ir_mode(&self) -> PatternTransformIrMode {
-        self.callback_ir.mode.get()
+        // A read makes no state: a runtime with none runs the default mode.
+        self.callback_ir
+            .get()
+            .map_or(PatternTransformIrMode::Auto, |ir| ir.mode.get())
     }
 
     /// Snapshot bounded producer-side callback-IR counters.
     #[doc(hidden)]
     pub fn pattern_transform_ir_stats(&self) -> PatternTransformIrStats {
-        self.callback_ir.stats.get()
+        self.callback_ir
+            .get()
+            .map_or_else(PatternTransformIrStats::default, |ir| ir.stats.get())
     }
 
     #[doc(hidden)]
     pub fn reset_pattern_transform_ir_stats(&self) {
-        self.callback_ir
-            .stats
-            .set(PatternTransformIrStats::default());
+        if let Some(ir) = self.callback_ir.get() {
+            ir.stats.set(PatternTransformIrStats::default());
+        }
+    }
+
+    /// The console buffer, made at the first writer.
+    pub(crate) fn logs(&self) -> &Rc<RefCell<Vec<String>>> {
+        self.logs.get_or_init(Rc::default)
     }
 
     pub fn take_logs(&self) -> Vec<String> {
-        std::mem::take(&mut self.logs.borrow_mut())
+        match self.logs.get() {
+            Some(logs) => mem::take(&mut logs.borrow_mut()),
+            None => Vec::new(),
+        }
     }
 
     /// Run `f`, and drop the console lines it writes: the lines of a query
     /// whose notes do not play now.
     pub fn with_logs_dropped<R>(&self, f: impl FnOnce() -> R) -> R {
-        let kept = self.logs.borrow().len();
+        // The buffer may not exist yet, and `f` may make it and write to it.
+        let kept = self.logs.get().map_or(0, |logs| logs.borrow().len());
         let result = f();
-        self.logs.borrow_mut().truncate(kept);
+        if let Some(logs) = self.logs.get() {
+            logs.borrow_mut().truncate(kept);
+        }
         result
     }
 
     /// Set the cycle that `getTime()` returns. The host calls it with the
     /// start of each scheduling window.
     pub fn set_cycle_time(&self, cycle: f64) {
-        self.cycle_time.set(cycle);
+        self.cycle_time_init.set(cycle);
+        if let Some(bridge) = self.bridge.get() {
+            bridge.cycle_time.set(cycle);
+        }
     }
 
     /// Set the tempo, in cycles per second, that `getCps()` returns. The
     /// host calls it before each evaluation and each scheduling window.
     pub fn set_cps(&self, cps: f64) {
-        self.cps.set(cps);
+        self.cps_init.set(cps);
+        if let Some(bridge) = self.bridge.get() {
+            bridge.cps.set(cps);
+        }
     }
 
     /// Run `f` without logging the query errors a stack contains. A caller
@@ -284,16 +304,60 @@ impl JsRuntime {
     /// Take over `bus` as this realm's MIDI input bus, with its ports and
     /// their controller values. Call it before the semantic bindings
     /// install: they open the score's ports on the bus held then.
-    pub fn adopt_midi_input_bus(&mut self, bus: std::sync::Arc<rustel_core::midi_in::InputBus>) {
-        self.midi_in_bus = bus;
+    pub fn adopt_midi_input_bus(&mut self, bus: Arc<rustel_core::midi_in::InputBus>) {
+        // The host bus replaces a bus made at a first use, and the handles
+        // stay. Call it before an opener takes the bus of the runtime.
+        let handles = self
+            .midi_in
+            .take()
+            .map_or_else(Rc::default, |midi| midi.handles);
+        self.midi_in = OnceCell::from(MidiInput { bus, handles });
+    }
+
+    /// The MIDI bus and its handle state, made when a score or the host
+    /// first asks for either.
+    fn midi(&self) -> &MidiInput {
+        self.midi_in.get_or_init(|| MidiInput {
+            // The launch-pad words of a fresh bus cost their Vec alone.
+            bus: Arc::new(rustel_core::midi_in::InputBus::new()),
+            handles: Rc::default(),
+        })
+    }
+
+    /// The handle state of this runtime's MIDI inputs.
+    pub(crate) fn midi_handles(&self) -> &Rc<RefCell<MidiInputHandles>> {
+        &self.midi().handles
+    }
+
+    /// Whether this runtime made its MIDI input bus: a hidden probe for
+    /// the rule that a score with no input makes none.
+    #[doc(hidden)]
+    pub fn midi_bus_made(&self) -> bool {
+        self.midi_in.get().is_some()
+    }
+
+    /// Clear the MIDI key ring, when a bus was made: a score that named no
+    /// input has no keys to clear.
+    pub fn clear_midi_keys(&self) {
+        if let Some(midi) = self.midi_in.get() {
+            midi.bus.clear_keys();
+        }
+    }
+
+    /// Retire the MIDI key backlog, when a bus was made: see
+    /// [`rustel_core::midi_in::InputBus::retire_key_backlog`].
+    pub fn retire_midi_key_backlog(&self, takeover_cycle: f64) {
+        if let Some(midi) = self.midi_in.get() {
+            midi.bus.retire_key_backlog(takeover_cycle);
+        }
     }
 
     /// The MIDI-input tables this runtime's scores have named.
     ///
     /// The host attaches listeners to these; evaluation only ever interns a
     /// name into them, which is why opening a device cannot stall a score.
-    pub fn midi_input_bus(&self) -> std::sync::Arc<rustel_core::midi_in::InputBus> {
-        std::sync::Arc::clone(&self.midi_in_bus)
+    pub fn midi_input_bus(&self) -> Arc<rustel_core::midi_in::InputBus> {
+        Arc::clone(&self.midi().bus)
     }
 
     /// Publish a successful score evaluation's complete MIDI-input set.
@@ -308,8 +372,17 @@ impl JsRuntime {
         generation: u64,
     ) -> Result<(), String> {
         let bindings = &effects.midi_inputs.bindings;
-        let ports: Vec<std::sync::Arc<rustel_core::midi_in::InputPort>> = {
-            let handles = self.midi_in_handles.borrow();
+        // A score that named no input, on a runtime that made no bus and no
+        // handle, commits the state a fresh bus already holds.
+        if bindings.is_empty()
+            && effects.midi_inputs.provisional_handles.is_empty()
+            && self.midi_in.get().is_none()
+        {
+            effects.midi_inputs.resolved = true;
+            return Ok(());
+        }
+        let ports: Vec<Arc<rustel_core::midi_in::InputPort>> = {
+            let handles = self.midi_handles().borrow();
             bindings
                 .iter()
                 .map(|binding| {
@@ -325,10 +398,11 @@ impl JsRuntime {
 
         // The bus validates the entire candidate before replacing either of
         // its retained generations.
-        self.midi_in_bus
+        self.midi()
+            .bus
             .commit_generation(generation, ports.clone())?;
 
-        let mut handles = self.midi_in_handles.borrow_mut();
+        let mut handles = self.midi_handles().borrow_mut();
         let active: BTreeMap<String, u64> = bindings
             .iter()
             .map(|binding| (binding.selector.clone(), binding.handle))
@@ -400,7 +474,6 @@ impl JsRuntime {
     /// evaluation mutates live globals in place; if it throws halfway, what
     /// already happened stays. Rolling it back would change the language contract.
     pub fn with_deadline<R>(&self, budget: std::time::Duration, f: impl FnOnce() -> R) -> R {
-        let _settings = self.core_settings.bind();
         struct Guard(
             std::rc::Rc<Cell<Option<std::time::Instant>>>,
             Option<std::time::Instant>,
@@ -410,28 +483,35 @@ impl JsRuntime {
                 self.0.set(self.1);
             }
         }
-        let prev = self.deadline.get();
-        self.interrupted.set(false);
+        let bridge = self.bridge();
+        let prev = bridge.deadline.get();
+        bridge.interrupted.set(false);
         // A NESTED bounded run must never buy more time than the one that
         // contains it. `chop(32).slow(0.001)` re-enters queryArc ~1000× per
         // cycle from a JS callback; with a fresh budget each time the
         // a fresh budget each time would multiply the allowed work. Inheriting
         // the tighter deadline keeps one save bounded by one budget.
+        let now = std::time::Instant::now();
         let deadline = match prev {
-            Some(outer) => (std::time::Instant::now() + budget).min(outer),
-            None => std::time::Instant::now() + budget,
+            Some(outer) => (now + budget).min(outer),
+            None => now + budget,
         };
-        self.deadline.set(Some(deadline));
-        let _g = Guard(self.deadline.clone(), prev);
+        bridge.deadline.set(Some(deadline));
+        let _g = Guard(bridge.deadline.clone(), prev);
         // The same deadline bounds NATIVE query recursion: QuickJS's
         // interrupt handler only fires while JavaScript runs, and a
         // pattern can spend minutes in Rust below every hap budget.
-        rustel_core::with_query_deadline(deadline, f)
+        // A query turn binds the settings of this runtime before it comes
+        // here, and binds them one time.
+        self.core_settings
+            .with(|| rustel_core::with_query_deadline_from(now, deadline, f))
     }
 
     /// Whether the last deadline-bounded run was interrupted.
     pub fn was_interrupted(&self) -> bool {
-        self.interrupted.get()
+        self.bridge
+            .get()
+            .is_some_and(|bridge| bridge.interrupted.get())
     }
 
     /// Refresh the structural reason for a bounded evaluation to stop even
@@ -440,28 +520,43 @@ impl JsRuntime {
     /// JavaScript; this exit check makes the deadline cover validation through
     /// the final active-graph publication as well.
     pub(super) fn bounded_evaluation_interrupted(&self) -> bool {
-        let cancellation_requested = self.cancel_flag.get().is_some_and(|pointer| {
+        let Some(bridge) = self.bridge.get() else {
+            return false;
+        };
+        let cancellation_requested = bridge.cancel_flag.get().is_some_and(|pointer| {
             // SAFETY: a pointer is installed only while the public bounded
             // evaluator owns the borrowed AtomicBool, under an RAII guard.
             unsafe { &*pointer }.load(std::sync::atomic::Ordering::Relaxed)
         });
         if cancellation_requested {
-            self.cancelled.set(true);
+            bridge.cancelled.set(true);
             return true;
         }
-        if self
+        if bridge
             .deadline
             .get()
             .is_some_and(|at| std::time::Instant::now() >= at)
         {
-            self.interrupted.set(true);
+            bridge.interrupted.set(true);
             return true;
         }
         false
     }
 
+    /// Discard the jobs that the script engine holds, and give their count.
+    /// The discard runs no job and no score code. A runtime with no realm
+    /// holds no job.
+    pub(super) fn discard_jobs(&self) -> usize {
+        match self.realm.get() {
+            Some(_) => with_ctx_running_no_script(self, |ctx| discard_pending_jobs(&ctx)),
+            None => 0,
+        }
+    }
+
     pub fn jobs_pending(&self) -> bool {
-        self.rt.is_job_pending()
+        self.realm
+            .get()
+            .is_some_and(|realm| realm.rt.is_job_pending())
     }
 
     /// Evaluate arbitrary JS source. Used by tests and by prebake.
@@ -550,7 +645,8 @@ impl JsRuntime {
     /// Only score JavaScript can catch such a panic, so with no script run
     /// since the last call there is nothing to raise.
     pub fn raise_caught_native_panic(&self) {
-        if !self.script_may_have_run.replace(false) {
+        // A runtime with no realm ran no script.
+        if self.realm.get().is_none() || !self.script_may_have_run.replace(false) {
             return;
         }
         with_ctx_running_no_script(self, |ctx| {
@@ -647,6 +743,10 @@ impl JsRuntime {
     }
 
     pub(crate) fn begin_slider_candidate(&self) -> Result<(), String> {
+        // A runtime with no realm holds no slider: there is no set to fork.
+        if self.realm.get().is_none() {
+            return Ok(());
+        }
         with_ctx(self, |ctx| -> Result<(), String> {
             let values = rquickjs::Object::new(ctx.clone()).map_err(|error| error.to_string())?;
             values
@@ -665,6 +765,9 @@ impl JsRuntime {
     }
 
     pub(super) fn discard_slider_candidate(&self) {
+        if self.realm.get().is_none() {
+            return;
+        }
         with_ctx(self, |ctx| {
             if let Ok(sets) = host_slider_sets(&ctx)
                 && let Ok(active) = sets.get::<rquickjs::Value>(0)
@@ -678,6 +781,10 @@ impl JsRuntime {
     }
 
     pub(crate) fn begin_voicing_candidate(&self) -> Result<(), String> {
+        // A runtime with no realm holds no voicing registry.
+        if self.realm.get().is_none() {
+            return Ok(());
+        }
         with_ctx(self, |ctx| -> Result<(), String> {
             let sets = host_voicing_sets(&ctx).map_err(|error| error.to_string())?;
             // Direct JsRuntime embedders may evaluate before installing the
@@ -723,6 +830,9 @@ impl JsRuntime {
     }
 
     pub(super) fn discard_voicing_candidate(&self) {
+        if self.realm.get().is_none() {
+            return;
+        }
         with_ctx(self, |ctx| {
             let Ok(sets) = host_voicing_sets(&ctx) else {
                 return;
@@ -741,6 +851,10 @@ impl JsRuntime {
     }
 
     pub(super) fn commit_score_candidates(&self) -> Result<(), String> {
+        // A runtime with no realm began no candidate.
+        if self.realm.get().is_none() {
+            return Ok(());
+        }
         self.commit_score_candidates_with_hook(|| Ok(()))
     }
 
@@ -840,13 +954,15 @@ impl JsRuntime {
     }
 
     pub(super) fn effect_policy_pending(&self) -> bool {
-        self.effect_policy_refusal.borrow().is_some()
+        self.bridge
+            .get()
+            .is_some_and(|bridge| bridge.effect_policy_refusal.borrow().is_some())
     }
 
     pub(super) fn effect_policy_message(&self) -> String {
-        self.effect_policy_refusal
-            .borrow()
-            .clone()
+        self.bridge
+            .get()
+            .and_then(|bridge| bridge.effect_policy_refusal.borrow().clone())
             .unwrap_or_else(|| "query-time host effect was refused".into())
     }
 
@@ -855,9 +971,16 @@ impl JsRuntime {
         // One allocator per runtime, shared by both wrapper families: a
         // separate counter for each would hand the same id to both, which is
         // exactly the wrong-callback invocation the identity rules prevent.
-        let id = self.ids.get();
-        self.ids.set(id + 1);
+        let ids = self.callback_ids();
+        let id = ids.get();
+        ids.set(id + 1);
         id
+    }
+
+    /// The callback id counter, made at the first evaluation or query that
+    /// bridges a callback frame.
+    pub(crate) fn callback_ids(&self) -> &Rc<Cell<CallbackId>> {
+        self.ids.get_or_init(Rc::default)
     }
 
     pub fn builder(&self) -> GraphBuilder {
@@ -946,6 +1069,8 @@ impl JsRuntime {
                         .map_err(|error| error.to_string())?
                         .set(0, wrapper)
                         .map_err(|e| e.to_string())?;
+                    // The wrapper took the place of a native graph in play.
+                    self.native_active.borrow_mut().take();
                     Ok(0)
                 }
                 Slot::Held => {
@@ -1014,7 +1139,7 @@ impl JsRuntime {
             Slot::Active => host_active(ctx)
                 .map_err(|error| error.to_string())?
                 .get(0)
-                .map_err(|_| "active slot is empty".to_string()),
+                .map_err(|_| ACTIVE_SLOT_EMPTY.to_string()),
             Slot::Held => {
                 let arr = host_held(ctx).map_err(|error| error.to_string())?;
                 arr.get(index)
@@ -1051,9 +1176,14 @@ impl JsRuntime {
         f: impl FnOnce() -> R,
     ) -> Result<R, QueryError> {
         self.sync_host_voicing_default()?;
+        // A graph of the native tier reaches no callback of a script, so no
+        // wrapper owns its query.
+        if self.native_active.borrow().is_some() {
+            return Ok(rustel_core::with_callback_host(self, f));
+        }
         let _scope = QueryScope::push_active_native(self).map_err(QueryError::Message)?;
         Ok(with_ctx(self, |_ctx| {
-            let frame = BridgeFrame::new(self.ids.clone());
+            let frame = BridgeFrame::new(Rc::clone(self.callback_ids()));
             let _bridge = BridgeScope::push(&frame);
             rustel_core::with_callback_host(self, f)
         }))
@@ -1113,31 +1243,35 @@ impl JsRuntime {
 
     /// The QuickJS heap ceiling currently in force, in bytes.
     pub fn memory_limit(&self) -> usize {
-        self.heap.limit()
+        match self.bridge.get() {
+            Some(bridge) => bridge.heap.limit(),
+            None => self.heap_limit_init.get(),
+        }
     }
 
     /// Bytes currently live on the QuickJS heap, as this allocator accounts
     /// them.
     pub fn heap_live(&self) -> usize {
-        self.heap.live()
+        self.bridge.get().map_or(0, |bridge| bridge.heap.live())
     }
 
     /// Lower the heap ceiling. The ceiling is monotonic: it can only go down.
-    ///
-    /// Tests use this to cause exhaustion at a small size: a test at 512 MiB
-    /// would have to allocate 512 MiB. An embedder on a small device can also
-    /// set a tighter bound than this build's default.
-    ///
-    /// The setter refuses three values:
-    ///
-    /// * **Zero.** QuickJS reads a limit of zero as unlimited, so accepting it
-    ///   would remove the ceiling.
-    /// * **Any increase.** Allowing a caller to lower the limit and then raise
-    ///   it again would violate the monotonic contract.
-    /// * **A value below the live heap.** Every later allocation would be
-    ///   denied, and the ceiling cannot be raised again.
     pub fn set_memory_limit(&self, bytes: usize) -> Result<(), String> {
-        self.heap.lower_to(bytes)
+        if let Some(bridge) = self.bridge.get() {
+            bridge.heap.lower_to(bytes)
+        } else {
+            if bytes == 0 {
+                return Err("JavaScript heap memory limit must be non-zero".into());
+            }
+            let current = self.heap_limit_init.get();
+            if bytes > current {
+                return Err(format!(
+                    "JavaScript heap memory limit cannot be raised from {current} to {bytes} bytes"
+                ));
+            }
+            self.heap_limit_init.set(bytes);
+            Ok(())
+        }
     }
 
     /// `query` with an explicit hap-count budget.
@@ -1220,10 +1354,10 @@ impl JsRuntime {
         let _effect_query = EffectQueryScope::enter(self);
         let out = if self.query_turn_depth.get() > 0
             || self.heap_boundary_depth.get() > 0
-            || self.cancel_flag.get().is_some()
+            || self.bridge().cancel_flag.get().is_some()
         {
             f()
-        } else if self.deadline.get().is_some() {
+        } else if self.bridge().deadline.get().is_some() {
             self.with_heap_boundary(f)
         } else {
             self.with_bounded_query_turn(
@@ -1276,7 +1410,7 @@ impl JsRuntime {
 
         // A stale job has no attributable query owner. Always discard it, but
         // preserve caller cancellation as the dominant public reason.
-        let stale_jobs = with_ctx_running_no_script(self, |ctx| discard_pending_jobs(&ctx));
+        let stale_jobs = self.discard_jobs();
         if cancellation.load(std::sync::atomic::Ordering::Relaxed) {
             return Err(QueryError::Limit(rustel_core::QueryLimit::Cancelled));
         }
@@ -1301,21 +1435,20 @@ impl JsRuntime {
             fn drop(&mut self) {
                 // Cleanup never executes jobs or JavaScript and is therefore
                 // safe after a deadline/cancellation interrupt and on unwind.
-                with_ctx_running_no_script(self.rt, |ctx| {
-                    let _ = discard_pending_jobs(&ctx);
-                });
-                self.rt.cancel_flag.set(self.previous_cancel);
+                self.rt.discard_jobs();
+                self.rt.bridge().cancel_flag.set(self.previous_cancel);
                 self.rt.query_limit_millis.set(self.previous_millis);
                 self.rt.query_turn_depth.set(self.previous_depth);
             }
         }
 
+        let bridge = self.bridge();
         let previous_depth = self.query_turn_depth.replace(1);
         let previous_millis = self.query_limit_millis.replace(Some(millis));
-        let previous_cancel = self
+        let previous_cancel = bridge
             .cancel_flag
             .replace(Some(cancellation as *const std::sync::atomic::AtomicBool));
-        self.cancelled.set(false);
+        bridge.cancelled.set(false);
         let _turn = QueryTurnGuard {
             rt: self,
             previous_depth,
@@ -1336,14 +1469,14 @@ impl JsRuntime {
         // reason for direct callers; they deliberately do not inspect the
         // current clock or cancellation flag after `f`, which could
         // retroactively reject an already-committed scheduler tick.
-        let jobs = with_ctx_running_no_script(self, |ctx| discard_pending_jobs(&ctx));
+        let jobs = self.discard_jobs();
         let effect_policy = effect_policy_owner.newly_raised_policy();
         if !translate_latched {
             // Scheduler ticks carry the structural refusal in `TickStatus` and
             // retain their typed reason. Let Session distinguish Stop's
             // established partial-success semantics from resource failure.
             // Direct queries have no such status value and translate below.
-            if self.cancelled.get() || self.was_interrupted() {
+            if bridge.cancelled.get() || self.was_interrupted() {
                 return out;
             }
             if heap_exhausted {
@@ -1357,7 +1490,7 @@ impl JsRuntime {
             }
             return out;
         }
-        if self.cancelled.get() {
+        if bridge.cancelled.get() {
             Err(QueryError::Limit(rustel_core::QueryLimit::Cancelled))
         } else if self.was_interrupted() {
             Err(QueryError::Limit(rustel_core::QueryLimit::JsCpuDeadline {
@@ -1407,9 +1540,66 @@ impl JsRuntime {
         cancellation: &std::sync::atomic::AtomicBool,
     ) -> Result<Vec<Hap>, QueryError> {
         let _settings = self.core_settings.bind();
+        if matches!(slot, Slot::Active)
+            && let Some(pattern) = self.native_in_play()
+        {
+            return self.query_native(&pattern, begin, end, budget, cancellation);
+        }
         self.with_bounded_query_turn(budget, cancellation, true, || {
             self.query_inner(slot, index, begin, end)
         })
+    }
+
+    /// The native graph in play, when a query of it is a turn of its own
+    /// that runs no script: no query turn is open, and the default voicings
+    /// are not an object of the script engine to read first.
+    fn native_in_play(&self) -> Option<Pattern> {
+        if self.query_turn_depth.get() > 0
+            || self.heap_boundary_depth.get() > 0
+            || rustel_core::voicings::selected_default_voicings_is_host_owned()
+        {
+            return None;
+        }
+        // A handle of the graph, so the cell is free while the query runs.
+        self.native_active.borrow().clone()
+    }
+
+    /// [`Self::query_cancellable`] of a native graph. The graph reaches no
+    /// callback of a script, so the turn holds what bounds native work,
+    /// the deadline and the cancellation flag, and none of the state of a
+    /// script turn: no job, no heap latch and no effect policy.
+    fn query_native(
+        &self,
+        pattern: &Pattern,
+        begin: Fraction,
+        end: Fraction,
+        budget: std::time::Duration,
+        cancellation: &std::sync::atomic::AtomicBool,
+    ) -> Result<Vec<Hap>, QueryError> {
+        // The refusals of a bounded turn before it starts.
+        if cancellation.load(std::sync::atomic::Ordering::Relaxed) {
+            return Err(QueryError::Limit(rustel_core::QueryLimit::Cancelled));
+        }
+        if budget.is_zero() {
+            return Err(QueryError::Limit(rustel_core::QueryLimit::JsCpuDeadline {
+                millis: 0,
+            }));
+        }
+        if let Some(bridge) = self.bridge.get() {
+            bridge.cancelled.set(false);
+            bridge.interrupted.set(false);
+        }
+        rustel_core::with_cancellation(cancellation, || {
+            // A query of a few nodes reads no clock.
+            rustel_core::with_query_budget(budget, || {
+                // A stack reports a lane that threw through the logger of
+                // the runtime.
+                rustel_core::with_callback_host(self, || {
+                    self.query_sorted_recording_throw(pattern, begin, end)
+                })
+            })
+        })
+        .map_err(QueryError::from)
     }
 
     /// Cancellable query with a caller-specific hap cap. The previous cap is
@@ -1440,6 +1630,19 @@ impl JsRuntime {
     ) -> Result<Vec<Hap>, QueryError> {
         self.sync_host_voicing_default()?;
         if matches!(slot, Slot::Active) {
+            // The handle of the native graph in play, so the cell is free
+            // while the query runs. Such a graph reaches no callback of a
+            // script, so no wrapper owns its query.
+            let held = self.native_active.borrow().clone();
+            if let Some(pattern) = held {
+                return rustel_core::with_callback_host(self, || {
+                    self.query_sorted_recording_throw(&pattern, begin, end)
+                })
+                .map_err(QueryError::from);
+            }
+            if self.realm.get().is_none() {
+                return Err(QueryError::Message(ACTIVE_SLOT_EMPTY.into()));
+            }
             // Reading the slot runs no score code.
             let native = with_ctx_running_no_script(self, |ctx| -> Option<Pattern> {
                 let value: rquickjs::Value = host_active(&ctx).ok()?.get(0).ok()?;
@@ -1478,7 +1681,7 @@ impl JsRuntime {
                 // new cells then. They belong to this query only, so the frame
                 // is torn down with it rather than accumulating across queries.
                 return with_ctx(self, |_ctx| {
-                    let frame = BridgeFrame::new(self.ids.clone());
+                    let frame = BridgeFrame::new(Rc::clone(self.callback_ids()));
                     let _bridge = BridgeScope::push(&frame);
                     rustel_core::with_callback_host(self, || {
                         self.query_sorted_recording_throw(&pattern, begin, end)
@@ -1494,7 +1697,7 @@ impl JsRuntime {
         })?;
         let _scope = QueryScope::push(self, slot, index)?;
         let haps = with_ctx(self, |_ctx| {
-            let frame = BridgeFrame::new(self.ids.clone());
+            let frame = BridgeFrame::new(Rc::clone(self.callback_ids()));
             let _bridge = BridgeScope::push(&frame);
             rustel_core::with_callback_host(self, || {
                 self.query_sorted_recording_throw(&pattern, begin, end)
@@ -1537,6 +1740,11 @@ impl JsRuntime {
 
     fn query_shadow_inner(&self, begin: Fraction, end: Fraction) -> Result<Vec<Hap>, QueryError> {
         self.sync_host_voicing_default()?;
+        // A graph of the native tier has no shadow, and a runtime with no
+        // realm has no wrapper.
+        if self.native_active.borrow().is_some() || self.realm.get().is_none() {
+            return Ok(Vec::new());
+        }
         with_ctx(self, |ctx| -> Result<Vec<Hap>, QueryError> {
             let active: rquickjs::Value = host_active(&ctx)
                 .map_err(|error| QueryError::Message(error.to_string()))?
@@ -1552,7 +1760,7 @@ impl JsRuntime {
             // The shadow owns the callbacks of its lanes.
             let _scope = WrapperQueryScope::push(&ctx, shadow)
                 .map_err(|error| QueryError::Message(error.to_string()))?;
-            let frame = BridgeFrame::new(self.ids.clone());
+            let frame = BridgeFrame::new(Rc::clone(self.callback_ids()));
             let _bridge = BridgeScope::push(&frame);
             rustel_core::with_callback_host(self, || {
                 self.query_sorted_recording_throw(&pattern, begin, end)

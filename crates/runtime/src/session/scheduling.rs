@@ -1,7 +1,7 @@
 use super::*;
 
 impl Session {
-    #[cfg(any(feature = "device-audio", test))]
+    #[cfg(feature = "device-audio")]
     pub(crate) fn take_pending_producer_turn(&mut self) -> ProducerTurnRecord {
         self.pending_producer_turn.scheduler_queue_depth =
             u32::try_from(self.scheduler.queued()).unwrap_or(u32::MAX);
@@ -29,7 +29,7 @@ impl Session {
         self.record_producer_phase(ProducerPhase::AssetPreparation, elapsed);
     }
 
-    #[cfg(any(feature = "device-audio", test))]
+    #[cfg(feature = "device-audio")]
     pub(crate) fn record_producer_ring_push(
         &mut self,
         elapsed: Duration,
@@ -44,7 +44,7 @@ impl Session {
         self.pending_producer_turn.queue_saturated |= saturated;
     }
 
-    #[cfg(any(feature = "device-audio", test))]
+    #[cfg(feature = "device-audio")]
     pub(crate) fn record_producer_cover_age(&mut self, elapsed: Duration) {
         self.pending_producer_turn.cover_age_nanos = self
             .pending_producer_turn
@@ -60,7 +60,7 @@ impl Session {
             .saturating_add(1);
     }
 
-    #[cfg(any(feature = "device-audio", test))]
+    #[cfg(feature = "device-audio")]
     fn merge_producer_turn(&mut self, record: ProducerTurnRecord) {
         for phase in ProducerPhase::ALL {
             let index = phase as usize;
@@ -193,7 +193,7 @@ impl Session {
                 };
                 let whole_begin = hap.whole_or_part().begin;
                 let onset = OnsetEventJson {
-                    live_controls: hap.live_controls,
+                    live_controls: hap.live_controls(),
                     onset_id: 0,
                     generation,
                     whole_begin: whole_begin.show(),
@@ -213,7 +213,7 @@ impl Session {
                 }
                 match self.live_audio_event(&onset, sample_rate, cps, lookup) {
                     Ok(event) => {
-                        self.csound.discard(&event.controls);
+                        self.csound_discard(&event.controls);
                         rendered = true;
                     }
                     Err(error @ rustel_voice::VoiceError::SampleLoading(_)) => {
@@ -326,7 +326,7 @@ impl Session {
     /// they take, so an edit lands late rather than being refused for
     /// publishing after its takeover. A shorter floor than the default
     /// pricing changes nothing.
-    #[cfg(any(feature = "device-audio", test))]
+    #[cfg(feature = "device-audio")]
     pub fn set_replacement_headroom_floor(&mut self, floor: Duration) {
         if floor > super::LIVE_REPLACEMENT_MIN_HEADROOM {
             self.replacement_headroom_floor = floor;
@@ -1453,7 +1453,7 @@ impl Session {
         left_out_events.sort_unstable();
         if !left_out_events.is_empty() {
             for &index in &left_out_events {
-                self.csound.discard(&events[index].controls);
+                self.csound_discard(&events[index].controls);
             }
             handover::remove_ascending(&mut events, &left_out_events);
             if !sample_identities.is_empty() {
@@ -1524,7 +1524,7 @@ impl Session {
         // separate policies; their diagnostic text is not a failure class.
         if let Some(message) = invalid_control {
             for event in &events {
-                self.csound.discard(&event.controls);
+                self.csound_discard(&event.controls);
             }
             let scope = if events.is_empty() && !self.has_pending_external_output() {
                 "every onset of"
@@ -2571,7 +2571,7 @@ mod tests {
             session.set_direct_diagnostic_logging(false);
             let effect = Value::object(vec![("name".into(), Value::Str("delay".into()))]);
             let with_plugin = || {
-                let effects = Value::List(vec![effect.clone()]);
+                let effects = Value::list(vec![effect.clone()]);
                 sound_controls("sine", vec![("vst".into(), effects)])
             };
             let plugin_lines = |session: &mut Session, now: f64| -> Vec<String> {
@@ -2666,7 +2666,7 @@ mod tests {
                     inline_jobs: 0,
                 };
                 let counts = |session: &mut Session, refusals, late_jobs| -> Vec<String> {
-                    crate::vst::named_chains(&session.chains, turn(refusals, late_jobs));
+                    crate::vst::named_chains(session.chains(), turn(refusals, late_jobs));
                     output_lines(session)
                 };
                 assert_eq!(counts(&mut session, 1, 3), [late]);
@@ -2675,7 +2675,7 @@ mod tests {
                 assert_eq!(counts(&mut session, 4, 4), [refused, late]);
                 // A new output counts from 0, also over 2 turns.
                 session.set_pattern(voice("sine", 1.0)).unwrap();
-                crate::vst::named_chains(&session.chains, turn(1, 0));
+                crate::vst::named_chains(session.chains(), turn(1, 0));
                 assert_eq!(counts(&mut session, 1, 2), [refused, late]);
                 // A session with no live output tells nothing.
                 session.set_pattern(voice("sine", 1.0)).unwrap();
@@ -2705,7 +2705,7 @@ mod tests {
                 let chains: Vec<Option<u64>> =
                     events.map(|event| event.controls.insert_chain).collect();
                 assert!(chains[0].is_some() && chains.iter().all(|chain| *chain == chains[0]));
-                let named = crate::vst::named_chains(&session.chains, turn(0, 0)).named;
+                let named = crate::vst::named_chains(session.chains(), turn(0, 0)).named;
                 assert_eq!(named.len(), 1);
             }
         }

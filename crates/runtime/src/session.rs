@@ -32,9 +32,12 @@ mod plugin_wait;
 #[cfg(all(feature = "vst", feature = "device-audio"))]
 pub use plugin_wait::{PLUGIN_WAIT, SEAM_WAIT};
 
+use std::cell::OnceCell;
 use std::collections::VecDeque;
 use std::path::Path;
 use std::sync::Arc;
+#[cfg(feature = "vst")]
+use std::sync::Mutex;
 use std::sync::atomic::AtomicBool;
 use std::time::Duration;
 use std::time::Instant;
@@ -56,7 +59,7 @@ use crate::hap_json::{
 use crate::osc_bridge::ScoreOscAccess;
 #[cfg(any(feature = "device-audio", test))]
 use crate::producer::{ProducerPhase, ProducerTurnRecord};
-use crate::render::{RenderFormat, write_onset_dump, write_silent_wav};
+use crate::render::{RenderFormat, write_onset_dump_until, write_silent_wav};
 use crate::samples::ScoreSampleAccess;
 use crate::score_import::ScoreImportAccess;
 
@@ -223,6 +226,22 @@ pub struct SessionDiagnostic {
     pub kind: String,
     pub message: String,
     pub recoverable: bool,
+}
+
+/// What evaluated a score.
+///
+/// A score of patterns, controls, functions, arrows and lanes needs no
+/// JavaScript: the session builds its graph with no script engine. Any
+/// other score runs in the script engine, which costs more time and
+/// memory.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ScoreEngine {
+    /// The session built the score with no script engine.
+    Native,
+    /// The script engine ran the score. `line` is the line of the score,
+    /// counted from 1, where the native route stopped, when it is known:
+    /// the line holds a form or a call that only JavaScript has.
+    Script { line: Option<usize> },
 }
 
 /// The kind of a refusal when the library has not finished loading the
@@ -762,6 +781,40 @@ fn query_failure_is_news(
     true
 }
 
+/// The plugin chains of a session and the flag that goes with them: the
+/// flag is true while a slider of the score in play links a parameter value,
+/// and the session reads it with no lock. One cell holds both, so no reader
+/// sees chains without their flag.
+#[cfg(feature = "vst")]
+#[derive(Clone)]
+struct PluginChains {
+    chains: Arc<Mutex<crate::vst::Chains>>,
+    slider_links: Arc<AtomicBool>,
+}
+
+#[cfg(feature = "vst")]
+impl PluginChains {
+    fn new() -> Self {
+        let chains = Arc::new(Mutex::new(crate::vst::Chains::new()));
+        let slider_links = crate::vst::slider_links(&chains);
+        Self {
+            chains,
+            slider_links,
+        }
+    }
+}
+
+/// Visuals update waiting to be committed or drained by the host window.
+/// `Clear` avoids boxing an empty candidate on every non-visual evaluation.
+#[cfg(feature = "hydra")]
+#[derive(Default)]
+enum PendingHydra {
+    #[default]
+    None,
+    Clear,
+    Ready(Box<rustel_jsruntime::HydraCandidate>),
+}
+
 /// One-process headless runtime: one QuickJS heap, one scheduler transport.
 pub struct Session {
     js: JsRuntime,
@@ -771,7 +824,7 @@ pub struct Session {
     recovery_epoch: u64,
     recovery_generation: u64,
     recovered_source: Option<Arc<str>>,
-    recovery_prebakes: Arc<Vec<recovery::RecoveryPrebake>>,
+    recovery_prebakes: Option<Arc<Vec<recovery::RecoveryPrebake>>>,
     #[cfg(any(test, feature = "test-support"))]
     injected_panic: std::cell::Cell<Option<SessionPanicPoint>>,
     /// Serial intents from the last scheduling pass, awaiting the live loop.
@@ -789,11 +842,11 @@ pub struct Session {
     /// has committed it. A candidate the replacement probe rejects is dropped
     /// here rather than reaching a window.
     #[cfg(feature = "hydra")]
-    staged_hydra: Option<Box<rustel_jsruntime::HydraCandidate>>,
+    staged_hydra: PendingHydra,
     /// The visuals recording of the score that is now installed, waiting for
     /// the surface that owns the window to drain it.
     #[cfg(feature = "hydra")]
-    pending_hydra: Option<Box<rustel_jsruntime::HydraCandidate>>,
+    pending_hydra: PendingHydra,
     /// Per-score diagnostic gates for bounded MIDI collection. They prevent a
     /// dense pattern from turning one refused route into producer-thread log
     /// spam while still reporting the first actionable failure.
@@ -839,18 +892,18 @@ pub struct Session {
     /// [`Self::load_ran_plugins`].
     #[cfg(feature = "vst")]
     plugins_to_load: Vec<String>,
-    /// The plugin chains of the scores of this session. The names source
-    /// and the values source of the live output read the same chains.
+    /// The plugin chains of the scores of this session, with their
+    /// slider-links flag, made at the first use: a score with no plugin
+    /// pays for none. The names source and the values source of the live
+    /// output read the same chains.
     #[cfg(feature = "vst")]
-    chains: Arc<std::sync::Mutex<crate::vst::Chains>>,
-    /// The flag of [`Self::chains`] that is true while a slider of the score
-    /// in play links a parameter value: see [`Self::set_slider_value`].
-    #[cfg(feature = "vst")]
-    slider_links: Arc<AtomicBool>,
+    plugin_chains: OnceCell<PluginChains>,
     /// The lanes of the scores of this session, each with the number its
     /// plugin notes carry.
     #[cfg(feature = "vst")]
     lanes: crate::vst::LaneTable,
+    /// What evaluated the last score. See [`Self::score_engine`].
+    score_engine: Option<ScoreEngine>,
     /// The last look of [`Self::plugins_pending`]: its time, the generation
     /// of the score, and the count.
     #[cfg(feature = "vst")]
@@ -1026,7 +1079,9 @@ pub struct Session {
     /// The default sample banks. `None` until enabled;
     /// resolution then falls back to the bundled `bd` alone.
     samples: Option<std::sync::Arc<crate::samples::SampleLibrary>>,
-    pub(crate) csound: crate::csound::State,
+    /// The orchestra store of this session, made at the first use: a score
+    /// with no orchestra pays for none.
+    csound: OnceCell<crate::csound::State>,
     /// The text of each imported script, by the specifier that names it. A
     /// script is fetched once and runs again in a rebuilt realm.
     import_sources: std::collections::BTreeMap<String, Arc<str>>,
@@ -1040,8 +1095,6 @@ pub struct Session {
     /// Full-screen owners drain this instead of allowing writes behind their
     /// alternate screen. It is bounded independently of score complexity.
     pending_diagnostics: VecDeque<SessionDiagnostic>,
-    bindings_ready: bool,
-    voicings_ready: bool,
     /// Whether this Session has claimed its native module settings instead of
     /// continuing to inherit the ambient Rust compatibility state.
     core_settings_owned: bool,
@@ -1170,19 +1223,12 @@ impl Session {
                 "channels must be greater than zero".into(),
             ));
         }
-        let js = config
-            .pointer
-            .clone()
-            .map_or_else(JsRuntime::new, JsRuntime::with_pointer)
-            .map_err(|e| RuntimeError::Js(e.to_string()))?;
+        // The script engine starts at the first score, prelude or import
+        // that needs it.
+        let js = JsRuntime::deferred(config.pointer.clone());
         let score_cps = config.cps;
         let transport = Arc::new(Transport::default());
         let scheduler = Scheduler::new(transport.clone(), config.cps, config.horizon);
-        let csound = crate::csound::State::new(config.score_import_access.csound_allowed());
-        #[cfg(feature = "vst")]
-        let chains = Arc::new(std::sync::Mutex::new(crate::vst::Chains::new()));
-        #[cfg(feature = "vst")]
-        let slider_links = crate::vst::slider_links(&chains);
         Ok(Self {
             js,
             panic_guard_active: false,
@@ -1191,7 +1237,7 @@ impl Session {
             recovery_epoch: 0,
             recovery_generation: 0,
             recovered_source: None,
-            recovery_prebakes: Arc::default(),
+            recovery_prebakes: None,
             #[cfg(any(test, feature = "test-support"))]
             injected_panic: std::cell::Cell::new(None),
             #[cfg(feature = "serial")]
@@ -1199,9 +1245,9 @@ impl Session {
             #[cfg(feature = "midi")]
             pending_midi: Vec::new(),
             #[cfg(feature = "hydra")]
-            staged_hydra: None,
+            staged_hydra: PendingHydra::None,
             #[cfg(feature = "hydra")]
-            pending_hydra: None,
+            pending_hydra: PendingHydra::None,
             #[cfg(feature = "midi")]
             midi_oversized_route_reported: false,
             #[cfg(feature = "midi")]
@@ -1226,11 +1272,10 @@ impl Session {
             #[cfg(feature = "vst")]
             plugins_to_load: Vec::new(),
             #[cfg(feature = "vst")]
-            chains,
-            #[cfg(feature = "vst")]
-            slider_links,
+            plugin_chains: OnceCell::new(),
             #[cfg(feature = "vst")]
             lanes: crate::vst::LaneTable::default(),
+            score_engine: None,
             #[cfg(feature = "vst")]
             plugin_look: None,
             #[cfg(all(feature = "vst", feature = "device-audio"))]
@@ -1294,13 +1339,11 @@ impl Session {
             last_path: EvaluateSource::Pattern,
             last_play_iterations: 0,
             samples: None,
-            csound,
+            csound: OnceCell::new(),
             import_sources: std::collections::BTreeMap::new(),
             import_errors: std::collections::BTreeMap::new(),
             direct_diagnostic_logging: rustel_voice::default_direct_diagnostic_logging(),
             pending_diagnostics: VecDeque::new(),
-            bindings_ready: false,
-            voicings_ready: false,
             core_settings_owned: false,
             core_settings_initialized: false,
             reported_query_throw: None,
@@ -1314,8 +1357,9 @@ impl Session {
     /// waiting for something to commit. Cleared into `pending_hydra` there.
     #[cfg(feature = "hydra")]
     pub(crate) fn promote_staged_hydra(&mut self) {
-        if let Some(candidate) = self.staged_hydra.take() {
-            self.pending_hydra = Some(candidate);
+        match std::mem::take(&mut self.staged_hydra) {
+            PendingHydra::None => {}
+            staged => self.pending_hydra = staged,
         }
     }
 
@@ -1323,7 +1367,9 @@ impl Session {
     /// own: close the picture, unless the evaluation already recorded one.
     #[cfg(feature = "hydra")]
     pub(crate) fn stage_hydra_close_when_unstaged(&mut self) {
-        self.staged_hydra.get_or_insert_with(Box::default);
+        if matches!(self.staged_hydra, PendingHydra::None) {
+            self.staged_hydra = PendingHydra::Clear;
+        }
     }
 
     /// The visuals program a committed score installed, if there is a new one.
@@ -1333,11 +1379,128 @@ impl Session {
     /// update whose program is empty is the instruction to close.
     #[cfg(feature = "hydra")]
     pub fn take_pending_hydra(&mut self) -> Option<Box<rustel_jsruntime::HydraCandidate>> {
-        self.pending_hydra.take()
+        match std::mem::take(&mut self.pending_hydra) {
+            PendingHydra::None => None,
+            PendingHydra::Clear => Some(Box::default()),
+            PendingHydra::Ready(candidate) => Some(candidate),
+        }
     }
 
     pub fn config(&self) -> &SessionConfig {
         &self.config
+    }
+
+    /// The plugin chains of this session, made at the first use.
+    #[cfg(feature = "vst")]
+    pub(crate) fn chains(&self) -> &Arc<Mutex<crate::vst::Chains>> {
+        &self.plugin_chains().chains
+    }
+
+    /// The slider-links flag of the chains, made with them.
+    #[cfg(feature = "vst")]
+    pub(crate) fn slider_links(&self) -> &Arc<AtomicBool> {
+        &self.plugin_chains().slider_links
+    }
+
+    #[cfg(feature = "vst")]
+    fn plugin_chains(&self) -> &PluginChains {
+        self.plugin_chains.get_or_init(|| {
+            let plugins = PluginChains::new();
+            if !self.lanes.is_empty() || self.lanes.document() != 0 {
+                crate::vst::score_changed(
+                    &plugins.chains,
+                    &self.lanes,
+                    self.last_source.as_deref(),
+                    self.plugins_live(),
+                );
+            }
+            plugins
+        })
+    }
+
+    /// Ends the plan of the text before, when the session has chains: a
+    /// session with none has no plan.
+    #[cfg(all(feature = "vst", feature = "device-audio"))]
+    pub(crate) fn forget_plugin_plan(&self) {
+        if let Some(plugins) = self.plugin_chains.get() {
+            crate::vst::forget_plan(&plugins.chains);
+        }
+    }
+
+    /// The orchestra store of this session, made at the first use.
+    pub(crate) fn csound(&self) -> &crate::csound::State {
+        self.csound.get_or_init(|| {
+            crate::csound::State::new(self.config.score_import_access.csound_allowed())
+        })
+    }
+
+    /// Whether this session made its orchestra store. A store never made
+    /// holds the empty snapshot that a new store holds.
+    pub(crate) fn csound_made(&self) -> bool {
+        self.csound.get().is_some()
+    }
+
+    /// Stage the orchestras of an evaluation. A score that asks for none,
+    /// on a session that made no orchestra state, makes none: the answer
+    /// is the `None` that an empty stage gives.
+    pub(crate) fn csound_stage(
+        &self,
+        effects: &[rustel_jsruntime::CsoundSource],
+    ) -> Result<Option<crate::csound::Candidate>, RuntimeError> {
+        if effects.is_empty() && !self.csound_made() {
+            return Ok(None);
+        }
+        self.csound()
+            .stage(effects, &self.config.score_import_access)
+    }
+
+    /// Stage the orchestras of an evaluation on top of `accepted`, the
+    /// snapshot of a recovery or a rollback. The stage waits for a store
+    /// only when it has nothing to give a store: no source and an empty
+    /// snapshot. A snapshot with an orchestra always reaches the store.
+    pub(crate) fn csound_stage_from(
+        &self,
+        accepted: &crate::CsoundSnapshot,
+        effects: &[rustel_jsruntime::CsoundSource],
+    ) -> Result<Option<crate::csound::Candidate>, RuntimeError> {
+        if effects.is_empty() && accepted.is_empty() && !self.csound_made() {
+            return Ok(None);
+        }
+        self.csound()
+            .stage_from_snapshot(accepted, effects, &self.config.score_import_access)
+    }
+
+    /// Commit a staged orchestra. `None` commits nothing, on a session that
+    /// made no state.
+    pub(crate) fn csound_commit(&self, candidate: Option<crate::csound::Candidate>) {
+        if candidate.is_none() && !self.csound_made() {
+            return;
+        }
+        self.csound().commit(candidate);
+    }
+
+    /// The score in play changed: the chains of its orchestra, if a session
+    /// ever made one, end with it.
+    pub(crate) fn csound_score_changed(&self) {
+        if let Some(csound) = self.csound.get() {
+            csound.score_changed();
+        }
+    }
+
+    /// The errors of the orchestra store, none from a store never made.
+    pub(crate) fn csound_take_errors(&self) -> Vec<String> {
+        self.csound
+            .get()
+            .map_or_else(Vec::new, crate::csound::State::take_errors)
+    }
+
+    /// Drop what a store holds for a note that never plays. A store never
+    /// made holds nothing.
+    #[cfg(feature = "device-audio")]
+    pub(crate) fn csound_discard(&self, controls: &rustel_audio::OscillatorControls) {
+        if let Some(csound) = self.csound.get() {
+            csound.discard(controls);
+        }
     }
 
     /// Effective voice budget. Like other module settings, an explicit score
@@ -1361,7 +1524,10 @@ impl Session {
     /// Replace the origins that text may import scripts from. The next
     /// evaluation reads the new list.
     pub fn set_score_import_access(&mut self, access: ScoreImportAccess) {
-        self.csound.set_allowed(access.csound_allowed());
+        // A store made later takes the access from the config.
+        if let Some(csound) = self.csound.get() {
+            csound.set_allowed(access.csound_allowed());
+        }
         self.config.score_import_access = access;
     }
 
@@ -1376,11 +1542,18 @@ impl Session {
     }
 
     pub fn csound_snapshot(&self) -> crate::CsoundSnapshot {
-        self.csound.snapshot()
+        self.csound.get().map_or_else(
+            crate::CsoundSnapshot::default,
+            crate::csound::State::snapshot,
+        )
     }
 
     pub fn restore_csound_snapshot(&mut self, snapshot: &crate::CsoundSnapshot) {
-        self.csound.restore(snapshot)
+        // A store never made holds the empty snapshot already.
+        if snapshot.is_empty() && !self.csound_made() {
+            return;
+        }
+        self.csound().restore(snapshot)
     }
 
     pub fn last_evaluate_source(&self) -> EvaluateSource {
@@ -1419,10 +1592,10 @@ impl Session {
                 .store(true, std::sync::atomic::Ordering::Relaxed);
             device.set_restart_lead(Arc::clone(&self.restart_lead));
         }
-        device.set_insert_provider(self.csound.provider(false));
-        let csound = self.csound.clone();
+        device.set_insert_provider(self.csound().provider(false));
+        let csound = self.csound().clone();
         #[cfg(feature = "vst")]
-        let plugins = self.chains.clone();
+        let plugins = self.chains().clone();
         device.set_insert_names(Arc::new(move |turn: rustel_audio::InsertTurn| {
             // Only a plugin copy goes back by a release. A Csound copy is
             // busy while its worker runs.
@@ -1442,7 +1615,7 @@ impl Session {
         // move: see `Self::set_slider_value`.
         #[cfg(feature = "vst")]
         {
-            let chains = self.chains.clone();
+            let chains = self.chains().clone();
             let values = move |room| crate::vst::take_slider_values(&chains, room);
             device.set_insert_values(Arc::new(values));
         }
@@ -1636,6 +1809,40 @@ impl Session {
         self.plugin_lead_changed();
     }
 
+    /// Let scores the native tier proves skip JavaScript, or send every
+    /// score to JavaScript, for tests and same-machine A/B.
+    #[doc(hidden)]
+    pub fn set_native_tier(&self, enabled: bool) {
+        self.js.set_native_tier(enabled);
+    }
+
+    /// Whether the last evaluated score ran on the native tier.
+    #[doc(hidden)]
+    pub fn evaluated_natively(&self) -> bool {
+        self.js.evaluated_natively()
+    }
+
+    /// What evaluated the last score that this session evaluated with no
+    /// error, or `None` before the first one. A front end shows it, so that
+    /// an edit that moves a score to the script engine is seen.
+    pub fn score_engine(&self) -> Option<ScoreEngine> {
+        self.score_engine
+    }
+
+    /// Whether the script engine of this session started. It starts at the
+    /// first score, prelude or import that needs JavaScript, and a session
+    /// of native scores holds no script heap.
+    pub fn script_engine_started(&self) -> bool {
+        self.js.script_engine_started()
+    }
+
+    /// The active graph as its score built it, for tests that compare two
+    /// builds of a score.
+    #[doc(hidden)]
+    pub fn active_pattern_for_test(&self) -> Option<rustel_core::Pattern> {
+        self.js.active_graph_for_test()
+    }
+
     /// The generation of the score of the last look of
     /// [`Self::plugins_pending`] at the plugin copies. `None` before the
     /// first look.
@@ -1664,7 +1871,7 @@ impl Session {
             return 0;
         }
         let rate = self.plugin_rate.load(std::sync::atomic::Ordering::Relaxed);
-        crate::vst::retry(&self.chains, None, rate)
+        crate::vst::retry(self.chains(), None, rate)
     }
 
     /// True when an evaluation of this session ran a plugin call. A plugin
@@ -1689,7 +1896,7 @@ impl Session {
         if !self.plugins_live() {
             return Vec::new();
         }
-        crate::vst::plugin_names(&self.chains)
+        crate::vst::plugin_names(self.chains())
     }
 
     /// The next score texts of this session are of `document`: the key a
@@ -1714,8 +1921,14 @@ impl Session {
     #[cfg(feature = "vst")]
     pub fn forget_plugin_document(&mut self, document: u64) -> bool {
         let live = self.plugins_live();
-        let held = crate::vst::forget_document(&self.chains, &mut self.lanes, document, live);
-        self.end_closed_plugin_document() || (held && self.transport.is_stopped())
+        if let Some(plugins) = self.plugin_chains.get() {
+            let held =
+                crate::vst::forget_document(&plugins.chains, &mut self.lanes, document, live);
+            self.end_closed_plugin_document() || (held && self.transport.is_stopped())
+        } else {
+            self.lanes.forget(document);
+            false
+        }
     }
 
     /// Ends the plugin chains of each closed document while the transport
@@ -1729,7 +1942,10 @@ impl Session {
             return false;
         }
         let live = self.plugins_live();
-        crate::vst::end_closed_documents(&self.chains, &self.lanes, live)
+        // A session with no chains has none of a closed document.
+        self.plugin_chains.get().is_some_and(|plugins| {
+            crate::vst::end_closed_documents(&plugins.chains, &self.lanes, live)
+        })
     }
 
     /// Keeps the plugin name of each plugin call an evaluation ran. `names`
@@ -1775,7 +1991,7 @@ impl Session {
     ) -> Result<rustel_audio::AudioEvent, rustel_voice::VoiceError> {
         let lookup = crate::csound::Lookup {
             samples,
-            state: &self.csound,
+            state: self.csound(),
         };
         crate::render::live_audio_event(onset, sample_rate, cps, &lookup, |_| None)
     }
@@ -1818,7 +2034,7 @@ impl Session {
     ) -> Vec<usize> {
         let live = self.plugins_live();
         let notes = onsets.iter().map(|onset| &onset.value);
-        let chains = crate::vst::assign(&self.chains, &self.lanes, &self.csound, notes, live);
+        let chains = crate::vst::assign(self.chains(), &self.lanes, self.csound(), notes, live);
         let (mut known, mut left_out) = (Vec::new(), Vec::new());
         let events = events.iter_mut().zip(chains).zip(onsets);
         for (place, ((event, chain), onset)) in events.enumerate() {
@@ -1829,10 +2045,10 @@ impl Session {
             if let ValueJson::Raw(value) = &onset.value {
                 let param_of =
                     |name: &str, key: &str| crate::vst::started()?.loaded(name)?.param(key);
-                crate::vst::link_sliders(&self.chains, value, &event.controls, param_of);
+                crate::vst::link_sliders(self.chains(), value, &event.controls, param_of);
             }
             let controls = &mut event.controls;
-            let lead = crate::vst::latencies(&self.chains, controls, sample_rate, &mut known);
+            let lead = crate::vst::latencies(self.chains(), controls, sample_rate, &mut known);
             if lead == 0 {
                 continue;
             }
@@ -1869,7 +2085,7 @@ impl Session {
     /// The plugin chains of this session, for the tests of the chains.
     #[cfg(all(test, feature = "vst"))]
     pub(crate) fn chains_for_test(&self) -> &std::sync::Mutex<crate::vst::Chains> {
-        &self.chains
+        self.chains()
     }
 
     /// The Csound chains of this session take the chain of each Csound note
@@ -1877,7 +2093,7 @@ impl Session {
     /// [`Self::chain_live_events`].
     fn record_csound_chains(&self, events: &[rustel_audio::AudioEvent]) {
         for event in events {
-            self.csound.record_chain(&event.controls);
+            self.csound().record_chain(&event.controls);
         }
     }
 
@@ -1963,9 +2179,9 @@ pub(crate) mod tests {
         let note = ValueJson::Raw(plugin_note(session));
         let live = session.plugins_live();
         let chains = crate::vst::assign(
-            &session.chains,
+            session.chains(),
             &session.lanes,
-            &session.csound,
+            session.csound(),
             [&note],
             live,
         );
@@ -2679,7 +2895,7 @@ pub(crate) mod tests {
     pub(super) fn default_voicing_value() -> Value {
         let mut controls = rustel_core::OrderedMap::new();
         controls.insert("chord".into(), Value::Str("C7".into()));
-        Value::List(
+        Value::list(
             rustel_core::voicings::render_voicing(&controls).expect("configured C7 voicing"),
         )
     }

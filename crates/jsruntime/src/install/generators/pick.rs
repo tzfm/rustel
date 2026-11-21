@@ -95,7 +95,19 @@ pub(super) fn install<'js>(
             }),
         )
         .map_err(|error| error.to_string())?;
-        proto.set(name, method).map_err(|error| error.to_string())?;
+        proto
+            .set(name, method.clone())
+            .map_err(|error| error.to_string())?;
+        record_builtin_method(
+            ctx,
+            name,
+            method.into_value(),
+            BuiltinMethod::Pick {
+                index: index_mode,
+                join: join_mode,
+            },
+        )
+        .map_err(|error| error.to_string())?;
 
         let raw_method = Function::new(
             ctx.clone(),
