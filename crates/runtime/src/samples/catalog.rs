@@ -899,12 +899,42 @@ impl SampleLibrary {
             });
     }
 
+    /// How many score policies this library has taken. A host that reads it
+    /// before it sends policies knows they are in force once it has moved by
+    /// as many.
+    pub fn policies_taken(&self) -> u64 {
+        self.shared.policies_taken.load(Ordering::Acquire)
+    }
+
     /// Take back what a score's sources no longer allow under `access`: each
     /// bank a score registered from a source that is gone, and the grant of
     /// its files, so none of them is fetched again. A file already in the
     /// loader's line is refused when the loader reaches it. The open set's
     /// folder and the sources of Settings are the player's own and stay.
     pub fn withdraw_sources(&self, access: &ScoreSampleAccess) {
+        self.take_policy(access);
+        // A source allowed again: the maps it brought before are fetched
+        // anew, and until then a check does not judge the names they bring.
+        // Forgotten after the policy is stored, so a map asked for again is
+        // published under it.
+        {
+            let mut tables = self
+                .shared
+                .source_tables
+                .lock()
+                .expect("samples source tables");
+            let back = tables
+                .withdrawn
+                .iter()
+                .filter(|map| !map_refused(access, map))
+                .cloned()
+                .collect::<HashSet<_>>();
+            tables.forget(|map| back.contains(map));
+        }
+        self.shared.policies_taken.fetch_add(1, Ordering::Release);
+    }
+
+    fn take_policy(&self, access: &ScoreSampleAccess) {
         let mut own: HashSet<Arc<str>> = HashSet::new();
         for bank in self.global.read().expect("global banks").values() {
             own.extend(bank_file_urls(bank).into_iter().cloned());
@@ -968,6 +998,32 @@ impl SampleLibrary {
             .write()
             .expect("custom filenames") = local_names::index(custom.values());
         drop((owners, custom, grants));
+        // A map that was in when its source went keeps its standing while
+        // the source is off: its names were the score's. Its banks are gone,
+        // so it is marked, and fetched anew once the source is back.
+        let packs: HashSet<String> = self
+            .shared
+            .global_rows
+            .lock()
+            .expect("global rows")
+            .slots
+            .iter()
+            .map(|slot| serde_json::to_string(&slot.spec).unwrap_or_default())
+            .collect();
+        let mut tables = self
+            .shared
+            .source_tables
+            .lock()
+            .expect("samples source tables");
+        let SourceTables {
+            sources, withdrawn, ..
+        } = &mut *tables;
+        withdrawn.extend(
+            sources
+                .iter()
+                .filter(|map| !packs.contains(*map) && map_refused(access, map))
+                .cloned(),
+        );
     }
 
     #[cfg(any(test, feature = "test-support"))]
@@ -2210,6 +2266,12 @@ impl SampleLibrary {
 /// grant: the withdrawal judged it, and kept the files of the player's own
 /// banks. The caller holds the write lock of `held`, the grants, so no
 /// withdrawal runs between this and the publication.
+/// Whether `access` refuses the URL a score's `samples("…")` map names.
+fn map_refused(access: &ScoreSampleAccess, map: &str) -> bool {
+    serde_json::from_str::<String>(map)
+        .is_ok_and(|spec| matches!(access.source_for(&spec), Ok(None)))
+}
+
 pub(super) fn under_current_policy(
     shared: &Shared,
     held: &HashMap<Arc<str>, ScoreFetchAccess>,
@@ -2675,6 +2737,49 @@ mod tests {
             matches!(state("zzz"), GlobalSourceState::Failed(ref why) if why.starts_with("zzz:")),
             "{reports:?}"
         );
+    }
+
+    /// A map that was in when its source was turned off keeps its standing
+    /// while the source is off. Once the source is back it is fetched anew,
+    /// and its files are given back: its banks went with the source. A map
+    /// of a source still allowed, and one no URL names, keep their standing.
+    #[test]
+    fn a_source_allowed_again_fetches_its_map_anew() {
+        let library = SampleLibrary::empty();
+        for spec in [
+            "http://kit.invalid/strudel.json",
+            "http://kept.invalid/strudel.json",
+            "github:me/mine",
+        ] {
+            library.note_samples_source_for_tests(spec);
+        }
+        let mut both = ScoreSampleAccess::denied();
+        both.permit_source("http://kit.invalid").unwrap();
+        both.permit_source("http://kept.invalid").unwrap();
+        library
+            .register_score_custom(r#"{"kit":"a.wav"}"#, Some("http://kit.invalid/"), &both)
+            .expect("an allowed bank");
+        let mut kept = ScoreSampleAccess::denied();
+        kept.permit_source("http://kept.invalid").unwrap();
+        let standing = |spec: &str| library.samples_source_state(spec);
+
+        library.withdraw_sources(&kept);
+        assert!(!library.knows("kit"));
+        assert_eq!(
+            standing("http://kit.invalid/strudel.json"),
+            Some(SourceState::Ready)
+        );
+        library.withdraw_sources(&both);
+        assert_eq!(standing("http://kit.invalid/strudel.json"), None);
+        assert!(!library.knows_samples_source("http://kit.invalid/strudel.json"));
+        // Its files are given back: the map fetched again brings the bank.
+        library
+            .register_score_custom(r#"{"kit":"a.wav"}"#, Some("http://kit.invalid/"), &both)
+            .expect("an allowed bank");
+        assert!(library.knows("kit"));
+        for spec in ["http://kept.invalid/strudel.json", "github:me/mine"] {
+            assert_eq!(standing(spec), Some(SourceState::Ready), "{spec}");
+        }
     }
 
     /// A source that failed - refused under the old policy - is forgotten
