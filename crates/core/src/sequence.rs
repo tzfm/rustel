@@ -4990,7 +4990,7 @@ impl Layer {
                 Ok(())
             })
         };
-        let pushed = if grid.ticks.is_power_of_two() {
+        let pushed = if grid.ticks.is_power_of_two() || met <= 2 {
             emit_range(None, &mut cuts)
         } else {
             with_tick_grid_if(grid.ticks, met >= 8, |reductions| {
@@ -7324,7 +7324,67 @@ pub(crate) fn applied(
             if let Some(set) = layer.set(values, apply, flow) {
                 return Some(set);
             }
-            let (met, pairs) = layer.met(values, Side::Functions)?;
+            let (mut met, pairs) = layer.met(values, Side::Functions)?;
+            // Fast path: single-value constant built-in control applied by Set
+            // folds into `met.dress` directly without materializing per-step
+            // `BuiltinMap` objects or copying `layer.values` when 1-to-1.
+            if apply.in_place_op() == Some(crate::compose::ComposeOp::Set)
+                && flow == LookupFlow::Set
+                && values.values.len() == 1
+                && layer.is_direct_keyed()
+                && layer.dress().tail.is_none()
+            {
+                let rhs_packed: Option<(u16, &Value)> = if values.is_direct_keyed()
+                    && values.dress.as_deref().is_none_or(|d| d.set_map.is_none())
+                {
+                    Some((values.seq_packed_key(), &values.values[0]))
+                } else if values.named_id == 0
+                    && values
+                        .dress
+                        .as_deref()
+                        .is_none_or(|d| d.set_map.is_none() && d.tail.is_none())
+                    && let Value::Object(map) = &values.values[0]
+                    && let Some(entries) = map.as_builtin()
+                    && let crate::value::Slice::Builtin(keys, vals) = entries.as_slice()
+                    && keys.len() == 1
+                {
+                    Some((keys[0], &vals[0]))
+                } else {
+                    None
+                };
+                if let Some((k1, v1)) = rhs_packed {
+                    let id1 = k1 & 0x03ff;
+                    if id1 != 0
+                        && id1 != layer.named_id
+                        && crate::controls::builtin_name_str_by_id(id1) != Some("value")
+                        && v1.is_data(0)
+                    {
+                        let pairs_slice = pairs.as_slice();
+                        let identity = pairs_slice.len() == layer.values.len()
+                            && pairs_slice
+                                .iter()
+                                .enumerate()
+                                .all(|(i, &(f, _))| f as usize == i);
+                        if !identity {
+                            met.values = pairs_slice
+                                .iter()
+                                .map(|&(f, _)| layer.values[f as usize].clone())
+                                .collect();
+                        }
+                        met.change_dress(|dress| {
+                            let mut shared = None;
+                            dress.set_packed_here(
+                                &[k1],
+                                std::slice::from_ref(v1),
+                                Locations::new(),
+                                &mut shared,
+                            );
+                        });
+                        met.refresh_direct();
+                        return Some(met);
+                    }
+                }
+            }
             // Fast path: two direct-keyed built-in layers combined by Set
             // build each exact-sized BuiltinMap directly without temporary
             // 1-key maps or intermediate Vec<Value>.

@@ -10171,7 +10171,7 @@ impl Pattern {
         thread: &QueryThread,
         state: &State,
         from: usize,
-        buf: &mut Vec<Hap>,
+        haps: impl Iterator<Item = Hap>,
         out: &mut Vec<Hap>,
     ) -> Option<bool> {
         let mut keys: [Option<&Key>; 4] = [None; 4];
@@ -10200,14 +10200,14 @@ impl Pattern {
             count: u8,
             pieces: [TimeSpan; 8],
             nums: [[f64; 4]; 8],
-            step_patches: StepPatchCache,
+            step_patches: [Option<(value::PatchedBase, Option<u32>, value::StepPatch)>; 2],
             step_next: u8,
             fallback_caches: Option<Box<[value::SharedWaveCache; 8]>>,
         }
-        let mut slots: [Option<MultiStepSlot>; 4] = [None, None, None, None];
+        let mut slots: [Option<MultiStepSlot>; 2] = [None, None];
         let mut slot_next = 0u8;
         let mut patches: [(&Key, f64); 4] = [(first_key, 0.0); 4];
-        for hf in buf.drain(..) {
+        for hf in haps {
             let met = if has_continuous {
                 hf.whole_or_part()
             } else {
@@ -10250,7 +10250,7 @@ impl Pattern {
                 let idx = if let Some(empty) = slots.iter().position(Option::is_none) {
                     empty
                 } else {
-                    let victim = usize::from(slot_next & 3);
+                    let victim = usize::from(slot_next & 1);
                     slot_next = slot_next.wrapping_add(1);
                     victim
                 };
@@ -10260,7 +10260,7 @@ impl Pattern {
                     count: count as u8,
                     pieces,
                     nums,
-                    step_patches: [None, None, None, None],
+                    step_patches: [None, None],
                     step_next: 0,
                     fallback_caches: None,
                 });
@@ -10327,7 +10327,7 @@ impl Pattern {
                         if let Some(empty) = slot.step_patches.iter().position(Option::is_none) {
                             empty
                         } else {
-                            let v = usize::from(slot.step_next & 3);
+                            let v = usize::from(slot.step_next & 1);
                             slot.step_next = slot.step_next.wrapping_add(1);
                             v
                         };
@@ -10410,32 +10410,192 @@ impl Pattern {
         }
         let from = out.len();
         let items = &*app.waves;
-        let ok = with_list(|buf| {
-            app.inner
-                .answer_onto(thread, state, table::Order::Graph, buf);
-            if thread.stop_requested() {
-                return Some(true);
+        app.inner
+            .answer_onto(thread, state, table::Order::Graph, out);
+        if thread.stop_requested() {
+            out.truncate(from);
+            return true;
+        }
+        let inner_len = out.len() - from;
+        if inner_len == 0 {
+            return true;
+        }
+        let apply = Combine::Composed(compose::ComposeOp::Set);
+        let mut shared_steps = 0u32;
+        let mut uniform_steps = items.len() <= 4;
+        let mut has_continuous = false;
+        let mut single_step_mask = 0u8;
+        for (idx, item) in items.iter().enumerate() {
+            if item.steps == 0 {
+                has_continuous = true;
+            } else if fused::StepWave::step_covers_span(item.steps, state.span) {
+                single_step_mask |= 1u8 << idx;
+            } else if shared_steps == 0 {
+                shared_steps = item.steps;
+            } else if shared_steps != item.steps {
+                uniform_steps = false;
+                break;
             }
-            if buf.is_empty() {
-                return Some(true);
-            }
-            let apply = Combine::Composed(compose::ComposeOp::Set);
-            let mut shared_steps = 0u32;
-            let mut uniform_steps = items.len() <= 4;
-            let mut has_continuous = false;
-            let mut single_step_mask = 0u8;
-            for (idx, item) in items.iter().enumerate() {
-                if item.steps == 0 {
-                    has_continuous = true;
-                } else if fused::StepWave::step_covers_span(item.steps, state.span) {
-                    single_step_mask |= 1u8 << idx;
-                } else if shared_steps == 0 {
-                    shared_steps = item.steps;
-                } else if shared_steps != item.steps {
-                    uniform_steps = false;
-                    break;
+        }
+        if inner_len <= 4 {
+            if uniform_steps
+                && shared_steps > 0
+                && items.len() >= 2
+                && out[from..].iter().all(|hf| {
+                    fused::StepWave::takes(hf)
+                        && (!has_continuous || (hf.whole.is_some() && hf.part.within_one_cycle()))
+                        && fused::StepWave::step_grid_over(shared_steps, hf.part)
+                            .is_some_and(|g| (1..=8).contains(&g.len()))
+                })
+            {
+                let mut stack_haps: [Option<Hap>; 4] = [None, None, None, None];
+                for (slot, hf) in stack_haps.iter_mut().zip(out.drain(from..)) {
+                    *slot = Some(hf);
                 }
+                let ok = Self::try_query_app_wave_uniform_steps_onto(
+                    items,
+                    shared_steps,
+                    has_continuous,
+                    single_step_mask,
+                    thread,
+                    state,
+                    from,
+                    stack_haps[..inner_len].iter_mut().filter_map(Option::take),
+                    out,
+                );
+                if ok.is_none() {
+                    out.truncate(from);
+                    return false;
+                }
+                return true;
             }
+            if let [item] = items
+                && item.steps > 0
+                && let Some(key) = controls::builtin_key_ref_by_id(item.key_id)
+                && out[from..].iter().all(|hf| {
+                    fused::StepWave::takes(hf)
+                        && fused::StepWave::step_grid_over(item.steps, hf.part)
+                            .is_some_and(|g| g.len() <= 8)
+                })
+            {
+                let mut stack_haps: [Option<Hap>; 4] = [None, None, None, None];
+                for (slot, hf) in stack_haps.iter_mut().zip(out.drain(from..)) {
+                    *slot = Some(hf);
+                }
+                let mut one_cache = value::SharedWaveCache::default();
+                let mut one_last: Option<(TimeSpan, f64)> = None;
+                let mut small_cache: [Option<SmallStepSlot>; 4] = [None, None, None, None];
+                let mut small_next = 0u8;
+                let mut ok = true;
+                for mut hf in stack_haps[..inner_len].iter_mut().filter_map(Option::take) {
+                    let cached_one = match one_last {
+                        Some((lp, ln)) if lp == hf.part => Some(ln),
+                        _ => fused::StepWave::step_number(
+                            &item.wave,
+                            item.steps,
+                            hf.part,
+                            &state.controls,
+                        )
+                        .inspect(|&n| {
+                            one_last = Some((hf.part, n));
+                            one_cache = value::SharedWaveCache::default();
+                        }),
+                    };
+                    if let Some(num) = cached_one {
+                        let part = hf.part;
+                        if !Meeting::set_number_in_place_cached(
+                            &mut hf,
+                            key,
+                            num,
+                            part,
+                            &apply,
+                            LookupFlow::Set,
+                            Some(&mut one_cache),
+                        ) {
+                            ok = false;
+                            break;
+                        }
+                        if thread.stop_requested() || !thread.push_budgeted(out, from, hf) {
+                            out.truncate(from);
+                            return true;
+                        }
+                        fused::note(fused::Hit::StepOne);
+                        continue;
+                    }
+                    let Some(grid) = fused::StepWave::step_grid_over(item.steps, hf.part) else {
+                        ok = false;
+                        break;
+                    };
+                    let count = grid.len();
+                    if count == 0 {
+                        continue;
+                    }
+                    if count == 1 {
+                        let k = grid.steps().start;
+                        let (Some(begin), Some(end)) = (grid.time(k), grid.time(k + 1)) else {
+                            ok = false;
+                            break;
+                        };
+                        let piece = grid.cut(k, TimeSpan::new(begin, end), hf.part);
+                        let Some(num) = item.wave.step_value_at(begin, &state.controls) else {
+                            ok = false;
+                            break;
+                        };
+                        if one_last.is_none_or(|(lp, _)| lp != hf.part) {
+                            one_last = Some((hf.part, num));
+                            one_cache = value::SharedWaveCache::default();
+                        }
+                        if !Meeting::set_number_in_place_cached(
+                            &mut hf,
+                            key,
+                            num,
+                            piece,
+                            &apply,
+                            LookupFlow::Set,
+                            Some(&mut one_cache),
+                        ) {
+                            ok = false;
+                            break;
+                        }
+                        if thread.stop_requested() || !thread.push_budgeted(out, from, hf) {
+                            out.truncate(from);
+                            return true;
+                        }
+                        fused::note(fused::Hit::StepMany);
+                        continue;
+                    }
+                    match meet_steps_small(
+                        thread,
+                        hf,
+                        key,
+                        &item.wave,
+                        &grid,
+                        &mut small_cache,
+                        &mut small_next,
+                        state,
+                        from,
+                        out,
+                    ) {
+                        Some(true) => {}
+                        Some(false) => {
+                            out.truncate(from);
+                            return true;
+                        }
+                        None => {
+                            ok = false;
+                            break;
+                        }
+                    }
+                }
+                if !ok {
+                    out.truncate(from);
+                    return false;
+                }
+                return true;
+            }
+        }
+        let ok = with_list(|buf| {
+            buf.extend(out.drain(from..));
             if uniform_steps
                 && shared_steps > 0
                 && items.len() >= 2
@@ -10454,7 +10614,7 @@ impl Pattern {
                     thread,
                     state,
                     from,
-                    buf,
+                    buf.drain(..),
                     out,
                 );
             }
