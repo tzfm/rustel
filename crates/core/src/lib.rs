@@ -1513,16 +1513,23 @@ struct PitchRewrite {
 /// its locations, for a node that holds them so. Most nodes take the
 /// union of a row alone, so the list is made when a node first reads it.
 pub(crate) struct Apart<'a> {
+    count: usize,
     make: &'a dyn Fn() -> Vec<(Value, Locations)>,
     made: std::cell::OnceCell<Vec<(Value, Locations)>>,
 }
 
 impl<'a> Apart<'a> {
-    pub(crate) fn new(make: &'a dyn Fn() -> Vec<(Value, Locations)>) -> Self {
+    pub(crate) fn new(count: usize, make: &'a dyn Fn() -> Vec<(Value, Locations)>) -> Self {
         Self {
+            count,
             make,
             made: std::cell::OnceCell::new(),
         }
+    }
+
+    #[inline]
+    fn has_many(&self) -> bool {
+        self.count > 1
     }
 
     fn each(&self) -> &[(Value, Locations)] {
@@ -13788,7 +13795,7 @@ impl Pattern {
         };
         // A handle of the control, as the one control of its row.
         let alone = || vec![(control.clone(), context.clone())];
-        self.write(waves, &under, context.clone(), &Apart::new(&alone));
+        self.write(waves, &under, context.clone(), &Apart::new(1, &alone));
         true
     }
 
@@ -13904,7 +13911,7 @@ impl Pattern {
                     each.map(|(one, _)| (one.clone(), Locations::new()))
                         .collect()
                 };
-                let apart = Apart::new(&bare);
+                let apart = Apart::new(apart.count, &bare);
                 let mut dress_cache = sequence::RenoteDressCache::default();
                 for picked in pick
                     .lookup
@@ -13944,8 +13951,7 @@ impl Pattern {
                     // A pattern that takes no control meets a constant of
                     // each control of the row, as it met them in the stack.
                     if pattern.meets_each_control() && control.is_data(0) {
-                        *pattern =
-                            pattern.met_row(control, context.clone(), apart.each().len() > 1);
+                        *pattern = pattern.met_row(control, context.clone(), apart.has_many());
                         continue;
                     }
                     let row = Self::apart_under(control, apart.each());
@@ -13963,8 +13969,7 @@ impl Pattern {
                         continue;
                     }
                     if pattern.meets_each_control() && control.is_data(0) {
-                        *pattern =
-                            pattern.met_row(control, context.clone(), apart.each().len() > 1);
+                        *pattern = pattern.met_row(control, context.clone(), apart.has_many());
                         continue;
                     }
                     let row = Self::apart_under(control, apart.each());
@@ -14129,6 +14134,26 @@ impl Pattern {
         }
         if inline_len == 0 || !control.is_data(0) {
             return None;
+        }
+        // Build the combined map in one allocation: innermost wave keys first
+        // (deduplicated, with placeholder 0.0 values) followed by `controls`
+        // (guaranteed disjoint by the `contains_key` checks above).
+        if extra_names.is_empty() {
+            let mut dedup: [Option<Key>; 8] = Default::default();
+            let mut dedup_len = 0usize;
+            for name in inline_names[..inline_len].iter_mut().rev() {
+                let key = name.take().expect("filled inline wave name");
+                if !dedup[..dedup_len].iter().flatten().any(|seen| seen == &key) {
+                    dedup[dedup_len] = Some(key);
+                    dedup_len += 1;
+                }
+            }
+            let wave_entries = dedup[..dedup_len]
+                .iter_mut()
+                .map(|slot| (slot.take().expect("dedup key"), Value::F64(0.0)));
+            let control_entries = controls.into_iter().map(|(k, v)| (k.clone(), v.clone()));
+            let set = Value::Object(OrderedMap::of_keys(wave_entries.chain(control_entries)));
+            return Some((depth, set, under));
         }
         // The innermost wave sets its name first.
         let mut places = OrderedMap::new();

@@ -258,13 +258,51 @@ pub(crate) struct InlineGrid<const N: usize> {
     steps: [SmallGridStep; N],
 }
 
+/// Compact 16-bit multi-range location runs stored inline for up to 7 entries
+/// (zero heap allocation, smaller total footprint than `Box<[u16]>` plus
+/// allocator overhead) and spilled to `Box<[u16]>` when longer.
+#[derive(Clone)]
+pub(crate) enum SmallPackedRuns {
+    Inline(u8, [u16; 7]),
+    Heap(Box<[u16]>),
+}
+
+impl SmallPackedRuns {
+    #[inline]
+    fn from_slice(slice: &[u16]) -> Self {
+        if slice.len() <= 7 {
+            let mut arr = [0u16; 7];
+            arr[..slice.len()].copy_from_slice(slice);
+            Self::Inline(slice.len() as u8, arr)
+        } else {
+            Self::Heap(Box::from(slice))
+        }
+    }
+
+    #[inline(always)]
+    fn as_slice(&self) -> &[u16] {
+        match self {
+            Self::Inline(len, arr) => &arr[..usize::from(*len)],
+            Self::Heap(boxed) => boxed,
+        }
+    }
+}
+
+impl std::ops::Deref for SmallPackedRuns {
+    type Target = [u16];
+    #[inline(always)]
+    fn deref(&self) -> &[u16] {
+        self.as_slice()
+    }
+}
+
 /// Compact grid storage for `1..=16` steps carrying deduplicated 16-bit
 /// multi-range location runs (`offset < 1024`, `len <= 30`) without `Box<Spare>`
 /// or a separate `Box<[SmallGridStep]>`.
 pub(crate) struct InlinePackedGrid<const N: usize> {
     ticks: NonZeroU32,
     base: u32,
-    packed: Box<[u16]>,
+    packed: SmallPackedRuns,
     steps: [SmallGridStep; N],
 }
 
@@ -274,7 +312,7 @@ pub(crate) struct PackedSliceGrid {
     ticks: NonZeroU32,
     base: u32,
     steps: Box<[SmallGridStep]>,
-    packed: Box<[u16]>,
+    packed: SmallPackedRuns,
 }
 
 const SMALL_RUN_END: u16 = 1 << 15;
@@ -282,7 +320,7 @@ const SMALL_RUN_LEN_BITS: u16 = 5;
 const SMALL_RUN_LEN_MASK: u16 = (1 << SMALL_RUN_LEN_BITS) - 1;
 const SMALL_RUN_OFF_LIMIT: u32 = 1 << 10;
 
-fn try_pack_runs_u16(runs: &[u32]) -> Option<Box<[u16]>> {
+fn try_pack_runs_u16(runs: &[u32]) -> Option<SmallPackedRuns> {
     if runs.is_empty() {
         return None;
     }
@@ -301,7 +339,11 @@ fn try_pack_runs_u16(runs: &[u32]) -> Option<Box<[u16]>> {
         };
         small.push(end_bit | ((offset as u16) << SMALL_RUN_LEN_BITS) | (len_plus_1 as u16));
     }
-    Some(small.into_boxed_slice())
+    if small.len() <= 7 {
+        Some(SmallPackedRuns::from_slice(small.as_slice()))
+    } else {
+        Some(SmallPackedRuns::Heap(small.into_boxed_slice()))
+    }
 }
 
 #[derive(Clone)]
@@ -384,7 +426,7 @@ impl CompactGrid {
         ticks: NonZeroU32,
         base: u32,
         steps: &[SmallGridStep],
-        packed: Box<[u16]>,
+        packed: SmallPackedRuns,
     ) -> Self {
         macro_rules! build {
             ($($n:literal => $var:ident),+) => {
@@ -422,7 +464,7 @@ impl CompactGrid {
         ticks: NonZeroU32,
         base: u32,
         steps: Box<[SmallGridStep]>,
-        packed: Box<[u16]>,
+        packed: SmallPackedRuns,
     ) -> Self {
         Self::PMany(Arc::new(PackedSliceGrid {
             ticks,
@@ -600,7 +642,7 @@ enum PackedRunsRef<'a> {
 /// when a grid can stay in [`CompactGrid`].
 enum PackedRunsInput {
     None,
-    Small(Box<[u16]>),
+    Small(SmallPackedRuns),
     Wide(Box<[u32]>),
 }
 
@@ -2267,7 +2309,7 @@ impl<'a> GridView<'a> {
         let new_ticks = NonZeroU32::new(new_ticks_u32)?;
         let clone_packed = || match self.packed {
             PackedRunsRef::None => PackedRunsInput::None,
-            PackedRunsRef::Small(runs) => PackedRunsInput::Small(Box::from(runs)),
+            PackedRunsRef::Small(runs) => PackedRunsInput::Small(SmallPackedRuns::from_slice(runs)),
             PackedRunsRef::Wide(runs) => PackedRunsInput::Wide(Box::from(runs)),
         };
         let (steps, packed, rare) = if mul == 1 && g1 == 1 {
@@ -5004,7 +5046,7 @@ impl Layer {
     ///
     /// `None` for more steps than a fold makes, for a period past the
     /// largest term, and for steps that are then not in the order of time.
-    fn met(&self, values: &Layer, side: Side) -> Option<(Layer, Vec<(u32, u32)>)> {
+    fn met(&self, values: &Layer, side: Side) -> Option<(Layer, SmallCopyBuf<(u32, u32), 16>)> {
         let keys = match side {
             Side::Functions => ContextKeys::merge(self.dress().keys(), values.dress().keys()),
             Side::Values => ContextKeys::merge(values.dress().keys(), self.dress().keys()),
@@ -5013,9 +5055,11 @@ impl Layer {
         // over the whole part: the places stay, and the locations of the
         // value go beside those of each step.
         if self.in_cycles() && values.fills_each_cycle() {
-            let pairs = (0..u32::try_from(self.values.len()).ok()?)
-                .map(|value| (value, 0))
-                .collect();
+            let count = u32::try_from(self.values.len()).ok()?;
+            let mut pairs = SmallCopyBuf::<(u32, u32), 16>::new((0, 0));
+            for value in 0..count {
+                pairs.push((value, 0));
+            }
             let met = self.with(|layer| {
                 layer.change_dress(|dress| {
                     match side {
@@ -5050,7 +5094,7 @@ impl Layer {
             static SPARE_RAWS: std::cell::RefCell<Vec<Raw>> =
                 const { std::cell::RefCell::new(Vec::new()) };
         }
-        let mut pairs: Vec<(u32, u32)> = Vec::new();
+        let mut pairs = SmallCopyBuf::<(u32, u32), 16>::new((0, 0));
         // Room for a step that meets one value in each turn.
         let room = usize::try_from(turns).ok()?.saturating_mul(self.count());
         let mut raws = SPARE_RAWS
@@ -5074,7 +5118,7 @@ impl Layer {
                 .collect::<Vec<_>>();
             &heap_parts
         };
-        let build = (|| -> Option<(Self, Vec<(u32, u32)>)> {
+        let build = (|| -> Option<(Self, SmallCopyBuf<(u32, u32), 16>)> {
             for turn in 0..turns {
                 let start = own_period.checked_mul(Fraction::int(turn))?;
                 for index in 0..own.len() {
@@ -5119,13 +5163,14 @@ impl Layer {
                             // The pairs are few: one for each value that a
                             // value meets.
                             let pair = (own_value, others.value(value_index));
-                            let value = match pairs.iter().position(|known| *known == pair) {
-                                Some(value) => value,
-                                None => {
-                                    pairs.push(pair);
-                                    pairs.len() - 1
-                                }
-                            };
+                            let value =
+                                match pairs.as_slice().iter().position(|known| *known == pair) {
+                                    Some(value) => value,
+                                    None => {
+                                        pairs.push(pair);
+                                        pairs.len() - 1
+                                    }
+                                };
                             let value = u32::try_from(value).ok()?;
                             // The value side's locations come first.
                             let locations = match side {
@@ -5180,7 +5225,7 @@ impl Layer {
         values: &Layer,
         side: Side,
         keys: &ContextKeys,
-    ) -> Option<(Layer, Vec<(u32, u32)>)> {
+    ) -> Option<(Layer, SmallCopyBuf<(u32, u32), 16>)> {
         if self.dress().before_len() != 0
             || values.dress().before_len() != 0
             || !values.dress().after().is_empty()
@@ -5254,7 +5299,7 @@ impl Layer {
                         begin: 0,
                         end: 0,
                     });
-                    let mut pairs: Vec<(u32, u32)> = Vec::new();
+                    let mut pairs = SmallCopyBuf::<(u32, u32), 16>::new((0, 0));
                     let mut in_cycles = true;
                     let turns_den = u64::from(p_den);
                     let ticks64 = u64::from(ticks);
@@ -5294,14 +5339,17 @@ impl Layer {
                                     }
                                     let (other_locs, other_n) = other.inline_locs_raw(j)?;
                                     let pair = (own_step.value, other_step.value);
-                                    let pair_idx =
-                                        match pairs.iter().position(|known| *known == pair) {
-                                            Some(idx) => idx,
-                                            None => {
-                                                pairs.push(pair);
-                                                pairs.len() - 1
-                                            }
-                                        };
+                                    let pair_idx = match pairs
+                                        .as_slice()
+                                        .iter()
+                                        .position(|known| *known == pair)
+                                    {
+                                        Some(idx) => idx,
+                                        None => {
+                                            pairs.push(pair);
+                                            pairs.len() - 1
+                                        }
+                                    };
                                     let value = u16::try_from(pair_idx).ok()?;
                                     let mut locs = [(0u32, 0u16); 4];
                                     let mut n_locs = 0usize;
@@ -7134,8 +7182,9 @@ pub(crate) fn applied(
                 match tail {
                     None => {
                         let met_values: Arc<[Value]> = pairs
-                            .into_iter()
-                            .map(|(f, v)| {
+                            .as_slice()
+                            .iter()
+                            .map(|&(f, v)| {
                                 Value::Object(crate::OrderedMap::from_two_packed(
                                     k0,
                                     layer.values[f as usize].clone(),
@@ -7152,8 +7201,9 @@ pub(crate) fn applied(
                     {
                         let tail_slice = entries.as_slice();
                         let met_values: Arc<[Value]> = pairs
-                            .into_iter()
-                            .map(|(f, v)| {
+                            .as_slice()
+                            .iter()
+                            .map(|&(f, v)| {
                                 Value::Object(crate::OrderedMap::from_keyed_tail_and_packed(
                                     k0,
                                     layer.values[f as usize].clone(),
@@ -7172,9 +7222,26 @@ pub(crate) fn applied(
             // locations of both sides are those of the steps.
             let fn_reader = layer.reader(None);
             let val_reader = values.reader(None);
-            let values = pairs
-                .into_iter()
-                .map(|(function, value)| {
+            let pairs_slice = pairs.as_slice();
+            if pairs_slice.len() <= 16 {
+                let mut stack_vals: [Value; 16] = std::array::from_fn(|_| Value::Undefined);
+                for (slot, &(function, value)) in stack_vals.iter_mut().zip(pairs_slice) {
+                    *slot = made(
+                        &fn_reader.get(function as usize)?,
+                        &val_reader.get(value as usize)?,
+                        apply,
+                        flow,
+                    )?;
+                }
+                let met_values: Arc<[Value]> = stack_vals[..pairs_slice.len()]
+                    .iter_mut()
+                    .map(|v| std::mem::replace(v, Value::Undefined))
+                    .collect();
+                return Some(met.valued(met_values));
+            }
+            let values = pairs_slice
+                .iter()
+                .map(|&(function, value)| {
                     made(
                         &fn_reader.get(function as usize)?,
                         &val_reader.get(value as usize)?,
@@ -7398,8 +7465,9 @@ pub(crate) fn applied_out(
                 // What each pair of values makes, with no location: the
                 // locations of both sides are those of the steps.
                 let values = pairs
-                    .into_iter()
-                    .map(|(value, function)| {
+                    .as_slice()
+                    .iter()
+                    .map(|&(value, function)| {
                         let hf = cycle_hap(functions.value(function as usize)?);
                         let hv = cycle_hap(layer.value(value as usize)?);
                         let hap = applied_hap(&hf, &hv, hv.whole, hv.part, apply, flow);

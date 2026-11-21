@@ -2398,32 +2398,62 @@ pub fn scale_owned<P: PatOps>(pat: P, scale_arg: Value) -> P {
     } else {
         scale_arg
     };
+    let mut stack_buf = [0u8; 64];
+    let mut stack_len = 0usize;
     let mut owned_name = String::new();
     let scale_name: Result<&str, ()> = match &scale_arg {
         Value::Str(s) => Ok(s.as_str()),
         Value::List(items) => {
-            fn append_flat(items: &[Value], out: &mut String) {
+            fn push_part(
+                part: &str,
+                stack_buf: &mut [u8; 64],
+                stack_len: &mut usize,
+                overflow: &mut String,
+            ) {
+                if !overflow.is_empty() {
+                    overflow.push(' ');
+                    overflow.push_str(part);
+                    return;
+                }
+                let sep = usize::from(*stack_len > 0);
+                if *stack_len + sep + part.len() <= stack_buf.len() {
+                    if sep != 0 {
+                        stack_buf[*stack_len] = b' ';
+                        *stack_len += 1;
+                    }
+                    stack_buf[*stack_len..*stack_len + part.len()].copy_from_slice(part.as_bytes());
+                    *stack_len += part.len();
+                } else {
+                    overflow.reserve(*stack_len + sep + part.len());
+                    overflow.push_str(
+                        std::str::from_utf8(&stack_buf[..*stack_len]).expect("valid utf8"),
+                    );
+                    if sep != 0 {
+                        overflow.push(' ');
+                    }
+                    overflow.push_str(part);
+                }
+            }
+            fn append_flat(
+                items: &[Value],
+                stack_buf: &mut [u8; 64],
+                stack_len: &mut usize,
+                overflow: &mut String,
+            ) {
                 for item in items {
                     match item {
-                        Value::List(inner) => append_flat(inner, out),
-                        Value::Str(s) => {
-                            if !out.is_empty() {
-                                out.push(' ');
-                            }
-                            out.push_str(s.as_str());
-                        }
-                        other => {
-                            if !out.is_empty() {
-                                out.push(' ');
-                            }
-                            out.push_str(&other.show());
-                        }
+                        Value::List(inner) => append_flat(inner, stack_buf, stack_len, overflow),
+                        Value::Str(s) => push_part(s.as_str(), stack_buf, stack_len, overflow),
+                        other => push_part(&other.show(), stack_buf, stack_len, overflow),
                     }
                 }
             }
-            owned_name.reserve(24);
-            append_flat(items, &mut owned_name);
-            Ok(owned_name.as_str())
+            append_flat(items, &mut stack_buf, &mut stack_len, &mut owned_name);
+            if !owned_name.is_empty() {
+                Ok(owned_name.as_str())
+            } else {
+                Ok(std::str::from_utf8(&stack_buf[..stack_len]).expect("valid utf8"))
+            }
         }
         _ => Err(()),
     };

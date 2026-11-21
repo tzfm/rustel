@@ -472,13 +472,13 @@ fn set_row(pattern: Pattern, row: &[ChainCall<'_>]) -> Result<Pattern, Pattern> 
             &keys[..len],
             &mut vals[..len],
             context,
-            &crate::Apart::new(&each),
+            &crate::Apart::new(row.len(), &each),
         );
     }
     let Some((union, context)) = union_of(row) else {
         return Err(pattern);
     };
-    pattern.with_row(&union, context, &crate::Apart::new(&each))
+    pattern.with_row(&union, context, &crate::Apart::new(row.len(), &each))
 }
 
 /// Fast stack-packed union for rows where every entry is a plain scalar
