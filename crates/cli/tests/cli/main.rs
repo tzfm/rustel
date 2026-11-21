@@ -9901,22 +9901,32 @@ fn a_hydra_array_entry_that_is_not_a_number_is_refused() {
     assert!(clean.contains("no issues found"), "{clean}");
 }
 
-/// `--until-silence` says that the silence it waited for is cut from the
-/// file, so a take that ends loud, where its last sound ended, reads right.
+/// `--until-silence` says how the take ended: on the silence it waited
+/// for, which is cut from the end, or at the end of the tail, when the
+/// music never stayed under the floor that long.
 #[test]
-fn until_silence_says_the_silence_is_cut() {
+fn until_silence_says_how_the_take_ended() {
     let path = scratch("until-silence.wav");
-    let out = ok_output(&[
-        "export",
-        "-e",
-        "$: s(\"bd\").gain(.3)",
-        "--cycles",
-        "1",
-        "--until-silence",
-        "-o",
-        path.to_str().expect("utf-8 path"),
-    ]);
+    let take = |floor: &str| {
+        let out = ok_output(&[
+            "export",
+            "-e",
+            "$: s(\"bd\").gain(.3)",
+            "--cycles",
+            "1",
+            "--until-silence",
+            "--silence-floor",
+            floor,
+            "-o",
+            path.to_str().expect("utf-8 path"),
+        ]);
+        String::from_utf8_lossy(&out.stdout).into_owned()
+    };
+    let cut = take("-60");
+    assert!(cut.contains("that silence is cut from the end"), "{cut}");
+    // No sample is that quiet but zero, and the take is never silent.
+    let full = take("-1000");
+    assert!(full.contains("the tail ran its full 60 s"), "{full}");
+    assert!(!full.contains("is cut"), "{full}");
     let _ = std::fs::remove_file(&path);
-    let said = String::from_utf8_lossy(&out.stdout);
-    assert!(said.contains("that silence is cut"), "{said}");
 }

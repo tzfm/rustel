@@ -198,6 +198,11 @@ pub struct RenderReport {
     /// the tape recorded, and the caller exits non-zero on it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub failed_save: Option<String>,
+    /// The silence stop ended the file: the music stayed quiet for the hold
+    /// in the tail, and that silence was cut. False when the tail ran to its
+    /// limit, or for a format with no audio.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub silence_cut: bool,
     pub onset_count: usize,
     /// Each distinct refusal of a note the render dropped: a sound it could
     /// not find or load, a control the engine refuses, a plugin that did

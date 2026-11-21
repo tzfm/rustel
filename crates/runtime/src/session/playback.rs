@@ -775,6 +775,7 @@ impl Session {
                  their place). Deterministic scalar render.",
                 saves.len() - failed_on_replay
             ),
+            silence_cut: false,
             onset_count: onsets.len(),
             voices_refused,
             plugin_lines,
@@ -1100,23 +1101,26 @@ impl Session {
         })?;
         let ((written_bytes, plugin_lines), voices_refused) = rendered;
         self.log_sample_failures();
+        let rate = f64::from(self.config.sample_rate);
+        let frames_written = written_bytes.map(|bytes| {
+            // Only the float WAV stores 4-byte samples. The mp3 stage is a
+            // 16-bit WAV.
+            let sample_bytes = if format == RenderFormat::ScalarF32Wav {
+                4
+            } else {
+                2
+            };
+            bytes / (usize::from(self.config.channels.max(1)) * sample_bytes)
+        });
         Ok(RenderReport {
             query_threw: play.query_threw.clone(),
             failed_save: None,
-            duration_secs: match written_bytes {
-                Some(bytes) => {
-                    // Only the float WAV stores 4-byte samples. The mp3 stage
-                    // is a 16-bit WAV.
-                    let sample_bytes = if format == RenderFormat::ScalarF32Wav {
-                        4
-                    } else {
-                        2
-                    };
-                    let frames = bytes / (usize::from(self.config.channels.max(1)) * sample_bytes);
-                    frames as f64 / f64::from(self.config.sample_rate)
-                }
-                None => duration_secs,
-            },
+            duration_secs: frames_written.map_or(duration_secs, |frames| frames as f64 / rate),
+            // A file shorter than the length and its tail ended on the
+            // silence; one as long ran the tail out.
+            silence_cut: stop_when_silent.is_some()
+                && frames_written
+                    .is_some_and(|frames| frames < (audio_secs * rate).round() as usize),
             cps: self.config.cps,
             sample_rate: if format == RenderFormat::Midi {
                 0

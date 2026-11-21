@@ -2901,16 +2901,23 @@ fn run_command(
                         report.onset_count,
                         if report.onset_count == 1 { "" } else { "s" },
                     );
-                    if until_silence {
-                        outln!(
-                            "{}",
-                            style::dim(
-                                on,
-                                &format!(
-                                    "the tail ran until the music stayed under {silence_floor} dBFS for {silence_hold} s; that silence is cut, so the file ends where the sound did"
-                                )
+                    let audio = matches!(
+                        format,
+                        RenderCliFormat::ScalarWav
+                            | RenderCliFormat::ScalarF32
+                            | RenderCliFormat::Mp3
+                    );
+                    if until_silence && audio {
+                        let how = if report.silence_cut {
+                            format!(
+                                "the tail ran until the music stayed under {silence_floor} dBFS for {silence_hold} s, and that silence is cut from the end"
                             )
-                        );
+                        } else {
+                            format!(
+                                "the music did not stay under {silence_floor} dBFS for {silence_hold} s, so the tail ran its full {RENDER_TAIL_CEILING_SECS} s"
+                            )
+                        };
+                        outln!("{}", style::dim(on, &how));
                     }
                 }
             }
