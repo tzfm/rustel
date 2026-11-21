@@ -1,3 +1,4 @@
+mod join;
 mod motion;
 pub(super) mod remap;
 pub(super) mod repeat;
@@ -114,7 +115,7 @@ impl Pending {
 /// A prefix that owns the next key.
 #[derive(Clone, Debug)]
 enum Awaiting {
-    /// `g` waits for the second `g` of `gg`.
+    /// `g` waits for the second `g` of `gg`, or the `J` of `gJ`.
     G,
     /// A text object's `i` or `a` waits for the character that names it.
     TextObject(TextObjectKind),
@@ -535,7 +536,7 @@ impl Editor {
                 || matches!(
                     key.code,
                     KeyCode::Char(
-                        'd' | 'c' | 'y' | 'x' | 'X' | 'D' | 'C' | 'Y' | 'p' | 'P' | 'v' | 'V'
+                        'd' | 'c' | 'y' | 'x' | 'X' | 'D' | 'C' | 'Y' | 'J' | 'p' | 'P' | 'v' | 'V'
                     )
                 ));
         // `v` and `V` take any selection as character-wise Visual, so only a
@@ -785,6 +786,7 @@ impl Editor {
                     }
                 }
             }
+            'J' => self.vim_join(true, explicit_count, moment)?,
             'r' => {
                 self.vim.pending.awaiting = Some(Awaiting::Replace {
                     count: explicit_count,
@@ -847,6 +849,9 @@ impl Editor {
                 self.vim_normalize_caret()?;
                 if key.code == KeyCode::Char('g') {
                     self.vim_finish_motion(Motion::FirstLine, moment)?;
+                } else if key.code == KeyCode::Char('J') && self.vim.pending.operator.is_none() {
+                    let count = self.vim.pending.count.take().map(NonZeroUsize::get);
+                    self.vim_join(false, count, moment)?;
                 } else {
                     self.vim_cancel_pending();
                 }
@@ -2681,5 +2686,44 @@ mod tests {
                 .expect("key")
         );
         assert!(!editor.vim_has_pending_command());
+    }
+
+    #[test]
+    fn capital_j_joins_lines_as_vim_does() {
+        for (source, caret, keys, joined, landed) in [
+            ("ab\n  cd\nef", 0, "J", "ab cd\nef", 2),
+            ("ab\ncd\nef", 0, "3J", "ab cd ef", 5),
+            ("ab\ncd\nef", 0, "9J", "ab cd ef", 5),
+            ("ab\ncd", 0, "1J", "ab cd", 2),
+            ("ab \ncd", 0, "J", "ab cd", 3),
+            ("f(\n)", 0, "J", "f()", 2),
+            ("ab\n\ncd", 0, "J", "ab\ncd", 1),
+            ("\n  cd", 0, "J", "cd", 0),
+            ("ab\n  cd", 0, "gJ", "ab  cd", 2),
+            ("ab\ncd\nef\ngh", 0, "VjJ", "ab cd\nef\ngh", 2),
+            ("ab\ncd\nef", 0, "vjjgJ", "abcdef", 4),
+            ("ab\ncd\n", 0, "J", "ab cd\n", 2),
+        ] {
+            let editor = typed(source, caret, keys);
+            assert_eq!(editor.source(), joined, "{keys} on {source:?}");
+            assert_eq!(head(&editor), landed, "{keys} on {source:?}");
+            assert!(editor.vim_is_normal(), "{keys} on {source:?}");
+        }
+        // The last line has nothing below to join.
+        for (source, caret) in [("ab", 0), ("ab\ncd\n", 3)] {
+            assert_eq!(typed(source, caret, "J").source(), source, "{source:?}");
+        }
+    }
+
+    #[test]
+    fn a_join_repeats_and_undoes_as_one_change() {
+        let mut editor = typed("a\nb\nc\nd\ne", 0, "3J");
+        assert_eq!(editor.source(), "a b c\nd\ne");
+        type_keys(&mut editor, "j.");
+        assert_eq!(editor.source(), "a b c\nd e");
+        type_keys(&mut editor, "u");
+        assert_eq!(editor.source(), "a b c\nd\ne");
+        type_keys(&mut editor, "u");
+        assert_eq!(editor.source(), "a\nb\nc\nd\ne");
     }
 }

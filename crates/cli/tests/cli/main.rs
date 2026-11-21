@@ -9764,6 +9764,40 @@ fn a_distortion_takes_its_volume_as_a_second_argument() {
     );
 }
 
+/// talkit speaks the whole documented range, C1 to C7: C7 is a hair above
+/// the range's top in whole hertz and still speaks; C8 is refused.
+#[test]
+fn talkit_speaks_up_to_c7() {
+    for (note, speaks) in [("c7", true), ("c1", true), ("c8", false)] {
+        let path = scratch("talkit-range.wav");
+        let out = run(&[
+            "export",
+            "-e",
+            &format!("$: note(\"{note}\").talkit(\"la\")"),
+            "--cycles",
+            "1",
+            "-o",
+            path.to_str().expect("utf-8 path"),
+        ]);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(out.status.success(), "{note}: {stderr}");
+        let wav = std::fs::read(&path).expect("wav");
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(
+            !stderr.contains("voice_refused"),
+            speaks,
+            "{note}: {stderr}"
+        );
+        let sounds = wav.len() > 44
+            && wav[44..]
+                .as_chunks::<2>()
+                .0
+                .iter()
+                .any(|sample| i16::from_le_bytes(*sample).unsigned_abs() > 100);
+        assert_eq!(sounds, speaks, "{note}: the take");
+    }
+}
+
 /// A scale name that will not read drops its notes, as on strudel.cc, and
 /// says so: the export reports why its lane is silent instead of writing
 /// silence with nothing said.
@@ -9819,7 +9853,8 @@ fn check_finds_what_only_the_query_refuses() {
 #[test]
 fn the_json_plugin_list_says_which_bundles_failed() {
     let directory = tempfile::tempdir().expect("plugin folder");
-    std::fs::create_dir_all(directory.path().join("plugins/RustelScanTestEmpty.vst3")).expect("empty bundle");
+    std::fs::create_dir_all(directory.path().join("plugins/RustelScanTestEmpty.vst3"))
+        .expect("empty bundle");
     let out = rustel()
         .args(["vst", "-j"])
         .env("RUSTEL_VST3_PATH", directory.path().join("plugins"))
@@ -9841,4 +9876,27 @@ fn the_json_plugin_list_says_which_bundles_failed() {
             .is_some_and(|reason| !reason.is_empty()),
         "{empty}"
     );
+}
+
+/// An animated Hydra array holds numbers only: any other entry refuses the
+/// score, as a NaN does, instead of installing a picture that only warns.
+#[test]
+fn a_hydra_array_entry_that_is_not_a_number_is_refused() {
+    for entry in [r#""x""#, "true", "null", "[1, 2]"] {
+        let score = format!("await initHydra()\nosc([10, {entry}, 30]).out()");
+        let out = run(&["check", "--no-samples", "-e", &score]);
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(!out.status.success(), "{entry}: {stdout}");
+        assert!(
+            stdout.contains("must be a finite number"),
+            "{entry}: {stdout}"
+        );
+    }
+    let clean = ok_stdout(&[
+        "check",
+        "--no-samples",
+        "-e",
+        "await initHydra()\nosc([10, 20, 30].smooth()).out()",
+    ]);
+    assert!(clean.contains("no issues found"), "{clean}");
 }

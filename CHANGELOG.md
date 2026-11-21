@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- Vim mode: `J` and `gJ` join lines, as in Vim. The shipped `$` label jumps move from `J` and `K` to `]$` and `[$`.
 - `rustel check` and `rustel query` take `--prebake setup.js`, so a score calling a prebake's helpers checks clean.
 - A sample source can be a repository page such as `https://github.com/user/repo`. It reads as `github:user/repo`, and a web page or a missing map says what to write instead.
 - A pattern can set the tempo: `cps("<0.5 1>")` changes it at each onset, unless Link or MIDI clock leads.
@@ -33,11 +34,13 @@
 - Fixed: one sample source in Settings that will not read fails only its own row; the other remote sources still load.
 - Fixed: allowing a source or native orchestras on the Permissions page runs the refused update again by itself whatever refused it, as the docs say, not only for a refusal named on the footer.
 
+- Fixed: talkit speaks C7, the top of its documented range, which was refused a hair above the range's limit in whole hertz.
 ## v0.1.7
 
 - Fixed: a scale name that will not read, such as `scale("C3:kafi raga")`, says why its notes are dropped in export, query and Studio, instead of a silent lane with nothing said.
 - Release archives and installers include signed build provenance for independent verification with GitHub CLI.
 - A video file plays as a sample: `mp4`, `m4v`, `mov`, `mkv` and `webm` play their audio track.
+- Fixed: a Hydra animated array with an entry that is not a number, such as `osc([10, "x", 30])`, refuses the new score as the docs say, instead of installing it with a warning.
 - `_video()` and `video()` draw a video sample's picture in sync with its sound. H.264, HEVC, AV1, VP9, VP8 and Motion JPEG decode natively.
 - The visuals docks show the clips of `_video()` and `video()` lanes. Enter opens a clip in a desktop window.
 - Settings ▸ General ▸ biggest video sets the largest video file that loads. The default is 256 MiB.
