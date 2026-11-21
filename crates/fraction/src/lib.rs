@@ -187,6 +187,11 @@ fn reduced_small(n: i64, d: i64) -> Fraction {
             d: den(i128::from(d >> shift)),
         };
     }
+    reduced_small_gcd(n, d)
+}
+
+#[inline(never)]
+fn reduced_small_gcd(n: i64, d: i64) -> Fraction {
     let divisor = gcd_u64(n.unsigned_abs(), d as u64) as i64;
     if divisor == 1 {
         return Fraction {
@@ -572,21 +577,7 @@ impl Fraction {
         {
             return time;
         }
-        // Terms of 32 bits reduce with a gcd of 32 bits.
-        if let Ok(magnitude) = u32::try_from(ticks.unsigned_abs()) {
-            if magnitude == 0 {
-                return Self::ZERO;
-            }
-            let (mut a, mut b) = (magnitude, d);
-            while b != 0 {
-                (a, b) = (b, a % b);
-            }
-            let n = i128::from(magnitude / a);
-            return Self {
-                n: if ticks < 0 { -n } else { n },
-                d: den(i128::from(d / a)),
-            };
-        }
+        // Terms of 64 bits reduce without wide division.
         if let Ok(ticks) = i64::try_from(ticks) {
             return reduced_small(ticks, i64::from(d));
         }
@@ -758,6 +749,12 @@ impl Fraction {
             }
             return Some(reduced_small(n * od + on * d, d * od));
         }
+        self.checked_add_wide(o)
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn checked_add_wide(self, o: Self) -> Option<Self> {
         let native = || {
             let divisor = gcd_u128(self.d.get() as u128, o.d.get() as u128) as i128;
             let left_scale = o.d.get() / divisor;
@@ -791,6 +788,12 @@ impl Fraction {
             }
             return Some(reduced_small(n * od - on * d, d * od));
         }
+        self.checked_sub_wide(o)
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn checked_sub_wide(self, o: Self) -> Option<Self> {
         let native = || {
             let divisor = gcd_u128(self.d.get() as u128, o.d.get() as u128) as i128;
             let left_scale = o.d.get() / divisor;
@@ -840,6 +843,12 @@ impl Fraction {
         if let (Some((n, d)), Some((on, od))) = (self.small(), o.small()) {
             return Some(reduced_small(n * on, d * od));
         }
+        self.checked_mul_wide(o)
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn checked_mul_wide(self, o: Self) -> Option<Self> {
         let left_cancel = gcd_u128(self.n.unsigned_abs(), o.d.get() as u128);
         let right_cancel = gcd_u128(o.n.unsigned_abs(), self.d.get() as u128);
         let left_n = div_signed_by_u128(self.n, left_cancel)?;
@@ -869,6 +878,12 @@ impl Fraction {
                 reduced_small(numerator, denominator)
             });
         }
+        self.checked_div_wide(o)
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn checked_div_wide(self, o: Self) -> Option<Self> {
         let numerator_cancel = gcd_u128(self.n.unsigned_abs(), o.n.unsigned_abs());
         let denominator_cancel = gcd_u128(self.d.get() as u128, o.d.get() as u128);
         let left_n = div_signed_by_u128(self.n, numerator_cancel)?;
@@ -947,21 +962,25 @@ impl Fraction {
         })
     }
 
+    #[inline]
     #[track_caller]
     pub fn add(self, o: Self) -> Self {
         ck(self.checked_add(o), "add")
     }
 
+    #[inline]
     #[track_caller]
     pub fn sub(self, o: Self) -> Self {
         ck(self.checked_sub(o), "sub")
     }
 
+    #[inline]
     #[track_caller]
     pub fn mul(self, o: Self) -> Self {
         ck(self.checked_mul(o), "mul")
     }
 
+    #[inline]
     #[track_caller]
     pub fn div(self, o: Self) -> Self {
         assert!(o.n != 0, "rustel-fraction: division by zero");
@@ -1205,13 +1224,21 @@ impl Ord for Fraction {
         if let (Some((n, d)), Some((on, od))) = (self.small(), o.small()) {
             return (n * od).cmp(&(on * d));
         }
+        self.cmp_wide(*o)
+    }
+}
+
+impl Fraction {
+    #[cold]
+    #[inline(never)]
+    fn cmp_wide(self, o: Self) -> Ordering {
         // Cross-multiply on the `i128` path; both denominators are positive
         // by normalisation. Fall back to the exact continued-fraction compare
         // when either product is outside i128.
         match (self.n.checked_mul(o.d.get()), o.n.checked_mul(self.d.get())) {
             (Some(left), Some(right)) => left.cmp(&right),
             _ => self
-                .checked_cmp(*o)
+                .checked_cmp(o)
                 .expect("checked_cmp is total for normalised fractions"),
         }
     }

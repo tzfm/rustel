@@ -3790,16 +3790,71 @@ impl QueryThread {
         self.stop.get() & STOP_ERROR_PENDING != 0
     }
 
+    /// Whether a refusal or expired deadline has already been recorded on
+    /// this thread (single byte load, no clock or tick check).
+    #[inline]
+    fn has_stopped_fast(&self) -> bool {
+        self.stop.get() & (STOP_REFUSED | STOP_DEADLINE_PASSED) != 0
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn rearm_deadline_refusal(&self) {
+        refuse(QueryLimit::QueryDeadline {
+            millis: self.deadline_millis.get(),
+        });
+    }
+
     /// See [`query_stop_requested`].
+    #[inline]
     fn stop_requested(&self) -> bool {
         let word = self.stop.get();
+        if word == 0 {
+            return false;
+        }
         if word & (STOP_REFUSED | STOP_DEADLINE_PASSED) != 0 {
+            if word & STOP_REFUSED == 0 {
+                self.rearm_deadline_refusal();
+            }
             return true;
         }
         if word & STOP_CANCEL_ARMED != 0 && self.cancellation_requested() {
             return true;
         }
-        word & STOP_DEADLINE_ARMED != 0 && self.deadline_after(1)
+        if word & STOP_DEADLINE_ARMED != 0 {
+            let before = self.deadline_tick.get();
+            let after = before.wrapping_add(1);
+            self.deadline_tick.set(after);
+            if (after >> 8) != (before >> 8) {
+                return self.deadline_check_clock();
+            }
+        }
+        false
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn deadline_check_clock(&self) -> bool {
+        if self.deadline_expired.get() {
+            self.rearm_deadline_refusal();
+            return true;
+        }
+        let (deadline, budget) = (self.deadline.get(), self.budget.get());
+        if deadline.is_none() && budget.is_none() {
+            return false;
+        }
+        let now = std::time::Instant::now();
+        let Some(deadline) = deadline else {
+            self.deadline.set(budget.map(|budget| now + budget));
+            return false;
+        };
+        if now < deadline {
+            return false;
+        }
+        self.deadline_expired.set(true);
+        self.set_stop_bit(STOP_DEADLINE_PASSED, true);
+        self.rearm_deadline_refusal();
+        true
     }
 
     /// See [`cancellation_requested`].
@@ -3837,11 +3892,11 @@ impl QueryThread {
         if deadline.is_none() && budget.is_none() {
             return false;
         }
-        // The clock is read when the count passes a multiple of 64.
+        // The clock is read when the count passes a multiple of 256.
         let before = self.deadline_tick.get();
         let after = before.wrapping_add(checks);
         self.deadline_tick.set(after);
-        if after / 64 == before / 64 {
+        if (after >> 8) == (before >> 8) {
             return false;
         }
         let now = std::time::Instant::now();
@@ -9466,7 +9521,7 @@ impl Pattern {
         } else {
             state.with_span(|span| span.with_time(|t| fast_query_time(t, factor, operation)))
         };
-        let edges = (!thread.stop_requested() && factor != Fraction::ZERO)
+        let edges = (!thread.has_stopped_fast() && factor != Fraction::ZERO)
             .then_some((state.span.begin, state.span.end));
         let from = out.len();
         self.answer_onto(thread, &asked, table::Order::Graph, out);
@@ -9513,7 +9568,7 @@ impl Pattern {
         } else {
             state.with_span(|span| span.with_time(|t| shift_query_time(t, by, operation)))
         };
-        let edges = (!thread.stop_requested()).then_some((state.span.begin, state.span.end));
+        let edges = (!thread.has_stopped_fast()).then_some((state.span.begin, state.span.end));
         let from = out.len();
         self.answer_onto(thread, &asked, table::Order::Graph, out);
         if out.len() == from {
@@ -14742,15 +14797,30 @@ impl Pattern {
                     static SHORT_QUERY_HINT: std::cell::Cell<(usize, u16)> =
                         const { std::cell::Cell::new((0, 20)) };
                 }
-                let is_short = state.span.end - state.span.begin <= Fraction::ONE;
+                let is_short = if state.span.end <= state.span.begin {
+                    true
+                } else {
+                    let b_cycle = state.span.begin.floor_int();
+                    let e_cycle = state.span.end.floor_int();
+                    match e_cycle.checked_sub(b_cycle) {
+                        Some(0) => true,
+                        Some(1) => state.span.end.cycle_pos() <= state.span.begin.cycle_pos(),
+                        _ => false,
+                    }
+                };
                 let root_ptr = Arc::as_ptr(&self.node) as usize;
+                let default_cap = if matches!(self.node_kind(), Node::Sequence(_)) {
+                    16usize
+                } else {
+                    32usize
+                };
                 let room = if is_short {
                     SHORT_QUERY_HINT.with(|hint| {
                         let (ptr, cap) = hint.get();
                         if ptr == root_ptr {
                             usize::from(cap)
                         } else {
-                            20
+                            default_cap
                         }
                     })
                 } else {
@@ -14759,8 +14829,9 @@ impl Pattern {
                 let (mut haps, data_only) = self.answer_with_room(state, order, room);
                 if is_short {
                     let len = haps.len();
-                    let needed = if len <= 20 {
-                        20u16
+                    let base = default_cap as u16;
+                    let needed = if len <= usize::from(base) {
+                        base
                     } else if len <= 32 {
                         32u16
                     } else if len <= 48 {

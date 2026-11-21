@@ -6223,6 +6223,49 @@ fn query_layers(
                 return Ok(());
             }
         }
+    } else if period.numer() == 1
+        && (period.denom() as u128).is_power_of_two()
+        && span.begin < span.end
+    {
+        let shift = (period.denom() as u128).trailing_zeros();
+        if let (Some(scaled_begin), Some(scaled_end)) = (
+            span.begin.checked_mul_pow2(shift),
+            span.end.checked_mul_pow2(shift),
+        ) {
+            let turn_idx = scaled_begin.floor_int();
+            if let Some(next_turn) = turn_idx.checked_add(1) {
+                let fits = if scaled_end.denom() == 1 {
+                    scaled_end.numer() <= next_turn
+                } else {
+                    scaled_end.floor_int() < next_turn
+                };
+                if fits
+                    && let Some(start) = Fraction::dyadic(turn_idx, shift)
+                    && let Some(begin) = scaled_begin.cycle_pos().checked_div_pow2(shift)
+                    && let Some(end) = (if scaled_end.denom() == 1 {
+                        Fraction::ONE
+                    } else {
+                        scaled_end.cycle_pos()
+                    })
+                    .checked_div_pow2(shift)
+                {
+                    let whole_cycles = (start.denom() == 1).then(|| start.numer());
+                    let turn = Turn {
+                        index: turn_idx,
+                        start,
+                        whole_cycles,
+                        begin,
+                        end,
+                        keys: std::cell::Cell::new(None),
+                    };
+                    for (i, layer) in layers.iter().enumerate() {
+                        let layer_ref = u16::try_from(offset + i).ok().map(|idx| (owner, idx));
+                        layer.push(thread, layer_ref, &turn, span, from, out)?;
+                    }
+                    return Ok(());
+                }
+            }
+        }
     }
     let mut turns = Turns::of(period, span)?;
     if turns.indices.end.checked_sub(turns.indices.start) == Some(1) {

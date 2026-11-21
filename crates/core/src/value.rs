@@ -3547,6 +3547,7 @@ impl OrderedMap {
 
     /// Whether the map's own storage answers for its data-ness: an empty
     /// map holds nothing else, and a made map was made of data values only.
+    #[inline]
     pub(crate) fn holds_only_data(&self) -> bool {
         match &self.entries {
             Entries::Empty | Entries::Made(_) => true,
@@ -3565,6 +3566,7 @@ impl OrderedMap {
     /// Whether the map's storage tells that it holds data only, with no
     /// walk of its entries. A table also holds data only when no compose
     /// made it: it refuses a value that is no data.
+    #[inline]
     pub(crate) fn is_known_data(&self) -> bool {
         matches!(self.entries, Entries::Dressed(..) | Entries::SeqLayer(..))
             || self.holds_only_data()
@@ -6268,16 +6270,31 @@ impl Value {
     /// Attach settings to nested executable metadata without allocating graph
     /// wrappers. Traversal is explicitly bounded because List/Object depth is
     /// user-controlled and Rust stack overflow aborts the process.
+    #[inline]
     pub(crate) fn attach_runtime_settings(
         &mut self,
         settings: &crate::settings::RuntimeSettings,
         depth: u32,
     ) -> bool {
-        // Most values of a query are maps of controls that say they hold
-        // data only: such a map has nothing to attach.
-        if matches!(self, Self::Object(values) if values.is_known_data()) {
+        // Most values of a query are scalars or maps of controls that say they
+        // hold data only: such values have nothing to attach.
+        if matches!(
+            self,
+            Self::F64(_) | Self::Str(_) | Self::Bool(_) | Self::Null | Self::Undefined
+        ) || matches!(self, Self::Object(values) if values.is_known_data())
+        {
             return true;
         }
+        self.attach_runtime_settings_slow(settings, depth)
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn attach_runtime_settings_slow(
+        &mut self,
+        settings: &crate::settings::RuntimeSettings,
+        depth: u32,
+    ) -> bool {
         if crate::cancellation_requested() || crate::query_deadline_expired() {
             return false;
         }
