@@ -1395,46 +1395,78 @@ impl<'p> Turn<'p> {
             _ => {}
         }
         // A registration reads the value of each pure argument. It takes
-        // the numbers (and trailing arrow transformers) that a call writes
-        // as they are, and the call makes no pattern of each.
+        // numbers, single-word mini literals, and trailing arrow transformers
+        // directly without wrapping each argument in a Pattern.
         if let BuiltinMethod::Registered(registration) = &builtin
             && arguments.len() == registration.arity.saturating_sub(1)
         {
             if arguments.len() <= 4 {
                 let takes_transformer =
                     registration.function_argument == FunctionArgument::Transformer;
+                let allow_mini_word = !registration.is_native_patterned();
                 let (last, leading) = match arguments.split_last() {
                     Some((last, leading)) => (Some(last), leading),
                     None => (None, arguments),
                 };
                 let mut stack_vals = [const { Value::Undefined }; 4];
+                let mut mini_steps = 0usize;
                 let mut direct = true;
+                let mut try_literal = |argument: &'p ScoreExpr<'p>, slot: &mut Value| -> bool {
+                    match argument {
+                        ScoreExpr::Number(number) => {
+                            *slot = Value::F64(*number);
+                            true
+                        }
+                        ScoreExpr::Call {
+                            callee, arguments, ..
+                        } if allow_mini_word
+                            && *callee == MINI_CALLEE
+                            && names.mini()
+                            && matches!(self.resolve(MINI_CALLEE), Resolved::Host)
+                            && let [ScoreExpr::String(source), ScoreExpr::Number(offset)] =
+                                self.held.row(*arguments)
+                            && offset.fract() == 0.0
+                            && offset.is_finite()
+                            && let Ok(at) = usize::try_from(*offset as i64)
+                            && let Some((value, _)) =
+                                rustel_mini::word_constant_value(source, at) =>
+                        {
+                            *slot = value;
+                            mini_steps += 1;
+                            true
+                        }
+                        _ => false,
+                    }
+                };
                 for (slot, argument) in stack_vals.iter_mut().zip(leading) {
-                    if let ScoreExpr::Number(number) = argument {
-                        *slot = Value::F64(*number);
-                    } else {
+                    if !try_literal(argument, slot) {
                         direct = false;
                         break;
                     }
                 }
-                if direct && let Some(last) = last {
-                    match last {
-                        ScoreExpr::Number(number) => {
-                            stack_vals[leading.len()] = Value::F64(*number);
+                if direct
+                    && let Some(last) = last
+                    && !try_literal(last, &mut stack_vals[leading.len()])
+                {
+                    if matches!(last, ScoreExpr::Arrow(_)) && takes_transformer {
+                        if let Native::Function(transformer) =
+                            self.evaluate(names, last, runtime)?
+                        {
+                            stack_vals[leading.len()] = Value::function(transformer);
+                        } else {
+                            return None;
                         }
-                        ScoreExpr::Arrow(_) if takes_transformer => {
-                            if let Native::Function(transformer) =
-                                self.evaluate(names, last, runtime)?
-                            {
-                                stack_vals[leading.len()] = Value::function(transformer);
-                            } else {
-                                return None;
-                            }
-                        }
-                        _ => direct = false,
+                    } else {
+                        direct = false;
                     }
                 }
                 if direct {
+                    if mini_steps > 0 {
+                        self.steps += mini_steps;
+                        if self.steps > MAX_STEPS {
+                            return None;
+                        }
+                    }
                     return Some(Native::Pattern(
                         registration.call_unpatternified(&stack_vals[..arguments.len()], receiver),
                     ));

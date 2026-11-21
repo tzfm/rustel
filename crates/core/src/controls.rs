@@ -173,6 +173,32 @@ impl ControlSpec {
         )
     }
 
+    /// [`Self::apply_value`] carrying source `locations` (for single-word mini
+    /// literals), avoiding an intermediate `Node::PureAt` allocation when the
+    /// receiver folds the control directly.
+    pub fn apply_constant(
+        &self,
+        mut pattern: Pattern,
+        value: Value,
+        mut locations: crate::Locations,
+    ) -> Pattern {
+        if locations.is_empty() {
+            return self.apply_value(pattern, value);
+        }
+        let alignment = crate::compose::default_alignment();
+        if alignment == crate::compose::Alignment::In {
+            match pattern.set_control_value_at(self, &value, locations) {
+                Ok(set) => return set,
+                Err((back, back_locs)) => {
+                    pattern = back;
+                    locations = back_locs;
+                }
+            }
+        }
+        let named = crate::pure_locations(value, locations).map_control_owned(self, false);
+        crate::compose::compose(&pattern, &named, crate::compose::ComposeOp::Set, alignment)
+    }
+
     /// A compound control called with one argument per positional name:
     /// `limit(-6, "hard")` beside `limit("-6:hard")`.
     ///
@@ -603,12 +629,7 @@ fn apply_argument(spec: &ControlSpec, pattern: Pattern, argument: &ChainArgument
     match argument {
         ChainArgument::Number(number) => spec.apply_value(pattern, Value::F64(*number)),
         ChainArgument::Constant(value, locations) => {
-            if locations.is_empty() {
-                spec.apply_value(pattern, value.clone())
-            } else {
-                let values = crate::pure_locations(value.clone(), locations.clone());
-                spec.apply_to(pattern, Some(values))
-            }
+            spec.apply_constant(pattern, value.clone(), locations.clone())
         }
         ChainArgument::Wave(wave, steps, math_inside) => {
             if crate::compose::default_alignment() == crate::compose::Alignment::In
@@ -632,14 +653,7 @@ fn apply_argument(spec: &ControlSpec, pattern: Pattern, argument: &ChainArgument
 fn apply_argument_owned(spec: &ControlSpec, pattern: Pattern, argument: ChainArgument) -> Pattern {
     match argument {
         ChainArgument::Number(number) => spec.apply_value(pattern, Value::F64(number)),
-        ChainArgument::Constant(value, locations) => {
-            if locations.is_empty() {
-                spec.apply_value(pattern, value)
-            } else {
-                let values = crate::pure_locations(value, locations);
-                spec.apply_to(pattern, Some(values))
-            }
-        }
+        ChainArgument::Constant(value, locations) => spec.apply_constant(pattern, value, locations),
         ChainArgument::Wave(wave, steps, math_inside) => {
             if crate::compose::default_alignment() == crate::compose::Alignment::In
                 && spec.id != 0

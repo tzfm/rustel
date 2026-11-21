@@ -15124,6 +15124,52 @@ impl Pattern {
         self.with_control(&spec.with_value(value.clone()), Locations::new())
     }
 
+    /// [`Self::set_control_value`] carrying source `context` (for single-word
+    /// mini literals), avoiding an intermediate `Node::PureAt` and temporary
+    /// `BuiltinMap<1>` when writing into a foldable sequence.
+    pub(crate) fn set_control_value_at(
+        mut self,
+        spec: &controls::ControlSpec,
+        value: &Value,
+        context: Locations,
+    ) -> Result<Self, (Self, Locations)> {
+        if context.is_empty() {
+            return self
+                .set_control_value(spec, value)
+                .map_err(|back| (back, Locations::new()));
+        }
+        if !value.is_data(0) {
+            return Err((self, context));
+        }
+        if matches!(value, Value::F64(_) | Value::Str(_) | Value::Bool(_))
+            && spec.id != 0
+            && spec.name() != "value"
+            && matches!(self.node_kind(), Node::Sequence(_))
+            && sequence::takes_plain_set(&self)
+        {
+            let packed_key = spec.id | (u16::from(value::Table::mark_bit(spec.name())) << 10);
+            let steps = self.steps();
+            let runtime = self.runtime_settings().cloned();
+            if let Some(cell) = self.own_node()
+                && let Node::Sequence(layers) = &mut cell.kind
+            {
+                let mut val = [value.clone()];
+                sequence::set_packed_here(layers, &[packed_key], &val, context);
+                val[0] = Value::Undefined;
+                let node = Arc::clone(&self.node);
+                self = Self::holding(node).with_steps(steps);
+                if let Some(runtime) = runtime {
+                    self.attach_runtime_settings(runtime);
+                }
+                return Ok(self);
+            }
+        }
+        let control = spec.with_value(value.clone());
+        let saved = context.clone();
+        self.with_control(&control, context)
+            .map_err(|back| (back, saved))
+    }
+
     /// This pattern after [`Self::set_control`] of each control of a row
     /// in turn, as one `set_control` of `union`, the union of the row, at
     /// `context`, the locations of each control, the last one first. `Err`

@@ -610,6 +610,13 @@ impl Registration {
             result
         }
     }
+
+    /// Whether this registration dispatches through a pattern-level native
+    /// combinator that inspects its argument patterns directly.
+    #[inline]
+    pub fn is_native_patterned(&self) -> bool {
+        matches!(self.func, CombinatorFn::NativePatterned(_))
+    }
 }
 
 fn all_pure(args: &[Pattern]) -> Option<Vec<Value>> {

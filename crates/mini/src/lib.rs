@@ -3051,9 +3051,94 @@ pub fn mini_at(src: &str, offset: usize) -> Result<Pattern, ParseError> {
     mini_in(&mut Room::default(), src, offset)
 }
 
-/// Value and inline source location of a single-word mini literal, with zero
-/// graph or vector allocation. `None` for rests, multi-word patterns, or
-/// expressions using operators.
+/// Value of a plain word or colon-separated chain (`"bd:1"`, `"c:minor"`)
+/// already validated to hold only sounding words.
+fn flat_atom_value(word: &str) -> Value {
+    if !word.contains(':') {
+        return atom_value(word);
+    }
+    let mut parts: [Value; 4] = [
+        Value::Undefined,
+        Value::Undefined,
+        Value::Undefined,
+        Value::Undefined,
+    ];
+    let mut count = 0usize;
+    let mut spilled: Option<Vec<Value>> = None;
+    for seg in word.split(':') {
+        let val = atom_value(seg);
+        if let Some(vec) = &mut spilled {
+            vec.push(val);
+        } else if count < parts.len() {
+            parts[count] = val;
+            count += 1;
+        } else {
+            let mut vec = Vec::with_capacity(8);
+            for slot in &mut parts {
+                vec.push(std::mem::replace(slot, Value::Undefined));
+            }
+            vec.push(val);
+            spilled = Some(vec);
+        }
+    }
+    let list: std::sync::Arc<[Value]> = match spilled {
+        Some(vec) => std::sync::Arc::from(vec),
+        None => {
+            let [p0, p1, p2, p3] = parts;
+            match count {
+                2 => std::sync::Arc::from([p0, p1]),
+                3 => std::sync::Arc::from([p0, p1, p2]),
+                _ => std::sync::Arc::from([p0, p1, p2, p3]),
+            }
+        }
+    };
+    Value::List(list)
+}
+
+/// Scan a word (or contiguous `word:word[:word...]` chain) starting at `start`
+/// within `bytes[..limit]`, returning its exclusive end byte offset.
+fn flat_word_end(src: &str, bytes: &[u8], start: usize, limit: usize) -> Option<usize> {
+    let mut end = start;
+    while end < limit
+        && let Some(len) = word_char_len(bytes, end)
+    {
+        end += len;
+    }
+    if end == start {
+        return None;
+    }
+    let first = &src[start..end];
+    if first == "." || first == "_" || first.contains("..") {
+        return None;
+    }
+    if end < limit && bytes[end] == b':' {
+        if matches!(first, "~" | "-") {
+            return None;
+        }
+        while end < limit && bytes[end] == b':' {
+            let w_start = end + 1;
+            let mut w_end = w_start;
+            while w_end < limit
+                && let Some(len) = word_char_len(bytes, w_end)
+            {
+                w_end += len;
+            }
+            if w_end == w_start {
+                return None;
+            }
+            let seg = &src[w_start..w_end];
+            if matches!(seg, "~" | "-" | "." | "_") || seg.contains("..") || seg.starts_with('^') {
+                return None;
+            }
+            end = w_end;
+        }
+    }
+    Some(end)
+}
+
+/// Value and inline source location of a single-word or colon-chained
+/// (`"bd:1"`, `"c:minor"`) mini literal, with zero graph or room allocation.
+/// `None` for rests, multi-word patterns, or expressions using other operators.
 pub fn word_constant_value(src: &str, offset: usize) -> Option<(Value, rustel_core::Locations)> {
     let bytes = src.as_bytes();
     let start = score_whitespace_end(bytes, 0);
@@ -3065,17 +3150,88 @@ pub fn word_constant_value(src: &str, offset: usize) -> Option<(Value, rustel_co
     while let Some(len) = word_char_len(bytes, end) {
         end += len;
     }
-    if end == start || score_whitespace_end(bytes, end) != bytes.len() {
+    if end == start {
         return None;
     }
-    let word = &src[start..end];
-    if matches!(word, "-" | "~" | "." | "_") {
+    let first = &src[start..end];
+    if matches!(first, "-" | "~" | "." | "_") || first.contains("..") {
         return None;
     }
-    let at = leaf_place(src, offset, &Span { start, end });
+    let mut after = score_whitespace_end(bytes, end);
+    if after == bytes.len() {
+        let at = leaf_place(src, offset, &Span { start, end });
+        let mut locations = rustel_core::Locations::new();
+        locations.push(at);
+        return Some((atom_value(first), locations));
+    }
+    if bytes.get(after) != Some(&b':') {
+        return None;
+    }
+    let mut parts: [Value; 4] = [
+        Value::Undefined,
+        Value::Undefined,
+        Value::Undefined,
+        Value::Undefined,
+    ];
+    parts[0] = atom_value(first);
+    let mut count = 1usize;
+    let mut last_end = end;
+    let mut spilled: Option<Vec<Value>> = None;
+    while bytes.get(after) == Some(&b':') {
+        let w_start = score_whitespace_end(bytes, after + 1);
+        let mut w_end = w_start;
+        while let Some(len) = word_char_len(bytes, w_end) {
+            w_end += len;
+        }
+        if w_end == w_start {
+            return None;
+        }
+        let seg = &src[w_start..w_end];
+        if matches!(seg, "-" | "~" | "." | "_") || seg.contains("..") || seg.starts_with('^') {
+            return None;
+        }
+        let val = atom_value(seg);
+        if let Some(vec) = &mut spilled {
+            vec.push(val);
+        } else if count < parts.len() {
+            parts[count] = val;
+            count += 1;
+        } else {
+            let mut vec = Vec::with_capacity(8);
+            for slot in &mut parts {
+                vec.push(std::mem::replace(slot, Value::Undefined));
+            }
+            vec.push(val);
+            spilled = Some(vec);
+        }
+        last_end = w_end;
+        after = score_whitespace_end(bytes, w_end);
+    }
+    if after != bytes.len() {
+        return None;
+    }
+    let list: std::sync::Arc<[Value]> = match spilled {
+        Some(vec) => std::sync::Arc::from(vec),
+        None => {
+            let [p0, p1, p2, p3] = parts;
+            match count {
+                2 => std::sync::Arc::from([p0, p1]),
+                3 => std::sync::Arc::from([p0, p1, p2]),
+                _ => std::sync::Arc::from([p0, p1, p2, p3]),
+            }
+        }
+    };
+    let at = leaf_place(
+        src,
+        offset,
+        &Span {
+            start,
+            end: last_end,
+        },
+    );
     let mut locations = rustel_core::Locations::new();
     locations.push(at);
-    Some((atom_value(word), locations))
+    Some((Value::List(list), locations))
 }
 
 /// The pattern of a text that is one word with whitespace around it: the
@@ -3200,7 +3356,9 @@ fn flat_sequence(src: &str, offset: usize) -> Option<Pattern> {
     let mut any_inner_alt = false;
     let mut any_group = false;
     while pos < limit {
-        if !is_alt && matches!(bytes[pos], b'<' | b'[') {
+        if (!is_alt && matches!(bytes[pos], b'<' | b'['))
+            || (is_alt && matches!(alt_suffix, RateSuffix::None) && bytes[pos] == b'[')
+        {
             let is_group = bytes[pos] == b'[';
             let close_ch = if is_group { b']' } else { b'>' };
             let close = bytes[pos + 1..limit].iter().position(|&b| b == close_ch)? + pos + 1;
@@ -3221,19 +3379,8 @@ fn flat_sequence(src: &str, offset: usize) -> Option<Pattern> {
             let first = alt_words_len;
             while inner_pos < inner_limit {
                 let s = inner_pos;
-                let mut e = s;
-                while e < inner_limit
-                    && let Some(len) = word_char_len(bytes, e)
-                {
-                    e += len;
-                }
-                if e == s {
-                    return None;
-                }
+                let e = flat_word_end(src, bytes, s, inner_limit)?;
                 let word = &src[s..e];
-                if word == "." || word == "_" || word.contains("..") {
-                    return None;
-                }
                 let next_inner = score_whitespace_end(bytes, e).min(inner_limit);
                 if next_inner == e && next_inner < inner_limit {
                     return None;
@@ -3270,22 +3417,11 @@ fn flat_sequence(src: &str, offset: usize) -> Option<Pattern> {
             continue;
         }
         let start = pos;
-        let mut end = start;
-        while end < limit
-            && let Some(len) = word_char_len(bytes, end)
-        {
-            end += len;
-        }
-        if end == start {
-            return None;
-        }
+        let end = flat_word_end(src, bytes, start, limit)?;
         let word = &src[start..end];
-        if word == "." || word == "_" || word.contains("..") {
-            return None;
-        }
         let next_pos = score_whitespace_end(bytes, end).min(limit);
         let (suffix, next_pos) = if next_pos == end && next_pos < limit {
-            if is_alt {
+            if word.contains(':') || (is_alt && !matches!(alt_suffix, RateSuffix::None)) {
                 return None;
             }
             parse_rate_suffix(end, limit)?
@@ -3359,7 +3495,7 @@ fn flat_sequence(src: &str, offset: usize) -> Option<Pattern> {
         if min_b >= (1 << 31) || max_b - min_b >= (1 << 22) {
             return None;
         }
-        let layer_values: std::sync::Arc<[Value]> = std::sync::Arc::from([atom_value(word)]);
+        let layer_values: std::sync::Arc<[Value]> = std::sync::Arc::from([flat_atom_value(word)]);
         let step = [rustel_core::TickStep {
             part_begin: 0,
             part_end,
@@ -3440,7 +3576,7 @@ fn flat_sequence(src: &str, offset: usize) -> Option<Pattern> {
         }
         let layer_values: std::sync::Arc<[Value]> = seen_words[..seen_len]
             .iter()
-            .map(|&word| atom_value(word))
+            .map(|&word| flat_atom_value(word))
             .collect();
         let (period, ticks) = if is_alt {
             (
@@ -3480,7 +3616,7 @@ fn flat_sequence(src: &str, offset: usize) -> Option<Pattern> {
     let mut step_len = 0usize;
     let mut min_begin = u32::MAX;
     let mut max_begin = 0u32;
-    let (period, ticks, in_cycles) = if is_alt {
+    let (period, ticks, in_cycles) = if is_alt && !matches!(alt_suffix, RateSuffix::None) {
         let (period, ticks, in_cycles, mul, rs, re) = match alt_suffix {
             RateSuffix::Fast(rate, rs, re) => (
                 Fraction::checked_new(count as i128, i128::from(rate))?,
@@ -3549,7 +3685,7 @@ fn flat_sequence(src: &str, offset: usize) -> Option<Pattern> {
         }
         (period, ticks, in_cycles)
     } else {
-        if count > 16 {
+        if !is_alt && count > 16 {
             return None;
         }
         let gcd_u32 = |mut a: u32, mut b: u32| {
@@ -3560,7 +3696,7 @@ fn flat_sequence(src: &str, offset: usize) -> Option<Pattern> {
             }
             a
         };
-        let mut period_cycles = 1u32;
+        let mut period_cycles = if is_alt { count as u32 } else { 1u32 };
         let mut sub_ticks = 1u32;
         for &item in &items[..count] {
             match item {
@@ -3591,14 +3727,23 @@ fn flat_sequence(src: &str, offset: usize) -> Option<Pattern> {
                 }
             }
         }
-        let ticks = (count as u32).checked_mul(sub_ticks)?;
+        let ticks = if is_alt {
+            sub_ticks
+        } else {
+            (count as u32).checked_mul(sub_ticks)?
+        };
         let total_ticks = period_cycles.checked_mul(ticks)?;
         if total_ticks > u32::from(u16::MAX) {
             return None;
         }
-        for t in 0..period_cycles {
+        let outer_iters = if is_alt { 1u32 } else { period_cycles };
+        for t in 0..outer_iters {
             for (slot, &item) in items[..count].iter().enumerate() {
-                let slot_start = (t * (count as u32) + (slot as u32)) * sub_ticks;
+                let slot_start = if is_alt {
+                    (slot as u32) * sub_ticks
+                } else {
+                    (t * (count as u32) + (slot as u32)) * sub_ticks
+                };
                 match item {
                     FlatItem::Word { start, end, suffix } => {
                         let word = &src[start..end];
@@ -3751,7 +3896,7 @@ fn flat_sequence(src: &str, offset: usize) -> Option<Pattern> {
     }
     let layer_values: std::sync::Arc<[Value]> = seen_words[..seen_len]
         .iter()
-        .map(|&word| atom_value(word))
+        .map(|&word| flat_atom_value(word))
         .collect();
     let ticks = std::num::NonZeroU32::new(ticks)?;
     let pattern = rustel_core::sequence_of_cut_ticks(
@@ -4796,6 +4941,8 @@ mod tests {
             ("a.b", 0),
             ("é2", 0),
             ("gm_piano", 2),
+            ("bd:3", 0),
+            ("c:minor", 4),
         ] {
             let planned = super::Planned::read(source, offset, &mut room)
                 .unwrap_or_else(|error| panic!("{source}: {error}"))
@@ -4812,9 +4959,11 @@ mod tests {
                 );
             }
         }
-        // A rest, the two words that the parser refuses, a marked step
-        // and a text of two words are no constant of one word.
-        for source in ["-", "~", ".", "_", "^bd", "bd sd", "bd:3", "bd*2", ""] {
+        // A rest, the two words that the parser refuses, a marked step, a
+        // broken tail, and a text of two words are no constant of one word.
+        for source in [
+            "-", "~", ".", "_", "^bd", "bd sd", "bd:~", "bd:", "bd*2", "",
+        ] {
             assert!(super::word_constant(source, 0).is_none(), "{source:?}");
         }
         let haps = |source: &str| {
