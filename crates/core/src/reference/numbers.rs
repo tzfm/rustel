@@ -221,7 +221,7 @@ pub const REFERENCE_NUMBERS: &[ReferenceNumber] = &[
     // A scale degree below 0 wraps down the scale.
     count("n", "value", -16.0, 32.0),
     // MIDI and devices.
-    count("control", "MIDI", 0.0, 127.0),
+    count("control", "[ccn, ccv]", 0.0, 127.0),
     count("gamepad", "index", 0.0, 3.0),
     count("setMaxPolyphony", "Max", 1.0, 256.0),
     count("binaryN", "nBits", 1.0, 32.0),
