@@ -4,8 +4,8 @@ nnoremap U <Action:update>
 vnoremap U <Action:update>
 nnoremap Q <Action:stop>
 vnoremap Q <Action:stop>
-nnoremap J /\$<CR>
-nnoremap K ?\$<CR>
+nnoremap ]$ /\$<CR>
+nnoremap [$ ?\$<CR>
 nnoremap M i_<C-c>l
 nnoremap X hx
 inoremap jk <Esc>
