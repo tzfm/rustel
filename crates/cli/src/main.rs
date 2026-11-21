@@ -2907,17 +2907,18 @@ fn run_command(
                             | RenderCliFormat::ScalarF32
                             | RenderCliFormat::Mp3
                     );
+                    // The rule, not a claim about this take: the length on the
+                    // line above says how it ended.
                     if until_silence && audio {
-                        let how = if report.silence_cut {
-                            format!(
-                                "the tail ran until the music stayed under {silence_floor} dBFS for {silence_hold} s, and that silence is cut from the end"
+                        outln!(
+                            "{}",
+                            style::dim(
+                                on,
+                                &format!(
+                                    "until silence: after the length asked for, the take ends once the music stays under {silence_floor} dBFS for {silence_hold} s, and that silence is cut; the tail runs {RENDER_TAIL_CEILING_SECS} s at most"
+                                )
                             )
-                        } else {
-                            format!(
-                                "the music did not stay under {silence_floor} dBFS for {silence_hold} s, so the tail ran its full {RENDER_TAIL_CEILING_SECS} s"
-                            )
-                        };
-                        outln!("{}", style::dim(on, &how));
+                        );
                     }
                 }
             }

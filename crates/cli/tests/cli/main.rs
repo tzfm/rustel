@@ -9901,13 +9901,12 @@ fn a_hydra_array_entry_that_is_not_a_number_is_refused() {
     assert!(clean.contains("no issues found"), "{clean}");
 }
 
-/// `--until-silence` says how the take ended: on the silence it waited
-/// for, which is cut from the end, or at the end of the tail, when the
-/// music never stayed under the floor that long.
+/// `--until-silence` states its rule under the length the take came to,
+/// for a format with audio; a format with none states nothing.
 #[test]
-fn until_silence_says_how_the_take_ended() {
-    let path = scratch("until-silence.wav");
-    let take = |floor: &str| {
+fn until_silence_states_its_rule_for_audio() {
+    let take = |name: &str| {
+        let path = scratch(name);
         let out = ok_output(&[
             "export",
             "-e",
@@ -9915,18 +9914,17 @@ fn until_silence_says_how_the_take_ended() {
             "--cycles",
             "1",
             "--until-silence",
-            "--silence-floor",
-            floor,
             "-o",
             path.to_str().expect("utf-8 path"),
         ]);
+        let _ = std::fs::remove_file(&path);
         String::from_utf8_lossy(&out.stdout).into_owned()
     };
-    let cut = take("-60");
-    assert!(cut.contains("that silence is cut from the end"), "{cut}");
-    // No sample is that quiet but zero, and the take is never silent.
-    let full = take("-1000");
-    assert!(full.contains("the tail ran its full 60 s"), "{full}");
-    assert!(!full.contains("is cut"), "{full}");
-    let _ = std::fs::remove_file(&path);
+    let audio = take("until-silence.wav");
+    assert!(
+        audio.contains("the take ends once the music stays under -60 dBFS for 2 s"),
+        "{audio}"
+    );
+    let onsets = take("until-silence.json");
+    assert!(!onsets.contains("until silence"), "{onsets}");
 }
