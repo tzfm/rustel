@@ -2607,8 +2607,15 @@ fn scale_note(steps: &ScaleSteps, note_or_step: &Value, anchor: Option<&Value>) 
         }
         None => steps.step(number).map(Value::Str),
     };
-    // An error removes the hap.
-    let stepped = stepped.ok()?;
+    let stepped = match stepped {
+        Ok(value) => value,
+        // An error removes the hap and is reported so a misspelt scale does
+        // not leave a silent lane with no diagnostic.
+        Err(error) => {
+            crate::signal_callback_failure(|| error);
+            return None;
+        }
+    };
     if accidental_offset == 0 {
         return Some(stepped);
     }
