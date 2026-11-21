@@ -44,6 +44,7 @@
 - Fixed: a scale name that will not read, such as `scale("C3:kafi raga")`, says why its notes are dropped in export, query and Studio, instead of a silent lane with nothing said.
 - Release archives and installers include signed build provenance for independent verification with GitHub CLI.
 - A video file plays as a sample: `mp4`, `m4v`, `mov`, `mkv` and `webm` play their audio track.
+- Fixed: a Hydra animated array with an entry that is not a number, such as `osc([10, "x", 30])`, refuses the new score as the docs say, instead of installing it with a warning.
 - `_video()` and `video()` draw a video sample's picture in sync with its sound. H.264, HEVC, AV1, VP9, VP8 and Motion JPEG decode natively.
 - The visuals docks show the clips of `_video()` and `video()` lanes. Enter opens a clip in a desktop window.
 - Settings ▸ General ▸ biggest video sets the largest video file that loads. The default is 256 MiB.

@@ -263,6 +263,16 @@ fn node<'js>(
         let mut entries = Vec::with_capacity(len);
         for index in 0..len {
             let entry = array.get::<rquickjs::Value>(index)?;
+            // An animated array steps through numbers; anything else in it
+            // refuses the score, as docs/hydra.md says, rather than
+            // installing a picture that only warns. Checked before the entry
+            // is read, so a nested array is not walked first.
+            if !entry.is_number() {
+                return Err(throw_type_error(
+                    ctx,
+                    "a hydra array entry must be a finite number",
+                ));
+            }
             entries.push(node(ctx, chains, &entry, depth + 1)?);
         }
         // The marks `ARRAY_UTILS` leaves. A numeric mark that is 0 or NaN

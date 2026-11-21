@@ -114,7 +114,8 @@ A path to a file reads that file as a sample map, as a URL does. Entries are
 relative to the map's folder. An entry that starts with `/` is relative to the
 granted folder. Entries can also be `http(s)` URLs, under the usual source
 grants. Names are file names as written, so `C#3.wav` is one file. A map
-entry outside the grant is refused, and the map must be 4 MiB or less. A map
+with an entry outside the grant is refused as a whole: none of its banks
+load, and the refusal names the entry. The map must be 4 MiB or less. A map
 from the network cannot read local files.
 
 ## How a folder becomes banks
