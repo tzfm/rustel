@@ -6,10 +6,12 @@
 - `rustel check` and `rustel query` take `--prebake setup.js`, so a score calling a prebake's helpers checks clean.
 - A sample source can be a repository page such as `https://github.com/user/repo`. It reads as `github:user/repo`, and a web page or a missing map says what to write instead.
 - A pattern can set the tempo: `cps("<0.5 1>")` changes it at each onset, unless Link or MIDI clock leads.
+- Fixed: a live output that fell behind and resumed is printed as a warning, not as an error, since the run plays on.
 - Fixed: leaving a Link session or letting go of an incoming MIDI clock plays the score's own tempo again, instead of the bent tempo the follow left until the next update.
 - Fixed: a `.dict()` name no dictionary has is an error, as on strudel.cc, instead of a lane that plays silence.
 - The reference search also finds entries by extension name, description, tags, parameters and examples, and by words spread across them. These matches come after the usual matches, under more matches.
 - The theme picker shows its Ctrl+N new, Ctrl+E edit and Ctrl+D delete keys.
+- Fixed: an export, query or check whose every note an error dropped, such as a scale name that will not read, exits 1 with the reason instead of passing as silence; a partial drop still plays what it can.
 - Fixed: the theme editor opened from the theme picker shows on top of the reference.
 - A score made of patterns, controls, functions, arrows and lanes is evaluated without JavaScript, 15 to 60 times faster on a new session, and an edit builds only the calls it changed. The script engine starts only for a score that needs it: the memory breakdown and `rustel play` name the line that needs it.
 - A score evaluated again keeps the answers of what it did not change, and a restarted section is asked only where it plays: the first query after an edit of a large score runs up to 170 times faster, and the first query of a score in sections about 17 times faster.
@@ -53,9 +55,11 @@
 - Hydra sketches read the mouse, `width` and `height`, and set `speed`, `bpm`, `fps` and `time`. Patterns read the mouse as `mousex` and `mousey`.
 - The reference knows the Hydra names, and a shared sketch with calls Rustel does not support still runs.
 - Picking a plugin from the reference opens its presets and closes the call.
+- Fixed: allowing a sample source on the Permissions page fetches the score's `samples()` import it had refused and re-runs the update with it, instead of the check still finding the sounds unknown.
 - Each open scene keeps its plugins loaded, and a scene you close frees them.
 - Plugins stay loaded when the output device or buffer size changes, and an undo within 5 seconds reuses the previous plugin copy.
 - A plugin chain with up to 1 second of latency plays in time, also in exports, and edits reach it that much later.
+- Fixed: the slider form in quick action says on the footer why it did not write the fader, such as a min above the max, instead of an Enter that seems to do nothing.
 - A plugin that fails or sends invalid audio goes silent with one warning, and the next evaluation loads it again.
 - A Studio export names a plugin that does not load, and Ctrl+C stops `rustel export` to MP3.
 - Samples, images and videos load only from allowed sources. `--allow-sample-origin` adds a source, and Settings ▸ Permissions allows a refused folder.

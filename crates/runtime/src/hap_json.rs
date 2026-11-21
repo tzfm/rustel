@@ -93,7 +93,8 @@ pub struct QueryReport {
     pub end: String,
     pub source: String,
     pub haps: Vec<HapJson>,
-    /// A thrown query's message. The CLI prints the report, then exits non-zero.
+    /// A thrown query's message, or the failure that dropped every hap. The
+    /// CLI prints the report, then exits non-zero.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub query_threw: Option<String>,
 }
@@ -147,8 +148,8 @@ pub struct PlayReport {
     /// Device status for this operation (`not-requested` or `played`).
     pub device_audio: String,
     pub note: String,
-    /// The message from a query that threw, or from a lane whose throw a
-    /// stack contained, if one did.
+    /// The message from a query that threw, from a lane whose throw a stack
+    /// contained, or from a failure that dropped every note, if one did.
     ///
     /// A throw yields no haps, so the render succeeds and writes a file that
     /// is silent where the score is not. Carrying it lets the caller exit

@@ -344,13 +344,15 @@ fn human_live_event(event: &serde_json::Value, verbosity: u8) -> Option<String> 
         // the writes go out at the open baud: news, not a failure. So are
         // serial writes refused, dropped late or rejected: the set plays on.
         // A plugin line is a warning too: the note plays with no plugin or
-        // with one value less.
+        // with one value less. So is a live output that fell behind and
+        // resumed at the present: the run plays on.
         if matches!(
             string(error, "kind"),
             Some(
                 "voice-refused"
                     | "serial-baud"
                     | "serial-trouble"
+                    | "live-recovered"
                     | rustel_runtime::PLUGIN_DIAGNOSTIC
             )
         ) {
@@ -5369,6 +5371,17 @@ mod tests {
         assert_eq!(
             line("serial-baud", "serialbaud 9600 was ignored").as_deref(),
             Some("warning: serialbaud 9600 was ignored")
+        );
+        // A stall the live output recovered from is news, not a failure.
+        assert_eq!(
+            line(
+                "live-recovered",
+                "the producer fell behind the audio clock; resumed at the present (1.654s skipped)"
+            )
+            .as_deref(),
+            Some(
+                "warning: the producer fell behind the audio clock; resumed at the present (1.654s skipped)"
+            )
         );
         // A note with no plugin still plays.
         assert_eq!(

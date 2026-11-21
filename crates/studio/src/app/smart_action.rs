@@ -617,6 +617,10 @@ fn checked_numbers(form: &mut SliderForm, whole: bool) -> Result<[f64; 4], Strin
     Ok([clamped, min, max, step])
 }
 
+/// The footer while the form is open.
+const FORM_HINT: &str =
+    "Tab or the arrows between the fields \u{b7} Enter applies \u{b7} Esc closes";
+
 /// The form's word for a value it pulled into range. Short enough for the
 /// form's row: the value and both ends of the range are on the rows above.
 const PULLED: &str = "value pulled into range \u{b7} Enter writes";
@@ -818,8 +822,7 @@ impl App {
         };
         form.focus(0);
         state.form = Some(form);
-        self.status =
-            "Tab or the arrows between the fields \u{b7} Enter applies \u{b7} Esc closes".into();
+        self.status = FORM_HINT.into();
         self.dirty_frame = true;
     }
 
@@ -864,6 +867,9 @@ impl App {
         let [value, min, max, step] = match checked_numbers(form, whole) {
             Ok(numbers) => numbers,
             Err(problem) => {
+                // On the footer too: the form's own row can sit below the
+                // fold of a short terminal, and Enter then reads as dead.
+                self.status = format!("fader not written: {problem}");
                 form.error = Some(problem);
                 self.dirty_frame = true;
                 return;
@@ -1158,6 +1164,10 @@ impl App {
             .and_then(|state| state.form.as_mut())
         {
             form.error = None;
+            // The refusal on the footer was about the text just edited.
+            if self.status.starts_with("fader not written: ") {
+                self.status = FORM_HINT.into();
+            }
         }
         self.dirty_frame = true;
     }
@@ -1684,6 +1694,36 @@ mod tests {
             precision_key(&mut app, KeyCode::Enter, KeyModifiers::NONE);
             assert!(app.editor().source().contains("slider(800,"));
             assert!(app.scenes.current().dirty, "quit saves the fader");
+        }
+
+        /// A min above the max is refused on the form, and the reason shows
+        /// in the form and on the footer: Enter that does nothing and says
+        /// nothing reads as a dead key.
+        #[test]
+        fn a_min_above_the_max_is_refused_and_says_why() {
+            let directory = tempfile::tempdir().expect("temp dir");
+            let (mut app, _) = plain_app(
+                directory.path(),
+                "$: s(\"bd*4\").gain(slider(0.25, 0, 1, 0.01))\n",
+            );
+            let before = app.editor().source();
+            open_action_on(&mut app, "0.25");
+            precision_key(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+            precision_key(&mut app, KeyCode::Tab, KeyModifiers::NONE);
+            precision_key(&mut app, KeyCode::Backspace, KeyModifiers::NONE);
+            precision_key(&mut app, KeyCode::Char('2'), KeyModifiers::NONE);
+            precision_key(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+            assert_eq!(app.editor().source(), before, "nothing is written");
+            let (_, rows) = app.smart_action_view().expect("the form stays open");
+            assert!(
+                rows.iter()
+                    .any(|row| row.contains("min has to be below max")),
+                "{rows:?}"
+            );
+            assert_eq!(app.status, "fader not written: min has to be below max");
+            // An edit makes the refusal stale: the footer is the hint again.
+            precision_key(&mut app, KeyCode::Backspace, KeyModifiers::NONE);
+            assert!(app.status.contains("Enter applies"), "{}", app.status);
         }
 
         /// A min above the value pulls the value up with it: a range that does
