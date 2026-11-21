@@ -260,6 +260,10 @@ impl App {
             && !self.sample_grants_owed
         {
             self.refused_update_owed = false;
+            // A source the permission allowed was refused when the score
+            // was checked: fetch it now, so the re-run's check finds its
+            // names on their way rather than unknown.
+            self.ask_for_imports_again(self.scenes.current().id);
             self.retry_refused_update();
         }
         #[cfg(feature = "hydra")]

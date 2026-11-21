@@ -350,6 +350,13 @@ impl App {
         });
     }
 
+    /// Ask again for every `samples()` source a scene imports: a source a
+    /// permission has just allowed is fetched now. One already in, on its
+    /// way, or resting after a failure is left as it stands.
+    pub(super) fn ask_for_imports_again(&self, scene_id: SceneId) {
+        self.ask_for_imports(scene_id, |_, _| true);
+    }
+
     /// Ask the engine again for every `samples("…")` a scene names whose
     /// failure has rested, so a failure the network caused recovers by
     /// itself. Typing never asks: an update does, and the poll does in the
