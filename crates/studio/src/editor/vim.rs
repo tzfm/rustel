@@ -125,6 +125,15 @@ enum Awaiting {
     CommandLine { text: String },
 }
 
+/// A `:` command the studio answers, not the editor.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum VimRequest {
+    /// `:w` writes the score.
+    Write,
+    /// `:wq` and `:x` write the score and close its tab.
+    WriteClose,
+}
+
 /// The Visual a studio chord left, at the revision it left it. Its band
 /// stays selected for the chord to act on.
 #[derive(Clone, Copy, Debug)]
@@ -155,6 +164,7 @@ pub(super) struct VimState {
     autoindent: Option<(Revision, Range<ByteOffset>)>,
     last_change: Option<LastChange>,
     repeat_state: RepeatState,
+    request: Option<VimRequest>,
 }
 
 impl Editor {
@@ -277,6 +287,11 @@ impl Editor {
 
     /// How many times Vim itself has filled the register. Text taken in
     /// from the clipboard does not count.
+    /// The `:` command the studio owes an answer, taken once.
+    pub(crate) fn take_vim_request(&mut self) -> Option<VimRequest> {
+        self.vim.request.take()
+    }
+
     pub(crate) fn vim_register_writes(&self) -> u64 {
         self.vim.register_writes
     }
@@ -889,10 +904,12 @@ impl Editor {
                         self.vim_normalize_caret()?;
                     }
                     "$" => self.vim_move(Motion::LastLine, 0)?,
+                    "w" | "write" => self.vim.request = Some(VimRequest::Write),
+                    "wq" | "x" | "xit" => self.vim.request = Some(VimRequest::WriteClose),
                     "" => {}
                     number => match number.parse::<usize>() {
                         Ok(number) => self.vim_move(Motion::FirstLine, number.max(1))?,
-                        Err(_) => self.vim.message = Some("Use :<line>, :undo or :redo"),
+                        Err(_) => self.vim.message = Some("Use :<line>, :w, :wq, :undo or :redo"),
                     },
                 }
                 return Ok(true);

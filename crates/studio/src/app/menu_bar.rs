@@ -479,6 +479,9 @@ impl App {
             Do::RenameSet => self.open_set_prompt(SetPrompt::RenameSet),
             Do::ConsolidateSamples => self.consolidate_samples(),
             Do::DeleteScene => self.arm_delete_scene(),
+            Do::SaveScene => {
+                self.save_scene();
+            }
             Do::CloseScene => {
                 self.close_scene();
             }

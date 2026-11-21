@@ -168,7 +168,7 @@ impl HelpContext {
     fn bindings(self) -> [(&'static str, &'static str); 3] {
         match self {
             Self::Editor => [
-                ("^S / F5", "write and play the current scene"),
+                ("^S / F5", "save and play the current scene"),
                 ("^G / F8", "stop all sound"),
                 ("^F / ^D", "argument values / function docs"),
             ],
@@ -509,7 +509,7 @@ fn shortcut_rows_with_keybinds(
         ),
         HelpRow::new(
             shortcut_with_alias(keybinds, BindAction::Evaluate),
-            "write and play the current scene",
+            "save and play the current scene",
         ),
         HelpRow::new(
             hint(BindAction::RewindEvaluate),
@@ -615,6 +615,17 @@ fn shortcut_rows_with_keybinds(
                 }
             },
             "rename the current scene",
+        ),
+        HelpRow::new(
+            {
+                let save = hint(BindAction::SaveScene);
+                if save.is_empty() {
+                    "Scene > Save, or :w".to_owned()
+                } else {
+                    save
+                }
+            },
+            "save the current scene, keep what plays",
         ),
         HelpRow::new(
             hint(BindAction::CloseScene),
