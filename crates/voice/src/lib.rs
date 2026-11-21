@@ -348,6 +348,48 @@ mod classification_tests {
 }
 #[cfg(test)]
 mod tests {
+    /// An instrument note ends 1 ms before the next note starts, also with
+    /// floating-point dust in its duration. A note-off on the frame of the
+    /// next note-on made some plugins click.
+    #[test]
+    fn an_instrument_note_ends_before_the_next_note_starts() {
+        struct Plugin;
+        impl super::SampleLookup for Plugin {
+            fn resolve(&self, _s: &str, _n: f64, _midi: f64) -> super::SampleResolution {
+                super::SampleResolution::Unknown
+            }
+            fn insert(
+                &self,
+                _request: &super::PluginRequest<'_>,
+            ) -> Result<Option<rustel_audio::InsertControls>, String> {
+                let key = rustel_audio::InsertKey {
+                    plugin: 1,
+                    preset: 0,
+                };
+                Ok(Some(rustel_audio::InsertControls::new(key)))
+            }
+        }
+        let value = serde_json::json!({ "note": 60, "vsti": { "name": "synth" } });
+        let resolve = |duration: f64, time: f64| {
+            super::resolve_voice_with_samples(&value, 1, duration, time, 48_000, 0.5, &Plugin)
+                .expect("the note plays")
+        };
+        let first = 1.234_567_89;
+        let note = resolve(0.500_000_000_000_000_1, first);
+        let next = resolve(0.5, first + 0.5);
+        let frames = |event: &rustel_audio::OnsetEvent| {
+            let note = event.controls.instrument.and_then(|plugin| plugin.note());
+            u64::from(note.expect("the plugin gets the note").frames)
+        };
+        let gap = next.onset_frame - note.onset_frame - frames(&note);
+        assert!((47..=48).contains(&gap), "a gap of 1 ms, not {gap} frames");
+        assert_eq!(
+            frames(&resolve(0.000_5, first)),
+            12,
+            "a short note keeps half"
+        );
+    }
+
     /// A library still fetching a manifest answers Loading for every name
     /// it has not seen. That must not cost a native synth its onset: the
     /// first `sbd` after a switch was lost exactly this way.
@@ -3041,9 +3083,10 @@ fn resolve_voice_at(
             instrument.with_note(rustel_audio::InsertNote {
                 pitch: (69.0 + 12.0 * (frequency / 440.0).log2()) as f32,
                 velocity: controls.velocity.clamp(0.0, 1.0),
-                frames: (duration_secs * f64::from(sample_rate))
-                    .ceil()
-                    .clamp(1.0, f64::from(u32::MAX)) as u32,
+                frames: ((duration_secs - INSTRUMENT_NOTE_GAP_SECS.min(duration_secs / 2.0))
+                    * f64::from(sample_rate))
+                .ceil()
+                .clamp(1.0, f64::from(u32::MAX)) as u32,
             })
         });
         (
@@ -3139,6 +3182,12 @@ fn resolve_voice_at(
     event.synth = synth;
     Ok(event)
 }
+
+/// An instrument plugin gets the end of a note this much early, as the MIDI
+/// output does. The end then comes before the start of the next note, also
+/// after rounding. A note-off and a note-on on the same frame make some
+/// plugins click. A short note keeps half its length.
+const INSTRUMENT_NOTE_GAP_SECS: f64 = 0.001;
 
 /// Give each bus name in `object` its slot: the `bus` control, the `n` of a
 /// `bus` source, and the bus of each `bmod` entry. A bus number keeps its own
