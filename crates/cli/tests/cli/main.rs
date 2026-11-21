@@ -9840,6 +9840,16 @@ fn an_unreadable_scale_is_reported_when_its_notes_drop() {
             .iter()
             .any(|sample| i16::from_le_bytes(*sample).unsigned_abs() > 100);
     assert!(loud, "the cycles that read their scale sound");
+    // A single-quoted unknown name drops every note the same way: query and
+    // check say so too, not only the bounce.
+    let score = "$: n(\"0 2 4 7\").scale('C3:zzz').s(\"sine\")";
+    assert_reported_failure(&["query", "-e", score], "Invalid scale name");
+    let checked = run(&["check", "--no-samples", "-e", score]);
+    assert!(!checked.status.success(), "{checked:?}");
+    assert!(
+        String::from_utf8_lossy(&checked.stdout).contains("Invalid scale name"),
+        "{checked:?}"
+    );
 }
 
 /// `check` queries the score's first cycle, so a score that evaluates but
