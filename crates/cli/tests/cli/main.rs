@@ -9799,8 +9799,9 @@ fn talkit_speaks_up_to_c7() {
 }
 
 /// A scale name that will not read drops its notes, as on strudel.cc, and
-/// says why. A bounce whose every note was dropped fails with that reason,
-/// rather than writing silence; one that keeps some notes fails open.
+/// says why. A bounce whose every note was dropped exits 1 with that
+/// reason, rather than passing as silence; one that keeps some notes fails
+/// open.
 #[test]
 fn an_unreadable_scale_is_reported_when_its_notes_drop() {
     let path = scratch("unreadable-scale.wav");

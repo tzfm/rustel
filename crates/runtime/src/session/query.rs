@@ -181,6 +181,9 @@ impl Session {
         // A stack contains a lane's throw and keeps the other lanes' haps.
         // The report still says that the score threw.
         let contained = rustel_core::take_query_contained_throw();
+        // Taken whether or not it is reported, so a following query starts
+        // clean.
+        let callback_failure = rustel_core::take_query_callback_failure();
         Ok(QueryReport {
             begin: fraction_label(begin),
             end: fraction_label(end),
@@ -195,7 +198,7 @@ impl Session {
                 .js
                 .take_query_throw()
                 .or(contained)
-                .or_else(|| rustel_core::take_query_callback_failure().filter(|_| haps.is_empty())),
+                .or_else(|| callback_failure.filter(|_| haps.is_empty())),
         })
     }
 

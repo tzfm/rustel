@@ -398,7 +398,7 @@ impl Session {
         }
 
         Ok(PlayReport {
-            // Only a throw empties a window. A contained callback failure
+            // A throw empties a window. A contained callback failure
             // (a `filterValues`/`filterHaps` predicate that threw) fails
             // open: the hap it judged keeps playing and the bounce is
             // complete, so the diagnostic above reports it and the exit
@@ -410,7 +410,7 @@ impl Session {
             // it fails as a throw does, with the same message.
             query_threw: thrown
                 .or(contained_throw)
-                .or_else(|| callback_failure.clone().filter(|_| onsets.is_empty())),
+                .or_else(|| callback_failure.filter(|_| onsets.is_empty())),
             duration_secs,
             cps: self.config.cps,
             generation,
