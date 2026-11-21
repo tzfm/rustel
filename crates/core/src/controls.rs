@@ -326,7 +326,7 @@ pub(crate) fn named_value(names: &[Arc<str>], mut value: Value) -> Value {
 pub enum ChainArgument {
     Number(f64),
     Constant(Value, crate::Locations),
-    Wave(crate::fused::Wave, u32, bool),
+    Wave(crate::fused::Wave, u32, bool, u8),
     Pattern(Pattern),
 }
 
@@ -631,7 +631,7 @@ fn apply_argument(spec: &ControlSpec, pattern: Pattern, argument: &ChainArgument
         ChainArgument::Constant(value, locations) => {
             spec.apply_constant(pattern, value.clone(), locations.clone())
         }
-        ChainArgument::Wave(wave, steps, math_inside) => {
+        ChainArgument::Wave(wave, steps, math_inside, op_flags) => {
             if crate::compose::default_alignment() == crate::compose::Alignment::In
                 && spec.id != 0
                 && !crate::sequence::builds_each_node()
@@ -640,7 +640,7 @@ fn apply_argument(spec: &ControlSpec, pattern: Pattern, argument: &ChainArgument
             {
                 pattern.apply_inline_wave(spec.id, wave.clone(), *steps, *math_inside)
             } else {
-                let pat = wave.to_pattern(*math_inside, *steps);
+                let pat = wave.to_pattern(*math_inside, *steps, *op_flags);
                 spec.apply_for(pattern, Some(&pat))
             }
         }
@@ -654,7 +654,7 @@ fn apply_argument_owned(spec: &ControlSpec, pattern: Pattern, argument: ChainArg
     match argument {
         ChainArgument::Number(number) => spec.apply_value(pattern, Value::F64(number)),
         ChainArgument::Constant(value, locations) => spec.apply_constant(pattern, value, locations),
-        ChainArgument::Wave(wave, steps, math_inside) => {
+        ChainArgument::Wave(wave, steps, math_inside, op_flags) => {
             if crate::compose::default_alignment() == crate::compose::Alignment::In
                 && spec.id != 0
                 && !crate::sequence::builds_each_node()
@@ -663,7 +663,7 @@ fn apply_argument_owned(spec: &ControlSpec, pattern: Pattern, argument: ChainArg
             {
                 pattern.apply_inline_wave(spec.id, wave, steps, math_inside)
             } else {
-                let pat = wave.to_pattern(math_inside, steps);
+                let pat = wave.to_pattern(math_inside, steps, op_flags);
                 spec.apply_to(pattern, Some(pat))
             }
         }

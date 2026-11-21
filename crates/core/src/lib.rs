@@ -3336,6 +3336,11 @@ impl Pattern {
         self.effective_flags() & FLAG_IMPURE == 0
     }
 
+    /// Whether this node is a sequence carrying any lazy sourced layer.
+    pub fn has_sourced_layers(&self) -> bool {
+        matches!(self.node_kind(), Node::Sequence(layers) if sequence::has_source(layers))
+    }
+
     /// Whether a result cache may keep what this pattern answers: no
     /// JavaScript, and nothing reachable that answers differently to the
     /// same query. See [`purity::Purity::volatile`].

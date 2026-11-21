@@ -1113,9 +1113,8 @@ fn a_chain_of_controls_answers_as_each_control_in_turn() {
                                 spec.apply_to(pattern, Some(values))
                             }
                         }
-                        ChainArgument::Wave(wave, steps, math_inside) => {
-                            spec.apply_to(pattern, Some(wave.to_pattern(math_inside, steps)))
-                        }
+                        ChainArgument::Wave(wave, steps, math_inside, op_flags) => spec
+                            .apply_to(pattern, Some(wave.to_pattern(math_inside, steps, op_flags))),
                         ChainArgument::Pattern(values) => spec.apply_to(pattern, Some(values)),
                     })
                 };

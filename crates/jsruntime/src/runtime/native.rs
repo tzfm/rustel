@@ -1159,6 +1159,7 @@ impl<'p> Turn<'p> {
         }
         let mut times: [(bool, Fraction); 3] = [(false, Fraction::ZERO); 3];
         let mut times_len = 0usize;
+        let mut op_flags = 0u8;
         let mut math_outer: [(ComposeOp, f64); 8] = [(ComposeOp::Add, 0.0); 8];
         let mut math_len = 0usize;
         let mut steps = 0u32;
@@ -1212,13 +1213,12 @@ impl<'p> Turn<'p> {
                         return None;
                     }
                     let inv = Fraction::ONE.checked_div(f)?;
-                    if inv != Fraction::ONE {
-                        if times_len >= times.len() {
-                            return None;
-                        }
-                        times[times_len] = (true, inv);
-                        times_len += 1;
+                    if times_len >= times.len() {
+                        return None;
                     }
+                    times[times_len] = (true, inv);
+                    op_flags |= 1u8 << times_len;
+                    times_len += 1;
                 }
                 "fast" | "density" => {
                     let Some(BuiltinMethod::Registered(reg)) = builtin_method(names, method_name)
@@ -1235,13 +1235,11 @@ impl<'p> Turn<'p> {
                     if f <= Fraction::ZERO {
                         return None;
                     }
-                    if f != Fraction::ONE {
-                        if times_len >= times.len() {
-                            return None;
-                        }
-                        times[times_len] = (true, f);
-                        times_len += 1;
+                    if times_len >= times.len() {
+                        return None;
                     }
+                    times[times_len] = (true, f);
+                    times_len += 1;
                 }
                 "late" | "early" => {
                     let Some(BuiltinMethod::Registered(reg)) = builtin_method(names, method_name)
@@ -1258,13 +1256,14 @@ impl<'p> Turn<'p> {
                     if method_name == "early" {
                         offset = offset.checked_neg()?;
                     }
-                    if offset != Fraction::ZERO {
-                        if times_len >= times.len() {
-                            return None;
-                        }
-                        times[times_len] = (false, offset);
-                        times_len += 1;
+                    if times_len >= times.len() {
+                        return None;
                     }
+                    times[times_len] = (false, offset);
+                    if method_name == "early" {
+                        op_flags |= 1u8 << times_len;
+                    }
+                    times_len += 1;
                 }
                 "range" => {
                     let Some(BuiltinMethod::Registered(reg)) = builtin_method(names, method_name)
@@ -1347,7 +1346,7 @@ impl<'p> Turn<'p> {
             return None;
         }
         self.steps += nodes;
-        Some(ChainArgument::Wave(wave, steps, math_inside))
+        Some(ChainArgument::Wave(wave, steps, math_inside, op_flags))
     }
 
     /// Evaluate `expression` where the score writes a part. The build

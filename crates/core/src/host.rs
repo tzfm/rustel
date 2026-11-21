@@ -1495,6 +1495,17 @@ impl QueryErrorBoundary {
         })
     }
 
+    /// Restore the outer error slots and discard any inner error or contained
+    /// failure without publishing it. Used by speculative probes such as
+    /// [`without_query_signals`].
+    pub(crate) fn discard(mut self) -> bool {
+        QUERY_ERRORS.with(|errors| {
+            let [inner, inner_callback_failure, inner_contained_throw] = errors.take_inner();
+            self.restore_in(errors);
+            inner.is_some() || inner_callback_failure.is_some() || inner_contained_throw.is_some()
+        })
+    }
+
     /// Put back what the query around this boundary held at its entry.
     fn restore_in(&mut self, errors: &QueryErrors) {
         if self.restored {
@@ -2398,8 +2409,8 @@ pub(crate) fn without_query_signals<T>(f: impl FnOnce() -> Option<T>) -> Option<
     let refusal = RefusalScope::enter();
     let result = f();
     let refused = refusal.finish();
-    let thrown = boundary.finish();
-    if refused || thrown.is_some() {
+    let failed = boundary.discard();
+    if refused || failed {
         return None;
     }
     result

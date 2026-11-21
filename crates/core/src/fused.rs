@@ -807,17 +807,28 @@ impl Wave {
     }
 
     /// Rebuild the exact signal pattern (before `ControlMap`) that this inline
-    /// wave represents.
-    pub(crate) fn to_pattern(&self, math_inside: bool, steps: u32) -> Pattern {
+    /// wave represents. Bit `i` of `op_flags` marks time change `i` (outer-first)
+    /// as `slow` (for `Fast`) or `early` (for `Late`) so graph-level construction
+    /// matches the unfolded combinator calls.
+    pub(crate) fn to_pattern(&self, math_inside: bool, steps: u32, op_flags: u8) -> Pattern {
         let apply_times = |mut pat: Pattern| {
             let (times, _) = self.times.parts();
-            for change in times.iter().rev() {
+            for (idx, change) in times.iter().enumerate().rev() {
+                let flipped = (op_flags & (1u8 << idx)) != 0;
                 match *change {
                     WaveTime::Fast(n, d) => {
-                        pat = pat.fast(Fraction::from_ticks(i128::from(n), d));
+                        if flipped && n > 0 {
+                            pat = pat.slow(Fraction::new(i128::from(d.get()), i128::from(n)));
+                        } else {
+                            pat = pat.fast(Fraction::from_ticks(i128::from(n), d));
+                        }
                     }
                     WaveTime::Late(n, d) => {
-                        pat = pat.late(Fraction::from_ticks(i128::from(n), d));
+                        if flipped {
+                            pat = pat.early(Fraction::new(-i128::from(n), i128::from(d.get())));
+                        } else {
+                            pat = pat.late(Fraction::from_ticks(i128::from(n), d));
+                        }
                     }
                 }
             }
@@ -841,7 +852,7 @@ impl Wave {
     /// multi-cycle parts, >48-bit rationals, or `cut_mask` boundaries).
     pub(crate) fn to_control_pattern(&self, key_id: u16, math_inside: bool, steps: u32) -> Pattern {
         Pattern::of(Pattern::control_map_node(
-            self.to_pattern(math_inside, steps),
+            self.to_pattern(math_inside, steps, 0),
             key_id,
             false,
         ))

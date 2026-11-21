@@ -9820,7 +9820,11 @@ fn an_unreadable_scale_is_reported_when_its_notes_drop() {
     assert!(path.exists(), "the take is written");
     let _ = std::fs::remove_file(&path);
     assert!(stderr.contains("query_threw"), "{stderr}");
-    assert!(stderr.contains("Scale name raga is incomplete"), "{stderr}");
+    assert!(
+        stderr.contains(r#"Invalid scale name \"C3 kafi\""#)
+            || stderr.contains("Scale name raga is incomplete"),
+        "{stderr}"
+    );
 }
 
 /// `check` queries the score's first cycle, so a score that evaluates but

@@ -184,6 +184,14 @@ pub(crate) fn parse_mini_in_room(source: &str, offset: i64) -> Result<Pattern, S
     {
         return Ok(word);
     }
+    if let Some(pattern) = MINI_MEMO.with(|memo| {
+        memo.borrow()
+            .get(source, offset)
+            .filter(|pattern| pattern.has_sourced_layers())
+            .cloned()
+    }) {
+        return Ok(pattern);
+    }
     let at = usize::try_from(offset).unwrap_or(0);
     let pattern = MINI_MEMO
         .with(|memo| rustel_mini::mini_in(&mut memo.borrow_mut().room, source, at))
@@ -195,6 +203,9 @@ pub(crate) fn parse_mini_in_room(source: &str, offset: i64) -> Result<Pattern, S
     } else {
         pattern
     };
+    if pattern.has_sourced_layers() {
+        MINI_MEMO.with(|memo| memo.borrow_mut().insert(source, offset, pattern.clone()));
+    }
     Ok(pattern)
 }
 

@@ -6939,6 +6939,13 @@ pub(crate) fn constant_value_at(values: &Pattern) -> Option<(Value, Locations)> 
 
 /// Build a single-cycle named sequence directly from a plain constant value
 /// and source locations, skipping an intermediate `Node::PureAt` allocation.
+/// Whether `layers` includes any lazy [`Steps::Source`] layer.
+pub(crate) fn has_source(layers: &[Layer]) -> bool {
+    layers
+        .iter()
+        .any(|layer| matches!(layer.steps.inner(), Steps::Source(_)))
+}
+
 pub(crate) fn of_single_named(
     value: Value,
     locations: Locations,
@@ -6952,7 +6959,7 @@ pub(crate) fn of_single_named(
     };
     let mut layer = Layer::of_single(Fraction::ONE, raw, Arc::new([value]));
     Layer::named_in_place(std::slice::from_mut(&mut layer), spec);
-    Pattern::of(Node::Sequence(Arc::from([layer])))
+    Pattern::of(Node::Sequence(Arc::from([layer]))).with_steps(Some(Fraction::ONE))
 }
 
 /// `pattern` with each value named by the control of `names`, as

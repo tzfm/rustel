@@ -230,7 +230,7 @@ impl RunApply {
             _ => match (self.combine(), other.combine()) {
                 (Combine::Composed(a), Combine::Composed(b)) => a == b,
                 (Combine::SetMerged, Combine::SetMerged) => true,
-                (Combine::With(a), Combine::With(b)) => Arc::ptr_eq(&a, &b),
+                (Combine::With(_), Combine::With(_)) => true,
                 _ => false,
             },
         }
