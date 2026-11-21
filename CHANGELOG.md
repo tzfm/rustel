@@ -54,6 +54,7 @@
 - A plugin chain with up to 1 second of latency plays in time, also in exports, and edits reach it that much later.
 - A plugin that fails or sends invalid audio goes silent with one warning, and the next evaluation loads it again.
 - A Studio export names a plugin that does not load, and Ctrl+C stops `rustel export` to MP3.
+- Fixed: a live output that fell behind and resumed is printed as a warning, not as an error, since the run plays on.
 - Samples, images and videos load only from allowed sources. `--allow-sample-origin` adds a source, and Settings ▸ Permissions allows a refused folder.
 - Scores render faster on small machines and 64-bit ARM, queries of repeating patterns run up to 180 times faster, and decoded samples load faster the next time.
 - On a slow machine, an edit of a playing score arrives late instead of being refused, and the set no longer goes silent when the old score also comes back late. A dense synth score no longer refuses its edits.
