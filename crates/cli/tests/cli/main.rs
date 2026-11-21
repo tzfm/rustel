@@ -9764,6 +9764,40 @@ fn a_distortion_takes_its_volume_as_a_second_argument() {
     );
 }
 
+/// talkit speaks the whole documented range, C1 to C7: C7 is a hair above
+/// the range's top in whole hertz and still speaks; C8 is refused.
+#[test]
+fn talkit_speaks_up_to_c7() {
+    for (note, speaks) in [("c7", true), ("c1", true), ("c8", false)] {
+        let path = scratch("talkit-range.wav");
+        let out = run(&[
+            "export",
+            "-e",
+            &format!("$: note(\"{note}\").talkit(\"la\")"),
+            "--cycles",
+            "1",
+            "-o",
+            path.to_str().expect("utf-8 path"),
+        ]);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(out.status.success(), "{note}: {stderr}");
+        let wav = std::fs::read(&path).expect("wav");
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(
+            !stderr.contains("voice_refused"),
+            speaks,
+            "{note}: {stderr}"
+        );
+        let sounds = wav.len() > 44
+            && wav[44..]
+                .as_chunks::<2>()
+                .0
+                .iter()
+                .any(|sample| i16::from_le_bytes(*sample).unsigned_abs() > 100);
+        assert_eq!(sounds, speaks, "{note}: the take");
+    }
+}
+
 /// A scale name that will not read drops its notes, as on strudel.cc, and
 /// says so: the export reports why its lane is silent instead of writing
 /// silence with nothing said.
