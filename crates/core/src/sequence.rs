@@ -6305,8 +6305,63 @@ fn revalued(
 /// [`Pattern::with_added_context`] gives, when `pattern` is a sequence. A
 /// `pure` keeps its own node, which says that it is one.
 pub(crate) fn located(pattern: &Pattern, locations: &[(usize, usize)]) -> Option<Pattern> {
-    let layers = redressed(folded(pattern)?, |dress| dress.extend_after(locations));
+    let layers = folded(pattern)?;
+    if layers.len() <= 8 {
+        let mut buf: [Option<Layer>; 8] = Default::default();
+        let mut last: Option<(*const Dress, Arc<Dress>)> = None;
+        for (slot, layer) in buf.iter_mut().zip(layers.iter()) {
+            let from = layer.dress.as_ref().map_or(std::ptr::null(), Arc::as_ptr);
+            let dress = match &last {
+                Some((seen, dress)) if *seen == from => Arc::clone(dress),
+                _ => {
+                    let mut dress = layer.dress().clone();
+                    dress.extend_after(locations);
+                    let dress = dress.into_arc();
+                    last = Some((from, Arc::clone(&dress)));
+                    dress
+                }
+            };
+            *slot = Some(layer.with(|l| {
+                l.dress = Some(dress);
+                l.refresh_direct();
+            }));
+        }
+        return Some(node_of_sound_stack(&mut buf, layers.len()));
+    }
+    let layers = redressed(layers, |dress| dress.extend_after(locations));
     Some(node_of_sound(layers))
+}
+
+/// Append `locations` onto `layers` of an owned `Node::Sequence` in place when
+/// unshared, avoiding `Layer`, `Arc<[Layer]>`, and `NodeCell` cloning.
+pub(crate) fn locate_in_place(layers: &mut Arc<[Layer]>, locations: &[(usize, usize)]) -> bool {
+    let Some(slice) = Arc::get_mut(layers) else {
+        return false;
+    };
+    let mut last: Option<(*const Dress, Arc<Dress>)> = None;
+    for layer in slice {
+        let from = layer.dress.as_ref().map_or(std::ptr::null(), Arc::as_ptr);
+        if !from.is_null()
+            && let Some(dress) = layer.dress.as_mut().and_then(Arc::get_mut)
+        {
+            dress.extend_after(locations);
+            layer.refresh_direct();
+            continue;
+        }
+        let dress = match &last {
+            Some((seen, dress)) if *seen == from => Arc::clone(dress),
+            _ => {
+                let mut dress = layer.dress().clone();
+                dress.extend_after(locations);
+                let dress = dress.into_arc();
+                last = Some((from, Arc::clone(&dress)));
+                dress
+            }
+        };
+        layer.dress = Some(dress);
+        layer.refresh_direct();
+    }
+    true
 }
 
 /// Set UI visual `slot` on `layers` of an owned `Node::Sequence` in place when
@@ -6353,25 +6408,89 @@ pub(crate) fn with_ui_visual_slot(pattern: &Pattern, slot: u8) -> Option<Pattern
 /// `whole_cycles` asks more: each step begins on a whole cycle, so a
 /// restart or a reset moves the picked pattern by whole cycles, and its
 /// cycles stay the cycles of the query.
+/// Whether `selector` is a plain selector sequence (no keys, and whole-cycle
+/// steps when `whole_cycles` is true).
+pub(crate) fn is_plain_selector(selector: &Pattern, whole_cycles: bool) -> bool {
+    let whole = |time: Fraction| time.denom() == 1;
+    let Some(layers) = folded(selector) else {
+        return false;
+    };
+    layers.iter().all(|layer| {
+        layer.dress().keys().is_empty()
+            && (!whole_cycles
+                || (whole(layer.period())
+                    && (0..layer.count()).all(|index| whole(layer.listing().whole(index).begin))))
+    })
+}
+
+/// Prepend `locations` onto `selector` in place when `selector` is uniquely
+/// owned, falling back to [`selecting`] otherwise.
+pub(crate) fn selecting_in_place(
+    selector: &mut Pattern,
+    locations: &Locations,
+    whole_cycles: bool,
+) -> bool {
+    if !is_plain_selector(selector, whole_cycles) {
+        return false;
+    }
+    if locations.is_empty() {
+        return true;
+    }
+    let steps = selector.steps();
+    let runtime = selector.runtime_settings().cloned();
+    if let Some(cell) = selector.own_node()
+        && let Node::Sequence(layers) = &mut cell.kind
+        && let Some(slice) = Arc::get_mut(layers)
+    {
+        let mut last: Option<(*const Dress, Arc<Dress>)> = None;
+        for layer in slice.iter_mut() {
+            let from = layer.dress.as_ref().map_or(std::ptr::null(), Arc::as_ptr);
+            if !from.is_null()
+                && let Some(dress) = layer.dress.as_mut().and_then(Arc::get_mut)
+            {
+                dress.prepend_before(locations.clone());
+                layer.refresh_direct();
+                continue;
+            }
+            let dress = match &last {
+                Some((seen, dress)) if *seen == from => Arc::clone(dress),
+                _ => {
+                    let mut dress = layer.dress().clone();
+                    dress.prepend_before(locations.clone());
+                    let dress = dress.into_arc();
+                    last = Some((from, Arc::clone(&dress)));
+                    dress
+                }
+            };
+            layer.dress = Some(dress);
+            layer.refresh_direct();
+        }
+        let node = Arc::clone(&selector.node);
+        *selector = Pattern::holding(node).with_steps(steps);
+        if let Some(runtime) = runtime {
+            selector.attach_runtime_settings(runtime);
+        }
+        return true;
+    }
+    let Some(next) = selecting(selector, locations, whole_cycles) else {
+        return false;
+    };
+    *selector = next;
+    true
+}
+
 pub(crate) fn selecting(
     selector: &Pattern,
     locations: &Locations,
     whole_cycles: bool,
 ) -> Option<Pattern> {
-    let whole = |time: Fraction| time.denom() == 1;
-    let layers = folded(selector)?;
-    let plain = layers.iter().all(|layer| {
-        layer.dress().keys().is_empty()
-            && (!whole_cycles
-                || (whole(layer.period())
-                    && (0..layer.count()).all(|index| whole(layer.listing().whole(index).begin))))
-    });
-    if !plain {
+    if !is_plain_selector(selector, whole_cycles) {
         return None;
     }
     if locations.is_empty() {
         return Some(selector.clone());
     }
+    let layers = folded(selector)?;
     let layers = redressed(layers, |dress| dress.prepend_before(locations.clone()));
     Some(node_of_sound(layers).with_steps_of(selector))
 }
@@ -6492,6 +6611,137 @@ impl RenoteDressCache {
         self.slots[idx] = Some((from, dress));
         self.next = self.next.wrapping_add(1);
     }
+}
+
+/// In-place variant of [`renoted_cached`] when `layers` is uniquely owned:
+/// mutates both `Arc<[Layer]>` and uniquely-owned `Arc<[Value]>` slices in
+/// place with zero heap allocations after validating all values on the stack.
+pub(crate) fn renote_in_place(
+    layers: &mut Arc<[Layer]>,
+    map: &HapMapFn,
+    note: &NoteFn,
+    known_keys: Option<&ContextKeys>,
+    dress_cache: &mut RenoteDressCache,
+) -> bool {
+    if layers.is_empty() {
+        return false;
+    }
+    let Some(slice) = Arc::get_mut(layers) else {
+        return false;
+    };
+    let mut total_values = 0usize;
+    for layer in slice.iter() {
+        let Some(names) = layer.named_names().filter(|_| !layer.dress().has_set()) else {
+            return false;
+        };
+        let [name] = names else {
+            return false;
+        };
+        if !matches!(&**name, "note" | "n") {
+            return false;
+        }
+        total_values += layer.values.len();
+    }
+    if total_values > 64 {
+        return false;
+    }
+    without_query_signals(|| {
+        let mut staged: [Value; 64] = std::array::from_fn(|_| Value::Undefined);
+        let mut cursor = 0usize;
+        for layer in slice.iter() {
+            for val in layer.values.iter() {
+                match val {
+                    Value::F64(_) | Value::Str(_) => {
+                        staged[cursor] = note(val)?;
+                        cursor += 1;
+                    }
+                    _ => return None,
+                }
+            }
+        }
+        // Resolve every layer's new dress before mutating any layer so a `None`
+        // from `map(&read)` leaves `layers` untouched.
+        let note_id = crate::controls::note_control_id();
+        let mut new_dresses: [Option<Option<Arc<Dress>>>; 8] = Default::default();
+        let mut extra_dresses: Vec<Option<Arc<Dress>>> = Vec::new();
+        for (idx, layer) in slice.iter().enumerate() {
+            let from = layer.dress.as_ref().map_or(std::ptr::null(), Arc::as_ptr);
+            let dress = match dress_cache.get(from) {
+                Some(cached) => cached,
+                None => {
+                    let keys = match known_keys {
+                        Some(added) => {
+                            if layer.dress().keys().is_empty() {
+                                added.clone()
+                            } else {
+                                ContextKeys::merge(added, layer.dress().keys())
+                            }
+                        }
+                        None => {
+                            let names = layer.named_names()?;
+                            let first_val = layer.values.first()?;
+                            let first = crate::controls::named_value(names, first_val.clone());
+                            let mut read = cycle_hap(first);
+                            read.keys = layer.dress().keys().clone();
+                            map(&read)?.keys
+                        }
+                    };
+                    let mut next = layer.dress().clone();
+                    if note_id != 0 {
+                        next.clear_custom_named();
+                    } else {
+                        next.set_custom_named(&crate::controls::note_names());
+                    }
+                    next.clear_set();
+                    next.set_keys(keys);
+                    let dress = (!next.is_bare()).then(|| next.into_arc());
+                    dress_cache.put(from, dress.clone());
+                    dress
+                }
+            };
+            if idx < new_dresses.len() {
+                new_dresses[idx] = Some(dress);
+            } else {
+                extra_dresses.push(dress);
+            }
+        }
+        let mut read_at = 0usize;
+        let mut extra_idx = 0usize;
+        for (idx, layer) in slice.iter_mut().enumerate() {
+            let len = layer.values.len();
+            let mut data = true;
+            for v in &staged[read_at..read_at + len] {
+                if !v.is_data(0) {
+                    data = false;
+                    break;
+                }
+            }
+            if let Some(vals) = Arc::get_mut(&mut layer.values) {
+                for (dst, src) in vals.iter_mut().zip(&mut staged[read_at..read_at + len]) {
+                    *dst = std::mem::replace(src, Value::Undefined);
+                }
+            } else {
+                layer.values = staged[read_at..read_at + len]
+                    .iter_mut()
+                    .map(|src| std::mem::replace(src, Value::Undefined))
+                    .collect();
+            }
+            read_at += len;
+            layer.set_data(data);
+            layer.set_maps(true);
+            layer.named_id = note_id;
+            layer.dress = if idx < new_dresses.len() {
+                new_dresses[idx].take().expect("dress computed")
+            } else {
+                let d = extra_dresses[extra_idx].take();
+                extra_idx += 1;
+                d
+            };
+            layer.refresh_direct();
+        }
+        Some(())
+    })
+    .is_some()
 }
 
 pub(crate) fn renoted_cached(
@@ -6839,38 +7089,59 @@ pub(crate) fn set_packed_here(
 /// [take it](takes_set). The layers are written where no other sequence
 /// holds them, and a copy of them otherwise.
 pub(crate) fn set_here(layers: &mut Arc<[Layer]>, control: &Value, context: Locations) {
+    let mut cache = RenoteDressCache::default();
+    set_here_cached(layers, control, context, &mut cache);
+}
+
+/// [`set_here`] sharing newly constructed dresses across multiple sequences
+/// (such as branches of a `Node::Pick`) via `cache`. Only immutable source
+/// dresses (`None` or shared `Arc`) are inserted into `cache`.
+pub(crate) fn set_here_cached(
+    layers: &mut Arc<[Layer]>,
+    control: &Value,
+    context: Locations,
+    cache: &mut RenoteDressCache,
+) {
     if Arc::get_mut(layers).is_none() {
         *layers = layers.iter().map(|layer| layer.with(|_| {})).collect();
     }
     let layers = Arc::get_mut(layers).expect("layers that no other sequence holds");
-    // Single layer with an unshared dress: mutate in place without cloning.
-    if let [layer] = layers
-        && let Some(dress) = layer.dress.as_mut().and_then(Arc::get_mut)
-    {
+    if let [layer] = layers {
+        let from = layer.dress.as_ref().map_or(std::ptr::null(), Arc::as_ptr);
+        if let Some(cached) = cache.get(from) {
+            layer.dress = cached;
+            layer.refresh_direct();
+            return;
+        }
+        if let Some(dress) = layer.dress.as_mut().and_then(Arc::get_mut) {
+            dress.set_here(control, context);
+            layer.refresh_direct();
+            return;
+        }
+        let mut dress = layer.dress().clone();
         dress.set_here(control, context);
+        let dress = dress.into_arc();
+        cache.put(from, Some(Arc::clone(&dress)));
+        layer.dress = Some(dress);
         layer.refresh_direct();
         return;
     }
-    // Layers that wore one dress wear one after.
-    let mut last: Option<(*const Dress, Arc<Dress>)> = None;
     for layer in layers {
+        let from = layer.dress.as_ref().map_or(std::ptr::null(), Arc::as_ptr);
+        if let Some(cached) = cache.get(from) {
+            layer.dress = cached;
+            layer.refresh_direct();
+            continue;
+        }
         if let Some(dress) = layer.dress.as_mut().and_then(Arc::get_mut) {
             dress.set_here(control, context.clone());
             layer.refresh_direct();
             continue;
         }
-        let from = layer.dress.as_ref().map_or(std::ptr::null(), Arc::as_ptr);
-        let dress = match &last {
-            Some((seen, dress)) if *seen == from => Arc::clone(dress),
-            _ => {
-                let mut dress = layer.dress().clone();
-                // The locations of the control, for each layer.
-                dress.set_here(control, context.clone());
-                let dress = dress.into_arc();
-                last = Some((from, Arc::clone(&dress)));
-                dress
-            }
-        };
+        let mut dress = layer.dress().clone();
+        dress.set_here(control, context.clone());
+        let dress = dress.into_arc();
+        cache.put(from, Some(Arc::clone(&dress)));
         layer.dress = Some(dress);
         layer.refresh_direct();
     }

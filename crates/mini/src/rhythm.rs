@@ -983,6 +983,33 @@ impl Pace {
     }
 }
 
+/// Inline storage for speed/slow sites above a layer (0 or 1 site inline with
+/// zero heap allocation, spilling to `Box<[At]>` only for nested speeds).
+enum AfterSites {
+    Empty,
+    One(At),
+    Many(Box<[At]>),
+}
+
+impl AfterSites {
+    fn from_above(above: &[At]) -> Self {
+        match *above {
+            [] => Self::Empty,
+            [one] => Self::One(one),
+            _ => Self::Many(above.iter().rev().copied().collect()),
+        }
+    }
+
+    #[inline]
+    fn as_slice(&self) -> &[At] {
+        match self {
+            Self::Empty => &[],
+            Self::One(one) => std::slice::from_ref(one),
+            Self::Many(many) => many,
+        }
+    }
+}
+
 /// One layer of the rhythm of a plan.
 struct LayerPlan {
     root: Root,
@@ -993,8 +1020,8 @@ struct LayerPlan {
     /// layers under them.
     pace: Pace,
     /// Where the text writes the speeds and the slow counts above the
-    /// layer, the innermost first. An empty list holds no room.
-    after: Box<[At]>,
+    /// layer, the innermost first. Zero or one site stays inline.
+    after: AfterSites,
 }
 
 impl LayerPlan {
@@ -1006,7 +1033,7 @@ impl LayerPlan {
             turns,
             pace: Pace::ONE,
             // One list for the layer, the innermost first.
-            after: above.iter().rev().copied().collect(),
+            after: AfterSites::from_above(above),
         }
     }
 
@@ -1996,7 +2023,7 @@ impl Plans {
             instant,
             cycle: 0,
             pace,
-            after,
+            after: after.as_slice(),
             each,
             last: None,
         };
@@ -3877,7 +3904,7 @@ mod tests {
             .unwrap()
             .unwrap();
         let layers = planned.layers().unwrap();
-        let after = &layers[0].0.after;
+        let after = layers[0].0.after.as_slice();
         assert_eq!(after.len(), 2);
         assert!(after[0].0 < after[1].0);
     }
@@ -3895,12 +3922,12 @@ mod tests {
         let mut room = Room::default();
         let planned = Planned::read("<a b c d e>", 0, &mut room).unwrap().unwrap();
         let layers = planned.layers().unwrap();
-        assert!(layers[0].0.after.is_empty());
+        assert!(layers[0].0.after.as_slice().is_empty());
         let planned = Planned::read("<a b c d e>*2", 0, &mut room)
             .unwrap()
             .unwrap();
         let layers = planned.layers().unwrap();
-        assert_eq!(layers[0].0.after.len(), 1);
+        assert_eq!(layers[0].0.after.as_slice().len(), 1);
     }
 
     /// A word that a text writes again has the value that it made the

@@ -197,14 +197,15 @@ impl NativePatternedCombinator {
     }
 
     fn apply(&self, args: &[Pattern], pat: Pattern) -> Pattern {
-        let pure_args = args
-            .iter()
-            .map(Pattern::as_pure_pattern)
-            .collect::<Option<Vec<_>>>();
-        match (pure_args, pat.as_pure_pattern()) {
-            (Some(args), Some(pat)) => (self.pure)(&args, pat).pattern().clone(),
-            _ => (self.any)(args, pat),
+        if pat.is_pure()
+            && let Some(pure_args) = args
+                .iter()
+                .map(Pattern::as_pure_pattern)
+                .collect::<Option<Vec<_>>>()
+        {
+            return (self.pure)(&pure_args, crate::purity::PurePattern::assert_pure(pat)).0;
         }
+        (self.any)(args, pat)
     }
 }
 
@@ -220,23 +221,29 @@ impl CombinatorFn {
     fn apply(&self, args: &[Value], pat: Pattern, pure_view: bool) -> Pattern {
         match self {
             // Use the pure view when the operand is pure and the arguments
-            // admit it. Binds through the `Pattern` view use the opaque dynamic
-            // constructor and mark their results impure. The `PurePattern` return
-            // type preserves the proof needed for tight-lookahead scheduling.
-            CombinatorFn::Native(n) => match pat.as_pure_pattern() {
-                Some(pure) if pure_view => {
-                    (n.pure)(args, pure).pattern().clone().retaining_callbacks(
-                        args.iter()
+            // admit it. Move `pat` directly so `Arc::get_mut` succeeds for
+            // uniquely-owned combinator receivers, and skip callback retention
+            // allocation when no argument is a `Value::Function`.
+            CombinatorFn::Native(n) => {
+                if pure_view && pat.is_pure() {
+                    let out = (n.pure)(args, crate::purity::PurePattern::assert_pure(pat)).0;
+                    if args.iter().any(|v| matches!(v, Value::Function(_))) {
+                        let callbacks = args
+                            .iter()
                             .filter_map(|value| match value {
                                 Value::Function(function) => Some(function.retained_callbacks()),
                                 _ => None,
                             })
                             .collect::<Vec<_>>()
-                            .concat(),
-                    )
+                            .concat();
+                        out.retaining_callbacks(callbacks)
+                    } else {
+                        out
+                    }
+                } else {
+                    (n.any)(args, pat)
                 }
-                _ => (n.any)(args, pat),
-            },
+            }
             CombinatorFn::NativePatterned(n) => {
                 let args = args.iter().cloned().map(crate::pure).collect::<Vec<_>>();
                 n.apply(&args, pat)
@@ -385,28 +392,63 @@ impl Registration {
     ///
     /// `args` are the leading arguments as *patterns* (already `reify`d).
     pub fn call(&self, args: &[Pattern], pat: Pattern) -> Pattern {
+        let preserved_steps = self.preserve_steps.then(|| pat.steps()).flatten();
         let result = if let CombinatorFn::NativePatterned(body) = &self.func {
-            body.apply(args, pat.clone())
+            body.apply(args, pat)
         } else if self.arity == 1 || args.is_empty() {
-            self.func.apply(&[], pat.clone(), true)
+            self.func.apply(&[], pat, true)
         } else if !self.patternify {
             // Non-patternified: leading args must be pure values. A non-pure
             // one keeps its position as Null. Dropping it would shift every
             // later argument one place left, and the body could not tell "no
             // argument" from "an argument that is not a literal".
-            let vals: Vec<Value> = args
-                .iter()
-                .map(|p| p.as_pure().unwrap_or(Value::Null))
-                .collect();
-            let pure_view = self.admits_pure_view(&vals);
-            self.func.apply(&vals, pat.clone(), pure_view)
-        } else if args.len() > self.arity.saturating_sub(1) && all_pure(args).is_none() {
+            if args.len() <= 4 {
+                let mut vals: [Value; 4] = std::array::from_fn(|_| Value::Null);
+                for (slot, p) in vals[..args.len()].iter_mut().zip(args) {
+                    if let Some(v) = p.as_pure() {
+                        *slot = v;
+                    }
+                }
+                let slice = &vals[..args.len()];
+                let pure_view = self.admits_pure_view(slice);
+                self.func.apply(slice, pat, pure_view)
+            } else {
+                let vals: Vec<Value> = args
+                    .iter()
+                    .map(|p| p.as_pure().unwrap_or(Value::Null))
+                    .collect();
+                let pure_view = self.admits_pure_view(&vals);
+                self.func.apply(&vals, pat, pure_view)
+            }
+        } else if args.len() > self.arity.saturating_sub(1)
+            && !args.iter().all(|a| a.as_pure().is_some())
+        {
             // Over-applied call: with more leading arguments than the arity
             // allows, the curry chain ends up applying a Pattern as if it
             // were a function, and the query fails with this exact error.
             // `echoWith(..., fast(2))` reaches it; absorbing the extra
             // argument instead would produce plausible-but-wrong haps.
             crate::query_error_pattern("hap_func.value is not a function")
+        } else if args.len() <= 4 && args.iter().all(|a| a.as_pure().is_some()) {
+            // ---- stack fast path for 1..=4 pure leading args --------------
+            let mut pures: [Value; 4] = std::array::from_fn(|_| Value::Undefined);
+            let mut locs: [(usize, usize); 4] = [(0, 0); 4];
+            let mut locs_len = 0usize;
+            for (i, a) in args.iter().enumerate() {
+                pures[i] = a.as_pure().expect("checked pure");
+                if let Some(loc) = a.pure_loc() {
+                    locs[locs_len] = loc;
+                    locs_len += 1;
+                }
+            }
+            let pures_slice = &pures[..args.len()];
+            let pure_view = self.admits_pure_view(pures_slice);
+            let out = self.func.apply(pures_slice, pat, pure_view);
+            if locs_len == 0 {
+                out
+            } else {
+                out.with_added_context_owned(&locs[..locs_len])
+            }
         } else if let Some(pures) = all_pure(args) {
             // ---- fast path ---------------------------------------------
             // All leading args pure. Not merely an optimisation: it also
@@ -415,11 +457,11 @@ impl Registration {
             let locs: Vec<(usize, usize)> =
                 args.iter().flat_map(|p| p.pure_loc().into_iter()).collect();
             let pure_view = self.admits_pure_view(&pures);
-            let out = self.func.apply(&pures, pat.clone(), pure_view);
+            let out = self.func.apply(&pures, pat, pure_view);
             if locs.is_empty() {
                 out
             } else {
-                out.with_added_context(locs)
+                out.with_added_context_owned(&locs)
             }
         } else {
             // ---- general path ------------------------------------------
@@ -524,7 +566,7 @@ impl Registration {
         };
 
         if self.preserve_steps {
-            result.with_steps_of(&pat)
+            result.with_steps(preserved_steps)
         } else {
             result
         }
@@ -532,11 +574,10 @@ impl Registration {
 
     /// The unpatternified `_name` form, calling `func` directly.
     pub fn call_unpatternified(&self, args: &[Value], pat: Pattern) -> Pattern {
-        let result = self
-            .func
-            .apply(args, pat.clone(), self.admits_pure_view(args));
+        let preserved_steps = self.preserve_steps.then(|| pat.steps()).flatten();
+        let result = self.func.apply(args, pat, self.admits_pure_view(args));
         if self.preserve_steps {
-            result.with_steps_of(&pat)
+            result.with_steps(preserved_steps)
         } else {
             result
         }

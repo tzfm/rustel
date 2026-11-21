@@ -13299,6 +13299,34 @@ impl Pattern {
 
     /// Borrowed variant of [`Self::with_added_context`] that avoids allocating
     /// a temporary `Vec` when folded into a sequence or materialized as one `Arc`.
+    /// Owned variant of [`Self::with_added_context_slice`]: mutates a uniquely
+    /// owned `Node::Sequence` in place instead of cloning layers and `NodeCell`.
+    pub(crate) fn with_added_context_owned(mut self, locs: &[(usize, usize)]) -> Self {
+        if locs.is_empty() {
+            return self;
+        }
+        if matches!(self.node_kind(), Node::Sequence(_)) && sequence::folds(&self) {
+            let steps = self.steps();
+            let runtime = self.runtime_settings().cloned();
+            let pure_loc = self.pure_loc_raw();
+            if let Some(cell) = self.own_node()
+                && let Node::Sequence(layers) = &mut cell.kind
+                && sequence::locate_in_place(layers, locs)
+            {
+                let node = Arc::clone(&self.node);
+                self = Self::holding(node).with_steps(steps);
+                if let Some(runtime) = runtime {
+                    self.attach_runtime_settings(runtime);
+                }
+                if let Some(loc) = pure_loc {
+                    self.set_pure_loc_raw(Some(loc));
+                }
+                return self;
+            }
+        }
+        self.with_added_context_slice(locs)
+    }
+
     pub fn with_added_context_slice(&self, locs: &[(usize, usize)]) -> Self {
         if let Some(located) = sequence::located(self, locs) {
             return located.with_steps_of(self);
@@ -13864,12 +13892,12 @@ impl Pattern {
             Node::Pick(pick) => {
                 // The locations of the constant come first on each hap,
                 // through the selector.
-                pick.selector = sequence::selecting(
-                    &pick.selector,
+                let ok = sequence::selecting_in_place(
+                    &mut pick.selector,
                     &context,
                     Self::picks_whole_cycles(pick.mode),
-                )
-                .expect("a selector that takes the locations of a control");
+                );
+                debug_assert!(ok, "a selector that takes the locations of a control");
                 // The selector holds the locations of the row.
                 let bare = || {
                     let each = apart.each().iter();
@@ -13877,11 +13905,32 @@ impl Pattern {
                         .collect()
                 };
                 let apart = Apart::new(&bare);
+                let mut dress_cache = sequence::RenoteDressCache::default();
                 for picked in pick
                     .lookup
                     .patterns_mut()
                     .filter(|picked| !picked.is_rest())
                 {
+                    if matches!(picked.node_kind(), Node::Sequence(_)) && sequence::folds(picked) {
+                        let p_steps = picked.steps();
+                        let p_runtime = picked.runtime_settings().cloned();
+                        if let Some(p_cell) = picked.own_node()
+                            && let Node::Sequence(layers) = &mut p_cell.kind
+                        {
+                            sequence::set_here_cached(
+                                layers,
+                                control,
+                                Locations::new(),
+                                &mut dress_cache,
+                            );
+                            let p_node = Arc::clone(&picked.node);
+                            *picked = Self::holding(p_node).with_steps(p_steps);
+                            if let Some(p_runtime) = p_runtime {
+                                picked.attach_runtime_settings(p_runtime);
+                            }
+                            continue;
+                        }
+                    }
                     picked.write_row(control, Locations::new(), &apart);
                 }
             }
@@ -15310,11 +15359,10 @@ impl Pattern {
     /// holds a table of its own, as a scale holds its notes, is made one
     /// time for the name. It gives the rewrite of a hap, and the note that
     /// the rewrite makes of a note or a step that a hap holds alone.
-    fn map_pitch_haps_native_interned<F, G>(
-        &self,
+    fn interned_pitch_rewrite<F, G>(
         key: &str,
         make: impl FnOnce() -> (F, G, Option<Arc<str>>),
-    ) -> Self
+    ) -> Arc<PitchRewrite>
     where
         F: Fn(&Hap) -> Option<Hap> + Send + Sync + 'static,
         G: Fn(&Value) -> Option<Value> + Send + Sync + 'static,
@@ -15322,14 +15370,13 @@ impl Pattern {
         static POOL: std::sync::OnceLock<
             std::sync::Mutex<std::collections::HashMap<String, Arc<PitchRewrite>>>,
         > = std::sync::OnceLock::new();
-        let steps = self.steps();
         let pool = POOL.get_or_init(Default::default);
         // The name is copied only for a body that the pool takes.
         let held = pool
             .lock()
             .ok()
             .and_then(|entries| entries.get(key).map(Arc::clone));
-        let interned = held.unwrap_or_else(|| {
+        held.unwrap_or_else(|| {
             interned_closure(pool, key.to_owned(), || {
                 let (of_hap, of_note, scale_tag) = make();
                 let hap: HapMapFn = Arc::new(move |hap: &Hap| {
@@ -15347,8 +15394,40 @@ impl Pattern {
                     keys,
                 })
             })
-        });
+        })
+    }
+
+    fn map_pitch_haps_native_interned<F, G>(
+        &self,
+        key: &str,
+        make: impl FnOnce() -> (F, G, Option<Arc<str>>),
+    ) -> Self
+    where
+        F: Fn(&Hap) -> Option<Hap> + Send + Sync + 'static,
+        G: Fn(&Value) -> Option<Value> + Send + Sync + 'static,
+    {
+        let steps = self.steps();
+        let interned = Self::interned_pitch_rewrite(key, make);
         self.pitched(&interned).with_steps(steps)
+    }
+
+    /// Owned variant of [`Self::map_pitch_haps_native_interned`]: mutates
+    /// uniquely-owned `Sequence` and `Pick` nodes in place instead of cloning
+    /// layers, value slices, and lookup tables.
+    pub(crate) fn map_pitch_haps_native_interned_owned<F, G>(
+        self,
+        key: &str,
+        make: impl FnOnce() -> (F, G, Option<Arc<str>>),
+    ) -> Self
+    where
+        F: Fn(&Hap) -> Option<Hap> + Send + Sync + 'static,
+        G: Fn(&Value) -> Option<Value> + Send + Sync + 'static,
+    {
+        let steps = self.steps();
+        let interned = Self::interned_pitch_rewrite(key, make);
+        let mut dress_cache = sequence::RenoteDressCache::default();
+        self.pitched_owned(&interned, &mut dress_cache)
+            .with_steps(steps)
     }
 
     /// [`Self::mapped_haps`] of a rewrite of pitch, which reads no span.
@@ -15357,6 +15436,56 @@ impl Pattern {
     fn pitched(&self, rewrite: &PitchRewrite) -> Self {
         let mut dress_cache = sequence::RenoteDressCache::default();
         self.pitched_cached(rewrite, &mut dress_cache)
+    }
+
+    fn pitched_owned(
+        mut self,
+        rewrite: &PitchRewrite,
+        dress_cache: &mut sequence::RenoteDressCache,
+    ) -> Self {
+        if matches!(self.node_kind(), Node::Sequence(_)) && sequence::folds(&self) {
+            let steps = self.steps();
+            let runtime = self.runtime_settings().cloned();
+            if let Some(cell) = self.own_node()
+                && let Node::Sequence(layers) = &mut cell.kind
+                && sequence::renote_in_place(
+                    layers,
+                    &rewrite.hap,
+                    &rewrite.note,
+                    rewrite.keys.as_ref(),
+                    dress_cache,
+                )
+            {
+                let node = Arc::clone(&self.node);
+                self = Self::holding(node).with_steps(steps);
+                if let Some(runtime) = runtime {
+                    self.attach_runtime_settings(runtime);
+                }
+                return self;
+            }
+        } else if let Node::Pick(picked) = self.node_kind()
+            && picked.mode != JoinMode::Squeeze
+            && sequence::folds(&self)
+            && sequence::is_plain_selector(&picked.selector, false)
+        {
+            let steps = self.steps();
+            let runtime = self.runtime_settings().cloned();
+            if let Some(cell) = self.own_node()
+                && let Node::Pick(picked) = &mut cell.kind
+            {
+                for slot in picked.lookup.patterns_mut() {
+                    let owned = std::mem::replace(slot, silence());
+                    *slot = owned.pitched_owned(rewrite, dress_cache);
+                }
+                let node = Arc::clone(&self.node);
+                self = Self::holding(node).with_steps(steps);
+                if let Some(runtime) = runtime {
+                    self.attach_runtime_settings(runtime);
+                }
+                return self;
+            }
+        }
+        self.pitched_cached(rewrite, dress_cache)
     }
 
     fn pitched_cached(

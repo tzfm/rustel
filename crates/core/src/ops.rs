@@ -146,6 +146,19 @@ pub trait PatOps: Clone + Sized + Send + Sync + 'static {
         let _ = key;
         self.map_pitch_haps_native(make().0)
     }
+    /// Owned variant of [`Self::map_pitch_haps_native_interned`] that can
+    /// mutate uniquely-owned pattern nodes in place.
+    fn map_pitch_haps_native_interned_owned<F, G>(
+        self,
+        key: &str,
+        make: impl FnOnce() -> (F, G, Option<std::sync::Arc<str>>),
+    ) -> Self
+    where
+        F: Fn(&Hap) -> Option<Hap> + Send + Sync + 'static,
+        G: Fn(&crate::Value) -> Option<crate::Value> + Send + Sync + 'static,
+    {
+        self.map_pitch_haps_native_interned(key, make)
+    }
     fn fit(&self) -> Self;
     /// One hap → N haps sharing its span (`voicing()`'s shape).
     fn expand_haps_native(&self, f: impl Fn(&Hap) -> Vec<Hap> + Send + Sync + 'static) -> Self;
@@ -496,6 +509,17 @@ impl PatOps for Pattern {
         G: Fn(&crate::Value) -> Option<crate::Value> + Send + Sync + 'static,
     {
         Pattern::map_pitch_haps_native_interned(self, key, make)
+    }
+    fn map_pitch_haps_native_interned_owned<F, G>(
+        self,
+        key: &str,
+        make: impl FnOnce() -> (F, G, Option<std::sync::Arc<str>>),
+    ) -> Self
+    where
+        F: Fn(&Hap) -> Option<Hap> + Send + Sync + 'static,
+        G: Fn(&crate::Value) -> Option<crate::Value> + Send + Sync + 'static,
+    {
+        Pattern::map_pitch_haps_native_interned_owned(self, key, make)
     }
     fn expand_pitch_haps_native(
         &self,
@@ -863,6 +887,17 @@ impl PatOps for PurePattern {
         G: Fn(&crate::Value) -> Option<crate::Value> + Send + Sync + 'static,
     {
         PurePattern::assert_pure(self.pattern().map_pitch_haps_native_interned(key, make))
+    }
+    fn map_pitch_haps_native_interned_owned<F, G>(
+        self,
+        key: &str,
+        make: impl FnOnce() -> (F, G, Option<std::sync::Arc<str>>),
+    ) -> Self
+    where
+        F: Fn(&Hap) -> Option<Hap> + Send + Sync + 'static,
+        G: Fn(&crate::Value) -> Option<crate::Value> + Send + Sync + 'static,
+    {
+        PurePattern::assert_pure(self.0.map_pitch_haps_native_interned_owned(key, make))
     }
     fn expand_pitch_haps_native(
         &self,

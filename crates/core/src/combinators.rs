@@ -2390,6 +2390,66 @@ pub fn scale<P: PatOps>(pat: &P, scale_arg: Value) -> P {
     })
 }
 
+/// Owned variant of [`scale`] that mutates uniquely-owned `Sequence` and `Pick`
+/// subtrees in place rather than cloning layers and value arrays.
+pub fn scale_owned<P: PatOps>(pat: P, scale_arg: Value) -> P {
+    let scale_arg = if matches!(scale_arg, Value::JsValue(_)) {
+        crate::materialize_js_value(&scale_arg)
+    } else {
+        scale_arg
+    };
+    let mut owned_name = String::new();
+    let scale_name: Result<&str, ()> = match &scale_arg {
+        Value::Str(s) => Ok(s.as_str()),
+        Value::List(items) => {
+            fn append_flat(items: &[Value], out: &mut String) {
+                for item in items {
+                    match item {
+                        Value::List(inner) => append_flat(inner, out),
+                        Value::Str(s) => {
+                            if !out.is_empty() {
+                                out.push(' ');
+                            }
+                            out.push_str(s.as_str());
+                        }
+                        other => {
+                            if !out.is_empty() {
+                                out.push(' ');
+                            }
+                            out.push_str(&other.show());
+                        }
+                    }
+                }
+            }
+            owned_name.reserve(24);
+            append_flat(items, &mut owned_name);
+            Ok(owned_name.as_str())
+        }
+        _ => Err(()),
+    };
+    let scale_name = match scale_name {
+        Ok(name) => name,
+        Err(()) => {
+            let shown = scale_arg.show();
+            return pat.map_pitch_haps_native(move |_| {
+                let shown = shown.clone();
+                crate::signal_query_error(move || {
+                    format!("scaleName.replaceAll is not a function (scale: {shown})")
+                });
+                None
+            });
+        }
+    };
+    pat.map_pitch_haps_native_interned_owned(scale_name, || {
+        let steps = std::sync::Arc::new(ScaleSteps::new(scale_name.to_owned()));
+        let tag = std::sync::Arc::clone(&steps.tag);
+        let kept = std::sync::Arc::clone(&steps);
+        let of_hap = move |hap: &crate::Hap| scale_hap(hap, &kept);
+        let of_note = move |note: &Value| scale_note(&steps, note, None);
+        (of_hap, of_note, Some(tag))
+    })
+}
+
 /// The key of the note that `scale` and `voicing` set, which each map of
 /// their haps shares.
 pub(crate) static NOTE: std::sync::LazyLock<crate::Key> =
