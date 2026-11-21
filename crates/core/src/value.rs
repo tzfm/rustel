@@ -22,9 +22,9 @@ pub struct OrderedMap {
 }
 
 /// Maximum inline patch slots carried by a [`Patched`] overlay before
-/// materialising a flat slice.
+/// spilling into its optional tail.
 const MAX_PATCHES: usize = 8;
-const INLINE_PATCHES: usize = 4;
+const INLINE_PATCHES: usize = 3;
 const TAIL_PATCHES: usize = MAX_PATCHES - INLINE_PATCHES;
 
 /// Compact `u16`-keyed storage for maps whose keys are all canonical
@@ -700,7 +700,7 @@ pub(crate) struct Patched {
     tail: Option<Box<PatchedTail>>,
 }
 
-const _: () = assert!(std::mem::size_of::<Patched>() <= 256);
+const _: () = assert!(std::mem::size_of::<Patched>() <= 216);
 
 /// Shared header for compact multi-slot numeric overlays (`StepPatchData<N>`).
 #[derive(Clone)]

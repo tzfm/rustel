@@ -4893,6 +4893,99 @@ impl Layer {
         if met == 0 {
             return Some(Ok(()));
         }
+        // Single-step fast path (dominant case for short playback windows):
+        // emit directly without `emit_range` closure, tick cache, or TLS lookup.
+        if met == 1 {
+            if !thread.charge(out.len() - others + 1) {
+                return Some(Err(SequenceStop::Query));
+            }
+            let (step_begin, step_end, step_value) = match grid_steps {
+                GridStepsRef::Small(steps) => {
+                    let s = steps[first];
+                    (
+                        u32::from(s.part_begin),
+                        u32::from(s.part_end),
+                        u32::from(s.value),
+                    )
+                }
+                GridStepsRef::Wide(steps) => {
+                    let s = steps[first];
+                    (s.part_begin, s.part_end, s.value)
+                }
+            };
+            let offset = turn
+                .whole_cycles
+                .and_then(|cycles| i64::try_from(cycles).ok())
+                .and_then(|cycles| cycles.checked_mul(i64::from(grid.ticks.get())));
+            let ticks_pow2 = grid
+                .ticks
+                .is_power_of_two()
+                .then(|| grid.ticks.trailing_zeros());
+            let tick_time = |tick: u32| -> Result<Fraction, SequenceStop> {
+                match offset.and_then(|offset| offset.checked_add(i64::from(tick))) {
+                    Some(ticks) => {
+                        if let Some(shift) = ticks_pow2
+                            && let Some(dyadic) = Fraction::dyadic_i64(ticks, shift)
+                        {
+                            Ok(dyadic)
+                        } else {
+                            Ok(grid.made_small_with(ticks, None))
+                        }
+                    }
+                    None => turn.moved(grid.made_small_with(i64::from(tick), None)),
+                }
+            };
+            let vis_begin = if begin_exact && i64::from(step_begin) == begin_low {
+                span.begin
+            } else {
+                match tick_time(step_begin) {
+                    Ok(t) => t,
+                    Err(e) => return Some(Err(e)),
+                }
+            };
+            let vis_end = if end_exact && i64::from(step_end) == end_high {
+                span.end
+            } else {
+                match tick_time(step_end) {
+                    Ok(t) => t,
+                    Err(e) => return Some(Err(e)),
+                }
+            };
+            let visible = TimeSpan::new(vis_begin, vis_end);
+            let whole = if let Some(rare) = grid.rare {
+                match rare.cuts().starting_at(first).split_first_at(first) {
+                    Some(cut) => {
+                        let wb = match tick_time(cut.begin) {
+                            Ok(t) => t,
+                            Err(e) => return Some(Err(e)),
+                        };
+                        let we = match tick_time(cut.end) {
+                            Ok(t) => t,
+                            Err(e) => return Some(Err(e)),
+                        };
+                        TimeSpan::new(wb, we)
+                    }
+                    None => visible,
+                }
+            } else {
+                visible
+            };
+            let part_begin = if i64::from(step_begin) <= begin_low {
+                span.begin
+            } else {
+                visible.begin
+            };
+            let part_end = if i64::from(step_end) >= end_high {
+                span.end
+            } else {
+                visible.end
+            };
+            let part = TimeSpan::new(part_begin, part_end);
+            let maker = self.maker(owner);
+            out.push(maker.make_grid(grid, first, step_value, whole, part));
+            thread.note_accumulated(out.len() - others);
+            return Some(Ok(()));
+        }
         // The list held `others` haps before the sequence wrote.
         if !thread.charge(out.len() - others + met) {
             return Some(Err(SequenceStop::Query));

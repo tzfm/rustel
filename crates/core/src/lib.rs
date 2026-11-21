@@ -415,6 +415,43 @@ fn cmp_order_keys(ak: OrderKey, bk: OrderKey, a: &Hap, b: &Hap) -> std::cmp::Ord
 }
 
 #[inline(never)]
+fn sort_few_haps_direct<const CAP: usize>(haps: &mut [Hap], first_bad: usize) {
+    let n = haps.len();
+    let mut indices = [0u8; CAP];
+    for (slot, dst) in indices[..n].iter_mut().enumerate() {
+        *dst = slot as u8;
+    }
+    for i in first_bad..n {
+        let key = indices[i];
+        let key_hap = &haps[key as usize];
+        let mut j = i;
+        while j > 0 {
+            let prev_idx = indices[j - 1] as usize;
+            if query_order(&haps[prev_idx], key_hap) != std::cmp::Ordering::Greater {
+                break;
+            }
+            indices[j] = indices[j - 1];
+            j -= 1;
+        }
+        indices[j] = key;
+    }
+    for i in 0..n {
+        let mut dst = i;
+        let mut src = indices[dst] as usize;
+        if src == dst {
+            continue;
+        }
+        while src != i {
+            haps.swap(dst, src);
+            indices[dst] = dst as u8;
+            dst = src;
+            src = indices[dst] as usize;
+        }
+        indices[dst] = dst as u8;
+    }
+}
+
+#[inline(never)]
 fn sort_few_haps<const CAP: usize>(haps: &mut [Hap], first_bad: usize) {
     let n = haps.len();
     let mut keys = [OrderKey::ZERO; CAP];
@@ -480,7 +517,7 @@ fn stable_sorted(mut haps: Vec<Hap>) -> Vec<Hap> {
             return haps;
         };
         if n <= 16 {
-            sort_few_haps::<16>(&mut haps, first_bad);
+            sort_few_haps_direct::<16>(&mut haps, first_bad);
         } else {
             sort_few_haps::<FEW_HAPS>(&mut haps, first_bad);
         }
