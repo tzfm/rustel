@@ -3183,15 +3183,15 @@ fn resolve_voice_at(
     Ok(event)
 }
 
-/// Give each bus name in `object` its slot: the `bus` control, the `n` of a
-/// `bus` source, and the bus of each `bmod` entry. A bus number keeps its own
-/// slot. Returns `None` when `object` holds no name.
 /// An instrument plugin gets the end of a note this much early, as the MIDI
 /// output does. The end then comes before the start of the next note, also
 /// after rounding. A note-off and a note-on on the same frame make some
 /// plugins click. A short note keeps half its length.
 const INSTRUMENT_NOTE_GAP_SECS: f64 = 0.001;
 
+/// Give each bus name in `object` its slot: the `bus` control, the `n` of a
+/// `bus` source, and the bus of each `bmod` entry. A bus number keeps its own
+/// slot. Returns `None` when `object` holds no name.
 fn with_bus_slots(
     object: &serde_json::Map<String, serde_json::Value>,
     samples: &dyn SampleLookup,
