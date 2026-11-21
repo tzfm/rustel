@@ -314,6 +314,50 @@ impl App {
         Ok(())
     }
 
+    /// Where the options object with `pair` goes in the plugin call that
+    /// opens at `open`, and the text that closes the call, when the call is
+    /// still open and holds only its name: `.vsti("Diva"` or `.vsti("Diva",`
+    /// with nothing after it on the line. A call closed, with more typed, or
+    /// with a name still open, gets none.
+    fn options_closing_open_call(&self, open: usize, pair: &str) -> Option<(usize, String)> {
+        let source = self.editor().source();
+        let code = rustel_runtime::lint::code_only(&source);
+        if members(&code, open, false).is_some() {
+            return None;
+        }
+        let rest = &source[open + 1..];
+        let quote = open + 1 + (rest.len() - rest.trim_start().len());
+        let &opening = source
+            .as_bytes()
+            .get(quote)
+            .filter(|&byte| matches!(byte, b'"' | b'\'' | b'`'))?;
+        let end = quote
+            + 1
+            + rustel_runtime::sounds::string_end(&source[quote + 1..], char::from(opening));
+        // A plain string ends on its own line: a quote on a line below
+        // closes another string.
+        let closed = source.as_bytes().get(end) == Some(&opening)
+            && (opening == b'`' || !source[quote..end].contains('\n'));
+        if !closed {
+            return None;
+        }
+        let line = source[end + 1..].split('\n').next().unwrap_or_default();
+        let (comma, after) = match line.trim_start().strip_prefix(',') {
+            Some(after) => (true, after),
+            None => (false, line),
+        };
+        if !after.trim().is_empty() {
+            return None;
+        }
+        Some(if comma {
+            let comma = end + 1 + line.find(',')?;
+            let gap = if after.is_empty() { " " } else { "" };
+            (comma + 1 + after.len(), format!("{gap}{{{pair}}})"))
+        } else {
+            (end + 1, format!(", {{{pair}}})"))
+        })
+    }
+
     /// The plugin and the range of the key at the caret, when the caret is
     /// where a key goes in the object of a plugin call: after `{` or `,`,
     /// with the start of a key or nothing typed.
@@ -852,6 +896,15 @@ impl App {
             && matches!(row, Some(PluginRow::Param(_) | PluginRow::Preset(_)))
             && let Some((_, open)) = &call
         {
+            // A call still being typed, with only the name in it: the pick
+            // goes in after the name as its options object and closes the
+            // call, as a picked name closes a call left open.
+            if let Some((at, ending)) = self.options_closing_open_call(*open, &text) {
+                let _ = self
+                    .editor_mut()
+                    .set_selection(crate::editor::Selection::caret(ByteOffset(at)));
+                return Some(ending);
+            }
             let Some((range, kept)) = parameter_edit(&self.editor().source(), *open, &text, None)
             else {
                 self.status =
@@ -1493,6 +1546,45 @@ mod tests {
                 .as_deref(),
             Some(".vsti(\"Serum 2\")")
         );
+    }
+
+    /// Enter on a preset with the caret in a call of the plugin that holds
+    /// only its name so far writes the options object and closes the call.
+    #[test]
+    fn a_preset_picked_in_a_call_left_open_closes_it() {
+        // The score after the pick goes in where the caret was put.
+        let pick = |marked: &str| {
+            let caret = marked.find('|').expect("the caret");
+            let mut app = vst_app(&format!("{}\n", marked.replace('|', "")), caret);
+            let panel = app.reference_panel.as_mut().expect("the vst tab");
+            panel.vst.show_section(VstSection::Presets);
+            panel.vst.selected = 1;
+            let text = app.plugin_text_at_caret("preset: \"Lead\"".into())?;
+            let mut source = app.editor().source().to_owned();
+            source.insert_str(app.editor().primary_selection().head.0, &text);
+            // The first line: the fixture's own lines follow.
+            source.lines().next().map(str::to_owned)
+        };
+        let lead = "$: n(\"c\").vsti(\"Serum 2\", {preset: \"Lead\"})";
+        for marked in [
+            "$: n(\"c\").vsti(\"Serum 2\"|",
+            "$: n(\"c\").vsti(\"Serum 2\",|",
+            "$: n(\"c\").vsti(\"Serum 2\"|,",
+            "$: n(\"c\").vsti(\"Serum 2\", |",
+            "$: n(\"c\").vsti(\"Ser|um 2\"",
+            "$: n(\"c\").vs|ti(\"Serum 2\"",
+        ] {
+            assert_eq!(pick(marked).as_deref(), Some(lead), "{marked}");
+        }
+        // A call that holds more than its name, or a name still open, is
+        // not guessed at.
+        for marked in [
+            "$: n(\"c\").vsti(\"Serum 2\", {gain: 1|",
+            "$: n(\"c\").vsti(\"Serum 2\"|, {gain: 1",
+            "$: n(\"c\").vsti(\"Serum 2\n$: s(\"|",
+        ] {
+            assert_eq!(pick(marked), None, "{marked}");
+        }
     }
 
     /// A plugin call picked with the caret in another call's arguments
