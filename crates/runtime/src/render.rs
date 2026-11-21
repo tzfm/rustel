@@ -289,9 +289,10 @@ pub(crate) fn bind_live_controls(event: &mut rustel_audio::OnsetEvent, onset: &O
     }
 }
 
-/// Converts the onsets of a finite play. `onsets` are in the order of their
-/// frames. Their notes take plugin chains of their own, as the notes of a
-/// render do: see [`crate::vst::render_chains`].
+/// Converts the onsets of a finite play that play locally: see
+/// [`plays_locally`]. `onsets` are in the order of their frames. Their notes
+/// take plugin chains of their own, as the notes of a render do: see
+/// [`crate::vst::render_chains`].
 // Only the device-audio play path builds full event batches today.
 #[cfg_attr(not(feature = "device-audio"), allow(dead_code))]
 pub(crate) fn scalar_events(
@@ -300,10 +301,11 @@ pub(crate) fn scalar_events(
     cps: f64,
     samples: &dyn rustel_voice::SampleLookup,
 ) -> Result<Vec<rustel_audio::OnsetEvent>, String> {
+    let local: Vec<_> = onsets.iter().filter(|onset| plays_locally(onset)).collect();
     #[cfg(feature = "vst")]
-    let mut chains = crate::vst::render_chains(&onsets.iter().collect::<Vec<_>>()).into_iter();
-    onsets
-        .iter()
+    let mut chains = crate::vst::render_chains(&local).into_iter();
+    local
+        .into_iter()
         .map(|onset| {
             let event = scalar_event(onset, sample_rate, cps, samples)?;
             #[cfg(feature = "vst")]
@@ -316,10 +318,17 @@ pub(crate) fn scalar_events(
         .collect()
 }
 
-/// The onsets of a render in the order of the music: the order of their
-/// frames.
+/// Whether an onset plays on local audio. `.midi()` sends a hap to MIDI in
+/// place of local audio, as on strudel.cc: a hap with a `midiport` makes no
+/// sound here, also when it has no MIDI message to send.
+pub(crate) fn plays_locally(onset: &OnsetEventJson) -> bool {
+    crate::midi_onset::midi_route(onset).is_none()
+}
+
+/// The onsets a render plays, in the order of the music: the order of their
+/// frames. An onset that goes to MIDI is not one of them.
 fn musical_order(onsets: &[OnsetEventJson], sample_rate: u32) -> Vec<&OnsetEventJson> {
-    let mut ordered: Vec<_> = onsets.iter().collect();
+    let mut ordered: Vec<_> = onsets.iter().filter(|onset| plays_locally(onset)).collect();
     ordered.sort_by_key(|onset| onset_frame_at(onset.target_time, sample_rate));
     ordered
 }
@@ -955,7 +964,7 @@ pub(crate) fn render_scalar_pcm_with_refusals(
         // The last pass counts the notices, so these rounds drop theirs.
         let mut dropped = notice_tally();
         for _ in 0..3 {
-            for onset in onsets {
+            for onset in onsets.iter().filter(|onset| plays_locally(onset)) {
                 stop.check()?;
                 let _ = tallied_scalar_event(onset, sample_rate, cps, lookup, 0, dropped.as_mut());
             }
@@ -1433,7 +1442,7 @@ pub(crate) fn write_scalar_wav_controlled_with_dispatch(
         let mut dropped = notice_tally();
         let mut spoke_at = std::time::Instant::now();
         for round in 0..3 {
-            for onset in onsets {
+            for onset in onsets.iter().filter(|onset| plays_locally(onset)) {
                 stop.check()?;
                 let _ = tallied_scalar_event(onset, sample_rate, cps, lookup, 0, dropped.as_mut());
                 if report && spoke_at.elapsed() >= std::time::Duration::from_secs(2) {
@@ -2286,6 +2295,39 @@ mod tests {
             &RenderStop::default(),
         )
         .expect("an ordinary in-memory render still renders");
+    }
+
+    /// `.midi()` takes the place of local audio, as on strudel.cc: a hap with
+    /// only `ccn` and `ccv` sent to MIDI renders silence, not the default
+    /// synth, and a routed note is silent too.
+    #[test]
+    fn a_hap_sent_to_midi_plays_no_local_audio() {
+        let render = |value: serde_json::Value| {
+            let (pcm, refused, _) = render_scalar_pcm_with_refusals(
+                48_000,
+                0.5,
+                &[onset(value)],
+                1.0,
+                None,
+                DspDispatch::automatic(),
+                rustel_audio::MAX_POLYPHONY,
+                None,
+                &RenderStop::default(),
+            )
+            .expect("render");
+            assert!(refused.is_empty(), "{refused:?}");
+            pcm.iter()
+                .fold(0.0_f32, |peak, sample| peak.max(sample.abs()))
+        };
+        assert!(render(serde_json::json!({ "ccn": 74, "ccv": 1 })) > 0.0);
+        assert_eq!(
+            render(serde_json::json!({ "ccn": 74, "ccv": 1, "midiport": 0 })),
+            0.0
+        );
+        assert_eq!(
+            render(serde_json::json!({ "note": 60, "midiport": "IAC" })),
+            0.0
+        );
     }
 
     // The direct note-grammar probe now exercises the shared resolver.
