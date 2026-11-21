@@ -852,6 +852,7 @@ pub(crate) enum Combine {
     With(Box<CombineFn>),
 }
 
+#[cfg(target_pointer_width = "64")]
 const _: () = assert!(std::mem::size_of::<Combine>() == 16);
 
 /// A function that makes one value of a function value and an argument

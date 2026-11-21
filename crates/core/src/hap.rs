@@ -542,6 +542,7 @@ pub struct Hap {
     pub(crate) keys: ContextKeys,
 }
 
+#[cfg(target_pointer_width = "64")]
 const _: () = assert!(std::mem::size_of::<Hap>() == 192);
 
 /// Read a `tags` key off a JS context object: an array of strings, anything

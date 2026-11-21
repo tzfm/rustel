@@ -259,6 +259,7 @@ const NODE_FLAGS_SHIFT: u32 = 24;
 #[derive(Clone)]
 pub struct PatternNodeRef(pub(crate) Arc<NodeCell>);
 
+#[cfg(target_pointer_width = "64")]
 const _: () = assert!(std::mem::size_of::<PatternNodeRef>() == 8);
 
 impl PatternNodeRef {
@@ -437,6 +438,7 @@ pub struct Pattern {
     extras: Option<Arc<PatternExtras>>,
 }
 
+#[cfg(target_pointer_width = "64")]
 const _: () = assert!(std::mem::size_of::<Pattern>() == 24);
 // A score builds thousands of nodes, so a node's size is most of a graph's
 // memory. A variant that grows every node fails here: box its rare part.

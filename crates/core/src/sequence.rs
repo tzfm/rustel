@@ -664,6 +664,7 @@ enum Listing {
     Grid(Arc<Grid>),
 }
 
+#[cfg(target_pointer_width = "64")]
 const _: () = assert!(std::mem::size_of::<Listing>() == 16);
 
 /// A step as a maker gives it, before the layer keeps it in a list.
@@ -1464,6 +1465,7 @@ pub(crate) struct Grid {
 }
 
 const _: () = assert!(std::mem::size_of::<SmallGridStep>() == 8);
+#[cfg(target_pointer_width = "64")]
 const _: () = assert!(std::mem::size_of::<Grid>() == 32);
 
 #[derive(Clone)]
@@ -1484,6 +1486,7 @@ enum SpareRare {
     Full(Box<SpareRareFull>),
 }
 
+#[cfg(target_pointer_width = "64")]
 const _: () = assert!(std::mem::size_of::<SpareRare>() == 24);
 
 /// Stack-backed growable buffer for small `Copy` items during grid construction,
@@ -1643,6 +1646,7 @@ struct Spare {
     rare: Option<Box<SpareRare>>,
 }
 
+#[cfg(target_pointer_width = "64")]
 const _: () = assert!(std::mem::size_of::<Spare>() == 24);
 
 impl Grid {
@@ -2632,7 +2636,9 @@ impl Values<'_> {
     }
 }
 // A layer is cloned by each fold: its steps stay behind a handle.
+#[cfg(target_pointer_width = "64")]
 const _: () = assert!(size_of::<Steps>() == 16);
+#[cfg(target_pointer_width = "64")]
 const _: () = assert!(size_of::<Layer>() == 48);
 
 /// Pack a single `(begin, end)` range into a non-zero `u32` for [`Dress`]:
@@ -2692,6 +2698,7 @@ pub(crate) struct Dress {
     tail: Option<Box<DressTail>>,
 }
 
+#[cfg(target_pointer_width = "64")]
 const _: () = assert!(size_of::<Dress>() == 48);
 
 static EMPTY_LOCATIONS: Locations = Locations::new();

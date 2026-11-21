@@ -92,6 +92,7 @@ struct Part {
     meta_kind: u8,
 }
 
+#[cfg(target_pointer_width = "64")]
 const _: () = assert!(std::mem::size_of::<Part>() == 24);
 
 struct MadePart {

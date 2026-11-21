@@ -1674,6 +1674,7 @@ enum Entries {
     StepPatch16(Arc<StepPatchData<16>>, u32),
 }
 
+#[cfg(target_pointer_width = "64")]
 const _: () = assert!(std::mem::size_of::<OrderedMap>() == 24);
 
 /// What the steps of one layer share when each reads as a map: its own
@@ -1689,6 +1690,7 @@ pub(crate) struct Table {
     marks_and_made: u64,
 }
 
+#[cfg(target_pointer_width = "64")]
 const _: () = assert!(std::mem::size_of::<Table>() == 56);
 
 /// The entries of one map, shared.
@@ -5598,6 +5600,7 @@ enum SharedStrRepr {
     Heap(Arc<Box<str>>),
 }
 
+#[cfg(target_pointer_width = "64")]
 const _: () = assert!(std::mem::size_of::<SharedStr>() == 16);
 
 impl SharedStr {
@@ -5855,7 +5858,9 @@ pub enum Value {
     Haps(HapList),
 }
 
+#[cfg(target_pointer_width = "64")]
 const _: () = assert!(std::mem::size_of::<Value>() == 24);
+#[cfg(target_pointer_width = "64")]
 const _: () = assert!(std::mem::size_of::<Option<Value>>() == 24);
 
 impl Value {

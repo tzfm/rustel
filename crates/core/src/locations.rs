@@ -31,6 +31,7 @@ const PACKED_LEN_MASK: u32 = (1 << PACKED_LEN_BITS) - 1;
 const PACKED_BEGIN_LIMIT: u32 = 1 << (32 - PACKED_LEN_BITS);
 
 // The ranges in place take the room of the list on the heap and its tag.
+#[cfg(target_pointer_width = "64")]
 const _: () = assert!(std::mem::size_of::<Locations>() == 32);
 
 /// The source locations of a hap. See the module documentation.
