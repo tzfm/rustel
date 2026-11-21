@@ -124,8 +124,8 @@ fn background_jobs_opens_and_closes() {
 }
 
 /// The docked log made a sheet again with Shift+F9 is a sheet: Esc closes
-/// it, gives the keys back to the score, and the footer no longer says that
-/// Esc closes it.
+/// it and gives the keys back to the score, and the footer says the log is
+/// closed, as it does when F9 closes it.
 #[test]
 fn esc_closes_the_log_made_a_sheet_again() {
     let mut studio = hermetic();
@@ -141,9 +141,15 @@ fn esc_closes_the_log_made_a_sheet_again() {
         "the sheet is gone:\n{}",
         studio.rows().join("\n")
     );
+    assert_eq!(studio.status(), "log closed");
+    // F9 closes it too, and says so.
+    studio.press(KeyCode::F(9), KeyModifiers::NONE);
+    assert_eq!(studio.focus(), Some(PanelKind::Log));
+    studio.press(KeyCode::F(9), KeyModifiers::NONE);
     assert!(
-        studio.status().starts_with("back to the score - "),
+        log_title_row(&studio.rows()).is_none(),
         "{}",
-        studio.status()
+        studio.rows().join("\n")
     );
+    assert_eq!(studio.status(), "log closed");
 }
