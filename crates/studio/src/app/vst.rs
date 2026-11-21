@@ -114,6 +114,31 @@ fn plugin_words(words: &PluginWords) -> (Vec<String>, Vec<String>) {
     }
 }
 
+/// The rest of a plugin call whose arguments so far, `typed`, are only its
+/// name and maybe a comma: the options object with `pair` in it, and the
+/// `)` that closes the call. None when the call holds more than that.
+fn closing_options(typed: &str, pair: &str) -> Option<String> {
+    let name = typed.trim_start();
+    let (name, comma) = match name.trim_end().strip_suffix(',') {
+        Some(name) => (name.trim_end(), true),
+        None => (name.trim_end(), false),
+    };
+    let quote = name
+        .chars()
+        .next()
+        .filter(|quote| matches!(quote, '"' | '\''))?;
+    let closed = name.len() >= 2 && name.ends_with(quote);
+    if !closed || name[1..name.len() - 1].contains(quote) {
+        return None;
+    }
+    let gap = match (comma, typed.ends_with(char::is_whitespace)) {
+        (false, _) => ", ",
+        (true, false) => " ",
+        (true, true) => "",
+    };
+    Some(format!("{gap}{{{pair}}})"))
+}
+
 /// True when `named`, the plugin name of a call, names the plugin that the
 /// list shows as `plugin`. The host also finds a plugin by a part of its
 /// name or by its bundle name, so `.vst("fixture")` is a call of Rustel
@@ -852,6 +877,16 @@ impl App {
             && matches!(row, Some(PluginRow::Param(_) | PluginRow::Preset(_)))
             && let Some((_, open)) = &call
         {
+            // A call still being typed, with only the name in it: the pick
+            // goes in as its options object and closes the call, as a
+            // picked name closes a call left open.
+            let caret = self.editor().primary_selection().head.0;
+            if let LinkPlace::Open(_) = self.link_place_at_caret()
+                && let Some(ending) =
+                    closing_options(&self.editor().source()[*open + 1..caret], &text)
+            {
+                return Some(ending);
+            }
             let Some((range, kept)) = parameter_edit(&self.editor().source(), *open, &text, None)
             else {
                 self.status =
@@ -1493,6 +1528,35 @@ mod tests {
                 .as_deref(),
             Some(".vsti(\"Serum 2\")")
         );
+    }
+
+    /// Enter on a preset with the caret in a call of the plugin that holds
+    /// only its name so far writes the options object and closes the call.
+    #[test]
+    fn a_preset_picked_in_a_call_left_open_closes_it() {
+        let pick = |marked: &str| {
+            let caret = marked.find('|').expect("the caret");
+            let mut app = vst_app(&marked.replace('|', ""), caret);
+            let panel = app.reference_panel.as_mut().expect("the vst tab");
+            panel.vst.show_section(VstSection::Presets);
+            panel.vst.selected = 1;
+            app.plugin_text_at_caret("preset: \"Lead\"".into())
+        };
+        let lead = |text: &str| Some(text.to_owned());
+        assert_eq!(
+            pick("$: n(\"c\").vsti(\"Serum 2\"|"),
+            lead(", {preset: \"Lead\"})")
+        );
+        assert_eq!(
+            pick("$: n(\"c\").vsti(\"Serum 2\",|"),
+            lead(" {preset: \"Lead\"})")
+        );
+        assert_eq!(
+            pick("$: n(\"c\").vsti(\"Serum 2\", |"),
+            lead("{preset: \"Lead\"})")
+        );
+        // A call that holds more than its name is not guessed at.
+        assert_eq!(pick("$: n(\"c\").vsti(\"Serum 2\", {gain: 1|"), None);
     }
 
     /// A plugin call picked with the caret in another call's arguments
