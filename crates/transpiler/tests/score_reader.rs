@@ -87,7 +87,7 @@ fn each_expression<'p, 's>(
                 row(*arguments);
                 expression(held, held.at(*receiver), visit);
             }
-            ScoreExpr::Arrow(arrow) => function(held, arrow, visit),
+            ScoreExpr::Arrow(arrow) => function(held, held.function(*arrow), visit),
         }
     }
     for statement in &program.statements {

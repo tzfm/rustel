@@ -623,12 +623,13 @@ impl<'s, F: Fn(&str) -> CallForm> Reader<'s, F> {
                 (Vec::new(), result.expr, result.height)
             }
         };
+        let arrow = self.held.hold_function(ScoreFunction {
+            parameters: ScoreParams::from_borrowed(parameters),
+            bindings,
+            result,
+        })?;
         Some(Some(Parsed {
-            expr: ScoreExpr::Arrow(Box::new(ScoreFunction {
-                parameters: ScoreParams::from_borrowed(parameters),
-                bindings,
-                result,
-            })),
+            expr: ScoreExpr::Arrow(arrow),
             height: height + 1,
             form: Form::Other,
         }))

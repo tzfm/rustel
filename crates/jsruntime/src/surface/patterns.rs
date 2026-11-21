@@ -388,7 +388,7 @@ pub(crate) fn native_pick_lookup<'js>(
             let key: String = pair.get(0)?;
             let value: rquickjs::Value = pair.get(1)?;
             let (pattern, sidecar) = reify_bridged(ctx, &value)?;
-            mapped.push((key, pattern));
+            mapped.push((key.into(), pattern));
             sidecars.push(sidecar);
         }
         Ok((

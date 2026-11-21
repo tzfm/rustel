@@ -50,6 +50,10 @@ impl Written {
 #[derive(Clone, Copy, Debug)]
 pub struct At(u32);
 
+/// The place of one arrow function in the [`Held`] list of a program.
+#[derive(Clone, Copy, Debug)]
+pub struct FuncAt(u32);
+
 /// The places of expressions in a row in the [`Held`] list of a program:
 /// the arguments of a call, or the elements of an array.
 #[derive(Clone, Copy, Debug, Default)]
@@ -69,22 +73,37 @@ impl Row {
     }
 }
 
-/// The expressions that the expressions of a program hold, in one list.
+/// The expressions and arrow functions that the expressions of a program hold,
+/// stored contiguously to avoid per-node heap allocations.
 #[derive(Clone, Debug, Default)]
-pub struct Held<'s>(Vec<ScoreExpr<'s>>);
+pub struct Held<'s> {
+    exprs: Vec<ScoreExpr<'s>>,
+    functions: Vec<ScoreFunction<'s>>,
+}
 
 impl<'s> Held<'s> {
     /// A list with room for `count` expressions.
     pub fn with_room(count: usize) -> Self {
-        Self(Vec::with_capacity(count))
+        Self {
+            exprs: Vec::with_capacity(count),
+            functions: Vec::new(),
+        }
     }
 
     /// Hold `expr`. `None` past the count that a place can say.
     #[inline]
     pub fn hold(&mut self, expr: ScoreExpr<'s>) -> Option<At> {
-        let at = u32::try_from(self.0.len()).ok()?;
-        self.0.push(expr);
+        let at = u32::try_from(self.exprs.len()).ok()?;
+        self.exprs.push(expr);
         Some(At(at))
+    }
+
+    /// Hold `function`. `None` past the count that a place can say.
+    #[inline]
+    pub fn hold_function(&mut self, function: ScoreFunction<'s>) -> Option<FuncAt> {
+        let at = u32::try_from(self.functions.len()).ok()?;
+        self.functions.push(function);
+        Some(FuncAt(at))
     }
 
     /// Hold `expr` alone as a row, which a call with one argument and an
@@ -100,27 +119,32 @@ impl<'s> Held<'s> {
     /// place can say.
     #[inline]
     pub fn hold_row(&mut self, exprs: impl IntoIterator<Item = ScoreExpr<'s>>) -> Option<Row> {
-        let start = self.0.len();
-        self.0.extend(exprs);
+        let start = self.exprs.len();
+        self.exprs.extend(exprs);
         Some(Row {
             start: u32::try_from(start).ok()?,
-            len: u32::try_from(self.0.len() - start).ok()?,
+            len: u32::try_from(self.exprs.len() - start).ok()?,
         })
     }
 
     /// The expression at `at`.
     pub fn at(&self, at: At) -> &ScoreExpr<'s> {
-        &self.0[at.0 as usize]
+        &self.exprs[at.0 as usize]
+    }
+
+    /// The arrow function at `at`.
+    pub fn function(&self, at: FuncAt) -> &ScoreFunction<'s> {
+        &self.functions[at.0 as usize]
     }
 
     /// The expressions of `row`.
     pub fn row(&self, row: Row) -> &[ScoreExpr<'s>] {
-        &self.0[row.start as usize..][..row.len as usize]
+        &self.exprs[row.start as usize..][..row.len as usize]
     }
 
     /// The expressions of `row`, to write.
     pub fn row_mut(&mut self, row: Row) -> &mut [ScoreExpr<'s>] {
-        &mut self.0[row.start as usize..][..row.len as usize]
+        &mut self.exprs[row.start as usize..][..row.len as usize]
     }
 }
 
@@ -249,7 +273,7 @@ impl Same<'_, '_, '_> {
                     && self.exprs(self.0.at(*receiver), self.1.at(*other_receiver))
                     && self.rows(*arguments, *other_arguments)
             }
-            (Arrow(a), Arrow(b)) => self.functions(a, b),
+            (Arrow(a), Arrow(b)) => self.functions(self.0.function(*a), self.1.function(*b)),
             _ => false,
         }
     }
@@ -372,7 +396,7 @@ pub enum ScoreExpr<'s> {
     },
     /// `(...parameters) => result`, or the same with a block of bindings
     /// and one `return`.
-    Arrow(Box<ScoreFunction<'s>>),
+    Arrow(FuncAt),
 }
 
 #[cfg(test)]

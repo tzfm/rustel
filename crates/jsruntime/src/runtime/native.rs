@@ -612,7 +612,9 @@ impl<'p> Turn<'p> {
                     _ => return None,
                 }
             }
-            ScoreExpr::Arrow(function) => Native::Function(self.arrow(names, function, runtime)?),
+            ScoreExpr::Arrow(function) => {
+                Native::Function(self.arrow(names, self.held.function(*function), runtime)?)
+            }
         })
     }
 
@@ -1642,7 +1644,7 @@ impl<'p> Turn<'p> {
                 enumerable_len: properties.len(),
                 entries: properties
                     .iter()
-                    .map(|(key, value)| Some(((*key).to_owned(), value.reified()?)))
+                    .map(|(key, value)| Some(((*key).into(), value.reified()?)))
                     .collect::<Option<_>>()?,
             },
             Native::Array(elements) => rustel_core::PickLookup::Array {

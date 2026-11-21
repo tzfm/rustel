@@ -223,9 +223,10 @@ fn expression(
                 .collect::<Option<Vec<_>>>()?;
             Some(ScoreExpr::Array(held.hold_row(elements)?))
         }
-        Expression::ArrowFunctionExpression(arrow) => Some(ScoreExpr::Arrow(Box::new(
-            arrow_function(arrow, depth, held)?,
-        ))),
+        Expression::ArrowFunctionExpression(arrow) => {
+            let func = arrow_function(arrow, depth, held)?;
+            Some(ScoreExpr::Arrow(held.hold_function(func)?))
+        }
         Expression::StaticMemberExpression(member) if !member.optional => {
             let object = expression(&member.object, depth, held)?;
             Some(ScoreExpr::Member {
@@ -444,11 +445,12 @@ mod tests {
     #[test]
     fn an_arrow_reads_as_a_function_with_or_without_a_block() {
         let reversed = |bindings| {
-            ScoreExpr::Arrow(Box::new(ScoreFunction {
+            let func = ScoreFunction {
                 parameters: vec!["x".into()].into(),
                 bindings,
                 result: method(ScoreExpr::Name("x".into()), "rev", vec![]),
-            }))
+            };
+            ScoreExpr::Arrow(HELD.with_borrow_mut(|held| held.hold_function(func).expect("a func")))
         };
         for (code, bindings) in [
             ("s.every(4, x => x.rev())", vec![]),

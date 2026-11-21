@@ -16,7 +16,7 @@ mod string;
 
 pub use lane::{LaneBodySource, LaneStatement, ReadLane, ReadLanes};
 pub use program::{
-    At, Held, Row, ScoreExpr, ScoreFunction, ScoreParams, ScoreProgram, ScoreProperty,
+    At, FuncAt, Held, Row, ScoreExpr, ScoreFunction, ScoreParams, ScoreProgram, ScoreProperty,
     ScoreStatement, Written,
 };
 pub use reader::{CallForm, MAX_NESTING, Read, left_at, read};

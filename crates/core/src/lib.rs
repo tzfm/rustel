@@ -5090,7 +5090,7 @@ pub enum PickLookup {
     },
     Object {
         enumerable_len: usize,
-        entries: Vec<(String, Pattern)>,
+        entries: Vec<(value::SharedStr, Pattern)>,
     },
 }
 
@@ -5154,7 +5154,7 @@ impl PickLookup {
                 enumerable_len: values.len(),
                 entries: values
                     .iter()
-                    .map(|(key, value)| (key.to_string(), Self::reify_value(value)))
+                    .map(|(key, value)| (value::SharedStr::from(key), Self::reify_value(value)))
                     .collect(),
             }),
             // Object.entries boxes strings and exposes one enumerable
@@ -5165,7 +5165,7 @@ impl PickLookup {
                     .enumerate()
                     .map(|(index, value)| {
                         (
-                            index.to_string(),
+                            value::SharedStr::from(index.to_string()),
                             pure(Value::Str(value.to_string().into())),
                         )
                     })
@@ -5244,14 +5244,14 @@ impl PickLookup {
             }
             Self::Object { entries, .. } => {
                 if let Value::Str(key) = value {
-                    return entries.iter().find_map(|(candidate, pattern)| {
-                        (candidate == key.as_str()).then_some(pattern)
-                    });
+                    return entries
+                        .iter()
+                        .find_map(|(candidate, pattern)| (candidate == key).then_some(pattern));
                 }
                 let key = pick_property_key(value);
                 entries
                     .iter()
-                    .find_map(|(candidate, pattern)| (candidate == &key).then_some(pattern))
+                    .find_map(|(candidate, pattern)| (candidate.as_str() == key).then_some(pattern))
             }
         }
     }
@@ -5293,8 +5293,7 @@ impl PickLookup {
 enum PickPatterns<'a> {
     Dense(std::slice::Iter<'a, Pattern>),
     Array(std::slice::Iter<'a, (usize, Pattern)>),
-    Object(std::slice::Iter<'a, (String, Pattern)>),
-    CompactObject(std::slice::Iter<'a, (value::SharedStr, Pattern)>),
+    Object(std::slice::Iter<'a, (value::SharedStr, Pattern)>),
 }
 
 impl<'a> Iterator for PickPatterns<'a> {
@@ -5306,7 +5305,6 @@ impl<'a> Iterator for PickPatterns<'a> {
             Self::Dense(it) => it.next(),
             Self::Array(it) => it.next().map(|(_, p)| p),
             Self::Object(it) => it.next().map(|(_, p)| p),
-            Self::CompactObject(it) => it.next().map(|(_, p)| p),
         }
     }
 }
@@ -5370,10 +5368,7 @@ impl CompactPickLookup {
                 entries,
             } => Self::Object {
                 enumerable_len,
-                entries: entries
-                    .into_iter()
-                    .map(|(k, p)| (crate::value::SharedStr::from(k), p))
-                    .collect(),
+                entries: entries.into_boxed_slice(),
             },
         }
     }
@@ -5418,7 +5413,7 @@ impl CompactPickLookup {
         match self {
             Self::Dense(patterns) => PickPatterns::Dense(patterns.iter()),
             Self::Array { entries, .. } => PickPatterns::Array(entries.iter()),
-            Self::Object { entries, .. } => PickPatterns::CompactObject(entries.iter()),
+            Self::Object { entries, .. } => PickPatterns::Object(entries.iter()),
         }
     }
 
@@ -13772,15 +13767,7 @@ impl Pattern {
     /// and it is of no kind that takes a control where it is. A row of
     /// controls is then one meeting.
     fn meets_each_control(&self) -> bool {
-        let takes = matches!(
-            self.node_kind(),
-            Node::AppLeft(..)
-                | Node::AppWave(..)
-                | Node::Constants(..)
-                | Node::Stack(_)
-                | Node::FilterValues(..)
-        );
-        !takes && self.meets_constants()
+        !self.takes_constants() && self.meets_constants()
     }
 
     /// This pattern with each hap met by the `set` of a constant of each
@@ -14099,12 +14086,10 @@ impl Pattern {
             Node::Pick(pick) => {
                 pick.mode != JoinMode::Squeeze
                     && sequence::folds(self)
-                    && sequence::selecting(
+                    && sequence::is_plain_selector(
                         &pick.selector,
-                        &Locations::new(),
                         Self::picks_whole_cycles(pick.mode),
                     )
-                    .is_some()
                     && pick.lookup.patterns().all(|picked| {
                         (picked.is_rest() && sequence::folds(picked))
                             || (sequence::lies_in_cycles(picked) && picked.takes_control(control))
@@ -15144,23 +15129,12 @@ impl Pattern {
         if matches!(value, Value::F64(_) | Value::Str(_) | Value::Bool(_))
             && spec.id != 0
             && spec.name() != "value"
-            && matches!(self.node_kind(), Node::Sequence(_))
-            && sequence::takes_plain_set(&self)
         {
             let packed_key = spec.id | (u16::from(value::Table::mark_bit(spec.name())) << 10);
-            let steps = self.steps();
-            let runtime = self.runtime_settings().cloned();
-            if let Some(cell) = self.own_node()
-                && let Node::Sequence(layers) = &mut cell.kind
-            {
+            if self.can_set_packed_direct(&[packed_key]) {
                 let mut val = [value.clone()];
-                sequence::set_packed_here(layers, &[packed_key], &val, context);
+                self.set_packed_direct(&[packed_key], &val, context);
                 val[0] = Value::Undefined;
-                let node = Arc::clone(&self.node);
-                self = Self::holding(node).with_steps(steps);
-                if let Some(runtime) = runtime {
-                    self.attach_runtime_settings(runtime);
-                }
                 return Ok(self);
             }
         }
@@ -15195,9 +15169,157 @@ impl Pattern {
         Ok(self)
     }
 
+    fn can_set_packed_direct(&self, keys: &[u16]) -> bool {
+        match self.node_kind() {
+            Node::Sequence(_) => sequence::takes_plain_set(self),
+            Node::AppWave(app) => {
+                if !self.keeps_runtime_over(&app.inner) {
+                    return false;
+                }
+                let mut combined = [0u16; 16];
+                let mut len = 0usize;
+                for item in app.waves.iter() {
+                    let Some(key) = controls::builtin_key_ref_by_id(item.key_id) else {
+                        return false;
+                    };
+                    if key.as_str() == "value" || keys.iter().any(|&k| (k & 0x3ff) == item.key_id) {
+                        return false;
+                    }
+                    let packed =
+                        item.key_id | (u16::from(value::Table::mark_bit(key.as_str())) << 10);
+                    if !combined[..len].contains(&packed) {
+                        if len >= combined.len() {
+                            return false;
+                        }
+                        combined[len] = packed;
+                        len += 1;
+                    }
+                }
+                if len + keys.len() > combined.len() {
+                    return false;
+                }
+                combined[len..len + keys.len()].copy_from_slice(keys);
+                app.inner
+                    .can_set_packed_direct(&combined[..len + keys.len()])
+            }
+            Node::Stack(patterns) => {
+                let mut any = false;
+                for pattern in patterns.iter() {
+                    if pattern.is_rest() {
+                        continue;
+                    }
+                    if !pattern.can_set_packed_direct(keys) {
+                        return false;
+                    }
+                    any = true;
+                }
+                any
+            }
+            Node::StackPure(cells) => {
+                let mut any = false;
+                for cell in cells.iter() {
+                    if matches!(cell.kind, Node::Silence) {
+                        continue;
+                    }
+                    if !plain_pattern(cell, 0).can_set_packed_direct(keys) {
+                        return false;
+                    }
+                    any = true;
+                }
+                any
+            }
+            Node::Pick(pick) => {
+                pick.mode != JoinMode::Squeeze
+                    && sequence::folds(self)
+                    && sequence::is_plain_selector(
+                        &pick.selector,
+                        Self::picks_whole_cycles(pick.mode),
+                    )
+                    && pick.lookup.patterns().all(|picked| {
+                        (picked.is_rest() && sequence::folds(picked))
+                            || (sequence::lies_in_cycles(picked)
+                                && picked.can_set_packed_direct(keys))
+                    })
+            }
+            _ => false,
+        }
+    }
+
+    fn set_packed_direct(&mut self, keys: &[u16], vals: &[Value], context: Locations) {
+        let steps = self.steps();
+        let runtime = self.runtime_settings().cloned();
+        let Some(cell) = self.own_node() else {
+            debug_assert!(false, "can_set_packed_direct matched an unwritable node");
+            return;
+        };
+        match &mut cell.kind {
+            Node::Sequence(layers) => sequence::set_packed_here(layers, keys, vals, context),
+            Node::AppWave(app) => {
+                let mut combined_keys = [0u16; 16];
+                let mut combined_vals = [const { Value::Undefined }; 16];
+                let mut len = 0usize;
+                for item in app.waves.iter() {
+                    let key = controls::builtin_key_ref_by_id(item.key_id)
+                        .expect("validated wave key id");
+                    let packed =
+                        item.key_id | (u16::from(value::Table::mark_bit(key.as_str())) << 10);
+                    if !combined_keys[..len].contains(&packed) {
+                        combined_keys[len] = packed;
+                        combined_vals[len] = Value::F64(0.0);
+                        len += 1;
+                    }
+                }
+                combined_keys[len..len + keys.len()].copy_from_slice(keys);
+                for (i, val) in vals.iter().enumerate() {
+                    combined_vals[len + i] = val.clone();
+                }
+                let total = len + keys.len();
+                app.inner.set_packed_direct(
+                    &combined_keys[..total],
+                    &combined_vals[..total],
+                    context,
+                );
+            }
+            Node::Stack(patterns) => {
+                for pattern in patterns.iter_mut().filter(|p| !p.is_rest()) {
+                    pattern.set_packed_direct(keys, vals, context.clone());
+                }
+            }
+            Node::StackPure(cells) => {
+                let mut patterns: Vec<Pattern> =
+                    cells.iter().map(|cell| plain_pattern(cell, 0)).collect();
+                for pattern in patterns.iter_mut().filter(|p| !p.is_rest()) {
+                    pattern.set_packed_direct(keys, vals, context.clone());
+                }
+                if can_pack_pure_cells(&patterns) {
+                    *cells = pack_pure_cells(patterns);
+                } else {
+                    cell.kind = Node::Stack(patterns.into_boxed_slice());
+                }
+            }
+            Node::Pick(pick) => {
+                let ok = sequence::selecting_in_place(
+                    &mut pick.selector,
+                    &context,
+                    Self::picks_whole_cycles(pick.mode),
+                );
+                debug_assert!(ok, "validated plain selector");
+                for picked in pick.lookup.patterns_mut().filter(|p| !p.is_rest()) {
+                    picked.set_packed_direct(keys, vals, Locations::new());
+                }
+            }
+            _ => unreachable!("validated by can_set_packed_direct"),
+        }
+        let node = Arc::clone(&self.node);
+        *self = Self::holding(node).with_steps(steps);
+        if let Some(runtime) = runtime {
+            self.attach_runtime_settings(runtime);
+        }
+    }
+
     /// Fast path of [`Self::with_row`] for stack-packed built-in controls:
-    /// writes directly into a foldable `Node::Sequence` without allocating a
-    /// temporary `BuiltinMap` when merging into an existing `Dress::set_map`.
+    /// writes directly into foldable sequences, wave chains, stacks, and picks
+    /// without allocating a temporary `BuiltinMap` union.
     pub(crate) fn with_packed_row(
         mut self,
         keys: &[u16],
@@ -15205,20 +15327,9 @@ impl Pattern {
         context: Locations,
         apart: &Apart<'_>,
     ) -> Result<Self, Self> {
-        if matches!(self.node_kind(), Node::Sequence(_)) && sequence::takes_plain_set(&self) {
-            let steps = self.steps();
-            let runtime = self.runtime_settings().cloned();
-            if let Some(cell) = self.own_node()
-                && let Node::Sequence(layers) = &mut cell.kind
-            {
-                sequence::set_packed_here(layers, keys, vals, context);
-                let node = Arc::clone(&self.node);
-                self = Self::holding(node).with_steps(steps);
-                if let Some(runtime) = runtime {
-                    self.attach_runtime_settings(runtime);
-                }
-                return Ok(self);
-            }
+        if self.can_set_packed_direct(keys) {
+            self.set_packed_direct(keys, vals, context);
+            return Ok(self);
         }
         let union = Value::Object(OrderedMap::from_packed_builtin(keys, vals));
         self.with_row(&union, context, apart)
@@ -15615,10 +15726,14 @@ impl Pattern {
         rewrite: &PitchRewrite,
         dress_cache: &mut sequence::RenoteDressCache,
     ) -> Self {
-        if matches!(self.node_kind(), Node::Sequence(_)) && sequence::folds(&self) {
+        if let Node::Sequence(layers) = self.node_kind()
+            && sequence::folds(&self)
+            && Arc::strong_count(&self.node) == 1
+            && Arc::strong_count(layers) == 1
+        {
             let steps = self.steps();
             let runtime = self.runtime_settings().cloned();
-            if let Some(cell) = self.own_node()
+            if let Some(cell) = Arc::get_mut(&mut self.node)
                 && let Node::Sequence(layers) = &mut cell.kind
                 && sequence::renote_in_place(
                     layers,
@@ -15639,6 +15754,7 @@ impl Pattern {
             && picked.mode != JoinMode::Squeeze
             && sequence::folds(&self)
             && sequence::is_plain_selector(&picked.selector, false)
+            && Arc::strong_count(&self.node) == 1
         {
             let steps = self.steps();
             let runtime = self.runtime_settings().cloned();
@@ -18324,7 +18440,7 @@ mod set_lookup_tests {
         };
         entries
             .iter()
-            .map(|(key, pattern)| (key.clone(), pattern.as_pure().expect("a pure entry")))
+            .map(|(key, pattern)| (key.to_string(), pattern.as_pure().expect("a pure entry")))
             .collect()
     }
 

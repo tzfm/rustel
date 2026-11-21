@@ -90,7 +90,10 @@ fn describe(hap: &Hap) -> String {
             entries,
         } => format!(
             "object {enumerable_len} {:?}",
-            entries.iter().map(|(key, _)| key).collect::<Vec<_>>()
+            entries
+                .iter()
+                .map(|(key, _)| key.as_str())
+                .collect::<Vec<_>>()
         ),
     });
     format!(
