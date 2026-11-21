@@ -617,6 +617,10 @@ fn checked_numbers(form: &mut SliderForm, whole: bool) -> Result<[f64; 4], Strin
     Ok([clamped, min, max, step])
 }
 
+/// The footer while the form is open.
+const FORM_HINT: &str =
+    "Tab or the arrows between the fields \u{b7} Enter applies \u{b7} Esc closes";
+
 /// The form's word for a value it pulled into range. Short enough for the
 /// form's row: the value and both ends of the range are on the rows above.
 const PULLED: &str = "value pulled into range \u{b7} Enter writes";
@@ -818,8 +822,7 @@ impl App {
         };
         form.focus(0);
         state.form = Some(form);
-        self.status =
-            "Tab or the arrows between the fields \u{b7} Enter applies \u{b7} Esc closes".into();
+        self.status = FORM_HINT.into();
         self.dirty_frame = true;
     }
 
@@ -1161,6 +1164,10 @@ impl App {
             .and_then(|state| state.form.as_mut())
         {
             form.error = None;
+            // The refusal on the footer was about the text just edited.
+            if self.status.starts_with("fader not written: ") {
+                self.status = FORM_HINT.into();
+            }
         }
         self.dirty_frame = true;
     }
@@ -1713,11 +1720,10 @@ mod tests {
                     .any(|row| row.contains("min has to be below max")),
                 "{rows:?}"
             );
-            assert!(
-                app.status.contains("min has to be below max"),
-                "{}",
-                app.status
-            );
+            assert_eq!(app.status, "fader not written: min has to be below max");
+            // An edit makes the refusal stale: the footer is the hint again.
+            precision_key(&mut app, KeyCode::Backspace, KeyModifiers::NONE);
+            assert!(app.status.contains("Enter applies"), "{}", app.status);
         }
 
         /// A min above the value pulls the value up with it: a range that does
