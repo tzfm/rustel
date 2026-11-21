@@ -181,6 +181,9 @@ impl Session {
         // A stack contains a lane's throw and keeps the other lanes' haps.
         // The report still says that the score threw.
         let contained = rustel_core::take_query_contained_throw();
+        // Taken whether or not it is reported, so a following query starts
+        // clean.
+        let callback_failure = rustel_core::take_query_callback_failure();
         Ok(QueryReport {
             begin: fraction_label(begin),
             end: fraction_label(end),
@@ -188,7 +191,14 @@ impl Session {
             haps: haps_to_json(&haps),
             // Taken after the query so the report owns the message; a
             // following query starts clean.
-            query_threw: self.js.take_query_throw().or(contained),
+            //
+            // A query whose every hap a contained failure dropped is empty
+            // because of the error: it says so, as a bounce does.
+            query_threw: self
+                .js
+                .take_query_throw()
+                .or(contained)
+                .or_else(|| callback_failure.filter(|_| haps.is_empty())),
         })
     }
 

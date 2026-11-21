@@ -9799,26 +9799,58 @@ fn talkit_speaks_up_to_c7() {
 }
 
 /// A scale name that will not read drops its notes, as on strudel.cc, and
-/// says so: the export reports why its lane is silent instead of writing
-/// silence with nothing said.
+/// says why. A bounce whose every note was dropped exits 1 with that
+/// reason, rather than passing as silence; one that keeps some notes fails
+/// open.
 #[test]
 fn an_unreadable_scale_is_reported_when_its_notes_drop() {
     let path = scratch("unreadable-scale.wav");
+    assert_reported_failure(
+        &[
+            "export",
+            "-e",
+            r#"$: n("0 2 4 7").scale("C3:kafi raga").s("sine").gain(.2)"#,
+            "--cycles",
+            "1",
+            "-o",
+            path.to_str().expect("utf-8 path"),
+        ],
+        "Scale name raga is incomplete",
+    );
+    let _ = std::fs::remove_file(&path);
+    // Half of the cycles read their scale: the bounce plays those, and says
+    // why the others are silent.
     let out = run(&[
         "export",
         "-e",
-        r#"$: n("0 2 4 7").scale("C3:kafi raga").s("sine").gain(.2)"#,
+        r#"$: n("0 2 4 7").scale("<C3:major raga>").s("sine").gain(.2)"#,
         "--cycles",
-        "1",
+        "2",
         "-o",
         path.to_str().expect("utf-8 path"),
     ]);
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(out.status.success(), "{stderr}");
-    assert!(path.exists(), "the take is written");
-    let _ = std::fs::remove_file(&path);
-    assert!(stderr.contains("query_threw"), "{stderr}");
     assert!(stderr.contains("Scale name raga is incomplete"), "{stderr}");
+    let take = std::fs::read(&path).expect("the take is written");
+    let _ = std::fs::remove_file(&path);
+    let loud = take.len() > 44
+        && take[44..]
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .any(|sample| i16::from_le_bytes(*sample).unsigned_abs() > 100);
+    assert!(loud, "the cycles that read their scale sound");
+    // A single-quoted unknown name drops every note the same way: query and
+    // check say so too, not only the bounce.
+    let score = "$: n(\"0 2 4 7\").scale('C3:zzz').s(\"sine\")";
+    assert_reported_failure(&["query", "-e", score], "Invalid scale name");
+    let checked = run(&["check", "--no-samples", "-e", score]);
+    assert!(!checked.status.success(), "{checked:?}");
+    assert!(
+        String::from_utf8_lossy(&checked.stdout).contains("Invalid scale name"),
+        "{checked:?}"
+    );
 }
 
 /// `check` queries the score's first cycle, so a score that evaluates but
