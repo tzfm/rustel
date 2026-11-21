@@ -1298,9 +1298,10 @@ struct App {
     editing_source: Option<String>,
     /// The page's sample grants changed and the engine does not have them yet.
     sample_grants_owed: bool,
-    /// The library's count of policies taken when the last grants were
-    /// sent: the grants are in force once the count moves past it.
-    sample_grants_sent_at: Option<u64>,
+    /// The library's count of policies taken before the grants still on
+    /// their way were sent, and how many were sent: they are all in force
+    /// once the count has moved by as many.
+    sample_grants_sent_at: Option<(u64, u64)>,
     /// A permit unblocked a refused update and the studio owes its re-run.
     /// It waits for the engine to hold the permission, so the re-run cannot
     /// be refused by the state it is running to use.

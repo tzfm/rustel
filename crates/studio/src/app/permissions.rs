@@ -542,20 +542,23 @@ impl App {
             .try_set_sample_grants(self.prefs.sample_grants())
         {
             self.sample_grants_owed = false;
-            self.sample_grants_sent_at = taken;
+            self.sample_grants_sent_at = match (self.sample_grants_sent_at, taken) {
+                (Some((before, sent)), _) => Some((before, sent + 1)),
+                (None, taken) => taken.map(|before| (before, 1)),
+            };
         }
     }
 
     /// Whether the engine holds the grants last sent. A check reads the
     /// library, and before then it reads the maps of the old grants.
     pub(super) fn sample_grants_in_force(&mut self) -> bool {
-        let Some(sent_at) = self.sample_grants_sent_at else {
+        let Some((before, sent)) = self.sample_grants_sent_at else {
             return true;
         };
         let in_force = self
             .worker
             .library()
-            .is_none_or(|library| library.policies_taken() > sent_at);
+            .is_none_or(|library| library.policies_taken() >= before + sent);
         if in_force {
             self.sample_grants_sent_at = None;
         }
