@@ -222,7 +222,9 @@ impl StudioEngine {
                 self.session.set_plugin_document(mark.document);
                 let reloaded =
                     self.session
-                        .reload_live(source, mini, transport.stopped_flag(), clock)?;
+                        .reload_live(source, mini, transport.stopped_flag(), clock);
+                eprintln!("DBGRELOAD {:?} session {}", reloaded.as_ref().map(|r| matches!(r, rustel_runtime::LiveReload::Waiting)).map_err(|e| e.to_string()), self.session.generation());
+                let reloaded = reloaded?;
                 match reloaded {
                     rustel_runtime::LiveReload::Installed(generation) => generation,
                     rustel_runtime::LiveReload::Waiting => {

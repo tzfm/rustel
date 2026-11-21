@@ -1071,6 +1071,7 @@ impl LiveFileProducer {
     /// unpublished cutover with its backlog, conversion latch, deferred
     /// rollback and loading-deferred line cut.
     fn supersede_cutover(&mut self, installed: crate::ReloadEvent) {
+        eprintln!("DBGARM supersede {}->{} path {:?}", installed.generation_before, installed.generation_after, installed.path);
         self.clear_pending();
         self.pending_publication = None;
         self.pending_generation = Some(installed.generation_after);
@@ -1195,6 +1196,7 @@ impl LiveFileProducer {
     /// its completion event to the recovery generation; otherwise this is an
     /// invisible same-graph cutover, not a synthetic save.
     pub fn arm_output_recovery_requery(&mut self, generation_before: u64, generation_after: u64) {
+        eprintln!("DBGARM recycle {generation_before}->{generation_after} pending {:?}", self.pending_generation);
         self.clear_pending();
         self.queued_through = 0.0;
         if let Some(csound) = &self.csound {
@@ -2042,6 +2044,7 @@ impl LiveFileProducer {
                 && session.generation() != generation
             {
                 self.prefill_candidate_committed = true;
+                eprintln!("DBGMISMATCH pending {generation} session {}", session.generation());
                 return Err(RuntimeError::Message(format!(
                     "pending device generation {generation} no longer matches Session generation {}; save a new score identity or restart the producer",
                     session.generation()

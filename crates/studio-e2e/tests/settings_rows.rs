@@ -1011,13 +1011,13 @@ fn a_source_turned_off_and_on_again_reruns_the_refused_update() {
         "samples('{origin}/map.json')\n$: s(\"sn\").gain(0.03)"
     ));
     studio.chord("ctrl+s");
-    studio.settle();
+    studio.settle(); eprintln!("DBGSTATUS {:?} {:?}", studio.status(), studio.errors());
     open_permissions(&mut studio);
     select_row(&mut studio, &format!("▸ {origin}"));
     studio.press(KeyCode::Enter, KeyModifiers::NONE);
-    studio.settle();
+    studio.settle(); eprintln!("DBGSTATUS {:?} {:?}", studio.status(), studio.errors());
     studio.press(KeyCode::Esc, KeyModifiers::NONE);
-    studio.settle();
+    studio.settle(); eprintln!("DBGSTATUS {:?} {:?}", studio.status(), studio.errors());
     // The map is fetched once the source is allowed. An update while it
     // is on its way may be refused, and the next one plays.
     studio.set_score(&format!(
@@ -1025,6 +1025,7 @@ fn a_source_turned_off_and_on_again_reruns_the_refused_update() {
     ));
     studio.chord("ctrl+s");
     studio.pump_until(Duration::from_secs(20), "the score plays sn", |studio| {
+        eprintln!("DBGLOOP {:?} {:?}", studio.status(), studio.errors());
         if studio.status().contains("refused") {
             studio.chord("ctrl+s");
         }
@@ -1034,10 +1035,10 @@ fn a_source_turned_off_and_on_again_reruns_the_refused_update() {
     select_row(&mut studio, &format!("▸ {origin}"));
 
     studio.press(KeyCode::Char(' '), KeyModifiers::NONE);
-    studio.settle();
+    studio.settle(); eprintln!("DBGSTATUS {:?} {:?}", studio.status(), studio.errors());
     assert!(row_with(&mut studio, &origin).contains("samples  off"));
     studio.press(KeyCode::Esc, KeyModifiers::NONE);
-    studio.settle();
+    studio.settle(); eprintln!("DBGSTATUS {:?} {:?}", studio.status(), studio.errors());
     studio.set_score(&format!(
         "samples('{origin}/map.json')\n$: s(\"sn sn\").gain(0.03)"
     ));
@@ -1049,7 +1050,7 @@ fn a_source_turned_off_and_on_again_reruns_the_refused_update() {
     open_permissions(&mut studio);
     select_row(&mut studio, &format!("▸ {origin}"));
     studio.press(KeyCode::Enter, KeyModifiers::NONE);
-    studio.settle();
+    studio.settle(); eprintln!("DBGSTATUS {:?} {:?}", studio.status(), studio.errors());
     studio.press(KeyCode::Esc, KeyModifiers::NONE);
     studio.pump_until(
         Duration::from_secs(20),
@@ -1065,11 +1066,11 @@ fn a_refused_folder_is_cut_down_to_its_domain_with_e() {
     let mut studio = hermetic();
     studio.set_score("samples('https://kit.invalid/kits/808/kit.json')\n$: s(\"bd\")");
     studio.chord("ctrl+s");
-    studio.settle();
+    studio.settle(); eprintln!("DBGSTATUS {:?} {:?}", studio.status(), studio.errors());
     open_permissions(&mut studio);
     select_row(&mut studio, "▸ kit.invalid/kits/808/");
     studio.press(KeyCode::Char('e'), KeyModifiers::NONE);
-    studio.settle();
+    studio.settle(); eprintln!("DBGSTATUS {:?} {:?}", studio.status(), studio.errors());
     assert!(
         studio.status().starts_with("edit a source"),
         "{}",
@@ -1079,7 +1080,7 @@ fn a_refused_folder_is_cut_down_to_its_domain_with_e() {
         studio.press(KeyCode::Backspace, KeyModifiers::NONE);
     }
     studio.press(KeyCode::Enter, KeyModifiers::NONE);
-    studio.settle();
+    studio.settle(); eprintln!("DBGSTATUS {:?} {:?}", studio.status(), studio.errors());
     let domain = row_with(&mut studio, "kit.invalid");
     assert!(
         domain.contains("▸ kit.invalid ") && domain.contains("samples  on"),
@@ -1105,7 +1106,7 @@ fn the_orchestra_switch_starts_on_and_space_takes_it_back_for_a_run() {
     let mut studio = hermetic();
     studio.set_score("loadCSound`instr voice\nendin`\n$: note(\"c3\").csound(\"voice\")");
     studio.chord("ctrl+s");
-    studio.settle();
+    studio.settle(); eprintln!("DBGSTATUS {:?} {:?}", studio.status(), studio.errors());
     // No permission refusal. A machine without the native library reports
     // the library's own absence, never the permission's.
     match studio.errors() {
@@ -1118,17 +1119,17 @@ fn the_orchestra_switch_starts_on_and_space_takes_it_back_for_a_run() {
 
     select_row(&mut studio, "▸ native orchestras");
     studio.press(KeyCode::Char(' '), KeyModifiers::NONE);
-    studio.settle();
+    studio.settle(); eprintln!("DBGSTATUS {:?} {:?}", studio.status(), studio.errors());
     assert!(row_with(&mut studio, "native orchestras").contains("  off"));
 
     studio.press(KeyCode::Esc, KeyModifiers::NONE);
-    studio.settle();
+    studio.settle(); eprintln!("DBGSTATUS {:?} {:?}", studio.status(), studio.errors());
     // An edit makes the save a new generation - the first one is still
     // sounding, whatever the machine's library said about it - so the press
     // must not land as a repeat of it.
     studio.set_score("loadCSound`instr voice\nendin`\n$: note(\"d3\").csound(\"voice\")");
     studio.chord("ctrl+s");
-    studio.settle();
+    studio.settle(); eprintln!("DBGSTATUS {:?} {:?}", studio.status(), studio.errors());
     assert_eq!(
         studio.errors().as_deref(),
         Some("Csound is not permitted - Settings → Permissions lets native orchestras run"),
@@ -1137,7 +1138,7 @@ fn the_orchestra_switch_starts_on_and_space_takes_it_back_for_a_run() {
     open_permissions(&mut studio);
     select_row(&mut studio, "▸ native orchestras");
     studio.press(KeyCode::Enter, KeyModifiers::NONE);
-    studio.settle();
+    studio.settle(); eprintln!("DBGSTATUS {:?} {:?}", studio.status(), studio.errors());
     assert!(row_with(&mut studio, "native orchestras").contains("  on"));
     // The permission re-ran the refused update by itself. A machine with
     // the native library installs it and says so; a machine without one
@@ -1178,7 +1179,7 @@ fn tab_cycles_the_pages_and_wraps() {
         "launch on",            // and back to general
     ] {
         studio.press(KeyCode::Tab, KeyModifiers::NONE);
-        studio.settle();
+        studio.settle(); eprintln!("DBGSTATUS {:?} {:?}", studio.status(), studio.errors());
         let rows = studio.rows().join("\n");
         assert!(
             rows.contains(expected),

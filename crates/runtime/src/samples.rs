@@ -155,6 +155,7 @@ impl RefusedSources {
     const MAX: usize = 16;
 
     fn note(&self, source: String) {
+        eprintln!("DBGNOTE {source} {:?}", std::thread::current().name());
         if let Ok(mut sources) = self.0.lock() {
             sources.retain(|kept| *kept != source);
             sources.push(source);
@@ -165,10 +166,12 @@ impl RefusedSources {
     }
 
     fn take(&self) -> Vec<String> {
-        self.0
+        let taken: Vec<String> = self.0
             .lock()
             .map(|mut sources| std::mem::take(&mut *sources))
-            .unwrap_or_default()
+            .unwrap_or_default();
+        if !taken.is_empty() { eprintln!("DBGTAKE {taken:?} {:?}", std::thread::current().name()); }
+        taken
     }
 }
 

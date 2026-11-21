@@ -500,6 +500,18 @@ impl Transport {
         self.generation.load(Ordering::SeqCst)
     }
     fn bump(&self) -> Generation {
+        {
+            let trace = std::backtrace::Backtrace::force_capture().to_string();
+            let frames: Vec<&str> = trace
+                .lines()
+                .map(str::trim)
+                .filter_map(|l| l.split_once(": ").map(|(_, name)| name))
+                .filter(|name| !name.contains("closure") && !name.starts_with("/") && !name.contains("panic") && !name.contains("call_once") && !name.contains("catch_unwind") && !name.contains("try"))
+                .skip(1)
+                .take(14)
+                .collect();
+            eprintln!("DBGBUMP to {} | {}", self.generation.load(Ordering::SeqCst) + 1, frames.join(" | "));
+        }
         self.generation.fetch_add(1, Ordering::SeqCst) + 1
     }
 }
