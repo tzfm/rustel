@@ -1497,12 +1497,14 @@ impl Plans {
         let (words, last) = (word(chain)?, word(last)?);
         // A handle of each value, for the list.
         let last = values.get(last)?.clone();
-        let list = match values.get(words)?.clone() {
-            Value::List(mut list) => {
-                list.push(last);
-                list
+        let list: Arc<[Value]> = match values.get(words)?.clone() {
+            Value::List(list) => {
+                let mut out = Vec::with_capacity(list.len() + 1);
+                out.extend_from_slice(&list);
+                out.push(last);
+                Arc::from(out)
             }
-            first => Box::new(vec![first, last]),
+            first => Arc::from([first, last]),
         };
         let held = u32::try_from(values.len()).ok()?;
         values.push(Value::List(list));

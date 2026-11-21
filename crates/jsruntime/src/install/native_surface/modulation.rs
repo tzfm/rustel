@@ -74,7 +74,7 @@ fn apply_modulator_value(
     key: &str,
     default: &std::sync::Mutex<Option<Value>>,
 ) -> Value {
-    let Value::List(mut pair) = rustel_core::materialize_js_value(pair) else {
+    let Value::List(pair) = rustel_core::materialize_js_value(pair) else {
         rustel_core::signal_query_error(|| "invalid modulator state".into());
         return Value::Undefined;
     };
@@ -82,14 +82,14 @@ fn apply_modulator_value(
         rustel_core::signal_query_error(|| "invalid modulator state".into());
         return Value::Undefined;
     }
-    let mut controls = match pair.remove(0) {
-        Value::Object(controls) => controls,
+    let mut controls = match &pair[0] {
+        Value::Object(controls) => controls.clone(),
         _ => {
             rustel_core::signal_query_error(|| "modulate expects object-valued haps".into());
             return Value::Undefined;
         }
     };
-    let mut id = pair.remove(0);
+    let mut id = pair[1].clone();
     let default_value = {
         let mut stored = default
             .lock()

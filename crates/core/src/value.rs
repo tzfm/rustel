@@ -5589,7 +5589,7 @@ pub enum Value {
     F64(f64),
     /// Text: stored inline up to 14 bytes or shared on the heap.
     Str(SharedStr),
-    List(Box<Vec<Value>>),
+    List(Arc<[Value]>),
     Object(OrderedMap),
     /// A native Pattern nested in a JavaScript array/object value.
     Pattern(Box<PatternValue>),
@@ -5598,7 +5598,7 @@ pub enum Value {
     JsValue(JsValueRef),
     /// A pattern transformer. Upstream's `reify(func)` puts one of these in a
     /// hap; see [`FunctionRef`].
-    Function(Box<FunctionRef>),
+    Function(Arc<FunctionRef>),
     /// Congruent haps carried by `collect()` until a score callback consumes
     /// them.
     Haps(HapList),
@@ -5611,7 +5611,19 @@ impl Value {
     /// Construct a `Value::List` from a `Vec<Value>`.
     #[inline]
     pub fn list(values: Vec<Value>) -> Self {
-        Self::List(Box::new(values))
+        Self::List(Arc::from(values))
+    }
+
+    /// Construct a `Value::List` directly from a slice/array into one `Arc<[Value]>`.
+    #[inline]
+    pub fn list_from_arc(values: Arc<[Value]>) -> Self {
+        Self::List(values)
+    }
+
+    /// Construct a `Value::Function` from a [`FunctionRef`].
+    #[inline]
+    pub fn function(function: FunctionRef) -> Self {
+        Self::Function(Arc::new(function))
     }
 }
 
@@ -5778,11 +5790,11 @@ impl Value {
             Self::Bool(value) => Self::Bool(*value),
             Self::F64(value) => Self::F64(*value),
             Self::Str(value) => Self::Str(value.clone()),
-            Self::List(values) => Self::List(values.clone()),
+            Self::List(values) => Self::List(Arc::clone(values)),
             Self::Object(values) => Self::Object(values.clone()),
             Self::Pattern(value) => Self::Pattern(value.clone()),
             Self::JsValue(value) => Self::JsValue(*value),
-            Self::Function(value) => Self::Function(value.clone()),
+            Self::Function(value) => Self::Function(Arc::clone(value)),
             Self::Haps(value) => Self::Haps(value.clone()),
         }
     }
@@ -6012,10 +6024,20 @@ impl Value {
                 {
                     return true;
                 }
-                for value in values.iter_mut() {
-                    if !value.attach_runtime_settings(settings, depth + 1) {
-                        return false;
+                if let Some(slice) = Arc::get_mut(values) {
+                    for value in slice.iter_mut() {
+                        if !value.attach_runtime_settings(settings, depth + 1) {
+                            return false;
+                        }
                     }
+                } else {
+                    let mut owned = values.to_vec();
+                    for value in owned.iter_mut() {
+                        if !value.attach_runtime_settings(settings, depth + 1) {
+                            return false;
+                        }
+                    }
+                    *values = Arc::from(owned);
                 }
             }
             Self::Object(values) => {
@@ -6035,7 +6057,7 @@ impl Value {
                 value.pattern.attach_runtime_settings(settings.clone());
             }
             Self::Function(function) => {
-                function.attach_runtime_settings(settings.clone());
+                Arc::make_mut(function).attach_runtime_settings(settings.clone());
             }
             Self::Haps(haps) => {
                 if !haps
@@ -6393,7 +6415,7 @@ mod tests {
 
         for omitted in [
             Value::Undefined,
-            Value::Function(Box::new(super::FunctionRef::js(99))),
+            Value::Function(std::sync::Arc::new(super::FunctionRef::js(99))),
         ] {
             let host = MaterializeHost {
                 omitted,
@@ -6458,7 +6480,7 @@ mod tests {
         let lowered = super::FunctionRef::lowered_js(9, program);
         assert!(lowered.is_native());
         assert_eq!(lowered.callback_id(), Some(9));
-        let value = Value::Function(Box::new(lowered.clone()));
+        let value = Value::Function(std::sync::Arc::new(lowered.clone()));
         assert!(value.has_js_function());
         assert!(!crate::pure(value).is_pure());
         assert!(super::is_rendered_function(&format!("{lowered:?}")));
@@ -6489,7 +6511,7 @@ mod tests {
         assert!(lowered.is_native());
         standing.mark_stale();
         assert!(!lowered.is_native(), "a stale program takes no pure view");
-        assert!(Value::Function(Box::new(lowered.clone())).has_js_function());
+        assert!(Value::Function(std::sync::Arc::new(lowered.clone())).has_js_function());
 
         // A pure graph built before the change still applies it. With no
         // host, nothing can run the callback, so it answers with an error.

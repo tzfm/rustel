@@ -266,8 +266,8 @@ pub(crate) fn named_value(names: &[Arc<str>], mut value: Value) -> Value {
         && let Value::List(values) = value
     {
         let result = bag.get_or_insert_with(OrderedMap::new);
-        for (name, value) in names.iter().zip(*values) {
-            result.insert_key(Key::from(Arc::clone(name)), value);
+        for (name, value) in names.iter().zip(values.iter()) {
+            result.insert_key(Key::from(Arc::clone(name)), value.clone());
         }
         return Value::Object(result.clone());
     }
@@ -1040,7 +1040,9 @@ mod tests {
     #[test]
     fn a_chain_transformer_is_native_for_pure_patterns_alone() {
         let gain: &'static ControlSpec = Box::leak(Box::new(ControlSpec::new(["gain"])));
-        let script = pure(Value::Function(Box::new(crate::value::FunctionRef::js(9))));
+        let script = pure(Value::Function(std::sync::Arc::new(
+            crate::value::FunctionRef::js(9),
+        )));
         assert!(!script.is_pure());
         let chains = [
             (vec![(gain, ChainArgument::Number(0.5))], true),

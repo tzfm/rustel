@@ -4796,7 +4796,7 @@ fn query_weight_sequence(cumulative: &[Pattern], state: &State) -> Vec<Hap> {
                 let mut context = outer.context.clone();
                 context.append(&inner.context);
                 let mut values = match &outer.value {
-                    Value::List(values) => (**values).clone(),
+                    Value::List(values) => values.to_vec(),
                     _ => Vec::new(),
                 };
                 values.push(inner.value.clone());
@@ -13446,11 +13446,11 @@ impl Pattern {
             ValueReading::default(),
             Combine::with(Arc::new(|acc: &Value, v: &Value| match acc {
                 Value::List(xs) => {
-                    let mut xs = xs.clone();
-                    xs.push(v.clone());
-                    Value::List(xs)
+                    let mut out = xs.to_vec();
+                    out.push(v.clone());
+                    Value::list(out)
                 }
-                other => Value::list(vec![other.clone(), v.clone()]),
+                other => Value::list_from_arc(Arc::from([other.clone(), v.clone()])),
             })),
             LookupFlow::Infer,
         ))))
@@ -14063,8 +14063,11 @@ impl Pattern {
         let controls = control
             .as_object()
             .filter(|controls| !compose::union_drops(controls))?;
-        // The names of the waves, the outermost first.
-        let mut names: Vec<Key> = Vec::new();
+        // The names of the waves, the outermost first. Keep up to 8 inline on
+        // the stack to avoid per-call heap allocations on modulated chains.
+        let mut inline_names: [Option<Key>; 8] = Default::default();
+        let mut inline_len = 0usize;
+        let mut extra_names: Vec<Key> = Vec::new();
         let mut depth = 0usize;
         let mut under = self;
         loop {
@@ -14074,7 +14077,8 @@ impl Pattern {
                         return None;
                     }
                     let mut ok = true;
-                    let saved = names.len();
+                    let saved_inline = inline_len;
+                    let saved_extra = extra_names.len();
                     for item in app.waves.iter().rev() {
                         let Some(key) = controls::builtin_key_ref_by_id(item.key_id) else {
                             ok = false;
@@ -14083,10 +14087,19 @@ impl Pattern {
                         if controls.contains_key(key) {
                             return None;
                         }
-                        names.push(key.clone());
+                        if inline_len < inline_names.len() {
+                            inline_names[inline_len] = Some(key.clone());
+                            inline_len += 1;
+                        } else {
+                            extra_names.push(key.clone());
+                        }
                     }
                     if !ok {
-                        names.truncate(saved);
+                        for slot in &mut inline_names[saved_inline..inline_len] {
+                            *slot = None;
+                        }
+                        inline_len = saved_inline;
+                        extra_names.truncate(saved_extra);
                         break;
                     }
                     depth += 1;
@@ -14102,19 +14115,27 @@ impl Pattern {
                     if controls.contains_key(&name) || !under.keeps_runtime_over(&pair.0) {
                         return None;
                     }
-                    names.push(name);
+                    if inline_len < inline_names.len() {
+                        inline_names[inline_len] = Some(name);
+                        inline_len += 1;
+                    } else {
+                        extra_names.push(name);
+                    }
                     depth += 1;
                     under = &pair.0;
                 }
                 _ => break,
             }
         }
-        if names.is_empty() || !control.is_data(0) {
+        if inline_len == 0 || !control.is_data(0) {
             return None;
         }
         // The innermost wave sets its name first.
         let mut places = OrderedMap::new();
-        for name in names.iter().rev() {
+        for name in extra_names.iter().rev() {
+            places.set_data(name, Value::F64(0.0));
+        }
+        for name in inline_names[..inline_len].iter().rev().flatten() {
             places.set_data(name, Value::F64(0.0));
         }
         let mut set = Value::Object(places);
@@ -16967,7 +16988,7 @@ pub fn unjoin(pattern: Pattern, pieces: Pattern, function: Option<&value::Functi
     let transform = function.cloned();
     let mut dependencies = vec![pattern];
     if let Some(function) = &transform {
-        dependencies.push(pure(Value::Function(Box::new(function.clone()))));
+        dependencies.push(pure(Value::Function(Arc::new(function.clone()))));
     }
     Pattern::of(Node::PatternOfHap(Box::new(HapBind(
         pieces,
@@ -19567,7 +19588,7 @@ mod restart_tests {
         name: &str,
         apply: impl Fn(Pattern) -> Pattern + Send + Sync + 'static,
     ) -> Pattern {
-        pure(Value::Function(Box::new(
+        pure(Value::Function(std::sync::Arc::new(
             crate::value::FunctionRef::registered(name, Arc::new(apply), true),
         )))
     }

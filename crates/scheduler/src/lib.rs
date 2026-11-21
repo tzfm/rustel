@@ -203,8 +203,8 @@ fn trace_edo_scale(value: &Value) -> Option<TraceEdoScale> {
     }
     // `intLabels` is one-based: degree `i` is named at `i + 1`.
     // Missing entries leave the corresponding degree unnamed.
-    let labels = match value.get("intLabels") {
-        Some(Value::List(labels)) => labels.as_slice(),
+    let labels: &[Value] = match value.get("intLabels") {
+        Some(Value::List(labels)) => labels,
         _ => &[],
     };
     let interval_labels = (0..degree_indexes.len())
@@ -2375,11 +2375,11 @@ mod tests {
                 ("root", Value::Str("130.8128".into())),
                 (
                     "degreeIndexes",
-                    Value::List(indexes.iter().copied().map(Value::F64).collect()),
+                    Value::list(indexes.iter().copied().map(Value::F64).collect()),
                 ),
                 (
                     "intLabels",
-                    Value::List(vec![
+                    Value::list(vec![
                         Value::Null,
                         Value::Str("P1".into()),
                         Value::Str("M2".into()),

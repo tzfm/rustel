@@ -157,7 +157,7 @@ pub(super) fn value_as_pattern(value: &Value) -> Pattern {
 
 pub(super) fn pure_list(pattern: &Pattern) -> Option<Vec<Value>> {
     match pattern.as_pure()? {
-        Value::List(values) => Some(*values),
+        Value::List(values) => Some(values.to_vec()),
         _ => None,
     }
 }

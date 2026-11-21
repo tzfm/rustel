@@ -5635,13 +5635,37 @@ pub fn sequence_of_sourced(layer: SourcedLayer) -> Option<Pattern> {
 /// Incremental builder for multi-layer sequences, allowing callers to reuse a
 /// single `Vec<SourceStep>` buffer across layers.
 pub struct SequenceBuilder {
-    layers: Vec<Layer>,
+    inline: [Option<Layer>; 8],
+    inline_len: usize,
+    overflow: Vec<Layer>,
 }
 
 impl SequenceBuilder {
     pub fn with_capacity(capacity: usize) -> Self {
         Self {
-            layers: Vec::with_capacity(capacity),
+            inline: Default::default(),
+            inline_len: 0,
+            overflow: if capacity > 8 {
+                Vec::with_capacity(capacity)
+            } else {
+                Vec::new()
+            },
+        }
+    }
+
+    fn push_layer(&mut self, layer: Layer) {
+        if self.overflow.is_empty() && self.inline_len < self.inline.len() {
+            self.inline[self.inline_len] = Some(layer);
+            self.inline_len += 1;
+        } else {
+            if self.overflow.is_empty() {
+                self.overflow.reserve(self.inline_len + 4);
+                for slot in &mut self.inline[..self.inline_len] {
+                    self.overflow.push(slot.take().expect("layer present"));
+                }
+                self.inline_len = 0;
+            }
+            self.overflow.push(layer);
         }
     }
 
@@ -5652,8 +5676,7 @@ impl SequenceBuilder {
         in_cycles: bool,
         steps: &mut [SourceStep],
     ) {
-        self.layers
-            .push(Layer::of_indexed_slice(period, values, in_cycles, steps));
+        self.push_layer(Layer::of_indexed_slice(period, values, in_cycles, steps));
     }
 
     pub fn push_ticks(
@@ -5670,16 +5693,25 @@ impl SequenceBuilder {
         let Some(layer) = layer_of_ticks(period, ticks, values, in_cycles, raw_steps) else {
             return false;
         };
-        self.layers.push(layer);
+        self.push_layer(layer);
         true
     }
 
     pub fn push_sourced(&mut self, layer: SourcedLayer) {
-        self.layers.push(Layer::of_source(layer));
+        self.push_layer(Layer::of_source(layer));
     }
 
-    pub fn finish(self) -> Option<Pattern> {
-        node(self.layers)
+    pub fn finish(mut self) -> Option<Pattern> {
+        if self.overflow.is_empty() {
+            if self.inline[..self.inline_len]
+                .iter()
+                .all(|l| l.as_ref().is_some_and(Layer::is_sound))
+            {
+                return Some(node_of_sound_stack(&mut self.inline, self.inline_len));
+            }
+            return None;
+        }
+        node(self.overflow)
     }
 }
 
@@ -8298,7 +8330,7 @@ mod tests {
         let control = |name: &str| ControlSpec::new([name]);
         // A filter keeps its node, so no control folds into the steps.
         let kept = |layers: &[SequenceLayer]| built(layers).filter_haps(|_| true);
-        let function = Value::Function(Box::new(crate::value::FunctionRef::js(7)));
+        let function = Value::Function(std::sync::Arc::new(crate::value::FunctionRef::js(7)));
         let bases: [Base<'_>; 4] = [
             ("controls under a signal", &|layers| {
                 let notes = built(layers).map_control(&control("n"), false);

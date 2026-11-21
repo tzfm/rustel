@@ -638,7 +638,7 @@ mod tests {
             when_registration(),
             vec![
                 two_whole_condition(),
-                crate::pure(Value::Function(Box::new(inner))),
+                crate::pure(Value::Function(std::sync::Arc::new(inner))),
             ],
         );
         let program = PatternTransformProgram::new([instruction]).expect("compilable");
@@ -659,7 +659,7 @@ mod tests {
     #[test]
     fn a_registered_call_refuses_every_uncompilable_shape() {
         let lowered = FunctionRef::lowered_js(4, PatternTransformProgram::new([]).unwrap());
-        let function = crate::pure(Value::Function(Box::new(lowered)));
+        let function = crate::pure(Value::Function(std::sync::Arc::new(lowered)));
         let condition = two_whole_condition();
         // The wrong number of leading arguments.
         for arguments in [
@@ -681,7 +681,7 @@ mod tests {
         for arguments in [
             vec![
                 condition.clone(),
-                crate::pure(Value::Function(Box::new(FunctionRef::js(7)))),
+                crate::pure(Value::Function(std::sync::Arc::new(FunctionRef::js(7)))),
             ],
             vec![
                 crate::pure(Value::JsValue(crate::value::JsValueRef::new(7, false))),

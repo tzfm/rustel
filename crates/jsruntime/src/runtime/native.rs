@@ -1422,7 +1422,7 @@ impl<'p> Turn<'p> {
             values.push(match self.evaluate(names, last, runtime)? {
                 Native::Function(transformer) if takes_transformer => {
                     holds_transformer = true;
-                    rustel_core::pure(Value::Function(Box::new(transformer)))
+                    rustel_core::pure(Value::function(transformer))
                 }
                 value => value.reified()?,
             });

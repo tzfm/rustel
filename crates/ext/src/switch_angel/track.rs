@@ -144,7 +144,7 @@ impl ExtensionPatternNode for TrackSectionNode {
 fn duration(pattern: &Pattern) -> Option<(Fraction, Fraction)> {
     let value = pattern.as_pure()?;
     let values = match value {
-        Value::List(values) => *values,
+        Value::List(values) => values.to_vec(),
         value => vec![value],
     };
     let cycles = values.first().and_then(|value| {
@@ -168,10 +168,7 @@ fn modifiers(pattern: &Pattern) -> Option<Vec<(Value, Pattern)>> {
         };
         let marker = pair.first()?.clone();
         let callback = pair.get(1)?.as_function()?.clone();
-        output.push((
-            marker,
-            rustel_core::pure(Value::Function(Box::new(callback))),
-        ));
+        output.push((marker, rustel_core::pure(Value::function(callback))));
     }
     Some(output)
 }

@@ -51,11 +51,12 @@ fn build<'js>(
         let (pattern, owner) = reify_bridged(&ctx, argument)?;
         sidecars.push(owner);
         inputs = inputs.app_left_with(pattern, |left, right| {
-            let Value::List(mut values) = rustel_core::materialize_js_value(left) else {
+            let Value::List(values) = rustel_core::materialize_js_value(left) else {
                 return Value::Undefined;
             };
-            values.push(rustel_core::materialize_js_value(right));
-            Value::List(values)
+            let mut out = values.to_vec();
+            out.push(rustel_core::materialize_js_value(right));
+            Value::list(out)
         });
     }
     let pattern = receiver.outer_bind_controls(inputs, move |current, input| {
@@ -65,11 +66,11 @@ fn build<'js>(
             _ => rustel_core::OrderedMap::new(),
         };
         let mut inputs = match controls.get("workletInputs").cloned() {
-            Some(Value::List(inputs)) => *inputs,
+            Some(Value::List(inputs)) => inputs.to_vec(),
             _ => Vec::new(),
         };
         if let Value::List(values) = rustel_core::materialize_js_value(input) {
-            inputs.extend(*values);
+            inputs.extend_from_slice(&values);
         }
         controls.insert("workletSrc".into(), Value::Str(source.as_str().into()));
         controls.insert("workletInputs".into(), Value::list(inputs));

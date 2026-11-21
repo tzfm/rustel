@@ -175,10 +175,7 @@ fn lower_transform<'js>(
     };
     let mut sidecars = vec![sidecar];
     sidecars.extend(lowered.sidecars);
-    Ok((
-        rustel_core::pure(Value::Function(Box::new(function))),
-        sidecars,
-    ))
+    Ok((rustel_core::pure(Value::function(function)), sidecars))
 }
 
 #[cfg(test)]

@@ -29,7 +29,7 @@ fn set_plugin_field(hap: &Value, call: &str, field: &Field, setting: &Value) -> 
     }
     let chain = call == "vst";
     let mut effects = match controls.get(call) {
-        Some(Value::List(effects)) if chain => (**effects).clone(),
+        Some(Value::List(effects)) if chain => effects.to_vec(),
         _ => Vec::new(),
     };
     let held = if chain {

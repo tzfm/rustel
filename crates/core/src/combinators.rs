@@ -237,8 +237,8 @@ fn sliced_value(slices: &Value, index: &Value, value: &Value) -> Value {
             }
         }
         Value::List(values) => {
-            for (index, value) in values.into_iter().enumerate() {
-                controls.insert(index.to_string(), value);
+            for (index, value) in values.iter().enumerate() {
+                controls.insert(index.to_string(), value.clone());
             }
         }
         Value::Function(_) | Value::Pattern(_) | Value::JsValue(_) | Value::Haps(_) => {}
@@ -1134,12 +1134,12 @@ pub fn euclidish<P: PatOps>(pat: &P, pulses: i32, steps: i32, by: Fraction) -> P
 
 pub fn as_controls<P: PatOps>(pat: &P, mapping: &Value) -> P {
     let mapping = match crate::materialize_js_value(mapping) {
-        Value::List(values) => *values,
+        Value::List(values) => values.to_vec(),
         value => vec![value],
     };
     pat.fmap(move |value| {
         let values = match crate::materialize_js_value(value) {
-            Value::List(values) => *values,
+            Value::List(values) => values.to_vec(),
             value => vec![value],
         };
         let entries = mapping.iter().zip(values).filter_map(|(name, value)| {
@@ -2120,7 +2120,7 @@ pub fn csound<P: PatOps>(pat: &P, instrument: &Value, midi: bool) -> P {
 /// wrapped, and missing positions are `undefined`.
 fn slots(value: &Value, n: usize) -> Vec<Value> {
     let items: Vec<Value> = match value {
-        Value::List(items) => (**items).clone(),
+        Value::List(items) => items.to_vec(),
         other => vec![other.clone()],
     };
     (0..n)
@@ -3612,7 +3612,7 @@ mod tests {
                 .to_vec()
         };
         let bd = OrderedMap::from_entries([("s".into(), Value::Str("bd".into()))]);
-        let function = Value::Function(Box::new(FunctionRef::registered(
+        let function = Value::Function(std::sync::Arc::new(FunctionRef::registered(
             "id",
             std::sync::Arc::new(|pat| pat),
             true,

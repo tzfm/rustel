@@ -2373,11 +2373,14 @@ fn compile(ast: &Ast) -> Built {
                 build_validated(element),
                 |left, right| match left {
                     Value::List(values) => {
-                        let mut values = values.clone();
-                        values.push(right.clone());
-                        Value::List(values)
+                        let mut out = Vec::with_capacity(values.len() + 1);
+                        out.extend_from_slice(values);
+                        out.push(right.clone());
+                        Value::list(out)
                     }
-                    value => Value::list(vec![value.clone(), right.clone()]),
+                    value => {
+                        Value::list_from_arc(std::sync::Arc::from([value.clone(), right.clone()]))
+                    }
                 },
             ))
         }

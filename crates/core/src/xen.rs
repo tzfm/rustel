@@ -307,9 +307,9 @@ pub(crate) fn query_xen_patterns(
                 let Value::List(values) = values else {
                     return Value::Undefined;
                 };
-                let mut values = values.clone();
-                values.push(value.clone());
-                Value::List(values)
+                let mut out = values.to_vec();
+                out.push(value.clone());
+                Value::list(out)
             })
         })
         .fmap(|value| {
@@ -950,7 +950,7 @@ pub fn edo_scale<P: PatOps>(pat: &P, arg: Value) -> P {
     // Arrays only. A string definition fails with the verbatim flat()
     // TypeError rather than inventing string parsing that never existed.
     let definition: Vec<Value> = match &arg {
-        Value::List(items) => (**items).clone(),
+        Value::List(items) => items.to_vec(),
         _ => {
             return query_error_pattern::<P>(|| {
                 "scaleDefinition.flat is not a function".to_string()

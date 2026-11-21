@@ -320,7 +320,7 @@ pub(crate) fn argument_values(
     constants: &[Option<Value>],
 ) -> Vec<Value> {
     let riding = match riding {
-        Value::List(values) => (**values).clone(),
+        Value::List(values) => values.to_vec(),
         single => vec![single.clone()],
     };
     debug_assert_eq!(riding.len(), chain);
@@ -1115,7 +1115,7 @@ mod numeric_string_tests {
             }),
             true,
         );
-        let callback = pure(Value::Function(Box::new(transformer)));
+        let callback = pure(Value::Function(std::sync::Arc::new(transformer)));
         let count = pure(Value::F64((MAX_ITER_PARTS + 1) as f64));
         let receiver = pure(Value::Str("a".into()));
         let cases = [
@@ -1220,7 +1220,7 @@ mod numeric_string_tests {
             }),
             true,
         );
-        let callback = pure(Value::Function(Box::new(transformer)));
+        let callback = pure(Value::Function(std::sync::Arc::new(transformer)));
         let receiver = pure(Value::Str("a".into()));
         let echo_with = registry.get("echoWith").expect("registered echoWith");
 
@@ -1272,7 +1272,7 @@ mod numeric_string_tests {
             &[
                 pure(Value::F64(MAX_ECHO_COPIES as f64)),
                 pure(Value::F64(0.0)),
-                pure(Value::Function(Box::new(transformer))),
+                pure(Value::Function(std::sync::Arc::new(transformer))),
             ],
             pure(Value::Str("a".into())),
         );
@@ -1300,7 +1300,7 @@ mod purity_rule_tests {
     use std::sync::Arc;
 
     fn lowered() -> Value {
-        Value::Function(Box::new(FunctionRef::lowered_js(
+        Value::Function(std::sync::Arc::new(FunctionRef::lowered_js(
             1,
             PatternTransformProgram::new([]).unwrap(),
         )))
@@ -1313,7 +1313,10 @@ mod purity_rule_tests {
         let fast = registry.get("fast").expect("registered fast");
         assert!(sometimes.admits_pure_view(&[lowered()]));
         assert!(sometimes.admits_pure_view(&[Value::F64(0.5), lowered()]));
-        assert!(!sometimes.admits_pure_view(&[Value::Function(Box::new(FunctionRef::js(1)))]));
+        assert!(
+            !sometimes
+                .admits_pure_view(&[Value::Function(std::sync::Arc::new(FunctionRef::js(1)))])
+        );
         assert!(!sometimes.admits_pure_view(&[Value::list(vec![lowered()])]));
         assert!(!fast.admits_pure_view(&[lowered()]));
         assert!(fast.admits_pure_view(&[Value::F64(2.0)]));
@@ -1344,11 +1347,9 @@ mod purity_rule_tests {
         let registry = default_registry();
         let fast = registry.get("fast").expect("registered fast");
         let every = registry.get("every").expect("registered every");
-        let rev = pure(Value::Function(Box::new(FunctionRef::registered(
-            "rev",
-            Arc::new(|pattern| pattern.rev()),
-            true,
-        ))));
+        let rev = pure(Value::Function(std::sync::Arc::new(
+            FunctionRef::registered("rev", Arc::new(|pattern| pattern.rev()), true),
+        )));
         let patterned = crate::fastcat(vec![pure(Value::F64(2.0)), pure(Value::F64(4.0))]);
         assert!(fast.preserves_purity_with(&[pure(Value::F64(2.0))]));
         assert!(fast.preserves_purity_with(std::slice::from_ref(&patterned)));
@@ -1359,11 +1360,9 @@ mod purity_rule_tests {
         let every_two = every.call(
             &[
                 pure(Value::F64(2.0)),
-                pure(Value::Function(Box::new(FunctionRef::registered(
-                    "rev",
-                    Arc::new(|pattern| pattern.rev()),
-                    true,
-                )))),
+                pure(Value::Function(std::sync::Arc::new(
+                    FunctionRef::registered("rev", Arc::new(|pattern| pattern.rev()), true),
+                ))),
             ],
             receiver,
         );
@@ -1376,11 +1375,9 @@ mod purity_rule_tests {
         let registry = default_registry();
         let every = registry.get("every").expect("registered every");
         let rev = || {
-            pure(Value::Function(Box::new(FunctionRef::registered(
-                "rev",
-                Arc::new(|pattern| pattern.rev()),
-                true,
-            ))))
+            pure(Value::Function(std::sync::Arc::new(
+                FunctionRef::registered("rev", Arc::new(|pattern| pattern.rev()), true),
+            )))
         };
         // Two counts, one a cycle: data that the graph holds.
         let counts = || {
@@ -1412,7 +1409,7 @@ mod purity_rule_tests {
         // dynamic constructor.
         let behind_a_map = every.call(&[counts().with_query_time(|time| time), rev()], receiver());
         assert!(!behind_a_map.is_pure());
-        let script = pure(Value::Function(Box::new(FunctionRef::js(1))));
+        let script = pure(Value::Function(std::sync::Arc::new(FunctionRef::js(1))));
         assert!(!every.call(&[counts(), script], receiver()).is_pure());
         // Both constructors build the same patterns.
         for (begin, end) in [(0, 6), (1, 2), (-3, 5), (2, 2)] {
