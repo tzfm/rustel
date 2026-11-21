@@ -2382,6 +2382,17 @@ thread_local! {
 /// counting. Power-of-two grids skip the thread-local completely.
 #[inline]
 pub(crate) fn with_tick_grid<R>(ticks: NonZeroU32, f: impl FnOnce(Option<&TickGrid>) -> R) -> R {
+    with_tick_grid_if(ticks, true, f)
+}
+
+/// Borrow a cached [`TickGrid`] for `ticks`, building a new thread-local table
+/// for large denominators (`> 64`) only when `build_if_missing` is true.
+#[inline]
+pub(crate) fn with_tick_grid_if<R>(
+    ticks: NonZeroU32,
+    build_if_missing: bool,
+    f: impl FnOnce(Option<&TickGrid>) -> R,
+) -> R {
     let raw = ticks.get();
     if raw.is_power_of_two() || i64::from(raw) > TickGrid::MAX_DENOM {
         return f(None);
@@ -2404,6 +2415,9 @@ pub(crate) fn with_tick_grid<R>(ticks: NonZeroU32, f: impl FnOnce(Option<&TickGr
         return result;
     }
     let f = f.expect("closure not yet called");
+    if !build_if_missing {
+        return f(None);
+    }
     let Some(built) = TickGrid::new(denom) else {
         return f(None);
     };
@@ -4960,7 +4974,9 @@ impl Layer {
         let pushed = if grid.ticks.is_power_of_two() {
             emit_range(None, &mut cuts)
         } else {
-            with_tick_grid(grid.ticks, |reductions| emit_range(reductions, &mut cuts))
+            with_tick_grid_if(grid.ticks, met >= 8, |reductions| {
+                emit_range(reductions, &mut cuts)
+            })
         };
         if pushed.is_ok() {
             thread.note_accumulated(out.len() - others);

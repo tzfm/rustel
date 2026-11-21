@@ -1325,6 +1325,9 @@ impl<'p> Turn<'p> {
             &math_outer[..math_len],
             math_inside,
         )?;
+        if steps > 0 && wave.has_cuts() {
+            return None;
+        }
         if self.steps.saturating_add(nodes) > MAX_STEPS {
             return None;
         }

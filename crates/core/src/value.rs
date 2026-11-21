@@ -702,12 +702,9 @@ pub(crate) struct Patched {
 
 const _: () = assert!(std::mem::size_of::<Patched>() <= 256);
 
-/// Compact multi-slot numeric overlay storing up to 16 values (`n_keys * n_slots <= 16`,
-/// `1 <= n_keys <= 4`) over one uniform-key [`PatchedBase`]. Allows segmented steps
-/// (`meet_steps_small`) and multi-sample wave chains (`try_query_wave_chain_onto`) to
-/// share one allocation across all steps/samples and every chord note from the same base.
+/// Shared header for compact multi-slot numeric overlays (`StepPatchData<N>`).
 #[derive(Clone)]
-pub(crate) struct StepPatch {
+pub(crate) struct StepPatchHead {
     base: PatchedBase,
     marks: u64,
     keys: [Option<Key>; 4],
@@ -716,13 +713,76 @@ pub(crate) struct StepPatch {
     n_keys: u8,
     appended: u8,
     made: bool,
-    values: [Value; 16],
 }
 
-const _: () = assert!(std::mem::size_of::<StepPatch>() <= 512);
+/// Fixed-capacity multi-slot numeric overlay storing `N` values over one
+/// [`PatchedBase`]: `N = 4` fits in 192 B (including `Arc` header) for common
+/// 1–4 value playback windows, while `N = 16` handles denser batches.
+#[derive(Clone)]
+pub(crate) struct StepPatchData<const N: usize> {
+    head: StepPatchHead,
+    values: [Value; N],
+}
+
+const _: () = assert!(std::mem::size_of::<StepPatchData<4>>() <= 224);
+const _: () = assert!(std::mem::size_of::<StepPatchData<16>>() <= 512);
+
+/// Reference-counted handle to either a 4-value or 16-value [`StepPatchData`].
+#[derive(Clone)]
+pub(crate) enum StepPatch {
+    Small(Arc<StepPatchData<4>>),
+    Wide(Arc<StepPatchData<16>>),
+}
+
+/// Builder for [`StepPatch`], writing values directly into the uniquely owned
+/// `Arc<StepPatchData<N>>` so finishing moves the handle with zero stack copy.
+pub(crate) struct StepPatchBuilder(StepPatch);
+
+impl StepPatchBuilder {
+    #[inline(always)]
+    pub(crate) fn set_slot(&mut self, slot: usize, vals: &[f64]) {
+        let (n_keys, values): (usize, &mut [Value]) = match &mut self.0 {
+            StepPatch::Small(arc) => {
+                let data = Arc::get_mut(arc).expect("unique step patch builder");
+                (usize::from(data.head.n_keys), &mut data.values)
+            }
+            StepPatch::Wide(arc) => {
+                let data = Arc::get_mut(arc).expect("unique step patch builder");
+                (usize::from(data.head.n_keys), &mut data.values)
+            }
+        };
+        debug_assert_eq!(vals.len(), n_keys);
+        let offset = slot * n_keys;
+        for (k, &v) in vals.iter().enumerate() {
+            values[offset + k] = Value::F64(v);
+        }
+    }
+
+    #[inline(always)]
+    pub(crate) fn set_single_slot(&mut self, slot: usize, val: f64) {
+        match &mut self.0 {
+            StepPatch::Small(arc) => {
+                let data = Arc::get_mut(arc).expect("unique step patch builder");
+                debug_assert_eq!(data.head.n_keys, 1);
+                data.values[slot] = Value::F64(val);
+            }
+            StepPatch::Wide(arc) => {
+                let data = Arc::get_mut(arc).expect("unique step patch builder");
+                debug_assert_eq!(data.head.n_keys, 1);
+                data.values[slot] = Value::F64(val);
+            }
+        }
+    }
+
+    #[inline(always)]
+    pub(crate) fn finish(self) -> StepPatch {
+        self.0
+    }
+}
 
 impl StepPatch {
     pub(crate) const MAX_KEYS: usize = 4;
+    pub(crate) const MAX_SMALL_VALUES: usize = 4;
     pub(crate) const MAX_VALUES: usize = 16;
     pub(crate) const MAX_ROW: u32 = u32::MAX >> 4;
 
@@ -735,9 +795,52 @@ impl StepPatch {
         row: u32,
         keys: &[&Key],
         made: bool,
-    ) -> Option<Self> {
+        total_values: usize,
+    ) -> Option<StepPatchBuilder> {
+        if total_values > Self::MAX_VALUES {
+            return None;
+        }
+        let head = StepPatchHead::new_for_row(base, row, keys, made)?;
+        if total_values <= Self::MAX_SMALL_VALUES {
+            Some(StepPatchBuilder(StepPatch::Small(Arc::new(
+                StepPatchData {
+                    head,
+                    values: [const { Value::Undefined }; 4],
+                },
+            ))))
+        } else {
+            Some(StepPatchBuilder(StepPatch::Wide(Arc::new(StepPatchData {
+                head,
+                values: [const { Value::Undefined }; 16],
+            }))))
+        }
+    }
+
+    #[inline(always)]
+    fn ptr_eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Small(a), Self::Small(b)) => Arc::ptr_eq(a, b),
+            (Self::Wide(a), Self::Wide(b)) => Arc::ptr_eq(a, b),
+            _ => false,
+        }
+    }
+
+    #[inline(always)]
+    pub(crate) fn pack(row: u32, slot: usize) -> u32 {
+        debug_assert!(row <= Self::MAX_ROW && slot < 16);
+        (row << 4) | (slot as u32)
+    }
+
+    #[inline(always)]
+    pub(crate) fn unpack(packed: u32) -> (u32, usize) {
+        (packed >> 4, (packed & 0xF) as usize)
+    }
+}
+
+impl StepPatchHead {
+    fn new_for_row(base: PatchedBase, row: u32, keys: &[&Key], made: bool) -> Option<Self> {
         let n_keys = keys.len();
-        if n_keys == 0 || n_keys > Self::MAX_KEYS || row > Self::MAX_ROW {
+        if n_keys == 0 || n_keys > StepPatch::MAX_KEYS || row > StepPatch::MAX_ROW {
             return None;
         }
         let base_layout = base.layout(row);
@@ -768,35 +871,7 @@ impl StepPatch {
             n_keys: n_keys as u8,
             appended,
             made,
-            values: [const { Value::Undefined }; 16],
         })
-    }
-
-    #[inline(always)]
-    pub(crate) fn set_slot(&mut self, slot: usize, vals: &[f64]) {
-        let n = usize::from(self.n_keys);
-        debug_assert_eq!(vals.len(), n);
-        let offset = slot * n;
-        for (k, &v) in vals.iter().enumerate() {
-            self.values[offset + k] = Value::F64(v);
-        }
-    }
-
-    #[inline(always)]
-    pub(crate) fn set_single_slot(&mut self, slot: usize, val: f64) {
-        debug_assert_eq!(self.n_keys, 1);
-        self.values[slot] = Value::F64(val);
-    }
-
-    #[inline(always)]
-    pub(crate) fn pack(row: u32, slot: usize) -> u32 {
-        debug_assert!(row <= Self::MAX_ROW && slot < 16);
-        (row << 4) | (slot as u32)
-    }
-
-    #[inline(always)]
-    pub(crate) fn unpack(packed: u32) -> (u32, usize) {
-        (packed >> 4, (packed & 0xF) as usize)
     }
 
     #[inline(always)]
@@ -805,8 +880,8 @@ impl StepPatch {
     }
 
     #[inline(always)]
-    fn at(&self, packed: u32, index: usize) -> (&Key, &Value) {
-        let (row, slot) = Self::unpack(packed);
+    fn at<'a>(&'a self, values: &'a [Value], packed: u32, index: usize) -> (&'a Key, &'a Value) {
+        let (row, slot) = StepPatch::unpack(packed);
         let base_len = usize::from(self.base_len);
         let n_keys = usize::from(self.n_keys);
         let offset = slot * n_keys;
@@ -815,7 +890,7 @@ impl StepPatch {
                 if usize::from(self.reps[k]) == index {
                     return (
                         self.keys[k].as_ref().expect("step patch key"),
-                        &self.values[offset + k],
+                        &values[offset + k],
                     );
                 }
             }
@@ -827,7 +902,7 @@ impl StepPatch {
                 if rem == 0 {
                     return (
                         self.keys[k].as_ref().expect("step patch key"),
-                        &self.values[offset + k],
+                        &values[offset + k],
                     );
                 }
                 rem -= 1;
@@ -837,19 +912,24 @@ impl StepPatch {
     }
 
     #[inline(always)]
-    fn get<K: ?Sized + Named>(&self, packed: u32, key: &K) -> Option<&Value>
+    fn get<'a, K: ?Sized + Named>(
+        &'a self,
+        values: &'a [Value],
+        packed: u32,
+        key: &K,
+    ) -> Option<&'a Value>
     where
         Key: PartialEq<K>,
     {
         if self.marks & Table::mark(key.name()) == 0 {
             return None;
         }
-        let (row, slot) = Self::unpack(packed);
+        let (row, slot) = StepPatch::unpack(packed);
         let n_keys = usize::from(self.n_keys);
         let offset = slot * n_keys;
         for k in 0..n_keys {
             if self.keys[k].as_ref().is_some_and(|name| name == key) {
-                return Some(&self.values[offset + k]);
+                return Some(&values[offset + k]);
             }
         }
         self.base.layout(row).get(key)
@@ -863,7 +943,7 @@ impl StepPatch {
         if self.marks & Table::mark(key.name()) == 0 {
             return None;
         }
-        let (row, _) = Self::unpack(packed);
+        let (row, _) = StepPatch::unpack(packed);
         let n_keys = usize::from(self.n_keys);
         let mut appended_before = 0usize;
         for k in 0..n_keys {
@@ -883,14 +963,14 @@ impl StepPatch {
 
     /// Promote one `(row, slot)` view into an owned mutable [`Patched`] so
     /// downstream constant/wave overlays can stack without flattening `base`.
-    fn to_patched(&self, packed: u32) -> Option<(Patched, u32)> {
-        let (row, slot) = Self::unpack(packed);
+    fn to_patched(&self, values: &[Value], packed: u32) -> Option<(Patched, u32)> {
+        let (row, slot) = StepPatch::unpack(packed);
         let mut patched = Patched::empty(self.base.clone(), row, self.made)?;
         let n_keys = usize::from(self.n_keys);
         let offset = slot * n_keys;
         for k in 0..n_keys {
             let key = self.keys[k].as_ref()?;
-            let _ = patched.try_set(row, key, self.values[offset + k].clone(), true);
+            let _ = patched.try_set(row, key, values[offset + k].clone(), true);
         }
         Some((patched, row))
     }
@@ -1482,7 +1562,7 @@ impl Patched {
 /// Reusable per-timestamp or per-run overlay cache for chord/stacked haps
 /// sharing uniform-key [`Table`], `SeqLayer`, or [`Patched`] overlays.
 type PatchedCacheEntry = (Arc<Patched>, u32, Arc<Patched>);
-type StepPatchCacheEntry = (Arc<StepPatch>, u32, Arc<Patched>);
+type StepPatchCacheEntry = (StepPatch, u32, Arc<Patched>);
 
 #[derive(Default)]
 pub(crate) struct SharedWaveCache {
@@ -1552,15 +1632,15 @@ impl SharedWaveCache {
     }
 
     #[inline]
-    fn get_step_patch(&self, sp: &Arc<StepPatch>, slot_key: u32) -> Option<&Arc<Patched>> {
+    fn get_step_patch(&self, sp: &StepPatch, slot_key: u32) -> Option<&Arc<Patched>> {
         self.step_patched
             .iter()
             .flatten()
-            .find_map(|(k, tag, v)| (*tag == slot_key && Arc::ptr_eq(k, sp)).then_some(v))
+            .find_map(|(k, tag, v)| (*tag == slot_key && k.ptr_eq(sp)).then_some(v))
     }
 
     #[inline]
-    fn put_step_patch(&mut self, sp: Arc<StepPatch>, slot_key: u32, out: Arc<Patched>) {
+    fn put_step_patch(&mut self, sp: StepPatch, slot_key: u32, out: Arc<Patched>) {
         let slot = usize::from(self.step_patched_next) & 1;
         self.step_patched[slot] = Some((sp, slot_key, out));
         self.step_patched_next = self.step_patched_next.wrapping_add(1);
@@ -1588,9 +1668,10 @@ enum Entries {
     SeqLayer(Arc<[crate::sequence::Layer]>, u32, u16),
     /// A small overlay of up to [`MAX_PATCHES`] entries over a dressed row.
     Patched(Arc<Patched>, u32),
-    /// A multi-slot numeric overlay sharing one allocation across up to 16
-    /// steps or wave samples over a uniform-key base: `(patch, (row << 4) | slot)`.
-    StepPatch(Arc<StepPatch>, u32),
+    /// A compact 4-value multi-slot numeric overlay: `(patch, (row << 4) | slot)`.
+    StepPatch4(Arc<StepPatchData<4>>, u32),
+    /// A 16-value multi-slot numeric overlay: `(patch, (row << 4) | slot)`.
+    StepPatch16(Arc<StepPatchData<16>>, u32),
 }
 
 const _: () = assert!(std::mem::size_of::<OrderedMap>() == 24);
@@ -1766,7 +1847,8 @@ impl Table {
             | Entries::Dressed(..)
             | Entries::SeqLayer(..)
             | Entries::Patched(..)
-            | Entries::StepPatch(..) => Some(set.layout().to_shares()),
+            | Entries::StepPatch4(..)
+            | Entries::StepPatch16(..) => Some(set.layout().to_shares()),
         });
         let held = |name: &Key| {
             tail.as_deref()
@@ -1795,7 +1877,8 @@ impl Table {
                         | Entries::Dressed(..)
                         | Entries::SeqLayer(..)
                         | Entries::Patched(..)
-                        | Entries::StepPatch(..) => map.layout().to_shares(),
+                        | Entries::StepPatch4(..)
+                        | Entries::StepPatch16(..) => map.layout().to_shares(),
                     };
                     let bare = entries.is_empty() && tail.is_none();
                     if bare || entries.iter().any(|(name, _)| held(name)) || !value.is_data(0) {
@@ -1912,7 +1995,8 @@ impl Table {
             | Entries::Dressed(..)
             | Entries::SeqLayer(..)
             | Entries::Patched(..)
-            | Entries::StepPatch(..) => base.layout().to_shares(),
+            | Entries::StepPatch4(..)
+            | Entries::StepPatch16(..) => base.layout().to_shares(),
         };
         let replace = entries
             .iter()
@@ -2064,7 +2148,7 @@ pub(crate) enum Layout<'a> {
     /// A small overlay on top of a dressed table row.
     Overlay(&'a Patched, u32),
     /// A multi-slot numeric overlay on top of a dressed table row.
-    StepOverlay(&'a StepPatch, u32),
+    StepOverlay(&'a StepPatchHead, &'a [Value], u32),
 }
 
 impl<'a> Layout<'a> {
@@ -2077,7 +2161,7 @@ impl<'a> Layout<'a> {
             Self::Patched(base, replace, _, _) => base.len() + usize::from(replace == base.len()),
             Self::KeyedExtra(_, _, tail, _, _) => 2 + tail.len(),
             Self::Overlay(patched, _) => patched.len(),
-            Self::StepOverlay(step, _) => step.len(),
+            Self::StepOverlay(step, _, _) => step.len(),
         }
     }
 
@@ -2101,8 +2185,9 @@ impl<'a> Layout<'a> {
                 index: 0,
                 total: patched.len(),
             },
-            Self::StepOverlay(step, packed) => PairsInner::StepOverlay {
+            Self::StepOverlay(step, values, packed) => PairsInner::StepOverlay {
                 step,
+                values,
                 packed,
                 index: 0,
                 total: step.len(),
@@ -2139,7 +2224,7 @@ impl<'a> Layout<'a> {
                 }
             }
             Self::Overlay(patched, row) => patched.at(row, index),
-            Self::StepOverlay(step, packed) => step.at(packed, index),
+            Self::StepOverlay(step, values, packed) => step.at(values, packed, index),
         }
     }
 
@@ -2169,7 +2254,7 @@ impl<'a> Layout<'a> {
                 }
             }
             Self::Overlay(patched, row) => patched.position(row, key),
-            Self::StepOverlay(step, step_packed) => step.position(step_packed, key),
+            Self::StepOverlay(step, _, step_packed) => step.position(step_packed, key),
         }
     }
 
@@ -2202,7 +2287,7 @@ impl<'a> Layout<'a> {
                 }
             }
             Self::Overlay(patched, row) => patched.position(row, key),
-            Self::StepOverlay(step, packed) => step.position(packed, key),
+            Self::StepOverlay(step, _, packed) => step.position(packed, key),
         }
     }
 
@@ -2232,7 +2317,7 @@ impl<'a> Layout<'a> {
                 }
             }
             Self::Overlay(patched, row) => patched.get(row, key),
-            Self::StepOverlay(step, packed) => step.get(packed, key),
+            Self::StepOverlay(step, values, packed) => step.get(values, packed, key),
         }
     }
 }
@@ -2269,9 +2354,9 @@ impl Layout<'_> {
                     (key.clone(), value.clone())
                 })
                 .collect(),
-            Self::StepOverlay(step, packed) => (0..step.len())
+            Self::StepOverlay(step, values, packed) => (0..step.len())
                 .map(|index| {
-                    let (key, value) = step.at(packed, index);
+                    let (key, value) = step.at(values, packed, index);
                     (key.clone(), value.clone())
                 })
                 .collect(),
@@ -2350,7 +2435,8 @@ enum PairsInner<'a> {
     },
     /// Entries from a multi-slot numeric overlay over a dressed table row.
     StepOverlay {
-        step: &'a StepPatch,
+        step: &'a StepPatchHead,
+        values: &'a [Value],
         packed: u32,
         index: usize,
         total: usize,
@@ -2403,6 +2489,7 @@ impl<'a> Iterator for Pairs<'a> {
             }
             PairsInner::StepOverlay {
                 step,
+                values,
                 packed,
                 index,
                 total,
@@ -2410,7 +2497,7 @@ impl<'a> Iterator for Pairs<'a> {
                 if *index >= *total {
                     return None;
                 }
-                let pair = step.at(*packed, *index);
+                let pair = step.at(values, *packed, *index);
                 *index += 1;
                 Some(pair)
             }
@@ -2529,7 +2616,12 @@ impl OrderedMap {
                 layers[usize::from(*layer_idx)].seq_layout(*row)
             }
             Entries::Patched(patched, row) => Layout::Overlay(patched, *row),
-            Entries::StepPatch(step, packed) => Layout::StepOverlay(step, *packed),
+            Entries::StepPatch4(step, packed) => {
+                Layout::StepOverlay(&step.head, &step.values, *packed)
+            }
+            Entries::StepPatch16(step, packed) => {
+                Layout::StepOverlay(&step.head, &step.values, *packed)
+            }
         }
     }
 
@@ -2564,8 +2656,13 @@ impl OrderedMap {
             Entries::Patched(patched, row) => {
                 self.entries = Layout::Overlay(patched, *row).to_entries(patched.made);
             }
-            Entries::StepPatch(step, packed) => {
-                self.entries = Layout::StepOverlay(step, *packed).to_entries(step.made);
+            Entries::StepPatch4(step, packed) => {
+                self.entries = Layout::StepOverlay(&step.head, &step.values, *packed)
+                    .to_entries(step.head.made);
+            }
+            Entries::StepPatch16(step, packed) => {
+                self.entries = Layout::StepOverlay(&step.head, &step.values, *packed)
+                    .to_entries(step.head.made);
             }
             _ => {}
         }
@@ -2638,8 +2735,12 @@ impl OrderedMap {
 
     /// Point this map at `(row, slot)` of a shared [`StepPatch`].
     #[inline(always)]
-    pub(crate) fn set_step_patch(&mut self, patch: &Arc<StepPatch>, row: u32, slot: usize) {
-        self.entries = Entries::StepPatch(Arc::clone(patch), StepPatch::pack(row, slot));
+    pub(crate) fn set_step_patch(&mut self, patch: &StepPatch, row: u32, slot: usize) {
+        let packed = StepPatch::pack(row, slot);
+        self.entries = match patch {
+            StepPatch::Small(p) => Entries::StepPatch4(Arc::clone(p), packed),
+            StepPatch::Wide(p) => Entries::StepPatch16(Arc::clone(p), packed),
+        };
     }
 
     /// If this map is backed by a dressed [`Table`] or direct-keyed sequence
@@ -2669,8 +2770,13 @@ impl OrderedMap {
             Entries::Patched(patched, row) => {
                 self.entries = Layout::Overlay(patched, *row).to_entries(patched.made);
             }
-            Entries::StepPatch(step, packed) => {
-                self.entries = Layout::StepOverlay(step, *packed).to_entries(step.made);
+            Entries::StepPatch4(step, packed) => {
+                self.entries = Layout::StepOverlay(&step.head, &step.values, *packed)
+                    .to_entries(step.head.made);
+            }
+            Entries::StepPatch16(step, packed) => {
+                self.entries = Layout::StepOverlay(&step.head, &step.values, *packed)
+                    .to_entries(step.head.made);
             }
             _ => {}
         }
@@ -2921,7 +3027,12 @@ impl OrderedMap {
                 Held::View(layers[usize::from(*layer_idx)].seq_layout(*row))
             }
             Entries::Patched(patched, row) => Held::View(Layout::Overlay(patched, *row)),
-            Entries::StepPatch(step, packed) => Held::View(Layout::StepOverlay(step, *packed)),
+            Entries::StepPatch4(step, packed) => {
+                Held::View(Layout::StepOverlay(&step.head, &step.values, *packed))
+            }
+            Entries::StepPatch16(step, packed) => {
+                Held::View(Layout::StepOverlay(&step.head, &step.values, *packed))
+            }
         };
         self.entries = pack_entries(count, |index| entry(&mut held, index), false);
     }
@@ -3029,9 +3140,15 @@ impl OrderedMap {
                 let (key, value) = entry;
                 Layout::Overlay(&patched, row).with_entries(&key, None, value, false)
             }
-            Entries::StepPatch(step, packed) => {
+            Entries::StepPatch4(step, packed) => {
                 let (key, value) = entry;
-                Layout::StepOverlay(&step, packed).with_entries(&key, None, value, false)
+                Layout::StepOverlay(&step.head, &step.values, packed)
+                    .with_entries(&key, None, value, false)
+            }
+            Entries::StepPatch16(step, packed) => {
+                let (key, value) = entry;
+                Layout::StepOverlay(&step.head, &step.values, packed)
+                    .with_entries(&key, None, value, false)
             }
         };
     }
@@ -3146,7 +3263,7 @@ impl OrderedMap {
                     };
                     self.entries = layout.with_entries(key, at, value, false);
                 }
-                (Entries::Patched(..) | Entries::StepPatch(..), at) => {
+                (Entries::Patched(..) | Entries::StepPatch4(..) | Entries::StepPatch16(..), at) => {
                     let value = match at {
                         Some(at) => change(self.layout().at(at).1, value),
                         None => value.clone(),
@@ -3387,7 +3504,7 @@ impl OrderedMap {
         }
         let at = self.position(key);
         match (&self.entries, at) {
-            (Entries::Patched(..) | Entries::StepPatch(..), at) => {
+            (Entries::Patched(..) | Entries::StepPatch4(..) | Entries::StepPatch16(..), at) => {
                 let value = match at {
                     Some(at) => change(self.layout().at(at).1, other),
                     None => other.clone(),
@@ -3423,7 +3540,8 @@ impl OrderedMap {
                 layers[usize::from(*layer_idx)].seq_position(*row, key.name())
             }
             Entries::Patched(patched, row) => patched.position(*row, key),
-            Entries::StepPatch(step, packed) => step.position(*packed, key),
+            Entries::StepPatch4(step, packed) => step.head.position(*packed, key),
+            Entries::StepPatch16(step, packed) => step.head.position(*packed, key),
         }
     }
 
@@ -3438,7 +3556,8 @@ impl OrderedMap {
                 layers[usize::from(*layer_idx)].seq_is_made()
             }
             Entries::Patched(patched, _) => patched.made,
-            Entries::StepPatch(step, _) => step.made,
+            Entries::StepPatch4(step, _) => step.head.made,
+            Entries::StepPatch16(step, _) => step.head.made,
             Entries::Shared(_) => false,
         }
     }
@@ -3546,8 +3665,12 @@ impl OrderedMap {
                 return;
             }
         }
-        if let Entries::StepPatch(sp, packed) = &self.entries
-            && let Some((mut patched, row)) = sp.to_patched(*packed)
+        let sp_promoted = match &self.entries {
+            Entries::StepPatch4(sp, packed) => sp.head.to_patched(&sp.values, *packed),
+            Entries::StepPatch16(sp, packed) => sp.head.to_patched(&sp.values, *packed),
+            _ => None,
+        };
+        if let Some((mut patched, row)) = sp_promoted
             && patched.try_set(row, key, value.clone(), true).is_ok()
         {
             self.entries = Entries::Patched(Arc::new(patched), row);
@@ -3590,7 +3713,9 @@ impl OrderedMap {
                 .with_entries(key, at, value, true);
             return;
         }
-        if let Entries::Patched(..) | Entries::StepPatch(..) = &self.entries {
+        if let Entries::Patched(..) | Entries::StepPatch4(..) | Entries::StepPatch16(..) =
+            &self.entries
+        {
             self.entries = self
                 .layout()
                 .with_entries(key, self.position(key), value, true);
@@ -3840,23 +3965,46 @@ impl OrderedMap {
                         return;
                     }
                 }
-                Entries::StepPatch(sp, packed) => {
+                Entries::StepPatch4(sp4, packed) => {
                     let packed = *packed;
                     let (row, slot) = StepPatch::unpack(packed);
-                    let slot_key = if sp.base.has_uniform_keys() {
+                    let slot_key = if sp4.head.base.has_uniform_keys() {
                         slot as u32
                     } else {
                         packed
                     };
-                    if let Some(cached) = cache.get_step_patch(sp, slot_key) {
+                    let handle = StepPatch::Small(Arc::clone(sp4));
+                    if let Some(cached) = cache.get_step_patch(&handle, slot_key) {
                         self.entries = Entries::Patched(Arc::clone(cached), row);
                         return;
                     }
-                    if let Some((mut patched, p_row)) = sp.to_patched(packed)
+                    if let Some((mut patched, p_row)) = sp4.head.to_patched(&sp4.values, packed)
                         && patched.try_set(p_row, key, value.clone(), true).is_ok()
                     {
                         let arc = Arc::new(patched);
-                        cache.put_step_patch(Arc::clone(sp), slot_key, Arc::clone(&arc));
+                        cache.put_step_patch(handle, slot_key, Arc::clone(&arc));
+                        self.entries = Entries::Patched(arc, p_row);
+                        return;
+                    }
+                }
+                Entries::StepPatch16(sp16, packed) => {
+                    let packed = *packed;
+                    let (row, slot) = StepPatch::unpack(packed);
+                    let slot_key = if sp16.head.base.has_uniform_keys() {
+                        slot as u32
+                    } else {
+                        packed
+                    };
+                    let handle = StepPatch::Wide(Arc::clone(sp16));
+                    if let Some(cached) = cache.get_step_patch(&handle, slot_key) {
+                        self.entries = Entries::Patched(Arc::clone(cached), row);
+                        return;
+                    }
+                    if let Some((mut patched, p_row)) = sp16.head.to_patched(&sp16.values, packed)
+                        && patched.try_set(p_row, key, value.clone(), true).is_ok()
+                    {
+                        let arc = Arc::new(patched);
+                        cache.put_step_patch(handle, slot_key, Arc::clone(&arc));
                         self.entries = Entries::Patched(arc, p_row);
                         return;
                     }
@@ -4017,27 +4165,55 @@ impl OrderedMap {
                         return;
                     }
                 }
-                Entries::StepPatch(sp, packed) => {
+                Entries::StepPatch4(sp4, packed) => {
                     let packed = *packed;
                     let (row, slot) = StepPatch::unpack(packed);
-                    let slot_key = if sp.base.has_uniform_keys() {
+                    let slot_key = if sp4.head.base.has_uniform_keys() {
                         slot as u32
                     } else {
                         packed
                     };
+                    let handle = StepPatch::Small(Arc::clone(sp4));
                     if let Some(c) = cache.as_deref()
-                        && let Some(cached) = c.get_step_patch(sp, slot_key)
+                        && let Some(cached) = c.get_step_patch(&handle, slot_key)
                     {
                         self.entries = Entries::Patched(Arc::clone(cached), row);
                         return;
                     }
-                    if let Some((mut patched, p_row)) = sp.to_patched(packed)
+                    if let Some((mut patched, p_row)) = sp4.head.to_patched(&sp4.values, packed)
                         && patched.attach_overlay(p_row, Arc::clone(ov_entries), true)
                     {
                         patched.made = true;
                         let arc = Arc::new(patched);
                         if let Some(c) = cache.as_deref_mut() {
-                            c.put_step_patch(Arc::clone(sp), slot_key, Arc::clone(&arc));
+                            c.put_step_patch(handle, slot_key, Arc::clone(&arc));
+                        }
+                        self.entries = Entries::Patched(arc, p_row);
+                        return;
+                    }
+                }
+                Entries::StepPatch16(sp16, packed) => {
+                    let packed = *packed;
+                    let (row, slot) = StepPatch::unpack(packed);
+                    let slot_key = if sp16.head.base.has_uniform_keys() {
+                        slot as u32
+                    } else {
+                        packed
+                    };
+                    let handle = StepPatch::Wide(Arc::clone(sp16));
+                    if let Some(c) = cache.as_deref()
+                        && let Some(cached) = c.get_step_patch(&handle, slot_key)
+                    {
+                        self.entries = Entries::Patched(Arc::clone(cached), row);
+                        return;
+                    }
+                    if let Some((mut patched, p_row)) = sp16.head.to_patched(&sp16.values, packed)
+                        && patched.attach_overlay(p_row, Arc::clone(ov_entries), true)
+                    {
+                        patched.made = true;
+                        let arc = Arc::new(patched);
+                        if let Some(c) = cache.as_deref_mut() {
+                            c.put_step_patch(handle, slot_key, Arc::clone(&arc));
                         }
                         self.entries = Entries::Patched(arc, p_row);
                         return;
@@ -4295,8 +4471,11 @@ impl OrderedMap {
                         Held::View(layers[usize::from(*layer_idx)].seq_layout(*row))
                     }
                     Entries::Patched(patched, row) => Held::View(Layout::Overlay(patched, *row)),
-                    Entries::StepPatch(step, packed) => {
-                        Held::View(Layout::StepOverlay(step, *packed))
+                    Entries::StepPatch4(step, packed) => {
+                        Held::View(Layout::StepOverlay(&step.head, &step.values, *packed))
+                    }
+                    Entries::StepPatch16(step, packed) => {
+                        Held::View(Layout::StepOverlay(&step.head, &step.values, *packed))
                     }
                 };
                 let count = base_len + append_len;
@@ -4479,7 +4658,8 @@ impl OrderedMap {
                 layers[usize::from(*layer_idx)].seq_get(*row, key)
             }
             Entries::Patched(patched, row) => patched.get(*row, key),
-            Entries::StepPatch(step, packed) => step.get(*packed, key),
+            Entries::StepPatch4(step, packed) => step.head.get(&step.values, *packed, key),
+            Entries::StepPatch16(step, packed) => step.head.get(&step.values, *packed, key),
         }
     }
 
@@ -4514,7 +4694,8 @@ impl OrderedMap {
                 layers[usize::from(*layer_idx)].seq_len(*row)
             }
             Entries::Patched(patched, _) => patched.len(),
-            Entries::StepPatch(step, _) => step.len(),
+            Entries::StepPatch4(step, _) => step.head.len(),
+            Entries::StepPatch16(step, _) => step.head.len(),
         }
     }
 
@@ -5773,9 +5954,9 @@ fn hash_data_entries(layout: Layout<'_>, state: &mut impl std::hash::Hasher) {
                 hash_data(value, state);
             }
         }
-        Layout::StepOverlay(step, packed) => {
+        Layout::StepOverlay(step, values, packed) => {
             for index in 0..step.len() {
-                let (key, value) = step.at(packed, index);
+                let (key, value) = step.at(values, packed, index);
                 key.hash(state);
                 hash_data(value, state);
             }

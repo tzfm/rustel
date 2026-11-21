@@ -649,7 +649,7 @@ mod tests {
     fn a_room_put_away_holds_no_list_and_keeps_the_literals() {
         let room_is_bare = || MINI_MEMO.with(|memo| memo.borrow().room.is_bare());
         forget_mini_literals();
-        transpiled_mini("bd [sd cp] hh*2 <a b>", 3).expect("a literal");
+        transpiled_mini("bd [sd [cp oh]] hh(3,8) <a,b>", 3).expect("a literal");
         assert!(!room_is_bare());
         rest_mini_room();
         assert!(room_is_bare());

@@ -339,6 +339,7 @@ pub(crate) const FEW_HAPS: usize = 64;
 /// the float of a time whose parts a float holds exactly, which the one
 /// rounding of their division keeps in order. `NAN` for any other time,
 /// which only the time itself orders.
+#[inline(always)]
 fn order_key(time: Fraction) -> f64 {
     /// The first whole number that a float skips.
     const EXACT: i128 = 1 << 53;
@@ -348,13 +349,125 @@ fn order_key(time: Fraction) -> f64 {
     }
 }
 
+/// Precomputed float keys for [`query_order`] across part begin and whole begin.
+#[derive(Clone, Copy)]
+struct OrderKey {
+    pb: f64,
+    wb: f64,
+}
+
+impl OrderKey {
+    const ZERO: Self = Self { pb: 0.0, wb: 0.0 };
+
+    #[inline(always)]
+    fn of(hap: &Hap, prev: Option<(&Hap, Self)>) -> Self {
+        let pb = match prev {
+            Some((ph, pk)) if ph.part.begin == hap.part.begin => pk.pb,
+            _ => order_key(hap.part.begin),
+        };
+        let wb = match hap.whole {
+            None => f64::NEG_INFINITY,
+            Some(w) if w.begin == hap.part.begin => pb,
+            Some(w) => match prev {
+                Some((ph, pk)) if ph.whole.is_some_and(|pw| pw.begin == w.begin) => pk.wb,
+                _ => order_key(w.begin),
+            },
+        };
+        Self { pb, wb }
+    }
+}
+
+#[inline(always)]
+fn cmp_order_keys(ak: OrderKey, bk: OrderKey, a: &Hap, b: &Hap) -> std::cmp::Ordering {
+    if ak.pb < bk.pb {
+        return std::cmp::Ordering::Less;
+    }
+    if ak.pb > bk.pb {
+        return std::cmp::Ordering::Greater;
+    }
+    if a.part.begin != b.part.begin {
+        return a.part.begin.cmp(&b.part.begin);
+    }
+    if a.part.end != b.part.end {
+        return a.part.end.cmp(&b.part.end);
+    }
+    if ak.wb < bk.wb {
+        return std::cmp::Ordering::Less;
+    }
+    if ak.wb > bk.wb {
+        return std::cmp::Ordering::Greater;
+    }
+    if a.whole == b.whole {
+        return std::cmp::Ordering::Equal;
+    }
+    match (a.whole, b.whole) {
+        (None, None) => std::cmp::Ordering::Equal,
+        (None, Some(_)) => std::cmp::Ordering::Less,
+        (Some(_), None) => std::cmp::Ordering::Greater,
+        (Some(aw), Some(bw)) => {
+            if aw.begin != bw.begin {
+                aw.begin.cmp(&bw.begin)
+            } else {
+                aw.end.cmp(&bw.end)
+            }
+        }
+    }
+}
+
+#[inline(never)]
+fn sort_few_haps<const CAP: usize>(haps: &mut [Hap], first_bad: usize) {
+    let n = haps.len();
+    let mut keys = [OrderKey::ZERO; CAP];
+    keys[0] = OrderKey::of(&haps[0], None);
+    for i in 1..n {
+        keys[i] = OrderKey::of(&haps[i], Some((&haps[i - 1], keys[i - 1])));
+    }
+    let mut indices = [0u8; CAP];
+    for (slot, dst) in indices[..n].iter_mut().enumerate() {
+        *dst = slot as u8;
+    }
+    for i in first_bad..n {
+        let key = indices[i];
+        let key_idx = key as usize;
+        let key_k = keys[key_idx];
+        let key_hap = &haps[key_idx];
+        let mut j = i;
+        while j > 0 {
+            let prev_idx = indices[j - 1] as usize;
+            let greater = cmp_order_keys(keys[prev_idx], key_k, &haps[prev_idx], key_hap)
+                == std::cmp::Ordering::Greater;
+            if !greater {
+                break;
+            }
+            indices[j] = indices[j - 1];
+            j -= 1;
+        }
+        indices[j] = key;
+    }
+    // Apply the permutation in place by following disjoint cycles so each
+    // hap moves once per cycle step with zero heap allocation.
+    for i in 0..n {
+        let mut dst = i;
+        let mut src = indices[dst] as usize;
+        if src == dst {
+            continue;
+        }
+        while src != i {
+            haps.swap(dst, src);
+            indices[dst] = dst as u8;
+            dst = src;
+            src = indices[dst] as usize;
+        }
+        indices[dst] = dst as u8;
+    }
+}
+
 /// A stable sort of `haps` by [`query_order`] that moves each hap once.
 ///
 /// The sort orders indices and then moves each hap once. A hap is large, and
 /// a stable sort moves each element many times. Equal haps keep their input
-/// order, exactly as `sort_by` keeps them. Most pairs differ in the begin of
-/// their parts, which a float of each begin tells with no arithmetic of
-/// fractions.
+/// order, exactly as `sort_by` keeps them. Precomputing float keys for part
+/// and whole begins avoids repeated rational cross-multiplications.
 fn stable_sorted(mut haps: Vec<Hap>) -> Vec<Hap> {
     let n = haps.len();
     if n <= 1 {
@@ -366,53 +479,10 @@ fn stable_sorted(mut haps: Vec<Hap>) -> Vec<Hap> {
         else {
             return haps;
         };
-        let mut begins = [0.0f64; FEW_HAPS];
-        for (dst, hap) in begins[..n].iter_mut().zip(&haps) {
-            *dst = order_key(hap.part.begin);
-        }
-        let mut indices = [0u8; FEW_HAPS];
-        for (slot, dst) in indices[..n].iter_mut().enumerate() {
-            *dst = slot as u8;
-        }
-        for i in first_bad..n {
-            let key = indices[i];
-            let key_idx = key as usize;
-            let key_k = begins[key_idx];
-            let key_hap = &haps[key_idx];
-            let mut j = i;
-            while j > 0 {
-                let prev_idx = indices[j - 1] as usize;
-                let prev_k = begins[prev_idx];
-                let greater = if prev_k > key_k {
-                    true
-                } else if prev_k < key_k {
-                    false
-                } else {
-                    query_order(&haps[prev_idx], key_hap) == std::cmp::Ordering::Greater
-                };
-                if !greater {
-                    break;
-                }
-                indices[j] = indices[j - 1];
-                j -= 1;
-            }
-            indices[j] = key;
-        }
-        // Apply the permutation in place by following disjoint cycles so each
-        // hap moves once per cycle step with zero heap allocation.
-        for i in 0..n {
-            let mut dst = i;
-            let mut src = indices[dst] as usize;
-            if src == dst {
-                continue;
-            }
-            while src != i {
-                haps.swap(dst, src);
-                indices[dst] = dst as u8;
-                dst = src;
-                src = indices[dst] as usize;
-            }
-            indices[dst] = dst as u8;
+        if n <= 16 {
+            sort_few_haps::<16>(&mut haps, first_bad);
+        } else {
+            sort_few_haps::<FEW_HAPS>(&mut haps, first_bad);
         }
         return haps;
     }
@@ -420,12 +490,14 @@ fn stable_sorted(mut haps: Vec<Hap>) -> Vec<Hap> {
         haps.sort_by(query_order);
         return haps;
     };
-    let begins: Vec<f64> = haps.iter().map(|hap| order_key(hap.part.begin)).collect();
-    let order = |a: usize, b: usize| match begins[a].partial_cmp(&begins[b]) {
-        Some(order @ (std::cmp::Ordering::Less | std::cmp::Ordering::Greater)) => order,
-        // The same float, or a time that no float orders.
-        _ => query_order(&haps[a], &haps[b]),
-    };
+    let mut keys = Vec::with_capacity(haps.len());
+    let mut prev: Option<(&Hap, OrderKey)> = None;
+    for hap in &haps {
+        let k = OrderKey::of(hap, prev);
+        keys.push(k);
+        prev = Some((hap, k));
+    }
+    let order = |a: usize, b: usize| cmp_order_keys(keys[a], keys[b], &haps[a], &haps[b]);
     if (1..haps.len()).all(|at| order(at - 1, at) != std::cmp::Ordering::Greater) {
         return haps;
     }
@@ -2724,10 +2796,14 @@ impl TempoGrid {
         }
         let n = i64::try_from(time.numer()).ok()?;
         let ticks = n.checked_mul(self.cycle_ticks >> d.trailing_zeros())?;
-        Some(sequence::with_tick_grid(self.denom, |grid| match grid {
-            Some(grid) => grid.time(ticks),
-            None => Fraction::from_ticks(i128::from(ticks), self.denom),
-        }))
+        Some(sequence::with_tick_grid_if(
+            self.denom,
+            false,
+            |grid| match grid {
+                Some(grid) => grid.time(ticks),
+                None => Fraction::from_ticks(i128::from(ticks), self.denom),
+            },
+        ))
     }
 }
 
@@ -4225,7 +4301,7 @@ pub(crate) fn with_list<R>(work: impl FnOnce(&mut Vec<Hap>) -> R) -> R {
     let mut list = spare
         .ok()
         .flatten()
-        .unwrap_or_else(|| Vec::with_capacity(8));
+        .unwrap_or_else(|| Vec::with_capacity(4));
     let result = work(&mut list);
     list.clear();
     if list.capacity() > 0 && list.capacity() <= MOST_ROOM {
@@ -7660,7 +7736,7 @@ struct ValueSide<'a> {
 /// Reusable 4-slot stack cache for small (`2..=8` steps) segmented waves so
 /// 1/8-cycle chord windows share one [`value::StepPatch`] across all steps and
 /// every chord note from the same base.
-type StepPatchCache = [Option<(value::PatchedBase, Option<u32>, Arc<value::StepPatch>)>; 4];
+type StepPatchCache = [Option<(value::PatchedBase, Option<u32>, value::StepPatch)>; 4];
 
 struct SmallStepSlot {
     part: TimeSpan,
@@ -7750,14 +7826,14 @@ fn meet_steps_small(
             .flatten()
             .find(|(b, r, _)| b.same_source(&base) && *r == fixed_row)
         {
-            Some(Arc::clone(cached))
+            Some(cached.clone())
         } else if let Some(mut built) =
-            value::StepPatch::new_for_row(base.clone(), row, &[key], true)
+            value::StepPatch::new_for_row(base.clone(), row, &[key], true, count)
         {
             for (i, &num) in slot.nums.iter().enumerate().take(count) {
                 built.set_single_slot(i, num);
             }
-            let arc = Arc::new(built);
+            let sp = built.finish();
             let idx = if let Some(empty) = slot.step_patches.iter().position(Option::is_none) {
                 empty
             } else {
@@ -7765,8 +7841,8 @@ fn meet_steps_small(
                 slot.step_next = slot.step_next.wrapping_add(1);
                 v
             };
-            slot.step_patches[idx] = Some((base, fixed_row, Arc::clone(&arc)));
-            Some(arc)
+            slot.step_patches[idx] = Some((base, fixed_row, sp.clone()));
+            Some(sp)
         } else {
             None
         };
@@ -9975,6 +10051,7 @@ impl Pattern {
                             first_row,
                             &unique_keys[..n_unique],
                             true,
+                            n_slots * n_unique,
                         ) else {
                             for &j in &hap_idx[..m_len] {
                                 skip_mask |= 1u64 << j;
@@ -9984,7 +10061,7 @@ impl Pattern {
                         for (s, nums) in slot_nums[..n_slots].iter().enumerate() {
                             built.set_slot(s, &nums[..n_unique]);
                         }
-                        let sp = Arc::new(built);
+                        let sp = built.finish();
                         for k in 0..m_len {
                             let j = usize::from(hap_idx[k]);
                             let hap = &mut out[from + chunk_base + j];
@@ -10180,10 +10257,14 @@ impl Pattern {
                     .flatten()
                     .find(|(b, r, _)| b.same_source(&base) && *r == fixed_row)
                 {
-                    Some(Arc::clone(cached))
-                } else if let Some(mut built) =
-                    value::StepPatch::new_for_row(base.clone(), row, &unique_keys[..n_unique], true)
-                {
+                    Some(cached.clone())
+                } else if let Some(mut built) = value::StepPatch::new_for_row(
+                    base.clone(),
+                    row,
+                    &unique_keys[..n_unique],
+                    true,
+                    count * n_unique,
+                ) {
                     let mut vals = [0.0f64; value::StepPatch::MAX_KEYS];
                     for (s_idx, row_nums) in slot.nums.iter().enumerate().take(count) {
                         for w in 0..n_waves {
@@ -10191,7 +10272,7 @@ impl Pattern {
                         }
                         built.set_slot(s_idx, &vals[..n_unique]);
                     }
-                    let arc = Arc::new(built);
+                    let sp = built.finish();
                     let idx =
                         if let Some(empty) = slot.step_patches.iter().position(Option::is_none) {
                             empty
@@ -10200,8 +10281,8 @@ impl Pattern {
                             slot.step_next = slot.step_next.wrapping_add(1);
                             v
                         };
-                    slot.step_patches[idx] = Some((base, fixed_row, Arc::clone(&arc)));
-                    Some(arc)
+                    slot.step_patches[idx] = Some((base, fixed_row, sp.clone()));
+                    Some(sp)
                 } else {
                     None
                 };

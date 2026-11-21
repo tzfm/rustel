@@ -155,7 +155,7 @@ fn agrees(name: &str, source: &str) -> bool {
     );
     assert_eq!(
         lane_statements(source),
-        Some(read.lanes),
+        Some(read.lanes.to_statements(source)),
         "{name}: {source}"
     );
     true

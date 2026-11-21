@@ -690,11 +690,13 @@ impl Wave {
     /// whether all arithmetic sits inside or outside the time changes).
     pub(crate) fn of_inline_ref(pattern: crate::NodeRef<'_>) -> Option<(Self, bool)> {
         let (wave, math_inside) = Self::read_in(pattern, None, true)?;
-        let (_, cut_mask) = wave.times.parts();
-        if cut_mask != 0 {
-            return None;
-        }
         Some((wave, math_inside?))
+    }
+
+    /// Whether any arithmetic op sits under a cycle-cutting time transform.
+    #[inline]
+    pub fn has_cuts(&self) -> bool {
+        self.times.parts().1 != 0
     }
 
     /// Extract a segmented step wave eligible for build-time [`Node::AppWave`]
@@ -789,15 +791,17 @@ impl Wave {
                 WaveTime::late(value)?
             };
         }
-        if !math_inner_first.is_empty() && math_inside && !cycles_kept {
-            return None;
-        }
+        let cut_mask = if !math_inner_first.is_empty() && math_inside && !cycles_kept {
+            1u8 << times_outer_first.len()
+        } else {
+            0
+        };
         for &(op, _) in math_inner_first {
             op.of_numbers(0.0, 0.0)?;
         }
         Some(Self {
             math: WaveMath::from_ops(math_inner_first),
-            times: WaveTimes::from_raw(times, times_outer_first.len() as u8, 0),
+            times: WaveTimes::from_raw(times, times_outer_first.len() as u8, cut_mask),
             body,
         })
     }
