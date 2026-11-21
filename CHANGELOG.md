@@ -6,6 +6,7 @@
 - `rustel check` and `rustel query` take `--prebake setup.js`, so a score calling a prebake's helpers checks clean.
 - A sample source can be a repository page such as `https://github.com/user/repo`. It reads as `github:user/repo`, and a web page or a missing map says what to write instead.
 - A pattern can set the tempo: `cps("<0.5 1>")` changes it at each onset, unless Link or MIDI clock leads.
+- Fixed: a live output that fell behind and resumed is printed as a warning, not as an error, since the run plays on.
 - Fixed: leaving a Link session or letting go of an incoming MIDI clock plays the score's own tempo again, instead of the bent tempo the follow left until the next update.
 - Fixed: a `.dict()` name no dictionary has is an error, as on strudel.cc, instead of a lane that plays silence.
 - The reference search also finds entries by extension name, description, tags, parameters and examples, and by words spread across them. These matches come after the usual matches, under more matches.
@@ -54,7 +55,6 @@
 - A plugin chain with up to 1 second of latency plays in time, also in exports, and edits reach it that much later.
 - A plugin that fails or sends invalid audio goes silent with one warning, and the next evaluation loads it again.
 - A Studio export names a plugin that does not load, and Ctrl+C stops `rustel export` to MP3.
-- Fixed: a live output that fell behind and resumed is printed as a warning, not as an error, since the run plays on.
 - Samples, images and videos load only from allowed sources. `--allow-sample-origin` adds a source, and Settings ▸ Permissions allows a refused folder.
 - Scores render faster on small machines and 64-bit ARM, queries of repeating patterns run up to 180 times faster, and decoded samples load faster the next time.
 - On a slow machine, an edit of a playing score arrives late instead of being refused, and the set no longer goes silent when the old score also comes back late. A dense synth score no longer refuses its edits.
