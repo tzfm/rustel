@@ -140,7 +140,10 @@ impl ScoreSampleAccess {
     /// A remote grant takes this policy's sources, which judge its redirects.
     pub(super) fn regrant(&self, url: &str, grant: &ScoreFetchAccess) -> ScoreFetchAccess {
         match grant {
-            ScoreFetchAccess::Remote { .. } if matches!(self.source_for(url), Ok(Some(_))) => {
+            // A source allowed again gives back the files it was taken from.
+            ScoreFetchAccess::Remote { .. } | ScoreFetchAccess::Withdrawn
+                if matches!(self.source_for(url), Ok(Some(_))) =>
+            {
                 ScoreFetchAccess::Remote {
                     sources: Arc::clone(&self.sources),
                 }

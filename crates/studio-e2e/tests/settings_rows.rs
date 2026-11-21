@@ -10,7 +10,11 @@ static AUDIO_CALLBACK_ALLOCATOR: rustel_audio::tripwire::TripwireAlloc =
     rustel_audio::tripwire::TripwireAlloc;
 
 use crossterm::event::{KeyCode, KeyModifiers};
-use rustel_studio_e2e::{Hermetic, PanelKind, hermetic, hermetic_sized, reopen_over};
+use rustel_studio_e2e::{
+    Hermetic, PanelKind, hermetic, hermetic_sized, hermetic_with_own_sample_cache, reopen_over,
+    wav_bytes,
+};
+use std::time::Duration;
 
 /// Walk the sheet's rows by label until the given one is selected - by
 /// what is drawn, not by row arithmetic. Up/Down move the selection on
@@ -961,6 +965,97 @@ fn a_refused_sample_folder_is_allowed_with_one_key_and_kept() {
     let mut studio = reopen_over(studio);
     open_permissions(&mut studio);
     assert!(row_with(&mut studio, "http://kit.invalid").contains("samples  on"));
+}
+
+/// A sample map on this machine, served until the test ends: `/map.json`
+/// names `sn`, and any other path is a short silent file.
+fn serve_a_map() -> String {
+    use std::io::{BufRead, BufReader, Write};
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind server");
+    let origin = format!("http://{}", listener.local_addr().expect("address"));
+    let map = format!(r#"{{"_base":"{origin}/","sn":"sn.wav"}}"#);
+    std::thread::spawn(move || {
+        for stream in listener.incoming().flatten() {
+            let mut reader = BufReader::new(stream);
+            let mut line = String::new();
+            let _ = reader.read_line(&mut line);
+            let mut header = String::new();
+            while reader.read_line(&mut header).is_ok_and(|read| read > 2) {
+                header.clear();
+            }
+            let body = if line.contains("/map.json") {
+                map.clone().into_bytes()
+            } else {
+                wav_bytes()
+            };
+            let mut stream = reader.into_inner();
+            let _ = write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            );
+            let _ = stream.write_all(&body);
+        }
+    });
+    origin
+}
+
+/// A source turned off and on again brings its names back: the update
+/// refused for a name of its map while it was off runs again once it is
+/// on.
+#[test]
+fn a_source_turned_off_and_on_again_reruns_the_refused_update() {
+    let origin = serve_a_map();
+    let mut studio = hermetic_with_own_sample_cache();
+    studio.set_score(&format!(
+        "samples('{origin}/map.json')\n$: s(\"sn\").gain(0.03)"
+    ));
+    studio.chord("ctrl+s");
+    studio.settle();
+    open_permissions(&mut studio);
+    select_row(&mut studio, &format!("▸ {origin}"));
+    studio.press(KeyCode::Enter, KeyModifiers::NONE);
+    studio.settle();
+    studio.press(KeyCode::Esc, KeyModifiers::NONE);
+    studio.settle();
+    // The map is fetched once the source is allowed. An update while it
+    // is on its way may be refused, and the next one plays.
+    studio.set_score(&format!(
+        "samples('{origin}/map.json')\n$: s(\"sn\").gain(0.02)"
+    ));
+    studio.chord("ctrl+s");
+    studio.pump_until(Duration::from_secs(20), "the score plays sn", |studio| {
+        if studio.status().contains("refused") {
+            studio.chord("ctrl+s");
+        }
+        studio.status().starts_with("updated")
+    });
+    open_permissions(&mut studio);
+    select_row(&mut studio, &format!("▸ {origin}"));
+
+    studio.press(KeyCode::Char(' '), KeyModifiers::NONE);
+    studio.settle();
+    assert!(row_with(&mut studio, &origin).contains("samples  off"));
+    studio.press(KeyCode::Esc, KeyModifiers::NONE);
+    studio.settle();
+    studio.set_score(&format!(
+        "samples('{origin}/map.json')\n$: s(\"sn sn\").gain(0.03)"
+    ));
+    studio.chord("ctrl+s");
+    studio.pump_until(Duration::from_secs(10), "the update is refused", |studio| {
+        studio.status().contains("unknown sound \"sn\"")
+    });
+
+    open_permissions(&mut studio);
+    select_row(&mut studio, &format!("▸ {origin}"));
+    studio.press(KeyCode::Enter, KeyModifiers::NONE);
+    studio.settle();
+    studio.press(KeyCode::Esc, KeyModifiers::NONE);
+    studio.pump_until(
+        Duration::from_secs(20),
+        "the refused update runs",
+        |studio| studio.status().starts_with("updated"),
+    );
 }
 
 /// `e` opens a refused folder in a prompt with its text. Cut down to the
