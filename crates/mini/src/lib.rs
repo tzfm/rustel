@@ -3181,6 +3181,10 @@ fn flat_sequence(src: &str, offset: usize) -> Option<Pattern> {
             first: u16,
             len: u16,
         },
+        Group {
+            first: u16,
+            len: u16,
+        },
     }
     let mut items: [FlatItem; 64] = [FlatItem::Word {
         start: 0,
@@ -3194,9 +3198,12 @@ fn flat_sequence(src: &str, offset: usize) -> Option<Pattern> {
     let mut any_fast = false;
     let mut any_slow = false;
     let mut any_inner_alt = false;
+    let mut any_group = false;
     while pos < limit {
-        if !is_alt && bytes[pos] == b'<' {
-            let close = bytes[pos + 1..limit].iter().position(|&b| b == b'>')? + pos + 1;
+        if !is_alt && matches!(bytes[pos], b'<' | b'[') {
+            let is_group = bytes[pos] == b'[';
+            let close_ch = if is_group { b']' } else { b'>' };
+            let close = bytes[pos + 1..limit].iter().position(|&b| b == close_ch)? + pos + 1;
             let next_after = score_whitespace_end(bytes, close + 1).min(limit);
             if next_after == close + 1 && next_after < limit {
                 return None;
@@ -3241,16 +3248,24 @@ fn flat_sequence(src: &str, offset: usize) -> Option<Pattern> {
                 }
                 inner_pos = next_inner;
             }
-            let alt_len = alt_words_len - first;
-            if alt_len == 0 || count >= items.len() {
+            let inner_len = alt_words_len - first;
+            if inner_len == 0 || count >= items.len() {
                 return None;
             }
-            items[count] = FlatItem::Alt {
-                first: first as u16,
-                len: alt_len as u16,
-            };
+            if is_group {
+                items[count] = FlatItem::Group {
+                    first: first as u16,
+                    len: inner_len as u16,
+                };
+                any_group = true;
+            } else {
+                items[count] = FlatItem::Alt {
+                    first: first as u16,
+                    len: inner_len as u16,
+                };
+                any_inner_alt = true;
+            }
             count += 1;
-            any_inner_alt = true;
             pos = next_after;
             continue;
         }
@@ -3370,8 +3385,13 @@ fn flat_sequence(src: &str, offset: usize) -> Option<Pattern> {
     if sounding == 0 {
         return Some(silence().with_steps(steps_meta));
     }
-    // Plain flat sequence or plain `<a b ...>` with no `*N` / `/N` suffix or inner `<...>`.
-    if !any_fast && !any_slow && !any_inner_alt && matches!(alt_suffix, RateSuffix::None) {
+    // Plain flat sequence or plain `<a b ...>` with no `*N` / `/N` suffix, inner `<...>`, or `[...]`.
+    if !any_fast
+        && !any_slow
+        && !any_inner_alt
+        && !any_group
+        && matches!(alt_suffix, RateSuffix::None)
+    {
         let mut seen_words: [&str; 64] = [""; 64];
         let mut seen_len = 0usize;
         let mut raw_steps = [(0u16, 0u16, 0u16, 0u32, 0u16); 64];
@@ -3562,6 +3582,13 @@ fn flat_sequence(src: &str, offset: usize) -> Option<Pattern> {
                         return None;
                     }
                 }
+                FlatItem::Group { len, .. } => {
+                    let g = u32::from(len);
+                    sub_ticks = (sub_ticks / gcd_u32(sub_ticks, g)).checked_mul(g)?;
+                    if sub_ticks > 256 {
+                        return None;
+                    }
+                }
             }
         }
         let ticks = (count as u32).checked_mul(sub_ticks)?;
@@ -3665,6 +3692,48 @@ fn flat_sequence(src: &str, offset: usize) -> Option<Pattern> {
                             loc1_len: 0,
                         };
                         step_len += 1;
+                    }
+                    FlatItem::Group { first, len } => {
+                        let w = sub_ticks / u32::from(len);
+                        for k in 0..usize::from(len) {
+                            let (start, end) = alt_words[usize::from(first) + k];
+                            let word = &src[start..end];
+                            if matches!(word, "~" | "-") {
+                                continue;
+                            }
+                            let value_idx =
+                                match seen_words[..seen_len].iter().position(|&w| w == word) {
+                                    Some(idx) => idx as u16,
+                                    None => {
+                                        if seen_len >= seen_words.len() {
+                                            return None;
+                                        }
+                                        let idx = seen_len as u16;
+                                        seen_words[seen_len] = word;
+                                        seen_len += 1;
+                                        idx
+                                    }
+                                };
+                            let (loc0_begin, loc0_len) = loc_of(start, end)?;
+                            if loc0_len > 0 {
+                                min_begin = min_begin.min(loc0_begin);
+                                max_begin = max_begin.max(loc0_begin);
+                            }
+                            if step_len >= raw_steps.len() {
+                                return None;
+                            }
+                            let pb = slot_start + (k as u32) * w;
+                            raw_steps[step_len] = rustel_core::TickStep {
+                                part_begin: pb as u16,
+                                part_end: (pb + w) as u16,
+                                value: value_idx,
+                                loc0_begin,
+                                loc0_len,
+                                loc1_begin: 0,
+                                loc1_len: 0,
+                            };
+                            step_len += 1;
+                        }
                     }
                 }
             }

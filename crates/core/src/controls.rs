@@ -196,6 +196,12 @@ impl ControlSpec {
             })
     }
 
+    /// Built-in control id (`0` for non-built-in controls).
+    #[inline]
+    pub fn builtin_id(&self) -> u16 {
+        self.id
+    }
+
     /// Free-function form: `gain(0.5)` with no receiver.
     pub fn standalone(&self, value: &Pattern) -> Pattern {
         self.pattern(value)
@@ -204,6 +210,13 @@ impl ControlSpec {
     /// Owned free-function form: names an unshared sequence in place.
     pub fn standalone_owned(&self, value: Pattern) -> Pattern {
         value.map_control_owned(self, false)
+    }
+
+    /// Direct free-function form for a single-word constant value and source
+    /// locations, building the named single-step sequence without an
+    /// intermediate `Node::PureAt` allocation.
+    pub fn standalone_word(&self, value: Value, locations: crate::Locations) -> Pattern {
+        crate::sequence::of_single_named(value, locations, self)
     }
 }
 

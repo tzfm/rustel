@@ -23,7 +23,6 @@ use rustel_core::value::FunctionRef;
 use rustel_transpiler::{
     Held, ScoreExpr, ScoreFunction, ScoreProgram, ScoreProperty, ScoreStatement, Written,
 };
-use std::sync::Arc;
 
 mod memo;
 
@@ -67,13 +66,36 @@ impl Native<'_> {
     }
 }
 
+/// Inline-optimized instruction buffer for an arrow chain, avoiding a heap
+/// `Vec` for zero- and one-step arrows (`x => x.fast(2)`).
+#[derive(Clone, Default)]
+enum ChainSteps {
+    #[default]
+    Empty,
+    One(PatternTransformInstruction),
+    Many(Vec<PatternTransformInstruction>),
+}
+
+impl ChainSteps {
+    fn push(&mut self, step: PatternTransformInstruction) {
+        match std::mem::take(self) {
+            Self::Empty => *self = Self::One(step),
+            Self::One(first) => *self = Self::Many(vec![first, step]),
+            Self::Many(mut vec) => {
+                vec.push(step);
+                *self = Self::Many(vec);
+            }
+        }
+    }
+}
+
 /// The method calls an arrow's body made on its parameter, as the steps
 /// that apply them to any pattern.
 #[derive(Clone)]
 struct Chain {
     /// The arrow whose parameter this is, by the order of compilation.
     arrow: usize,
-    steps: Vec<PatternTransformInstruction>,
+    steps: ChainSteps,
 }
 
 /// One call of a control with one argument, as the score writes it.
@@ -135,10 +157,11 @@ struct Turn<'p> {
     /// The list of the numbers of a call before, with its room for the
     /// next call.
     numbers: Vec<Value>,
-    /// Per-evaluation cache of parsed mini-notation literals evaluated inside
+    /// Per-evaluation cache of parsed mini-notation literals (control_id = 0)
+    /// and directly named controls (control_id = spec.id) evaluated inside
     /// function or arrow bodies, dropped when the build ends.
     mini_cache: std::collections::HashMap<
-        (usize, usize, i64),
+        (u16, usize, usize, i64),
         Pattern,
         std::hash::BuildHasherDefault<rustel_core::WordHasher>,
     >,
@@ -614,7 +637,7 @@ impl<'p> Turn<'p> {
         self.arrows += 1;
         let parameter = Native::Chain(Chain {
             arrow,
-            steps: Vec::new(),
+            steps: ChainSteps::Empty,
         });
         let names_buf = self.spare.frame_names.pop().unwrap_or_default();
         self.frames
@@ -630,13 +653,20 @@ impl<'p> Turn<'p> {
         if chain.arrow != arrow {
             return None;
         }
-        let program = Arc::new(PatternTransformProgram::new(chain.steps).ok()?);
-        let pure = Arc::clone(&program);
-        Some(FunctionRef::native(
-            None,
-            Arc::new(move |pattern| pure.apply_pure(pattern)),
-            Arc::new(move |pattern| program.apply(pattern)),
-        ))
+        match chain.steps {
+            ChainSteps::One(PatternTransformInstruction::Apply(mut func)) if func.is_native() => {
+                func.clear_name();
+                Some(func)
+            }
+            steps => {
+                let program = match steps {
+                    ChainSteps::Empty => PatternTransformProgram::new(std::iter::empty()).ok()?,
+                    ChainSteps::One(step) => PatternTransformProgram::new([step]).ok()?,
+                    ChainSteps::Many(vec) => PatternTransformProgram::new(vec).ok()?,
+                };
+                Some(FunctionRef::native_program(program))
+            }
+        }
     }
 
     /// Whether an arrow is being compiled. Its body runs again at every
@@ -729,7 +759,7 @@ impl<'p> Turn<'p> {
             }
             let offset = *offset as i64;
             if !self.frames.is_empty() {
-                let key = (source.as_ptr() as usize, source.len(), offset);
+                let key = (0u16, source.as_ptr() as usize, source.len(), offset);
                 if let Some(cached) = self.mini_cache.get(&key) {
                     return Some(Native::Pattern(cached.clone()));
                 }
@@ -746,6 +776,51 @@ impl<'p> Turn<'p> {
                 let [argument] = arguments else {
                     return None;
                 };
+                if let ScoreExpr::Call {
+                    callee: inner_callee,
+                    arguments: inner_args,
+                    ..
+                } = argument
+                    && inner_callee == MINI_CALLEE
+                    && let [ScoreExpr::String(source), ScoreExpr::Number(offset)] =
+                        self.held.row(*inner_args)
+                    && names.mini()
+                    && offset.fract() == 0.0
+                    && offset.is_finite()
+                {
+                    // Account for the inner `m(...)` step.
+                    if self.steps >= MAX_STEPS || self.depth >= MAX_DEPTH {
+                        return None;
+                    }
+                    self.steps += 1;
+                    let offset = *offset as i64;
+                    let spec_id = spec.builtin_id();
+                    if !self.frames.is_empty() && spec_id != 0 {
+                        let key = (spec_id, source.as_ptr() as usize, source.len(), offset);
+                        if let Some(cached) = self.mini_cache.get(&key) {
+                            return Some(Native::Pattern(cached.clone()));
+                        }
+                        let named = if let Ok(at) = usize::try_from(offset)
+                            && let Some((value, locations)) =
+                                rustel_mini::word_constant_value(source, at)
+                        {
+                            spec.standalone_word(value, locations)
+                        } else {
+                            let pat = crate::surface::parse_mini_in_room(source, offset).ok()?;
+                            spec.standalone_owned(pat)
+                        };
+                        self.mini_cache.insert(key, named.clone());
+                        return Some(Native::Pattern(named));
+                    }
+                    if let Ok(at) = usize::try_from(offset)
+                        && let Some((value, locations)) =
+                            rustel_mini::word_constant_value(source, at)
+                    {
+                        return Some(Native::Pattern(spec.standalone_word(value, locations)));
+                    }
+                    let pat = crate::surface::parse_mini_in_room(source, offset).ok()?;
+                    return Some(Native::Pattern(spec.standalone_owned(pat)));
+                }
                 let value = self.pattern_argument(names, argument, runtime)?;
                 Some(Native::Pattern(spec.standalone_owned(value)))
             }
@@ -1317,25 +1392,48 @@ impl<'p> Turn<'p> {
             _ => {}
         }
         // A registration reads the value of each pure argument. It takes
-        // the numbers that a call writes as they are, and the call makes
-        // no pattern of each.
+        // the numbers (and trailing arrow transformers) that a call writes
+        // as they are, and the call makes no pattern of each.
         if let BuiltinMethod::Registered(registration) = &builtin
             && arguments.len() == registration.arity.saturating_sub(1)
         {
             if arguments.len() <= 4 {
-                let mut stack_nums = [const { Value::Undefined }; 4];
-                let mut all_nums = true;
-                for (slot, argument) in stack_nums.iter_mut().zip(arguments) {
+                let takes_transformer =
+                    registration.function_argument == FunctionArgument::Transformer;
+                let (last, leading) = match arguments.split_last() {
+                    Some((last, leading)) => (Some(last), leading),
+                    None => (None, arguments),
+                };
+                let mut stack_vals = [const { Value::Undefined }; 4];
+                let mut direct = true;
+                for (slot, argument) in stack_vals.iter_mut().zip(leading) {
                     if let ScoreExpr::Number(number) = argument {
                         *slot = Value::F64(*number);
                     } else {
-                        all_nums = false;
+                        direct = false;
                         break;
                     }
                 }
-                if all_nums {
+                if direct && let Some(last) = last {
+                    match last {
+                        ScoreExpr::Number(number) => {
+                            stack_vals[leading.len()] = Value::F64(*number);
+                        }
+                        ScoreExpr::Arrow(_) if takes_transformer => {
+                            if let Native::Function(transformer) =
+                                self.evaluate(names, last, runtime)?
+                            {
+                                stack_vals[leading.len()] = Value::function(transformer);
+                            } else {
+                                return None;
+                            }
+                        }
+                        _ => direct = false,
+                    }
+                }
+                if direct {
                     return Some(Native::Pattern(
-                        registration.call_unpatternified(&stack_nums[..arguments.len()], receiver),
+                        registration.call_unpatternified(&stack_vals[..arguments.len()], receiver),
                     ));
                 }
             } else {

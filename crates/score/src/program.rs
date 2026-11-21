@@ -274,11 +274,58 @@ pub enum ScoreStatement<'s> {
     },
 }
 
+/// Inline-optimized parameter list for [`ScoreFunction`], avoiding a heap
+/// `Vec` allocation for zero- and one-parameter arrows (`x => ...`).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub enum ScoreParams<'s> {
+    #[default]
+    Empty,
+    One(Cow<'s, str>),
+    Many(Vec<Cow<'s, str>>),
+}
+
+impl<'s> ScoreParams<'s> {
+    #[inline]
+    pub fn as_slice(&self) -> &[Cow<'s, str>] {
+        match self {
+            Self::Empty => &[],
+            Self::One(one) => std::slice::from_ref(one),
+            Self::Many(many) => many.as_slice(),
+        }
+    }
+
+    pub fn from_borrowed(names: &[&'s str]) -> Self {
+        match names {
+            [] => Self::Empty,
+            [one] => Self::One(Cow::Borrowed(one)),
+            many => Self::Many(many.iter().copied().map(Cow::Borrowed).collect()),
+        }
+    }
+}
+
+impl<'s> std::ops::Deref for ScoreParams<'s> {
+    type Target = [Cow<'s, str>];
+    #[inline]
+    fn deref(&self) -> &[Cow<'s, str>] {
+        self.as_slice()
+    }
+}
+
+impl<'s> From<Vec<Cow<'s, str>>> for ScoreParams<'s> {
+    fn from(mut vec: Vec<Cow<'s, str>>) -> Self {
+        match vec.len() {
+            0 => Self::Empty,
+            1 => Self::One(vec.pop().expect("len 1")),
+            _ => Self::Many(vec),
+        }
+    }
+}
+
 /// What a function declaration or an arrow holds: plain parameters,
 /// bindings, then one result. `(a) => result` has no bindings.
 #[derive(Clone, Debug)]
 pub struct ScoreFunction<'s> {
-    pub parameters: Vec<Cow<'s, str>>,
+    pub parameters: ScoreParams<'s>,
     pub bindings: Vec<(Cow<'s, str>, ScoreExpr<'s>)>,
     pub result: ScoreExpr<'s>,
 }

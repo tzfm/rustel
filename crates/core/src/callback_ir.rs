@@ -302,8 +302,18 @@ impl PatternTransformProgram {
     pub fn new(
         instructions: impl IntoIterator<Item = PatternTransformInstruction>,
     ) -> Result<Self, PatternTransformBuildError> {
+        let iter = instructions.into_iter();
         let mut owned = Vec::new();
-        for instruction in instructions {
+        let hint = iter
+            .size_hint()
+            .0
+            .min(MAX_PATTERN_TRANSFORM_IR_INSTRUCTIONS);
+        if hint > 0 {
+            owned
+                .try_reserve_exact(hint)
+                .map_err(|_| PatternTransformBuildError::Allocation)?;
+        }
+        for instruction in iter {
             if owned.len() == MAX_PATTERN_TRANSFORM_IR_INSTRUCTIONS {
                 return Err(PatternTransformBuildError::InstructionLimit {
                     requested: owned.len().saturating_add(1),

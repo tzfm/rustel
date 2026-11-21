@@ -119,7 +119,7 @@ fn arrow_function(
     match &arrow.body {
         ArrowFunctionBody::FunctionBody(body) => block_function(parameters, body, depth, held),
         result => Some(ScoreFunction {
-            parameters,
+            parameters: parameters.into(),
             bindings: Vec::new(),
             result: expression(result.as_expression()?, depth, held)?,
         }),
@@ -170,7 +170,7 @@ fn block_function(
         })
         .collect::<Option<Vec<_>>>()?;
     Some(ScoreFunction {
-        parameters,
+        parameters: parameters.into(),
         bindings,
         result: expression(returned.argument.as_ref()?, depth, held)?,
     })
@@ -429,7 +429,7 @@ mod tests {
             program(vec![ScoreStatement::Function {
                 name: "lead".into(),
                 function: ScoreFunction {
-                    parameters: vec!["notes".into()],
+                    parameters: vec!["notes".into()].into(),
                     bindings: vec![(
                         "base".into(),
                         call("note", vec![ScoreExpr::Name("notes".into())])
@@ -445,7 +445,7 @@ mod tests {
     fn an_arrow_reads_as_a_function_with_or_without_a_block() {
         let reversed = |bindings| {
             ScoreExpr::Arrow(Box::new(ScoreFunction {
-                parameters: vec!["x".into()],
+                parameters: vec!["x".into()].into(),
                 bindings,
                 result: method(ScoreExpr::Name("x".into()), "rev", vec![]),
             }))

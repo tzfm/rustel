@@ -227,11 +227,16 @@ impl CombinatorFn {
             CombinatorFn::Native(n) => {
                 if pure_view && pat.is_pure() {
                     let out = (n.pure)(args, crate::purity::PurePattern::assert_pure(pat)).0;
-                    if args.iter().any(|v| matches!(v, Value::Function(_))) {
+                    if args
+                        .iter()
+                        .any(|v| matches!(v, Value::Function(f) if f.has_retained_callbacks()))
+                    {
                         let callbacks = args
                             .iter()
                             .filter_map(|value| match value {
-                                Value::Function(function) => Some(function.retained_callbacks()),
+                                Value::Function(function) if function.has_retained_callbacks() => {
+                                    Some(function.retained_callbacks())
+                                }
                                 _ => None,
                             })
                             .collect::<Vec<_>>()
@@ -429,25 +434,35 @@ impl Registration {
             // `echoWith(..., fast(2))` reaches it; absorbing the extra
             // argument instead would produce plausible-but-wrong haps.
             crate::query_error_pattern("hap_func.value is not a function")
-        } else if args.len() <= 4 && args.iter().all(|a| a.as_pure().is_some()) {
+        } else if args.len() <= 4 {
             // ---- stack fast path for 1..=4 pure leading args --------------
             let mut pures: [Value; 4] = std::array::from_fn(|_| Value::Undefined);
             let mut locs: [(usize, usize); 4] = [(0, 0); 4];
             let mut locs_len = 0usize;
+            let mut all_pure_small = true;
             for (i, a) in args.iter().enumerate() {
-                pures[i] = a.as_pure().expect("checked pure");
-                if let Some(loc) = a.pure_loc() {
-                    locs[locs_len] = loc;
-                    locs_len += 1;
+                if let Some(v) = a.as_pure() {
+                    pures[i] = v;
+                    if let Some(loc) = a.pure_loc() {
+                        locs[locs_len] = loc;
+                        locs_len += 1;
+                    }
+                } else {
+                    all_pure_small = false;
+                    break;
                 }
             }
-            let pures_slice = &pures[..args.len()];
-            let pure_view = self.admits_pure_view(pures_slice);
-            let out = self.func.apply(pures_slice, pat, pure_view);
-            if locs_len == 0 {
-                out
+            if all_pure_small {
+                let pures_slice = &pures[..args.len()];
+                let pure_view = self.admits_pure_view(pures_slice);
+                let out = self.func.apply(pures_slice, pat, pure_view);
+                if locs_len == 0 {
+                    out
+                } else {
+                    out.with_added_context_owned(&locs[..locs_len])
+                }
             } else {
-                out.with_added_context_owned(&locs[..locs_len])
+                self.call_patternified_general(args, pat)
             }
         } else if let Some(pures) = all_pure(args) {
             // ---- fast path ---------------------------------------------
@@ -464,111 +479,124 @@ impl Registration {
                 out.with_added_context_owned(&locs)
             }
         } else {
-            // ---- general path ------------------------------------------
-            // Build up a partial-application chain: `left.fmap` produces a
-            // pattern of "functions", each subsequent `appLeft` supplies the
-            // next argument, and the join flattens the resulting
-            // pattern-of-patterns. This is where the combinator body runs *at
-            // query time* - the reason querying can never be real-time
-            // itself.
-            let func = self.func.clone();
-            let pat_for_fn = pat.clone();
-            let function_argument = self.function_argument;
-
-            // A constant function argument rides outside the chain:
-            // collecting it per whole only duplicates one value, and the
-            // collected node carries the function's per-bridge identity into
-            // the graph, where two builds of one score cannot agree. The
-            // closure splices each constant back into its argument position.
-            let mut constants: Vec<Option<Value>> = if self.takes_function() {
-                args.iter()
-                    .map(|arg| match arg.as_pure() {
-                        Some(value @ Value::Function(_)) => Some(value),
-                        _ => None,
-                    })
-                    .collect()
-            } else {
-                Vec::new()
-            };
-            let mut chain: Vec<Pattern> = args
-                .iter()
-                .zip(constants.iter())
-                .filter(|(_, constant)| constant.is_none())
-                .map(|(arg, _)| arg.clone())
-                .collect();
-            if chain.is_empty() {
-                // An all-constant call cannot reach the general path; keep
-                // the whole chain all the same.
-                constants.clear();
-                chain = args.to_vec();
-            }
-
-            let n_chain = chain.len();
-            let retained = constants
-                .iter()
-                .filter_map(|constant| match constant {
-                    Some(Value::Function(function)) => Some(function.retained_callbacks()),
-                    _ => None,
-                })
-                .collect::<Vec<_>>()
-                .concat();
-
-            // Which constructor is used is decided by the combinator's TYPE,
-            // not by a flag. A `Native` body applied to a pure operand is
-            // provably pure, so purity can be inherited soundly; anything else
-            // goes through the dynamic constructor and is impure.
-            let pure_view = !self.takes_function()
-                || (constants
-                    .iter()
-                    .flatten()
-                    .all(|constant| admits_pure_view(function_argument, constant))
-                    && chain.iter().all(crate::sequence::is_data));
-            let build_collected = || {
-                let mut acc: Pattern = chain[0].fmap_collect();
-                for a in &chain[1..] {
-                    acc = acc.app_left_collect(a.clone());
-                }
-                acc
-            };
-            let inner = match (&self.func, pat.as_pure_pattern()) {
-                // Native body + pure operand: a single dynamic argument rides
-                // directly without wrapping every hap value in a one-element
-                // `Value::List`.
-                (CombinatorFn::Native(n), Some(pure_operand)) if pure_view => {
-                    let acc = if n_chain == 1 {
-                        chain[0].clone()
-                    } else {
-                        build_collected()
-                    };
-                    acc.fmap_to_pure_pattern_with_operand(
-                        &pure_operand,
-                        n.pure.clone(),
-                        n_chain,
-                        constants,
-                    )
-                }
-                // Anything else is an opaque closure -> always impure.
-                _ => build_collected().fmap_to_pattern(move |riding: &Value| {
-                    let values = argument_values(riding, n_chain, &constants);
-                    let pure_view = values
-                        .iter()
-                        .all(|value| admits_pure_view(function_argument, value));
-                    func.apply(&values, pat_for_fn.clone(), pure_view)
-                }),
-            };
-            let inner = inner.retaining_callbacks(retained);
-            match self.join {
-                JoinKind::Inner => inner.inner_join(),
-                JoinKind::Outer => inner.outer_join(),
-                JoinKind::Mix => inner.mix_join(),
-                JoinKind::Step => inner.step_join(),
-            }
+            self.call_patternified_general(args, pat)
         };
 
         if self.preserve_steps {
             result.with_steps(preserved_steps)
         } else {
             result
+        }
+    }
+
+    fn call_patternified_general(&self, args: &[Pattern], pat: Pattern) -> Pattern {
+        // ---- general path ------------------------------------------
+        // Build up a partial-application chain: `left.fmap` produces a
+        // pattern of "functions", each subsequent `appLeft` supplies the
+        // next argument, and the join flattens the resulting
+        // pattern-of-patterns. This is where the combinator body runs *at
+        // query time* - the reason querying can never be real-time
+        // itself.
+        let func = self.func.clone();
+        let pat_for_fn = pat.clone();
+        let function_argument = self.function_argument;
+
+        // A constant function argument rides outside the chain:
+        // collecting it per whole only duplicates one value, and the
+        // collected node carries the function's per-bridge identity into
+        // the graph, where two builds of one score cannot agree. The
+        // closure splices each constant back into its argument position.
+        let mut constants: Vec<Option<Value>> = if self.takes_function() {
+            args.iter()
+                .map(|arg| match arg.as_pure() {
+                    Some(value @ Value::Function(_)) => Some(value),
+                    _ => None,
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
+        let mut chain: Vec<Pattern> = args
+            .iter()
+            .zip(constants.iter())
+            .filter(|(_, constant)| constant.is_none())
+            .map(|(arg, _)| arg.clone())
+            .collect();
+        if chain.is_empty() {
+            // An all-constant call cannot reach the general path; keep
+            // the whole chain all the same.
+            constants.clear();
+            chain = args.to_vec();
+        }
+
+        let n_chain = chain.len();
+        let retained = if constants
+            .iter()
+            .any(|c| matches!(c, Some(Value::Function(f)) if f.has_retained_callbacks()))
+        {
+            constants
+                .iter()
+                .filter_map(|constant| match constant {
+                    Some(Value::Function(function)) if function.has_retained_callbacks() => {
+                        Some(function.retained_callbacks())
+                    }
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+                .concat()
+        } else {
+            Vec::new()
+        };
+
+        // Which constructor is used is decided by the combinator's TYPE,
+        // not by a flag. A `Native` body applied to a pure operand is
+        // provably pure, so purity can be inherited soundly; anything else
+        // goes through the dynamic constructor and is impure.
+        let pure_view = !self.takes_function()
+            || (constants
+                .iter()
+                .flatten()
+                .all(|constant| admits_pure_view(function_argument, constant))
+                && chain.iter().all(crate::sequence::is_data));
+        let build_collected = || {
+            let mut acc: Pattern = chain[0].fmap_collect();
+            for a in &chain[1..] {
+                acc = acc.app_left_collect(a.clone());
+            }
+            acc
+        };
+        let inner = match (&self.func, pat.as_pure_pattern()) {
+            // Native body + pure operand: a single dynamic argument rides
+            // directly without wrapping every hap value in a one-element
+            // `Value::List`.
+            (CombinatorFn::Native(n), Some(pure_operand)) if pure_view => {
+                let acc = if n_chain == 1 {
+                    chain[0].clone()
+                } else {
+                    build_collected()
+                };
+                acc.fmap_to_pure_pattern_with_operand(
+                    &pure_operand,
+                    n.pure.clone(),
+                    n_chain,
+                    constants,
+                )
+            }
+            // Anything else is an opaque closure -> always impure.
+            _ => build_collected().fmap_to_pattern(move |riding: &Value| {
+                let values = argument_values(riding, n_chain, &constants);
+                let pure_view = values
+                    .iter()
+                    .all(|value| admits_pure_view(function_argument, value));
+                func.apply(&values, pat_for_fn.clone(), pure_view)
+            }),
+        };
+        let inner = inner.retaining_callbacks(retained);
+        match self.join {
+            JoinKind::Inner => inner.inner_join(),
+            JoinKind::Outer => inner.outer_join(),
+            JoinKind::Mix => inner.mix_join(),
+            JoinKind::Step => inner.step_join(),
         }
     }
 

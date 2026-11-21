@@ -4671,7 +4671,7 @@ fn array_index(key: &str) -> Option<u32> {
 #[derive(Clone)]
 pub struct FunctionRef {
     id: u64,
-    name: Option<std::sync::Arc<str>>,
+    name: Option<SharedStr>,
     kind: FunctionKind,
     /// The first runtime that exposed this callable as metadata. An outer
     /// container must not replace the realm already owned by a nested value.
@@ -4686,6 +4686,9 @@ enum FunctionKind {
         >,
         any: std::sync::Arc<dyn Fn(crate::Pattern) -> crate::Pattern + Send + Sync>,
     },
+    /// A compiled native pattern-transform program (e.g. a native arrow chain)
+    /// stored directly without closure wrappers.
+    NativeProgram(std::sync::Arc<crate::callback_ir::PatternTransformProgram>),
     /// An opaque JavaScript function. Resolved through the callback host.
     Js(crate::CallbackId),
     /// A bounded native candidate whose exact JavaScript callable remains
@@ -4728,10 +4731,27 @@ impl FunctionRef {
     ) -> Self {
         Self {
             id: NEXT_FUNCTION_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
-            name: name.map(std::sync::Arc::from),
+            name: name.map(SharedStr::from),
             kind: FunctionKind::Native { pure, any },
             runtime_settings: None,
         }
+    }
+
+    /// A native transformer backed directly by a [`PatternTransformProgram`],
+    /// avoiding extra closure `Arc` allocations.
+    pub fn native_program(program: crate::callback_ir::PatternTransformProgram) -> Self {
+        Self {
+            id: NEXT_FUNCTION_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+            name: None,
+            kind: FunctionKind::NativeProgram(std::sync::Arc::new(program)),
+            runtime_settings: None,
+        }
+    }
+
+    /// Clear any display name (for anonymous arrows that wrap a single native
+    /// transformer directly).
+    pub fn clear_name(&mut self) {
+        self.name = None;
     }
 
     /// A partially applied registered combinator, as `fast(2)` produces.
@@ -4745,7 +4765,7 @@ impl FunctionRef {
     ) -> Self {
         Self {
             id: NEXT_FUNCTION_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
-            name: Some(std::sync::Arc::from(name)),
+            name: Some(SharedStr::from(name)),
             kind: FunctionKind::Registered {
                 apply,
                 provable_pure,
@@ -4799,7 +4819,7 @@ impl FunctionRef {
     }
 
     pub fn name(&self) -> Option<&str> {
-        self.name.as_deref()
+        self.name.as_ref().map(SharedStr::as_str)
     }
 
     fn attach_runtime_settings(&mut self, settings: crate::settings::RuntimeSettings) {
@@ -4818,7 +4838,7 @@ impl FunctionRef {
     /// [`Value::has_js_function`].
     pub fn is_native(&self) -> bool {
         match &self.kind {
-            FunctionKind::Native { .. } => true,
+            FunctionKind::Native { .. } | FunctionKind::NativeProgram(_) => true,
             FunctionKind::LoweredJs { program, .. } => program.is_current(),
             FunctionKind::Registered { provable_pure, .. } => *provable_pure,
             FunctionKind::Js(_) | FunctionKind::JsPatternIr { .. } => false,
@@ -4857,6 +4877,16 @@ impl FunctionRef {
     /// A closure that captures a function value cannot show it to purity, so
     /// [`crate::Pattern::retaining_callbacks`] is the only channel these ids
     /// reach a wrapper's harvest through.
+    /// Fast check for whether [`Self::retained_callbacks`] could be non-empty,
+    /// avoiding temporary `Vec` allocations for native and registered callables.
+    #[inline]
+    pub(crate) fn has_retained_callbacks(&self) -> bool {
+        matches!(
+            self.kind,
+            FunctionKind::Js(_) | FunctionKind::JsPatternIr { .. } | FunctionKind::LoweredJs { .. }
+        )
+    }
+
     pub(crate) fn retained_callbacks(&self) -> Vec<crate::CallbackId> {
         let mut ids = Vec::new();
         match &self.kind {
@@ -4871,7 +4901,9 @@ impl FunctionRef {
                 }
                 ids.extend(program.retained_callback_ids());
             }
-            FunctionKind::Native { .. } | FunctionKind::Registered { .. } => {}
+            FunctionKind::Native { .. }
+            | FunctionKind::NativeProgram(_)
+            | FunctionKind::Registered { .. } => {}
         }
         ids
     }
@@ -4943,7 +4975,9 @@ impl FunctionRef {
             FunctionKind::Js(id) => crate::host_call_value(*id, value),
             FunctionKind::JsPatternIr { fallback, .. }
             | FunctionKind::LoweredJs { fallback, .. } => crate::host_call_value(*fallback, value),
-            FunctionKind::Native { .. } | FunctionKind::Registered { .. } => {
+            FunctionKind::Native { .. }
+            | FunctionKind::NativeProgram(_)
+            | FunctionKind::Registered { .. } => {
                 crate::signal_query_error(|| {
                     "pattern transformer cannot be called as a value predicate".into()
                 });
@@ -4956,6 +4990,7 @@ impl FunctionRef {
     pub(crate) fn apply_unbound(&self, pattern: crate::Pattern) -> crate::Pattern {
         match &self.kind {
             FunctionKind::Native { any, .. } => any(pattern),
+            FunctionKind::NativeProgram(program) => program.apply(pattern),
             FunctionKind::Registered { apply, .. } => apply(pattern),
             FunctionKind::Js(id) => crate::host_call_pattern(*id, pattern),
             FunctionKind::JsPatternIr { fallback, program } => {
@@ -5034,6 +5069,7 @@ impl FunctionRef {
         for (pattern, _) in patterns {
             let transformed = match &self.kind {
                 FunctionKind::Native { any, .. } => any(pattern),
+                FunctionKind::NativeProgram(program) => program.apply(pattern),
                 FunctionKind::Registered { apply, .. } => apply(pattern),
                 FunctionKind::Js(_)
                 | FunctionKind::JsPatternIr { .. }
@@ -5065,7 +5101,7 @@ impl FunctionRef {
         if let Some(settings) = owner {
             return settings.with(|| {
                 self.apply_pure_unbound(pattern).map(|pattern| {
-                    let mut pattern = pattern.pattern().clone();
+                    let mut pattern = pattern.0;
                     pattern.force_runtime_settings(settings.clone());
                     crate::purity::PurePattern::assert_pure(pattern)
                 })
@@ -5081,6 +5117,7 @@ impl FunctionRef {
     ) -> Option<crate::purity::PurePattern> {
         match &self.kind {
             FunctionKind::Native { pure, .. } => Some(pure(pattern)),
+            FunctionKind::NativeProgram(program) => Some(program.apply_pure(pattern)),
             FunctionKind::LoweredJs { fallback, program } => Some(if program.is_current() {
                 // A construction kept with what the program built answers
                 // only while the program stands for its callback.
@@ -5088,9 +5125,7 @@ impl FunctionRef {
                 program.apply_pure(pattern)
             } else if crate::host_installed() {
                 crate::purity::PurePattern::host_built(crate::host_call_pattern_ir(
-                    *fallback,
-                    program,
-                    pattern.pattern().clone(),
+                    *fallback, program, pattern.0,
                 ))
             } else {
                 crate::purity::PurePattern::assert_pure(stale_without_host(*fallback))
@@ -5098,8 +5133,7 @@ impl FunctionRef {
             FunctionKind::Registered {
                 apply,
                 provable_pure,
-            } => provable_pure
-                .then(|| crate::purity::PurePattern::assert_pure(apply(pattern.pattern().clone()))),
+            } => provable_pure.then(|| crate::purity::PurePattern::assert_pure(apply(pattern.0))),
             FunctionKind::Js(_) | FunctionKind::JsPatternIr { .. } => None,
         }
     }
@@ -5152,14 +5186,21 @@ impl FunctionRef {
                 }
                 Some(out)
             }
+            FunctionKind::NativeProgram(program) => {
+                for (pattern, _) in patterns {
+                    out.push(program.apply_pure(pattern));
+                    if crate::query_error_pending() {
+                        break;
+                    }
+                }
+                Some(out)
+            }
             FunctionKind::Registered {
                 apply,
                 provable_pure,
             } if *provable_pure => {
                 for (pattern, _) in patterns {
-                    out.push(crate::purity::PurePattern::assert_pure(apply(
-                        pattern.pattern().clone(),
-                    )));
+                    out.push(crate::purity::PurePattern::assert_pure(apply(pattern.0)));
                     if crate::query_error_pending() {
                         break;
                     }
@@ -5217,8 +5258,12 @@ fn stale_without_host(fallback: crate::CallbackId) -> crate::Pattern {
 impl fmt::Debug for FunctionRef {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match (&self.kind, &self.name) {
-            (FunctionKind::Native { .. }, Some(name)) => write!(f, "fn {name}#{}", self.id),
-            (FunctionKind::Native { .. }, None) => write!(f, "fn #{}", self.id),
+            (FunctionKind::Native { .. } | FunctionKind::NativeProgram(_), Some(name)) => {
+                write!(f, "fn {name}#{}", self.id)
+            }
+            (FunctionKind::Native { .. } | FunctionKind::NativeProgram(_), None) => {
+                write!(f, "fn #{}", self.id)
+            }
             (FunctionKind::Registered { .. }, Some(name)) => write!(f, "fn {name}#{}", self.id),
             (FunctionKind::Registered { .. }, None) => write!(f, "fn #{}", self.id),
             (FunctionKind::Js(callback), _) => write!(f, "js fn #{} (cb {callback})", self.id),
@@ -6057,7 +6102,9 @@ impl Value {
                 value.pattern.attach_runtime_settings(settings.clone());
             }
             Self::Function(function) => {
-                Arc::make_mut(function).attach_runtime_settings(settings.clone());
+                if function.runtime_settings.is_none() {
+                    Arc::make_mut(function).attach_runtime_settings(settings.clone());
+                }
             }
             Self::Haps(haps) => {
                 if !haps

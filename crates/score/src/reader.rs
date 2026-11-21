@@ -14,8 +14,8 @@
 
 use crate::string::decode;
 use crate::{
-    Held, LaneBodySource, ReadLane, ReadLanes, Row, ScoreExpr, ScoreFunction, ScoreProgram,
-    ScoreProperty, ScoreStatement, Written,
+    Held, LaneBodySource, ReadLane, ReadLanes, Row, ScoreExpr, ScoreFunction, ScoreParams,
+    ScoreProgram, ScoreProperty, ScoreStatement, Written,
 };
 use std::borrow::Cow;
 
@@ -342,7 +342,7 @@ impl<'s, F: Fn(&str) -> CallForm> Reader<'s, F> {
                     ScoreStatement::Function {
                         name: name.into(),
                         function: ScoreFunction {
-                            parameters: borrowed(&parameters),
+                            parameters: ScoreParams::from_borrowed(&parameters),
                             bindings,
                             result,
                         },
@@ -625,7 +625,7 @@ impl<'s, F: Fn(&str) -> CallForm> Reader<'s, F> {
         };
         Some(Some(Parsed {
             expr: ScoreExpr::Arrow(Box::new(ScoreFunction {
-                parameters: borrowed(parameters),
+                parameters: ScoreParams::from_borrowed(parameters),
                 bindings,
                 result,
             })),
@@ -1522,11 +1522,6 @@ impl<'s, F: Fn(&str) -> CallForm> Reader<'s, F> {
         self.counted = at;
         self.line
     }
-}
-
-/// `names`, each as the text of the score holds it.
-fn borrowed<'s>(names: &[&'s str]) -> Vec<Cow<'s, str>> {
-    names.iter().map(|name| Cow::Borrowed(*name)).collect()
 }
 
 /// The digits from `from` in `bytes`: how many, and `value` folded left

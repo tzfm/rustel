@@ -6718,6 +6718,24 @@ pub(crate) fn constant_value_at(values: &Pattern) -> Option<(Value, Locations)> 
     Some((value, constant_locations(values)))
 }
 
+/// Build a single-cycle named sequence directly from a plain constant value
+/// and source locations, skipping an intermediate `Node::PureAt` allocation.
+pub(crate) fn of_single_named(
+    value: Value,
+    locations: Locations,
+    spec: &crate::controls::ControlSpec,
+) -> Pattern {
+    let raw = Raw {
+        whole: TimeSpan::new(Fraction::ZERO, Fraction::ONE),
+        part: None,
+        value: 0,
+        locations,
+    };
+    let mut layer = Layer::of_single(Fraction::ONE, raw, Arc::new([value]));
+    Layer::named_in_place(std::slice::from_mut(&mut layer), spec);
+    Pattern::of(Node::Sequence(Arc::from([layer])))
+}
+
 /// `pattern` with each value named by the control of `names`, as
 /// [`Pattern::map_control`] names it, when `pattern` is a sequence or a
 /// constant that holds no name and no control yet. See [`Layer::named`].
