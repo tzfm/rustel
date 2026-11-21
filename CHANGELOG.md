@@ -12,6 +12,7 @@
 - Fixed: leaving a Link session or letting go of an incoming MIDI clock plays the score's own tempo again, instead of the bent tempo the follow left until the next update.
 - Fixed: `mouseX` and `mouseY` inside `K()` say they need live control input, instead of a message about scope IDs.
 - Fixed: a `.dict()` name no dictionary has is an error, as on strudel.cc, instead of a lane that plays silence.
+- Fixed: the slider form and the knobs column's value form refuse a step of zero with the reason, as `rustel check` does, instead of writing a step of their own.
 - The reference search also finds entries by extension name, description, tags, parameters and examples, and by words spread across them. These matches come after the usual matches, under more matches.
 - The theme picker shows its Ctrl+N new, Ctrl+E edit and Ctrl+D delete keys.
 - Fixed: an export, query or check whose every note an error dropped, such as a scale name that will not read, exits 1 with the reason instead of passing as silence; a partial drop still plays what it can.
