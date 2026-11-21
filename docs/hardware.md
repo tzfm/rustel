@@ -351,6 +351,9 @@ period cannot reduce latency. Larger requests add buffer space.
 
 `RUSTEL_LIVE_BUFFER_FRAMES` overrides automatic.
 `RUSTEL_MAX_LIVE_LATENCY_MS` sets the accepted latency ceiling, from 50-5000 ms.
+The default is 250 ms, or 2000 ms inside WSL. Live playback stops when the
+output buffers more than that, so a large `--buffer-frames`, 8192 or more
+with most devices, needs the ceiling raised.
 
 ## Finding what makes a machine slow
 

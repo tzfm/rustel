@@ -814,7 +814,10 @@ A take records the main pair; it is not a recording of all separate outputs.
 To protect the master output, use Transport ▸ Add limiter to set. In the
 limiter's mixer strip,
 change the ceiling with arrows, use `c` to change mode, and use `b` or Enter to
-bypass it. Backspace removes it. The set remembers this limiter. The default
+bypass it. Backspace removes it. With makeup gain on, the default, the limiter
+lifts its ceiling to full scale: a lower ceiling limits harder and the master
+gets louder, never past 0 dBFS. Turn makeup off in Settings > Limiter to keep
+the master at or below the ceiling. The set remembers this limiter. The default
 limiter setting affects new or unconfigured sets. A score's `.limit(...)` is a
 separate effect.
 

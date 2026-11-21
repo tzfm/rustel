@@ -90,8 +90,8 @@ const OSC: crate::reference::ReferenceEntry = crate::reference::ReferenceEntry {
 const SYSEX: crate::reference::ReferenceEntry = crate::reference::ReferenceEntry {
     name: "sysex",
     synonyms: &[],
-    summary: "MIDI sysex: Sends a MIDI sysex message.",
-    description: "MIDI sysex: Sends a MIDI sysex message.",
+    summary: "MIDI sysex: a SysEx message, its identifier and data. SysEx is not sent yet.",
+    description: "MIDI sysex: a SysEx message, its identifier and data. SysEx is not sent yet.",
     params: &[
         crate::reference::ReferenceParam {
             name: "id",

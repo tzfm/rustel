@@ -50,8 +50,9 @@ rustel export song.strudel -o take.wav --duration 30s \
 rustel export song.strudel --format midi -o take.mid
 ```
 
-The `--until-silence` command renders for about 30 seconds, then waits for
-audio to stay below **−60 dBFS for 2 seconds**. Silence detection starts only after audio
+The `--until-silence` command renders the length you give, 30 seconds in the
+example above and 8 cycles when no length is given, then waits for audio to
+stay below **−60 dBFS for 2 seconds**. The file ends where that silence began. Silence detection starts only after audio
 has reached the threshold. The extra time is limited to 60 seconds, including
 for a score that never reaches the threshold. These are the default floor
 and hold values.
@@ -250,7 +251,9 @@ destructive commands then require `--force`.
 | 128 + signal | Interrupted: 130 for Ctrl+C, 143 for SIGTERM |
 
 Recoverable MIDI or serial failures can leave playback running and return 0
-on normal completion. Argument errors use text diagnostics, even with `--json`.
+on normal completion. An export with a refused voice returns 0 too: the
+refusal is reported as `voice_refused` and the rest of the bounce plays.
+Use `check` to find such a score before it is exported. Argument errors use text diagnostics, even with `--json`.
 
 ## Configuration
 
