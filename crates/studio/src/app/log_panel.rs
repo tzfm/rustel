@@ -124,6 +124,17 @@ impl App {
         self.dirty_frame = true;
     }
 
+    /// Close the log sheet and give the keys back to the score. The footer
+    /// says so, or the line that said Esc closes it would outlive the sheet.
+    fn close_log_sheet(&mut self) {
+        self.log_panel = None;
+        self.settle_focus();
+        self.status = format!(
+            "back to the score - {} opens the log again",
+            self.shortcut_or_menu(BindAction::Log, "View > Log")
+        );
+    }
+
     /// The log comes back the way it was left, alongside the set panel,
     /// the visuals docks and the mixer. Called only when `prefs.log_sticky`
     /// says the docked log survived the last session; a log merely open as
@@ -300,14 +311,8 @@ impl App {
             return true;
         }
         match code {
-            KeyCode::Esc => {
-                self.log_panel = None;
-                self.settle_focus();
-            }
-            KeyCode::Char('d' | 'D') if primary && shift => {
-                self.log_panel = None;
-                self.settle_focus();
-            }
+            KeyCode::Esc => self.close_log_sheet(),
+            KeyCode::Char('d' | 'D') if primary && shift => self.close_log_sheet(),
             // The selection the mouse pulled through the log goes to the
             // clipboard, like the score's.
             KeyCode::Char('c' | 'C') if primary => {
