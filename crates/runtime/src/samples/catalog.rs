@@ -884,15 +884,19 @@ impl SampleLibrary {
     /// as ordinary as a score that does the same.
     pub fn set_import_policy(&self, access: ScoreSampleAccess) {
         *self.shared.import_policy.lock().expect("import policy") = Some(access);
-        // A source refused under the old policy may be allowed now: forget
-        // its failure, so the next ask fetches it at once instead of
-        // waiting out the rest a failed fetch earns.
+        // A source the old policy refused may be allowed now: forget that
+        // refusal, so the next ask fetches it at once instead of waiting
+        // out the rest a failed fetch earns. A failure the network caused
+        // keeps its standing and its rest.
         self.shared
             .source_tables
             .lock()
             .expect("samples source tables")
             .states
-            .retain(|_, standing| !standing.failed());
+            .retain(|_, standing| {
+                !matches!(&standing.state, SourceState::Failed(why)
+                    if why.contains("is not an allowed sample source"))
+            });
     }
 
     /// Take back what a score's sources no longer allow under `access`: each
@@ -2681,7 +2685,11 @@ mod tests {
         let library = SampleLibrary::empty();
         library.note_samples_source_state_for_tests(
             "http://127.0.0.1:9/strudel.json",
-            SourceState::Failed("not an allowed sample source".into()),
+            SourceState::Failed("http://127.0.0.1:9 is not an allowed sample source.".into()),
+        );
+        library.note_samples_source_state_for_tests(
+            "http://127.0.0.1:9/flaky.json",
+            SourceState::Failed("connection refused".into()),
         );
         library.note_samples_source_state_for_tests(
             "http://127.0.0.1:9/kept.json",
@@ -2696,6 +2704,11 @@ mod tests {
             library.samples_source_state("http://127.0.0.1:9/kept.json"),
             Some(SourceState::Ready)
         );
+        // A failure the network caused keeps its rest.
+        assert!(matches!(
+            library.samples_source_state("http://127.0.0.1:9/flaky.json"),
+            Some(SourceState::Failed(_))
+        ));
     }
 
     /// A registration that was on its way under the policy before a source
