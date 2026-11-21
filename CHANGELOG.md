@@ -31,9 +31,11 @@
 - Fixed: a scene can call a name from a script that another scene of the set imports, as the docs say, instead of the check refusing it as unknown.
 - Fixed: `rustel check` queries the score's first cycle, so a score that evaluates but refuses when it plays, such as a Euclid step past its limit or a KabelSalat `out(16)`, fails the check as query and export do.
 - Fixed: one sample source in Settings that will not read fails only its own row; the other remote sources still load.
+- Fixed: allowing a source or native orchestras on the Permissions page runs the refused update again by itself whatever refused it, as the docs say, not only for a refusal named on the footer.
 
 ## v0.1.7
 
+- Fixed: a scale name that will not read, such as `scale("C3:kafi raga")`, says why its notes are dropped in export, query and Studio, instead of a silent lane with nothing said.
 - Release archives and installers include signed build provenance for independent verification with GitHub CLI.
 - A video file plays as a sample: `mp4`, `m4v`, `mov`, `mkv` and `webm` play their audio track.
 - Fixed: a Hydra animated array with an entry that is not a number, such as `osc([10, "x", 30])`, refuses the new score as the docs say, instead of installing it with a warning.
