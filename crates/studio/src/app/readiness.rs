@@ -354,6 +354,13 @@ impl App {
     /// failure has rested, so a failure the network caused recovers by
     /// itself. Typing never asks: an update does, and the poll does in the
     /// `background`, where a failure in a row rests longer.
+    /// Ask again for every `samples()` source a scene imports: a source a
+    /// permission has just allowed is fetched now. One already in or on its
+    /// way is left as it stands.
+    pub(super) fn ask_for_imports_again(&self, scene_id: SceneId) {
+        self.ask_for_imports(scene_id, |_, _| true);
+    }
+
     pub(super) fn retry_failed_imports(&self, scene_id: SceneId, background: bool) {
         self.ask_for_imports(scene_id, |library, spec| {
             library.is_some_and(|library| library.samples_source_rested(spec, background))

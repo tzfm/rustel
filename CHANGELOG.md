@@ -45,6 +45,7 @@
 - Hydra sketches read the mouse, `width` and `height`, and set `speed`, `bpm`, `fps` and `time`. Patterns read the mouse as `mousex` and `mousey`.
 - The reference knows the Hydra names, and a shared sketch with calls Rustel does not support still runs.
 - Picking a plugin from the reference opens its presets and closes the call.
+- Fixed: allowing a sample source on the Permissions page fetches the score's `samples()` import it had refused and re-runs the update with it, instead of the check still finding the sounds unknown.
 - Each open scene keeps its plugins loaded, and a scene you close frees them.
 - Plugins stay loaded when the output device or buffer size changes, and an undo within 5 seconds reuses the previous plugin copy.
 - A plugin chain with up to 1 second of latency plays in time, also in exports, and edits reach it that much later.

@@ -884,6 +884,15 @@ impl SampleLibrary {
     /// as ordinary as a score that does the same.
     pub fn set_import_policy(&self, access: ScoreSampleAccess) {
         *self.shared.import_policy.lock().expect("import policy") = Some(access);
+        // A source refused under the old policy may be allowed now: forget
+        // its failure, so the next ask fetches it at once instead of
+        // waiting out the rest a failed fetch earns.
+        self.shared
+            .source_tables
+            .lock()
+            .expect("samples source tables")
+            .states
+            .retain(|_, standing| !standing.failed());
     }
 
     /// Take back what a score's sources no longer allow under `access`: each
@@ -2661,6 +2670,31 @@ mod tests {
         assert!(
             matches!(state("zzz"), GlobalSourceState::Failed(ref why) if why.starts_with("zzz:")),
             "{reports:?}"
+        );
+    }
+
+    /// A source that failed - refused under the old policy - is forgotten
+    /// when the policy changes, so the next ask fetches it at once; a source
+    /// that loaded keeps its standing.
+    #[test]
+    fn a_new_policy_forgets_a_failed_source() {
+        let library = SampleLibrary::empty();
+        library.note_samples_source_state_for_tests(
+            "http://127.0.0.1:9/strudel.json",
+            SourceState::Failed("not an allowed sample source".into()),
+        );
+        library.note_samples_source_state_for_tests(
+            "http://127.0.0.1:9/kept.json",
+            SourceState::Ready,
+        );
+        library.set_import_policy(ScoreSampleAccess::denied());
+        assert_eq!(
+            library.samples_source_state("http://127.0.0.1:9/strudel.json"),
+            None
+        );
+        assert_eq!(
+            library.samples_source_state("http://127.0.0.1:9/kept.json"),
+            Some(SourceState::Ready)
         );
     }
 
