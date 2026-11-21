@@ -1200,6 +1200,9 @@ struct Shared {
     /// Published source maps and registration status share one retention
     /// budget. Publication and eviction are atomic for loader and UI readers.
     source_tables: Mutex<SourceTables>,
+    /// How many `samples("…")` maps have come in, again or for the first
+    /// time: a checker reads the names they bring after each one.
+    maps_in: AtomicU64,
     /// How many score policies [`SampleLibrary::withdraw_sources`] has
     /// taken, so a host can tell when one it sent is in force.
     policies_taken: AtomicU64,

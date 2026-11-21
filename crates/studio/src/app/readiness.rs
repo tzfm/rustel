@@ -18,6 +18,10 @@ pub(super) struct LintKnowledge {
     /// Why the focused scene's imports failed, those that did: a finding
     /// names the reason, and goes when the import is answered.
     import_failures: Vec<String>,
+    /// How many sample maps have come in. A map that comes in, or comes
+    /// in again after its source was turned off and on, brings names the
+    /// last check did not know.
+    maps_in: u64,
     midi_inputs: Option<Vec<String>>,
     midi_outputs: Option<Vec<String>>,
 }
@@ -737,10 +741,12 @@ impl App {
                 })
                 .collect()
         });
+        let maps_in = library.as_ref().map_or(0, |library| library.maps_in());
         LintKnowledge {
             sound_names: library
                 .is_some_and(|library| library.manifests_pending() == 0 && library.has_banks()),
             import_failures,
+            maps_in,
             midi_inputs: self.lint_midi_ports(MidiDirection::In),
             midi_outputs: self.lint_midi_ports(MidiDirection::Out),
         }

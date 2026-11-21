@@ -1056,6 +1056,14 @@ fn a_source_turned_off_and_on_again_reruns_the_refused_update() {
         "the refused update runs",
         |studio| studio.status().starts_with("updated"),
     );
+    // The check reads the names the map brought again: no finding is left
+    // standing about the sound that plays.
+    studio.pump_until(Duration::from_secs(10), "the check forgets sn", |studio| {
+        studio
+            .rows()
+            .iter()
+            .all(|row| !row.contains("unknown sound"))
+    });
 }
 
 /// `e` opens a refused folder in a prompt with its text. Cut down to the

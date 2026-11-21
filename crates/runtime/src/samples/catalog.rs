@@ -1798,6 +1798,12 @@ impl SampleLibrary {
         Some(crate::video::VideoPicture::Decoding)
     }
 
+    /// How many `samples("…")` maps have come in. It moves when a map
+    /// arrives, also one that came in before and was fetched again.
+    pub fn maps_in(&self) -> u64 {
+        self.shared.maps_in.load(Ordering::Acquire)
+    }
+
     /// Whether a `samples(...)` the score wrote - its string argument, as
     /// written - has been registered and published. A string argument
     /// reaches the library as the JSON text it stringifies to, so both
