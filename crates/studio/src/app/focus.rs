@@ -433,7 +433,12 @@ impl App {
                 self.status = "reference closed".into();
                 self.invalidate_maps();
             }
-            PanelKind::Log => self.log_panel = None,
+            PanelKind::Log => {
+                self.log_panel = None;
+                // However it closes: the line that said Esc closes the sheet
+                // would outlive it.
+                self.status = "log closed".into();
+            }
             PanelKind::Memory => self.close_memory_dock(),
             PanelKind::Jobs => self.jobs_panel = None,
             PanelKind::Export => {
