@@ -9819,7 +9819,7 @@ fn check_finds_what_only_the_query_refuses() {
 #[test]
 fn the_json_plugin_list_says_which_bundles_failed() {
     let directory = tempfile::tempdir().expect("plugin folder");
-    std::fs::create_dir_all(directory.path().join("plugins/Empty.vst3")).expect("empty bundle");
+    std::fs::create_dir_all(directory.path().join("plugins/RustelScanTestEmpty.vst3")).expect("empty bundle");
     let out = rustel()
         .args(["vst", "-j"])
         .env("RUSTEL_VST3_PATH", directory.path().join("plugins"))
@@ -9832,7 +9832,7 @@ fn the_json_plugin_list_says_which_bundles_failed() {
         .as_array()
         .expect("plugins")
         .iter()
-        .find(|row| row["name"] == "Empty")
+        .find(|row| row["name"] == "RustelScanTestEmpty")
         .expect("the empty bundle is listed");
     assert_eq!(empty["status"], "failed", "{empty}");
     assert!(
