@@ -589,8 +589,9 @@ fn stands_alone(source: &str, range: std::ops::Range<usize>) -> bool {
 /// whether the span the form writes over is still one whole call.
 ///
 /// The checks run in the order a player can act on them: a field that is
-/// not a number, a range with no travel, a call that must be fixed in the
-/// score first, and then a value outside its own range. The form corrects
+/// not a number, a range with no travel, a step at or below zero, a call
+/// that must be fixed in the score first, and then a value outside its own
+/// range. The form corrects
 /// only that last case, and it does so before anything is written: it puts
 /// the moved number in its field and the warning under it. Nothing is
 /// written on that Enter, because a write closes the form and the warning
@@ -601,6 +602,10 @@ fn checked_numbers(form: &mut SliderForm, whole: bool) -> Result<[f64; 4], Strin
     if min >= max {
         return Err("min has to be below max".into());
     }
+    // As the check: a fader that cannot move is not one.
+    if step <= 0.0 {
+        return Err("step has to be above zero".into());
+    }
     if !whole {
         return Err("the call here is not one whole slider - fix it in the score first".into());
     }
@@ -609,11 +614,6 @@ fn checked_numbers(form: &mut SliderForm, whole: bool) -> Result<[f64; 4], Strin
         form.set_field(Field::Value, slider::format_value(clamped));
         return Err(PULLED.into());
     }
-    let step = if step > 0.0 {
-        step
-    } else {
-        (max - min) / 1000.0
-    };
     Ok([clamped, min, max, step])
 }
 
@@ -830,7 +830,8 @@ impl App {
     ///
     /// The form stays open, with nothing written, only when there is
     /// something to read before a write: a field that is not a number, a
-    /// range with no travel, a span that is not one whole call, a score or
+    /// range with no travel, a step at or below zero, a span that is not one
+    /// whole call, a score or
     /// scene that changed under the form, a write the editor refused - and
     /// a value it had to pull into its range, which the next Enter writes.
     fn apply_slider_form(&mut self) {
@@ -1724,6 +1725,27 @@ mod tests {
             // An edit makes the refusal stale: the footer is the hint again.
             precision_key(&mut app, KeyCode::Backspace, KeyModifiers::NONE);
             assert!(app.status.contains("Enter applies"), "{}", app.status);
+        }
+
+        /// A step of zero is refused with the reason, as the check refuses it,
+        /// and the score is left as it was.
+        #[test]
+        fn a_zero_step_is_refused_and_says_why() {
+            let directory = tempfile::tempdir().expect("temp dir");
+            let (mut app, _) = plain_app(directory.path(), "$: s(\"bd*4\").gain(.15)\n");
+            let before = app.editor().source();
+            open_action_on(&mut app, ".15");
+            precision_key(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+            for _ in 0..3 {
+                precision_key(&mut app, KeyCode::Tab, KeyModifiers::NONE);
+            }
+            for _ in 0..8 {
+                precision_key(&mut app, KeyCode::Backspace, KeyModifiers::NONE);
+            }
+            precision_key(&mut app, KeyCode::Char('0'), KeyModifiers::NONE);
+            precision_key(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+            assert_eq!(app.editor().source(), before, "nothing is written");
+            assert_eq!(app.status, "fader not written: step has to be above zero");
         }
 
         /// A min above the value pulls the value up with it: a range that does
