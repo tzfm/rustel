@@ -750,6 +750,7 @@ fn run_once(mut options: StudioOptions) -> Result<Session, RuntimeError> {
     if crashed {
         app.log
             .session_end_marker(LogLevel::Error, "session ended - crash");
+        app.save_after_crash();
     } else {
         app.log.session_end();
     }
