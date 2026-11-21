@@ -287,6 +287,21 @@ impl Program {
                 for consumer in &graph.nodes {
                     for (inlet, &source) in consumer.inputs.iter().enumerate() {
                         if source == index {
+                            // `mouseX` is `cc("mouseX")`: the input it names
+                            // is live, and that is what K() cannot give it.
+                            if matches!(
+                                consumer.kind.as_str(),
+                                "midifreq" | "midigate" | "midivel" | "midicc" | "cc"
+                            ) {
+                                let name = node
+                                    .value
+                                    .as_str()
+                                    .filter(|name| name.starts_with("mouse"))
+                                    .unwrap_or(&consumer.kind);
+                                return Err(format!(
+                                    "KabelSalat node '{name}' requires live control input, which is unavailable in K()"
+                                ));
+                            }
                             if consumer.kind != "scope" || inlet != 1 {
                                 return Err(format!(
                                     "KabelSalat string constant {index} is only supported as a scope ID"

@@ -57,6 +57,24 @@ fn scope_string_ids_are_metadata_and_cannot_be_used_as_signals() {
 }
 
 #[test]
+fn mouse_inputs_say_they_need_live_control() {
+    for (name, kind) in [("mouseX", "mouseX"), ("mouseY", "mouseY"), ("1", "cc")] {
+        let error = Program::from_json(
+            &json!({"nodes":[
+                {"type":"n","value":name}, {"type":"cc","inputs":[0]},
+                {"type":"output","inputs":[1]}
+            ]})
+            .to_string(),
+        )
+        .unwrap_err();
+        assert!(
+            error.contains(&format!("'{kind}' requires live control input")),
+            "{error}"
+        );
+    }
+}
+
+#[test]
 fn forward_feedback_reads_previous_sample_and_constants_are_immediate() {
     let mut graph = graph(json!([
         {"type":"add","inputs":[1,2]}, {"type":"thru","inputs":[0]},
