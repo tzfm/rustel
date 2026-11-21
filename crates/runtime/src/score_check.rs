@@ -20,6 +20,7 @@ use rustel_fraction::Fraction;
 use crate::lint::{self, Diagnostic, Level};
 use crate::samples::SampleLibrary;
 use crate::session::{RuntimeError, Session};
+use rustel_voice::SampleLookup;
 
 /// Where an evaluation failure happened, when the underlying message says.
 ///
@@ -130,7 +131,10 @@ pub fn check_score_with(
     }
     // Evaluation queues imports under the session's existing sample grants.
     // The linter judges only the sources the loader has finished publishing.
-    let diagnostics = lint::lint_with(source, false, library, context);
+    let mut diagnostics = lint::lint_with(source, false, library, context);
+    if eval_error.is_none() && library.is_some() && !cancellation.load(Ordering::Relaxed) {
+        diagnostics.extend(notes_outside_their_fonts(session, cancellation));
+    }
     if eval_error.is_none() && cancellation.load(Ordering::Relaxed) {
         eval_error = Some(EvalError {
             message: RuntimeError::Cancelled.to_string(),
@@ -141,6 +145,88 @@ pub fn check_score_with(
         diagnostics,
         eval_error,
     }
+}
+
+/// The notes of the first cycle that a `gm_*` soundfont has no zone for:
+/// they play as silence, as on strudel.cc, and the check says so with the
+/// words a render uses. The fonts the cycle names are fetched first, for
+/// at most a few seconds; a font that does not come in is not judged.
+fn notes_outside_their_fonts(session: &mut Session, cancellation: &AtomicBool) -> Vec<Diagnostic> {
+    let Ok(report) = session.query_report(Fraction::ZERO, Fraction::ONE) else {
+        return Vec::new();
+    };
+    let Some(samples) = session.sample_library() else {
+        return Vec::new();
+    };
+    let fonts: Vec<_> = report
+        .haps
+        .iter()
+        .filter(|hap| hap.has_onset)
+        .filter_map(|hap| match &hap.value {
+            crate::hap_json::ValueJson::Raw(serde_json::Value::Object(object)) => {
+                let sound = object.get("s")?.as_str()?;
+                let font = sound.starts_with("gm_") && !object.contains_key("bank");
+                font.then(|| FontNote {
+                    value: object.clone(),
+                    sound: sound.to_owned(),
+                    at: hap.context.first().copied(),
+                })
+            }
+            _ => None,
+        })
+        .collect();
+    if fonts.is_empty() {
+        return Vec::new();
+    }
+    // Asking is what starts the fetch.
+    for note in &fonts {
+        let _ = rustel_voice::sample_failure(&note.value, samples.as_ref());
+    }
+    samples.wait_until_idle_cancellable(Duration::from_secs(5), || {
+        cancellation.load(Ordering::Relaxed)
+    });
+    font_notes_missing(fonts, samples.as_ref())
+}
+
+/// A note a `gm_*` soundfont plays: the hap's value, its sound, and where
+/// the score wrote it.
+struct FontNote {
+    value: serde_json::Map<String, serde_json::Value>,
+    sound: String,
+    at: Option<(usize, usize)>,
+}
+
+/// The findings for the font notes of a cycle against `samples`: one per
+/// message, so a note heard many times is said once.
+fn font_notes_missing(fonts: Vec<FontNote>, samples: &dyn SampleLookup) -> Vec<Diagnostic> {
+    let mut said = Vec::new();
+    let mut diagnostics = Vec::new();
+    for FontNote { value, sound, at } in fonts {
+        let n = value
+            .get("n")
+            .and_then(serde_json::Value::as_f64)
+            .unwrap_or(0.0);
+        // A font that came in has a range; one that failed to come in is
+        // the network's, not the score's.
+        if samples.note_range(&sound, n).is_none() {
+            continue;
+        }
+        let Some(message) = rustel_voice::sample_failure(&value, samples) else {
+            continue;
+        };
+        if said.contains(&message) {
+            continue;
+        }
+        let (from, to) = at.unwrap_or((0, 0));
+        diagnostics.push(Diagnostic {
+            level: Level::Value,
+            message: message.clone(),
+            from,
+            to,
+        });
+        said.push(message);
+    }
+    diagnostics
 }
 
 /// Pull the line number back out of a `" - line N"` or `" - line N, column
@@ -159,6 +245,61 @@ fn extract_reported_line(message: &str) -> Option<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A font that plays midi 48 to 84, found nowhere else.
+    struct Clarinet;
+
+    impl SampleLookup for Clarinet {
+        fn resolve(&self, _s: &str, _n: f64, midi: f64) -> rustel_voice::SampleResolution {
+            if (48.0..=84.0).contains(&midi) {
+                rustel_voice::SampleResolution::Loading
+            } else {
+                rustel_voice::SampleResolution::Failed
+            }
+        }
+
+        fn note_range(&self, s: &str, _n: f64) -> Option<(f64, f64)> {
+            (s == "gm_clarinet").then_some((48.0, 84.0))
+        }
+    }
+
+    fn font_note(sound: &str, note: &str) -> FontNote {
+        let serde_json::Value::Object(value) = serde_json::json!({ "s": sound, "note": note })
+        else {
+            unreachable!("an object")
+        };
+        FontNote {
+            value,
+            sound: sound.to_owned(),
+            at: Some((3, 9)),
+        }
+    }
+
+    /// A note a loaded font has no zone for is a finding, said once
+    /// however often it plays; a note in its range, and a font that never
+    /// came in, are not.
+    #[test]
+    fn a_note_outside_its_font_is_a_finding() {
+        let found = font_notes_missing(
+            vec![
+                font_note("gm_clarinet", "c2"),
+                font_note("gm_clarinet", "c2"),
+                font_note("gm_clarinet", "c3"),
+                font_note("gm_recorder", "c2"),
+            ],
+            &Clarinet,
+        );
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert_eq!(found[0].level, Level::Value);
+        assert_eq!((found[0].from, found[0].to), (3, 9));
+        assert!(
+            found[0]
+                .message
+                .contains("has no note at midi 36: it plays midi 48 to 84"),
+            "{}",
+            found[0].message
+        );
+    }
 
     #[test]
     fn extracts_a_line_with_no_column() {

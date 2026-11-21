@@ -4216,6 +4216,20 @@ fn non_scalar_speech_note() -> VoiceError {
     VoiceError::InvalidControl("talkit: note must be a note name or a MIDI number".into())
 }
 
+/// Why the sample of a hap's `object` would not sound, as a voice says it
+/// when the note plays: a file that failed, or a note a soundfont has no
+/// zone for. None when it would sound, is still loading, or names no
+/// sample.
+pub fn sample_failure(
+    object: &serde_json::Map<String, serde_json::Value>,
+    samples: &dyn SampleLookup,
+) -> Option<String> {
+    match sample_controls(object, samples) {
+        Err(VoiceError::SampleFailed(message)) => Some(message),
+        _ => None,
+    }
+}
+
 fn sample_controls(
     object: &serde_json::Map<String, serde_json::Value>,
     samples: &dyn SampleLookup,
