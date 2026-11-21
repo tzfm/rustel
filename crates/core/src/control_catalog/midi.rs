@@ -252,8 +252,8 @@ pub(super) const SYSEXID: ControlRow = ControlRow {
     reference: ReferenceEntry {
         name: "sysexid",
         synonyms: &[],
-        summary: "MIDI sysex ID: Sends a MIDI sysex identifier message.",
-        description: "MIDI sysex ID: Sends a MIDI sysex identifier message.",
+        summary: "MIDI sysex ID: the identifier of a SysEx message. SysEx is not sent yet.",
+        description: "MIDI sysex ID: the identifier of a SysEx message. SysEx is not sent yet.",
         params: &[
             ReferenceParam {
                 name: "id",
@@ -277,8 +277,8 @@ pub(super) const SYSEXDATA: ControlRow = ControlRow {
     reference: ReferenceEntry {
         name: "sysexdata",
         synonyms: &[],
-        summary: "MIDI sysex data: Sends a MIDI sysex message.",
-        description: "MIDI sysex data: Sends a MIDI sysex message.",
+        summary: "MIDI sysex data: the bytes of a SysEx message. SysEx is not sent yet.",
+        description: "MIDI sysex data: the bytes of a SysEx message. SysEx is not sent yet.",
         params: &[
             ReferenceParam {
                 name: "data",

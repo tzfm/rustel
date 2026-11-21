@@ -2682,7 +2682,9 @@ impl Row {
             Self::MasterLimiter => "a brickwall on new sets \u{b7} the mixer changes this set",
             Self::MasterLimiterCharacter => "how a limiter added from here works",
             Self::MasterLimiterCeiling => "how far under full scale a new one holds",
-            Self::MasterLimiterMakeup => "limiting changes the sound, not the loudness",
+            Self::MasterLimiterMakeup => {
+                "lifts the ceiling to full scale: a lower ceiling limits harder and sounds louder"
+            }
             Self::Minimap => "the Braille overview at the pane's right edge",
             Self::ShowScrollbars => "scrollbars appear only when the score overflows",
             Self::LineNumbers => "the numbers down the left edge of the score",
