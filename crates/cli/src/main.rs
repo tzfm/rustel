@@ -2907,7 +2907,7 @@ fn run_command(
                             style::dim(
                                 on,
                                 &format!(
-                                    "the tail ran until the music stayed under {silence_floor} dBFS for {silence_hold} s"
+                                    "the tail ran until the music stayed under {silence_floor} dBFS for {silence_hold} s; that silence is cut, so the file ends where the sound did"
                                 )
                             )
                         );
