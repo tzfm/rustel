@@ -232,6 +232,9 @@ impl TimeSpan {
     /// Zero-width rule (the classic off-by-one source): a point intersection
     /// does NOT count if it sits at the end of a non-zero-width span.
     pub fn intersection(&self, other: &TimeSpan) -> Option<TimeSpan> {
+        if self.begin == other.begin && self.end == other.end {
+            return (self.begin <= self.end).then_some(*self);
+        }
         let b = self.begin.max(other.begin);
         let e = self.end.min(other.end);
         if b > e {
@@ -358,21 +361,38 @@ fn stable_sorted(mut haps: Vec<Hap>) -> Vec<Hap> {
         return haps;
     }
     if n <= FEW_HAPS {
-        if (1..n).all(|at| query_order(&haps[at - 1], &haps[at]) != std::cmp::Ordering::Greater) {
+        let Some(first_bad) =
+            (1..n).find(|&at| query_order(&haps[at - 1], &haps[at]) == std::cmp::Ordering::Greater)
+        else {
             return haps;
+        };
+        let mut begins = [0.0f64; FEW_HAPS];
+        for (dst, hap) in begins[..n].iter_mut().zip(&haps) {
+            *dst = order_key(hap.part.begin);
         }
         let mut indices = [0u8; FEW_HAPS];
         for (slot, dst) in indices[..n].iter_mut().enumerate() {
             *dst = slot as u8;
         }
-        for i in 1..n {
+        for i in first_bad..n {
             let key = indices[i];
-            let key_hap = &haps[key as usize];
+            let key_idx = key as usize;
+            let key_k = begins[key_idx];
+            let key_hap = &haps[key_idx];
             let mut j = i;
-            while j > 0
-                && query_order(&haps[indices[j - 1] as usize], key_hap)
-                    == std::cmp::Ordering::Greater
-            {
+            while j > 0 {
+                let prev_idx = indices[j - 1] as usize;
+                let prev_k = begins[prev_idx];
+                let greater = if prev_k > key_k {
+                    true
+                } else if prev_k < key_k {
+                    false
+                } else {
+                    query_order(&haps[prev_idx], key_hap) == std::cmp::Ordering::Greater
+                };
+                if !greater {
+                    break;
+                }
                 indices[j] = indices[j - 1];
                 j -= 1;
             }
@@ -8377,13 +8397,15 @@ fn query_run(
     // Fast in-place path when every hap's active intersection lies within a
     // single cycle (true for all sub-cycle windows even when `whole` spans
     // multiple cycles): zero scratch buffer, zero Hap moves.
-    if out[from..].iter().all(|hf| {
-        let met = hf.whole_or_part();
-        match hf.part.intersection(&met) {
-            Some(part) => part.within_one_cycle(),
-            None => true,
-        }
-    }) {
+    let single_cycle = out[from..].iter().all(|hf| hf.part.within_one_cycle())
+        || out[from..].iter().all(|hf| {
+            let met = hf.whole_or_part();
+            match hf.part.intersection(&met) {
+                Some(part) => part.within_one_cycle(),
+                None => true,
+            }
+        });
+    if single_cycle {
         let mut stopped = false;
         if let [meeting] = meetings {
             let mut cache = value::SharedWaveCache::default();
@@ -8391,8 +8413,13 @@ fn query_run(
                 if stopped {
                     return false;
                 }
-                let met = hf.whole_or_part();
-                let Some(part) = hf.part.intersection(&met) else {
+                let Some(part) = (match hf.whole {
+                    None => (hf.part.begin <= hf.part.end).then_some(hf.part),
+                    Some(whole) if whole == hf.part => {
+                        (hf.part.begin <= hf.part.end).then_some(hf.part)
+                    }
+                    Some(whole) => hf.part.intersection(&whole),
+                }) else {
                     return false;
                 };
                 if !Meeting::in_place_run_meeting(hf, meeting, part, Some(&mut cache)) {
@@ -8420,8 +8447,13 @@ fn query_run(
             if stopped {
                 return false;
             }
-            let met = hf.whole_or_part();
-            let Some(part) = hf.part.intersection(&met) else {
+            let Some(part) = (match hf.whole {
+                None => (hf.part.begin <= hf.part.end).then_some(hf.part),
+                Some(whole) if whole == hf.part => {
+                    (hf.part.begin <= hf.part.end).then_some(hf.part)
+                }
+                Some(whole) => hf.part.intersection(&whole),
+            }) else {
                 return false;
             };
             for (m_idx, meeting) in meetings.iter().enumerate() {
@@ -9991,6 +10023,239 @@ impl Pattern {
         true
     }
 
+    /// Fast single-pass segmented wave application when `2..=4` waves share one
+    /// multi-step rate (`shared_steps`) and every hap splits into `1..=8` steps.
+    /// Kept out-of-line so its stack slots do not inflate callers that take the
+    /// sequential single-step path.
+    #[inline(never)]
+    #[allow(clippy::too_many_arguments)]
+    fn try_query_app_wave_uniform_steps_onto(
+        items: &[AppWaveItem],
+        shared_steps: u32,
+        has_continuous: bool,
+        single_step_mask: u8,
+        thread: &QueryThread,
+        state: &State,
+        from: usize,
+        buf: &mut Vec<Hap>,
+        out: &mut Vec<Hap>,
+    ) -> Option<bool> {
+        let mut keys: [Option<&Key>; 4] = [None; 4];
+        for (i, item) in items.iter().enumerate() {
+            keys[i] = Some(controls::builtin_key_ref_by_id(item.key_id)?);
+        }
+        let first_key = keys[0].expect("at least two items");
+        let n_waves = items.len();
+        let mut unique_keys: [&Key; value::StepPatch::MAX_KEYS] =
+            [first_key; value::StepPatch::MAX_KEYS];
+        let mut key_slot = [0u8; 4];
+        let mut n_unique = 0usize;
+        for w in 0..n_waves {
+            let key = keys[w].expect("key");
+            if let Some(pos) = unique_keys[..n_unique].iter().position(|&k| k == key) {
+                key_slot[w] = pos as u8;
+            } else {
+                unique_keys[n_unique] = key;
+                key_slot[w] = n_unique as u8;
+                n_unique += 1;
+            }
+        }
+        struct MultiStepSlot {
+            met: TimeSpan,
+            part: TimeSpan,
+            count: u8,
+            pieces: [TimeSpan; 8],
+            nums: [[f64; 4]; 8],
+            step_patches: StepPatchCache,
+            step_next: u8,
+            fallback_caches: Option<Box<[value::SharedWaveCache; 8]>>,
+        }
+        let mut slots: [Option<MultiStepSlot>; 4] = [None, None, None, None];
+        let mut slot_next = 0u8;
+        let mut patches: [(&Key, f64); 4] = [(first_key, 0.0); 4];
+        for hf in buf.drain(..) {
+            let met = if has_continuous {
+                hf.whole_or_part()
+            } else {
+                hf.part
+            };
+            let slot_idx = if let Some(idx) = slots.iter().position(|s| {
+                matches!(s, Some(slot) if slot.part == hf.part && (!has_continuous || slot.met == met))
+            }) {
+                idx
+            } else {
+                let grid = fused::StepWave::step_grid_over(shared_steps, hf.part)?;
+                let count = grid.len();
+                let mut pieces = [TimeSpan::new(Fraction::ZERO, Fraction::ZERO); 8];
+                let mut nums = [[0.0f64; 4]; 8];
+                let mut begin = grid.time(grid.steps().start)?;
+                for (s_idx, k) in grid.steps().enumerate() {
+                    if thread.stop_requested() {
+                        out.truncate(from);
+                        return Some(true);
+                    }
+                    let end = grid.time(k + 1)?;
+                    let piece = grid.cut(k, TimeSpan::new(begin, end), hf.part);
+                    pieces[s_idx] = piece;
+                    for (w, item) in items.iter().enumerate() {
+                        nums[s_idx][w] = if item.steps == 0 {
+                            item.wave.number(met, piece, &state.controls)?
+                        } else if single_step_mask & (1u8 << w) != 0 {
+                            fused::StepWave::step_number(
+                                &item.wave,
+                                item.steps,
+                                piece,
+                                &state.controls,
+                            )?
+                        } else {
+                            item.wave.step_value_at(begin, &state.controls)?
+                        };
+                    }
+                    begin = end;
+                }
+                let idx = if let Some(empty) = slots.iter().position(Option::is_none) {
+                    empty
+                } else {
+                    let victim = usize::from(slot_next & 3);
+                    slot_next = slot_next.wrapping_add(1);
+                    victim
+                };
+                slots[idx] = Some(MultiStepSlot {
+                    met,
+                    part: hf.part,
+                    count: count as u8,
+                    pieces,
+                    nums,
+                    step_patches: [None, None, None, None],
+                    step_next: 0,
+                    fallback_caches: None,
+                });
+                idx
+            };
+            let slot = slots[slot_idx].as_mut().expect("multi-step slot present");
+            let count = usize::from(slot.count);
+            out.reserve(count);
+            let bulk_ok = thread.charge(out.len() - from + count);
+            let mut template = hf;
+            if !template.keys.is_empty() {
+                let k = template.keys.get();
+                let mut clear_slot = k.slider_binding != 0;
+                if !clear_slot {
+                    for key in keys[..n_waves].iter().flatten() {
+                        if let Some(s) = controls::live_slot(key.as_str())
+                            && k.live_controls[s] != 0
+                        {
+                            clear_slot = true;
+                            break;
+                        }
+                    }
+                }
+                if clear_slot {
+                    let edit = template.keys.edit();
+                    for key in keys[..n_waves].iter().flatten() {
+                        if let Some(s) = controls::live_slot(key.as_str()) {
+                            edit.live_controls[s] = 0;
+                        }
+                    }
+                    edit.slider_binding = 0;
+                    template.keys.trim();
+                }
+            }
+            // Single-allocation StepPatch fast path across all `count` steps.
+            if count * n_unique <= value::StepPatch::MAX_VALUES
+                && let Value::Object(map) = &template.value
+                && let Some((base, row, uniform)) = map.step_base()
+            {
+                let fixed_row = (!uniform).then_some(row);
+                let sp = if let Some((_, _, cached)) = slot
+                    .step_patches
+                    .iter()
+                    .flatten()
+                    .find(|(b, r, _)| b.same_source(&base) && *r == fixed_row)
+                {
+                    Some(Arc::clone(cached))
+                } else if let Some(mut built) =
+                    value::StepPatch::new_for_row(base.clone(), row, &unique_keys[..n_unique], true)
+                {
+                    let mut vals = [0.0f64; value::StepPatch::MAX_KEYS];
+                    for (s_idx, row_nums) in slot.nums.iter().enumerate().take(count) {
+                        for w in 0..n_waves {
+                            vals[usize::from(key_slot[w])] = row_nums[w];
+                        }
+                        built.set_slot(s_idx, &vals[..n_unique]);
+                    }
+                    let arc = Arc::new(built);
+                    let idx =
+                        if let Some(empty) = slot.step_patches.iter().position(Option::is_none) {
+                            empty
+                        } else {
+                            let v = usize::from(slot.step_next & 3);
+                            slot.step_next = slot.step_next.wrapping_add(1);
+                            v
+                        };
+                    slot.step_patches[idx] = Some((base, fixed_row, Arc::clone(&arc)));
+                    Some(arc)
+                } else {
+                    None
+                };
+                if let Some(sp) = sp {
+                    let mut template = Some(template);
+                    for (s_idx, &piece) in slot.pieces.iter().enumerate().take(count) {
+                        let mut hap = if s_idx + 1 == count {
+                            template.take().expect("last step moves template")
+                        } else {
+                            template.as_ref().expect("template present").clone()
+                        };
+                        if let Value::Object(controls) = &mut hap.value {
+                            controls.set_step_patch(&sp, row, s_idx);
+                        }
+                        hap.part = piece;
+                        if bulk_ok {
+                            out.push(hap);
+                        } else if thread.stop_requested() || !thread.push_budgeted(out, from, hap) {
+                            out.truncate(from);
+                            return Some(true);
+                        }
+                    }
+                    if bulk_ok {
+                        thread.note_accumulated(out.len() - from);
+                    }
+                    fused::note(fused::Hit::StepMany);
+                    continue;
+                }
+            }
+            let caches = slot.fallback_caches.get_or_insert_with(|| {
+                Box::new(std::array::from_fn(|_| value::SharedWaveCache::default()))
+            });
+            let mut template = Some(template);
+            for s_idx in 0..count {
+                let mut hap = if s_idx + 1 == count {
+                    template.take().expect("last step moves template")
+                } else {
+                    template.as_ref().expect("template present").clone()
+                };
+                for w in 0..n_waves {
+                    patches[w] = (keys[w].expect("key"), slot.nums[s_idx][w]);
+                }
+                if let Value::Object(controls) = &mut hap.value {
+                    controls.set_data_many_cached(&patches[..n_waves], &mut caches[s_idx]);
+                }
+                hap.part = slot.pieces[s_idx];
+                if bulk_ok {
+                    out.push(hap);
+                } else if thread.stop_requested() || !thread.push_budgeted(out, from, hap) {
+                    out.truncate(from);
+                    return Some(true);
+                }
+            }
+            if bulk_ok {
+                thread.note_accumulated(out.len() - from);
+            }
+            fused::note(fused::Hit::StepMany);
+        }
+        Some(true)
+    }
+
     /// Direct execution for [`Node::AppWave`] when one or more items are
     /// multi-step segmented waves (`steps > 0`) spanning multiple steps of
     /// `state.span`: avoids rebuilding `AppLeft` + `OnceLock` graphs and uses
@@ -10017,13 +10282,8 @@ impl Pattern {
                 return Some(true);
             }
             let apply = Combine::Composed(compose::ComposeOp::Set);
-            // Fast single-pass path when all multi-step segmented waves in
-            // `items` share one step rate `S` (optionally mixed with continuous
-            // waves or slower segmented waves that cover `state.span` in a
-            // single step) and every hap splits into `1..=8` steps: applies all
-            // waves in one pass, sharing one `Arc<StepPatch>` when possible.
             let mut shared_steps = 0u32;
-            let mut uniform_steps = items.len() <= 8;
+            let mut uniform_steps = items.len() <= 4;
             let mut has_continuous = false;
             let mut single_step_mask = 0u8;
             for (idx, item) in items.iter().enumerate() {
@@ -10048,231 +10308,17 @@ impl Pattern {
                             .is_some_and(|g| (1..=8).contains(&g.len()))
                 })
             {
-                let mut keys: [Option<&Key>; 8] = [None; 8];
-                for (i, item) in items.iter().enumerate() {
-                    keys[i] = Some(controls::builtin_key_ref_by_id(item.key_id)?);
-                }
-                let first_key = keys[0].expect("at least two items");
-                let n_waves = items.len();
-                let mut unique_keys: [&Key; value::StepPatch::MAX_KEYS] =
-                    [first_key; value::StepPatch::MAX_KEYS];
-                let mut key_slot = [0u8; 8];
-                let mut n_unique = 0usize;
-                let mut can_step_patch = true;
-                for w in 0..n_waves {
-                    let key = keys[w].expect("key");
-                    if let Some(pos) = unique_keys[..n_unique].iter().position(|&k| k == key) {
-                        key_slot[w] = pos as u8;
-                    } else if n_unique < value::StepPatch::MAX_KEYS {
-                        unique_keys[n_unique] = key;
-                        key_slot[w] = n_unique as u8;
-                        n_unique += 1;
-                    } else {
-                        can_step_patch = false;
-                        break;
-                    }
-                }
-                struct MultiStepSlot {
-                    met: TimeSpan,
-                    part: TimeSpan,
-                    count: u8,
-                    pieces: [TimeSpan; 8],
-                    nums: [[f64; 8]; 8],
-                    step_patches: StepPatchCache,
-                    step_next: u8,
-                    fallback_caches: Option<Box<[value::SharedWaveCache; 8]>>,
-                }
-                let mut slots: [Option<MultiStepSlot>; 4] = [None, None, None, None];
-                let mut slot_next = 0u8;
-                let mut patches: [(&Key, f64); 8] = [(first_key, 0.0); 8];
-                for hf in buf.drain(..) {
-                    let met = if has_continuous {
-                        hf.whole_or_part()
-                    } else {
-                        hf.part
-                    };
-                    let slot_idx = if let Some(idx) = slots.iter().position(|s| {
-                        matches!(s, Some(slot) if slot.part == hf.part && (!has_continuous || slot.met == met))
-                    }) {
-                        idx
-                    } else {
-                        let grid = fused::StepWave::step_grid_over(shared_steps, hf.part)?;
-                        let count = grid.len();
-                        let mut pieces = [TimeSpan::new(Fraction::ZERO, Fraction::ZERO); 8];
-                        let mut nums = [[0.0f64; 8]; 8];
-                        let mut begin = grid.time(grid.steps().start)?;
-                        for (s_idx, k) in grid.steps().enumerate() {
-                            if thread.stop_requested() {
-                                out.truncate(from);
-                                return Some(true);
-                            }
-                            let end = grid.time(k + 1)?;
-                            let piece = grid.cut(k, TimeSpan::new(begin, end), hf.part);
-                            pieces[s_idx] = piece;
-                            for (w, item) in items.iter().enumerate() {
-                                nums[s_idx][w] = if item.steps == 0 {
-                                    item.wave.number(met, piece, &state.controls)?
-                                } else if single_step_mask & (1u8 << w) != 0 {
-                                    fused::StepWave::step_number(
-                                        &item.wave,
-                                        item.steps,
-                                        piece,
-                                        &state.controls,
-                                    )?
-                                } else {
-                                    item.wave.step_value_at(begin, &state.controls)?
-                                };
-                            }
-                            begin = end;
-                        }
-                        let idx = if let Some(empty) = slots.iter().position(Option::is_none) {
-                            empty
-                        } else {
-                            let victim = usize::from(slot_next & 3);
-                            slot_next = slot_next.wrapping_add(1);
-                            victim
-                        };
-                        slots[idx] = Some(MultiStepSlot {
-                            met,
-                            part: hf.part,
-                            count: count as u8,
-                            pieces,
-                            nums,
-                            step_patches: [None, None, None, None],
-                            step_next: 0,
-                            fallback_caches: None,
-                        });
-                        idx
-                    };
-                    let slot = slots[slot_idx].as_mut().expect("multi-step slot present");
-                    let count = usize::from(slot.count);
-                    out.reserve(count);
-                    let bulk_ok = thread.charge(out.len() - from + count);
-                    let mut template = hf;
-                    if !template.keys.is_empty() {
-                        let k = template.keys.get();
-                        let mut clear_slot = k.slider_binding != 0;
-                        if !clear_slot {
-                            for key in keys[..n_waves].iter().flatten() {
-                                if let Some(s) = controls::live_slot(key.as_str())
-                                    && k.live_controls[s] != 0
-                                {
-                                    clear_slot = true;
-                                    break;
-                                }
-                            }
-                        }
-                        if clear_slot {
-                            let edit = template.keys.edit();
-                            for key in keys[..n_waves].iter().flatten() {
-                                if let Some(s) = controls::live_slot(key.as_str()) {
-                                    edit.live_controls[s] = 0;
-                                }
-                            }
-                            edit.slider_binding = 0;
-                            template.keys.trim();
-                        }
-                    }
-                    // Single-allocation StepPatch fast path across all `count` steps.
-                    if can_step_patch
-                        && count * n_unique <= value::StepPatch::MAX_VALUES
-                        && let Value::Object(map) = &template.value
-                        && let Some((base, row, uniform)) = map.step_base()
-                    {
-                        let fixed_row = (!uniform).then_some(row);
-                        let sp = if let Some((_, _, cached)) = slot
-                            .step_patches
-                            .iter()
-                            .flatten()
-                            .find(|(b, r, _)| b.same_source(&base) && *r == fixed_row)
-                        {
-                            Some(Arc::clone(cached))
-                        } else if let Some(mut built) = value::StepPatch::new_for_row(
-                            base.clone(),
-                            row,
-                            &unique_keys[..n_unique],
-                            true,
-                        ) {
-                            let mut vals = [0.0f64; value::StepPatch::MAX_KEYS];
-                            for (s_idx, row_nums) in slot.nums.iter().enumerate().take(count) {
-                                for w in 0..n_waves {
-                                    vals[usize::from(key_slot[w])] = row_nums[w];
-                                }
-                                built.set_slot(s_idx, &vals[..n_unique]);
-                            }
-                            let arc = Arc::new(built);
-                            let idx = if let Some(empty) =
-                                slot.step_patches.iter().position(Option::is_none)
-                            {
-                                empty
-                            } else {
-                                let v = usize::from(slot.step_next & 3);
-                                slot.step_next = slot.step_next.wrapping_add(1);
-                                v
-                            };
-                            slot.step_patches[idx] = Some((base, fixed_row, Arc::clone(&arc)));
-                            Some(arc)
-                        } else {
-                            None
-                        };
-                        if let Some(sp) = sp {
-                            let mut template = Some(template);
-                            for (s_idx, &piece) in slot.pieces.iter().enumerate().take(count) {
-                                let mut hap = if s_idx + 1 == count {
-                                    template.take().expect("last step moves template")
-                                } else {
-                                    template.as_ref().expect("template present").clone()
-                                };
-                                if let Value::Object(controls) = &mut hap.value {
-                                    controls.set_step_patch(&sp, row, s_idx);
-                                }
-                                hap.part = piece;
-                                if bulk_ok {
-                                    out.push(hap);
-                                } else if thread.stop_requested()
-                                    || !thread.push_budgeted(out, from, hap)
-                                {
-                                    out.truncate(from);
-                                    return Some(true);
-                                }
-                            }
-                            if bulk_ok {
-                                thread.note_accumulated(out.len() - from);
-                            }
-                            fused::note(fused::Hit::StepMany);
-                            continue;
-                        }
-                    }
-                    let caches = slot.fallback_caches.get_or_insert_with(|| {
-                        Box::new(std::array::from_fn(|_| value::SharedWaveCache::default()))
-                    });
-                    let mut template = Some(template);
-                    for s_idx in 0..count {
-                        let mut hap = if s_idx + 1 == count {
-                            template.take().expect("last step moves template")
-                        } else {
-                            template.as_ref().expect("template present").clone()
-                        };
-                        for w in 0..n_waves {
-                            patches[w] = (keys[w].expect("key"), slot.nums[s_idx][w]);
-                        }
-                        if let Value::Object(controls) = &mut hap.value {
-                            controls.set_data_many_cached(&patches[..n_waves], &mut caches[s_idx]);
-                        }
-                        hap.part = slot.pieces[s_idx];
-                        if bulk_ok {
-                            out.push(hap);
-                        } else if thread.stop_requested() || !thread.push_budgeted(out, from, hap) {
-                            out.truncate(from);
-                            return Some(true);
-                        }
-                    }
-                    if bulk_ok {
-                        thread.note_accumulated(out.len() - from);
-                    }
-                    fused::note(fused::Hit::StepMany);
-                }
-                return Some(true);
+                return Self::try_query_app_wave_uniform_steps_onto(
+                    items,
+                    shared_steps,
+                    has_continuous,
+                    single_step_mask,
+                    thread,
+                    state,
+                    from,
+                    buf,
+                    out,
+                );
             }
             for (item_idx, item) in items.iter().enumerate() {
                 let key = controls::builtin_key_ref_by_id(item.key_id)?;

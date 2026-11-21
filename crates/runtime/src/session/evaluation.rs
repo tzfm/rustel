@@ -748,7 +748,8 @@ impl Session {
         let lane_numbers = match &mut read {
             Some(read) => {
                 let lanes = std::mem::take(&mut read.lanes);
-                self.lanes.read_statements(source, Some(lanes))
+                let shared = self.js.share_source_text(source);
+                self.lanes.read_statements_shared(&shared, Some(lanes))
             }
             None => self.lanes.read(source),
         };

@@ -254,7 +254,7 @@ pub(crate) struct LaneTable {
     /// try of an edit to the next. After a read of another text, the read
     /// of the text the session holds takes its place again: see
     /// [`Self::adopt_read`].
-    candidate: Option<(u64, String, ScoreLanes)>,
+    candidate: Option<(u64, std::sync::Arc<str>, ScoreLanes)>,
     /// True when the candidate is a read that moved to the reading
     /// document from another document: see [`Self::adopt_read`]. The next
     /// read pairs its lanes after the lanes of that document, and ends the
@@ -265,7 +265,7 @@ pub(crate) struct LaneTable {
     /// text, such as a text that failed, takes the place of the candidate,
     /// and this read stays.
     #[cfg(any(feature = "device-audio", test))]
-    held: Option<(u64, String, ScoreLanes)>,
+    held: Option<(u64, std::sync::Arc<str>, ScoreLanes)>,
     /// The score the output plays: see [`Audible`].
     audible: Audible,
     /// The lanes that left the score in play, while a chain has their
@@ -307,6 +307,17 @@ impl LaneTable {
     pub(crate) fn read_statements(
         &mut self,
         source: &str,
+        statements: Option<Vec<LaneStatement>>,
+    ) -> Vec<u64> {
+        let shared: std::sync::Arc<str> = std::sync::Arc::from(source);
+        self.read_statements_shared(&shared, statements)
+    }
+
+    /// [`Self::read_statements`] reusing a caller-owned shared `Arc<str>` for
+    /// `source` so the candidate record avoids cloning the score text.
+    pub(crate) fn read_statements_shared(
+        &mut self,
+        source: &std::sync::Arc<str>,
         statements: Option<Vec<LaneStatement>>,
     ) -> Vec<u64> {
         // The read takes the place of the candidate, with its mark.
@@ -379,7 +390,7 @@ impl LaneTable {
             lanes,
             places: false,
         };
-        self.candidate = Some((reading, source.to_owned(), read));
+        self.candidate = Some((reading, std::sync::Arc::clone(source), read));
         numbers
     }
 
@@ -401,9 +412,9 @@ impl LaneTable {
     #[cfg(any(feature = "device-audio", test))]
     pub(crate) fn adopt_read(&mut self, source: &str) -> bool {
         let last = self.candidate.as_ref();
-        if last.is_none_or(|(_, text, _)| text != source) {
+        if last.is_none_or(|(_, text, _)| text.as_ref() != source) {
             let held = self.held.as_ref();
-            let Some(held) = held.filter(|(_, text, _)| text == source) else {
+            let Some(held) = held.filter(|(_, text, _)| text.as_ref() == source) else {
                 return false;
             };
             self.candidate = Some(held.clone());
@@ -425,7 +436,7 @@ impl LaneTable {
     #[cfg(any(feature = "device-audio", test))]
     pub(crate) fn hold(&mut self, source: Option<&str>) {
         let read = self.candidate.as_ref();
-        let read = read.filter(|(_, text, _)| Some(text.as_str()) == source);
+        let read = read.filter(|(_, text, _)| Some(text.as_ref()) == source);
         self.held = read.cloned();
     }
 
@@ -445,7 +456,9 @@ impl LaneTable {
     /// leaves rest. The score before is then its score at rest, and its
     /// lanes away stay away unless they came back.
     pub(crate) fn install(&mut self, source: &str) {
-        let read = self.candidate.take_if(|(_, text, _)| text == source);
+        let read = self
+            .candidate
+            .take_if(|(_, text, _)| text.as_ref() == source);
         if let Some((document, _, read)) = read {
             self.put_in_play(document, read);
         }
@@ -455,9 +468,9 @@ impl LaneTable {
     /// the session's `Arc<str>` source text so no duplicate score text stays
     /// allocated.
     pub(crate) fn install_shared(&mut self, source: &std::sync::Arc<str>) {
-        let read = self
-            .candidate
-            .take_if(|(_, text, _)| text == source.as_ref());
+        let read = self.candidate.take_if(|(_, text, _)| {
+            std::sync::Arc::ptr_eq(text, source) || text.as_ref() == source.as_ref()
+        });
         if let Some((document, _, mut read)) = read {
             for lane in read.lanes.as_mut_slice() {
                 lane.body.share_with(source, lane.line);
@@ -601,7 +614,7 @@ impl LaneTable {
     /// else the score in play. See [`Self::install`].
     pub(super) fn read_of(&self, source: &str) -> (u64, &ScoreLanes) {
         let read = self.candidate.as_ref();
-        let read = read.filter(|(_, text, _)| text == source);
+        let read = read.filter(|(_, text, _)| text.as_ref() == source);
         read.map_or((self.document, &self.playing), |(document, _, read)| {
             (*document, read)
         })

@@ -237,8 +237,8 @@ impl<'s, F: Fn(&str) -> CallForm> Reader<'s, F> {
             line: 1,
             counted: 0,
             // Size initial storage proportionally to score length without
-            // over-allocating on short single-expression scores.
-            held: Held::with_room((source.len() / 12 + 4).clamp(8, 256)),
+            // doubling on short single-expression scores.
+            held: Held::with_room((source.len() / 6 + 12).clamp(16, 256)),
             // The lists of the score nest a few calls deep, and take their
             // room here once rather than as each one closes.
             listed: Vec::with_capacity(4),
@@ -248,7 +248,7 @@ impl<'s, F: Fn(&str) -> CallForm> Reader<'s, F> {
     fn program(&mut self) -> Option<Read<'s>> {
         // Most scores hold a handful of statements: size tightly for short
         // scores and avoid allocating `lanes` until a labeled lane appears.
-        let mut statements = Vec::with_capacity((self.source.len() / 64).clamp(1, 8));
+        let mut statements = Vec::with_capacity((self.source.len() / 256).clamp(1, 8));
         let mut lanes = Vec::new();
         let mut labeled = Vec::new();
         // The names the score declares, each one time.

@@ -435,7 +435,7 @@ impl<'p> Reuse<'p> {
             taken: vec![false; before.parts.len()],
             next: before.next,
             before,
-            made: Vec::new(),
+            made: Vec::with_capacity(8),
             shared_extras,
             made_reads: Vec::new(),
             names,
@@ -685,7 +685,11 @@ impl<'p> Reuse<'p> {
     /// The memo of this build: the parts it took and the parts it made, and
     /// each name of the program, together with the already-canonical node
     /// references reused from the prior build.
-    pub(super) fn finish(mut self, cps: Option<f64>) -> (Memo, Vec<PatternNodeRef>) {
+    pub(super) fn finish(
+        mut self,
+        cps: Option<f64>,
+        shared_source: Option<Arc<str>>,
+    ) -> (Memo, Vec<PatternNodeRef>) {
         let now = mem::take(&mut self.now);
         let taken = mem::take(&mut self.taken);
         let before_slots = mem::take(&mut self.before.part_slots);
@@ -800,8 +804,9 @@ impl<'p> Reuse<'p> {
         // A re-evaluation of the same text shares the handle the build
         // before kept, so the text lives one time. An aborted build makes
         // no handle.
-        let source = match &self.before.source {
-            Some(kept) if **kept == *self.source => Arc::clone(kept),
+        let source = match (&self.before.source, shared_source) {
+            (Some(kept), _) if **kept == *self.source => Arc::clone(kept),
+            (_, Some(shared)) if *shared == *self.source => shared,
             _ => Arc::from(self.source),
         };
         if entries.is_empty() {

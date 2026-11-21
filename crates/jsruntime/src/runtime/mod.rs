@@ -371,6 +371,9 @@ pub struct JsRuntime {
     /// What the last native build of a score kept for the next one. See
     /// [`native::Memo`].
     native_memo: RefCell<native::Memo>,
+    /// Pre-allocated shared source handle for an in-flight native evaluation so
+    /// the lane table and the native memo share one `Arc<str>`.
+    pending_source: RefCell<Option<Arc<str>>>,
     /// The byte of the text of the last score that the native tier left to
     /// JavaScript where it stopped, when it knows. See
     /// [`JsRuntime::native_left`].

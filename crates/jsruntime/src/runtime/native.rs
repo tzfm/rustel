@@ -304,8 +304,9 @@ impl JsRuntime {
         };
         match built {
             Ok((mut score, reuse)) => {
+                let pending_source = self.pending_source.borrow_mut().take();
                 if let Some(reuse) = reuse {
-                    let (mut memo, reused_nodes) = reuse.finish(score.cps);
+                    let (mut memo, reused_nodes) = reuse.finish(score.cps, pending_source);
                     rustel_core::intern::dedup_score_with_reused(
                         &mut score.pattern,
                         &reused_nodes,
@@ -320,6 +321,7 @@ impl JsRuntime {
                 Some(score)
             }
             Err(left) => {
+                self.pending_source.borrow_mut().take();
                 // The place is in the text that the program was read from.
                 self.native_left.set(left.filter(|_| source.is_some()));
                 None

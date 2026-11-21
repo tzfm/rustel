@@ -48,6 +48,7 @@ impl JsRuntime {
             heap_boundary_depth: Cell::new(0),
             query_limit_millis: Cell::new(None),
             native_memo: RefCell::default(),
+            pending_source: RefCell::default(),
             native_left: Cell::new(None),
             native_staged: RefCell::new(None),
             native_active: RefCell::new(None),
@@ -151,6 +152,20 @@ impl JsRuntime {
     #[doc(hidden)]
     pub fn native_source_text(&self) -> Option<Arc<str>> {
         self.native_memo.borrow().source.clone()
+    }
+
+    /// Return a shared handle for `source`, reusing the memo's handle when
+    /// byte-identical or allocating one `Arc<str>` for the upcoming build.
+    #[doc(hidden)]
+    pub fn share_source_text(&self, source: &str) -> Arc<str> {
+        if let Some(kept) = &self.native_memo.borrow().source
+            && **kept == *source
+        {
+            return Arc::clone(kept);
+        }
+        let shared: Arc<str> = Arc::from(source);
+        *self.pending_source.borrow_mut() = Some(Arc::clone(&shared));
+        shared
     }
 
     /// The callback-IR state, made at the first use. A runtime that lowers

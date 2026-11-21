@@ -3001,26 +3001,46 @@ impl<'r> Planned<'r> {
         if base >= (1 << 31) || (min_begin != u32::MAX && max_begin - base >= (1 << 22)) {
             return None;
         }
-        if local_buf.len() < values.len() {
-            local_buf.resize(values.len(), 0);
-        }
-        held_buf.clear();
-        for step in &mut raw_steps[..step_len] {
-            let global_idx = usize::from(step.value);
-            let slot = &mut local_buf[global_idx];
-            if *slot == 0 {
-                held_buf.push(global_idx as u32);
-                *slot = held_buf.len() as u32;
+        let layer_values: Arc<[Value]> = if values.len() <= 64 {
+            let mut local = [0u16; 64];
+            let mut held = [0u16; 64];
+            let mut held_len = 0usize;
+            for step in &mut raw_steps[..step_len] {
+                let global_idx = usize::from(step.value);
+                let slot = &mut local[global_idx];
+                if *slot == 0 {
+                    held[held_len] = global_idx as u16;
+                    held_len += 1;
+                    *slot = held_len as u16;
+                }
+                step.value = *slot - 1;
             }
-            step.value = (*slot - 1) as u16;
-        }
-        let layer_values: Arc<[Value]> = held_buf
-            .iter()
-            .map(|&idx| {
-                local_buf[idx as usize] = 0;
-                std::mem::replace(&mut values[idx as usize], Value::Undefined)
-            })
-            .collect();
+            held[..held_len]
+                .iter()
+                .map(|&idx| std::mem::replace(&mut values[usize::from(idx)], Value::Undefined))
+                .collect()
+        } else {
+            if local_buf.len() < values.len() {
+                local_buf.resize(values.len(), 0);
+            }
+            held_buf.clear();
+            for step in &mut raw_steps[..step_len] {
+                let global_idx = usize::from(step.value);
+                let slot = &mut local_buf[global_idx];
+                if *slot == 0 {
+                    held_buf.push(global_idx as u32);
+                    *slot = held_buf.len() as u32;
+                }
+                step.value = (*slot - 1) as u16;
+            }
+            held_buf
+                .iter()
+                .map(|&idx| {
+                    local_buf[idx as usize] = 0;
+                    std::mem::replace(&mut values[idx as usize], Value::Undefined)
+                })
+                .collect()
+        };
         let ticks = std::num::NonZeroU32::new(ticks)?;
         sequence_of_cut_ticks(
             period,

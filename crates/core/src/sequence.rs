@@ -3086,18 +3086,22 @@ fn share_dresses(layers: &mut [Layer]) {
     if layers.len() <= 1 {
         return;
     }
-    let mut worn: Vec<Arc<Dress>> = Vec::new();
-    for layer in layers {
-        let Some(dress) = &layer.dress else {
+    for i in 1..layers.len() {
+        let Some(dress_i) = layers[i].dress.as_ref() else {
             continue;
         };
-        let same = |other: &Arc<Dress>| {
-            Arc::ptr_eq(dress, other) || dress.same(other, |a, b| a.same_data(b))
-        };
-        match worn.iter().find(|other| same(other)) {
-            // A handle of the dress that the layers before wear.
-            Some(other) => layer.dress = Some(Arc::clone(other)),
-            None => worn.push(Arc::clone(dress)),
+        let mut found = None;
+        for prev in &layers[..i] {
+            if let Some(prev_dress) = prev.dress.as_ref()
+                && (Arc::ptr_eq(dress_i, prev_dress)
+                    || dress_i.same(prev_dress, |a, b| a.same_data(b)))
+            {
+                found = Some(Arc::clone(prev_dress));
+                break;
+            }
+        }
+        if let Some(shared) = found {
+            layers[i].dress = Some(shared);
         }
     }
 }
@@ -5712,6 +5716,54 @@ fn node_of_sound(mut layers: Vec<Layer>) -> Pattern {
     }
 }
 
+/// Build a sequence node directly into `Arc<[Layer]>` from a small stack buffer
+/// of non-empty layers without allocating an intermediate `Vec<Layer>`.
+fn node_of_sound_stack(layers: &mut [Option<Layer>], len: usize) -> Pattern {
+    let mut write = 0usize;
+    for read in 0..len {
+        if layers[read].as_ref().is_some_and(|l| l.count() > 0) {
+            if write != read {
+                layers.swap(write, read);
+            }
+            write += 1;
+        }
+    }
+    if write == 0 {
+        return silence();
+    }
+    if write == 1 {
+        let layer = layers[0].take().expect("one layer present");
+        return node_of_one(layer).unwrap_or_else(silence);
+    }
+    if write >= 2 {
+        for i in 1..write {
+            let Some(dress_i) = layers[i].as_ref().and_then(|l| l.dress.as_ref()) else {
+                continue;
+            };
+            let mut found = None;
+            for prev in &layers[..i] {
+                if let Some(prev_dress) = prev.as_ref().and_then(|l| l.dress.as_ref())
+                    && (Arc::ptr_eq(dress_i, prev_dress)
+                        || dress_i.same(prev_dress, |a, b| a.same_data(b)))
+                {
+                    found = Some(Arc::clone(prev_dress));
+                    break;
+                }
+            }
+            if let Some(shared) = found
+                && let Some(layer) = layers[i].as_mut()
+            {
+                layer.dress = Some(shared);
+            }
+        }
+    }
+    let arc: Arc<[Layer]> = layers[..write]
+        .iter_mut()
+        .map(|slot| slot.take().expect("layer present"))
+        .collect();
+    Pattern::of(Node::Sequence(arc))
+}
+
 /// One turn of a period, for a query of a span.
 struct Turn {
     index: i128,
@@ -6594,83 +6646,87 @@ pub(crate) fn applied(
         return None;
     }
     without_query_signals(|| {
-        let met = layers
-            .iter()
-            .map(|layer| {
-                if let Some(set) = layer.set(values, apply, flow) {
-                    return Some(set);
-                }
-                let (met, pairs) = layer.met(values, Side::Functions)?;
-                // Fast path: two direct-keyed built-in layers combined by Set
-                // build each exact-sized BuiltinMap directly without temporary
-                // 1-key maps or intermediate Vec<Value>.
-                if apply.in_place_op() == Some(crate::compose::ComposeOp::Set)
-                    && flow == LookupFlow::Set
-                    && layer.is_direct_keyed()
-                    && values.is_direct_keyed()
-                    && values.dress.as_deref().is_none_or(|d| d.set_map.is_none())
-                    && layer.named_id != values.named_id
-                    && crate::controls::builtin_name_str_by_id(values.named_id) != Some("value")
-                {
-                    let k0 = layer.seq_packed_key();
-                    let k1 = values.seq_packed_key();
-                    let tail = layer.dress.as_deref().and_then(|d| d.set_map.as_ref());
-                    match tail {
-                        None => {
-                            let met_values: Arc<[Value]> = pairs
-                                .into_iter()
-                                .map(|(f, v)| {
-                                    Value::Object(crate::OrderedMap::from_two_packed(
-                                        k0,
-                                        layer.values[f as usize].clone(),
-                                        k1,
-                                        values.values[v as usize].clone(),
-                                    ))
-                                })
-                                .collect();
-                            return Some(met.valued(met_values));
-                        }
-                        Some(entries)
-                            if !entries.keys().contains(&k1)
-                                && entries.keys().len() + 2
-                                    <= crate::value::MAX_BUILTIN_MAP_LEN =>
-                        {
-                            let tail_slice = entries.as_slice();
-                            let met_values: Arc<[Value]> = pairs
-                                .into_iter()
-                                .map(|(f, v)| {
-                                    Value::Object(crate::OrderedMap::from_keyed_tail_and_packed(
-                                        k0,
-                                        layer.values[f as usize].clone(),
-                                        tail_slice,
-                                        k1,
-                                        values.values[v as usize].clone(),
-                                    ))
-                                })
-                                .collect();
-                            return Some(met.valued(met_values));
-                        }
-                        Some(_) => {}
+        let apply_layer = |layer: &Layer| -> Option<Layer> {
+            if let Some(set) = layer.set(values, apply, flow) {
+                return Some(set);
+            }
+            let (met, pairs) = layer.met(values, Side::Functions)?;
+            // Fast path: two direct-keyed built-in layers combined by Set
+            // build each exact-sized BuiltinMap directly without temporary
+            // 1-key maps or intermediate Vec<Value>.
+            if apply.in_place_op() == Some(crate::compose::ComposeOp::Set)
+                && flow == LookupFlow::Set
+                && layer.is_direct_keyed()
+                && values.is_direct_keyed()
+                && values.dress.as_deref().is_none_or(|d| d.set_map.is_none())
+                && layer.named_id != values.named_id
+                && crate::controls::builtin_name_str_by_id(values.named_id) != Some("value")
+            {
+                let k0 = layer.seq_packed_key();
+                let k1 = values.seq_packed_key();
+                let tail = layer.dress.as_deref().and_then(|d| d.set_map.as_ref());
+                match tail {
+                    None => {
+                        let met_values: Arc<[Value]> = pairs
+                            .into_iter()
+                            .map(|(f, v)| {
+                                Value::Object(crate::OrderedMap::from_two_packed(
+                                    k0,
+                                    layer.values[f as usize].clone(),
+                                    k1,
+                                    values.values[v as usize].clone(),
+                                ))
+                            })
+                            .collect();
+                        return Some(met.valued(met_values));
                     }
+                    Some(entries)
+                        if !entries.keys().contains(&k1)
+                            && entries.keys().len() + 2 <= crate::value::MAX_BUILTIN_MAP_LEN =>
+                    {
+                        let tail_slice = entries.as_slice();
+                        let met_values: Arc<[Value]> = pairs
+                            .into_iter()
+                            .map(|(f, v)| {
+                                Value::Object(crate::OrderedMap::from_keyed_tail_and_packed(
+                                    k0,
+                                    layer.values[f as usize].clone(),
+                                    tail_slice,
+                                    k1,
+                                    values.values[v as usize].clone(),
+                                ))
+                            })
+                            .collect();
+                        return Some(met.valued(met_values));
+                    }
+                    Some(_) => {}
                 }
-                // What each pair of values makes, with no location: the
-                // locations of both sides are those of the steps.
-                let fn_reader = layer.reader(None);
-                let val_reader = values.reader(None);
-                let values = pairs
-                    .into_iter()
-                    .map(|(function, value)| {
-                        made(
-                            &fn_reader.get(function as usize)?,
-                            &val_reader.get(value as usize)?,
-                            apply,
-                            flow,
-                        )
-                    })
-                    .collect::<Option<Vec<Value>>>()?;
-                Some(met.valued(values.into()))
-            })
-            .collect::<Option<Vec<_>>>()?;
+            }
+            // What each pair of values makes, with no location: the
+            // locations of both sides are those of the steps.
+            let fn_reader = layer.reader(None);
+            let val_reader = values.reader(None);
+            let values = pairs
+                .into_iter()
+                .map(|(function, value)| {
+                    made(
+                        &fn_reader.get(function as usize)?,
+                        &val_reader.get(value as usize)?,
+                        apply,
+                        flow,
+                    )
+                })
+                .collect::<Option<Vec<Value>>>()?;
+            Some(met.valued(values.into()))
+        };
+        if layers.len() <= 8 {
+            let mut buf: [Option<Layer>; 8] = Default::default();
+            for (slot, layer) in buf.iter_mut().zip(layers.iter()) {
+                *slot = Some(apply_layer(layer)?);
+            }
+            return Some(node_of_sound_stack(&mut buf, layers.len()));
+        }
+        let met = layers.iter().map(apply_layer).collect::<Option<Vec<_>>>()?;
         Some(node_of_sound(met))
     })
 }
@@ -6913,7 +6969,28 @@ pub(crate) fn filtered(pattern: &Pattern, keep: &ValuePredicate) -> Option<Patte
 /// The stack of `patterns`, when each is a sequence, a constant or silence:
 /// the layers of each, one after the other.
 pub(crate) fn stacked(patterns: &[Pattern]) -> Option<Pattern> {
-    let mut stacked = Vec::new();
+    let mut total = 0usize;
+    for pattern in patterns {
+        if pattern.is_rest() && folds(pattern) {
+            continue;
+        }
+        total += layers(pattern)?.len();
+    }
+    if total <= 8 {
+        let mut buf: [Option<Layer>; 8] = Default::default();
+        let mut len = 0usize;
+        for pattern in patterns {
+            if pattern.is_rest() && folds(pattern) {
+                continue;
+            }
+            for layer in layers(pattern)?.iter() {
+                buf[len] = Some(layer.clone());
+                len += 1;
+            }
+        }
+        return Some(node_of_sound_stack(&mut buf, len));
+    }
+    let mut stacked = Vec::with_capacity(total);
     for pattern in patterns {
         if pattern.is_rest() && folds(pattern) {
             continue;
