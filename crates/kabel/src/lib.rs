@@ -163,6 +163,27 @@ struct JsonNode {
     #[serde(default)]
     inputs: Vec<usize>,
 }
+/// Whether a node reads MIDI or other live control, which K() cannot give.
+fn reads_live_input(kind: &str) -> bool {
+    matches!(kind, "midifreq" | "midigate" | "midivel" | "midicc" | "cc")
+}
+
+/// The refusal of a live-input node, by the name the score wrote: `mouseX`
+/// and `mouseY` are `cc` nodes reading their own name.
+fn live_input_refusal(nodes: &[JsonNode], node: &JsonNode) -> String {
+    let mouse = (node.kind == "cc")
+        .then(|| node.inputs.first())
+        .flatten()
+        .and_then(|&id| nodes.get(id))
+        .filter(|id| id.kind == "n")
+        .and_then(|id| id.value.as_str())
+        .filter(|name| matches!(*name, "mouseX" | "mouseY"));
+    format!(
+        "KabelSalat node '{}' requires live control input, which is unavailable in K()",
+        mouse.unwrap_or(&node.kind)
+    )
+}
+
 impl Program {
     /// Validates a serialized graph, including all feedback references and limits.
     pub fn from_json(source: &str) -> Result<Self, String> {
@@ -175,6 +196,11 @@ impl Program {
             return Err(format!(
                 "KabelSalat graph must contain 1..={MAX_NODES} nodes"
             ));
+        }
+        // A node that reads live control is refused first, so the name it
+        // reads (`mouseX` is `cc("mouseX")`) is not judged as a scope ID.
+        if let Some(live) = graph.nodes.iter().find(|node| reads_live_input(&node.kind)) {
+            return Err(live_input_refusal(&graph.nodes, live));
         }
         let mut program = Self {
             nodes: [Node::default(); MAX_NODES],
@@ -261,11 +287,8 @@ impl Program {
                 "qf" => Op::Qf,
                 "raw" | "floatbeat" => Op::Raw,
                 "bytebeat" => Op::Bytebeat,
-                "midifreq" | "midigate" | "midivel" | "midicc" | "cc" => {
-                    return Err(format!(
-                        "KabelSalat node '{}' requires live control input, which is unavailable in K()",
-                        node.kind
-                    ));
+                kind if reads_live_input(kind) => {
+                    return Err(live_input_refusal(&graph.nodes, node));
                 }
                 _ => return Err(format!("unsupported KabelSalat node '{}'", node.kind)),
             };
