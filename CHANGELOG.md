@@ -33,9 +33,10 @@
 - Fixed: one sample source in Settings that will not read fails only its own row; the other remote sources still load.
 - Fixed: allowing a source or native orchestras on the Permissions page runs the refused update again by itself whatever refused it, as the docs say, not only for a refusal named on the footer.
 
+- Fixed: talkit speaks C7, the top of its documented range, which was refused a hair above the range's limit in whole hertz.
 ## v0.1.7
 
-- Fixed: talkit speaks C7, the top of its documented range, which was refused a hair above the range's limit in whole hertz.
+- Fixed: a scale name that will not read, such as `scale("C3:kafi raga")`, says why its notes are dropped in export, query and Studio, instead of a silent lane with nothing said.
 - Release archives and installers include signed build provenance for independent verification with GitHub CLI.
 - A video file plays as a sample: `mp4`, `m4v`, `mov`, `mkv` and `webm` play their audio track.
 - `_video()` and `video()` draw a video sample's picture in sync with its sound. H.264, HEVC, AV1, VP9, VP8 and Motion JPEG decode natively.

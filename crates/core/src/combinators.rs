@@ -2410,7 +2410,13 @@ pub fn scale<P: PatOps>(pat: &P, scale_arg: Value) -> P {
             };
             let stepped = match stepped {
                 Ok(value) => value,
-                Err(_) => return None, // an error removes the hap
+                // An error removes the hap and is reported, as strudel.cc
+                // logs `[tonal]` and drops it: a silent lane with nothing
+                // said is what a misspelt scale left before.
+                Err(error) => {
+                    crate::signal_callback_failure(|| error);
+                    return None;
+                }
             };
             if accidental_offset != 0 {
                 // Accidental suffixes transpose the result; a numeric
