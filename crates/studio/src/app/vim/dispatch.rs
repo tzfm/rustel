@@ -303,6 +303,17 @@ mod tests {
     }
 
     #[test]
+    fn colon_w_says_it_saved() {
+        let directory = tempfile::tempdir().expect("temp dir");
+        let mut app = vim_app(directory.path(), "$: s(\"cp\")\n", "");
+        app.scenes.current_mut().refresh_dirty();
+        let name = app.scenes.current().name();
+        typed(&mut app, ":w");
+        press(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+        assert_eq!(app.status, format!("saved {name:?}"));
+    }
+
+    #[test]
     fn colon_wq_saves_and_closes_the_tab() {
         let directory = tempfile::tempdir().expect("temp dir");
         let mut app = vim_app(directory.path(), "$: s(\"bd\")\n", "");

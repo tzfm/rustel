@@ -69,8 +69,13 @@ impl App {
             }
             self.save_replay_tab(id);
         } else {
+            let before = scene.name();
             self.sync_name_from_title();
             self.write_scene(id, source);
+            // A rename already said so, and it names the file.
+            if self.scenes.current().name() == before {
+                self.status = format!("saved {before:?}");
+            }
         }
         self.dirty_frame = true;
     }
