@@ -1117,6 +1117,9 @@ struct SourceTables {
     states: HashMap<String, Standing>,
     order: VecDeque<String>,
     bytes: usize,
+    /// Maps that were in when a policy took their source back. Their
+    /// banks went with it, so the source allowed again fetches them anew.
+    withdrawn: HashSet<String>,
 }
 
 impl SourceTables {
@@ -1149,8 +1152,19 @@ impl SourceTables {
             self.bytes = self.bytes.saturating_sub(oldest.len());
             self.states.remove(&oldest);
             self.sources.remove(&oldest);
+            self.withdrawn.remove(&oldest);
         }
         previous
+    }
+
+    /// Drop every map `gone` names, standing and all, so the next ask for
+    /// one fetches it as new.
+    fn forget(&mut self, gone: impl Fn(&str) -> bool) {
+        self.states.retain(|map, _| !gone(map));
+        self.sources.retain(|map| !gone(map));
+        self.withdrawn.retain(|map| !gone(map));
+        self.order.retain(|map| !gone(map));
+        self.bytes = self.order.iter().map(String::len).sum();
     }
 
     fn forget_state(&mut self, map: &str) {
@@ -1186,6 +1200,9 @@ struct Shared {
     /// Published source maps and registration status share one retention
     /// budget. Publication and eviction are atomic for loader and UI readers.
     source_tables: Mutex<SourceTables>,
+    /// How many score policies [`SampleLibrary::withdraw_sources`] has
+    /// taken, so a host can tell when one it sent is in force.
+    policies_taken: AtomicU64,
     /// Who brought each name in `custom` that an import or the open set's
     /// folder brought, by bank name. Taken after `custom`.
     ///
