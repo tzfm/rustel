@@ -17,8 +17,7 @@ use vst3::Steinberg::*;
 use vst3::{ComPtr, ComWrapper};
 
 use crate::com::{
-    Changes, Events, Handler, HostApp, MAX_CHANGES, MAX_EVENTS, OutputChanges, Stream, pointer,
-    wide_to_string,
+    Changes, Events, Handler, HostApp, MAX_CHANGES, MAX_EVENTS, Stream, pointer, wide_to_string,
 };
 use crate::module::{ClassInfo, Module};
 use crate::{Job, ParamInfo, ParamRole, canonical, preset};
@@ -658,7 +657,7 @@ impl Loaded {
             plugin: Some(self),
             any_thread: true,
             changes: Changes::new(),
-            output_changes: OutputChanges::new(),
+            output_changes: Changes::new(),
             events: Events::new(),
             notes: [HeldNote::default(); MAX_NOTES],
             note_count: 0,
@@ -821,7 +820,7 @@ pub(crate) struct Instance {
     any_thread: bool,
     changes: ComWrapper<Changes>,
     /// The list a plugin writes its own parameter changes in, unread.
-    output_changes: ComWrapper<OutputChanges>,
+    output_changes: ComWrapper<Changes>,
     events: ComWrapper<Events>,
     notes: [HeldNote; MAX_NOTES],
     note_count: usize,
@@ -1495,6 +1494,7 @@ impl Instance {
         // memory this instance owns for the full call.
         let result = unsafe { ((*(*processor).vtbl).process)(processor, &mut data) };
         self.changes.clear();
+        self.output_changes.clear();
         if playing {
             self.move_clock(frames);
         }
