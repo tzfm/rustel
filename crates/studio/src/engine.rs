@@ -2644,6 +2644,12 @@ impl StudioEngine {
             // last sweep decided was still wanted is decided again: a tab
             // closed while it played goes with the next idle sweep.
             self.ask_idle_sweep();
+            // That sweep runs stopped, with nothing left to play out: no
+            // sweep is owed after an edit any more.
+            #[cfg(feature = "vst")]
+            {
+                self.plugins_sweep_again_at = None;
+            }
         }
         self.piano = [None; PIANO_KEYS];
         self.piano_close_when_idle = true;

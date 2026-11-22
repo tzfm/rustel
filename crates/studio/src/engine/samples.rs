@@ -1,7 +1,13 @@
 use super::*;
 
-/// How long a sweep that kept a plugin for a copy still playing waits
-/// before it looks again: see [`StudioEngine::unload_idle_plugins`].
+/// How long after an edit of the score in play the plugin sweep looks
+/// again: the 5 s of play the chains of a removed lane keep, and a second
+/// for the output to give their copies back. See
+/// [`StudioEngine::unload_idle_plugins`].
+#[cfg(feature = "vst")]
+const PLUGIN_SWEEP_AFTER_EDIT: std::time::Duration = std::time::Duration::from_secs(6);
+/// How long a sweep that kept a plugin for a copy the output still plays
+/// waits before it looks again.
 #[cfg(feature = "vst")]
 const PLUGIN_SWEEP_AGAIN: std::time::Duration = std::time::Duration::from_secs(2);
 
@@ -89,6 +95,13 @@ impl StudioEngine {
         // decided was still wanted has to be decided again.
         if self.current_score != source {
             self.ask_idle_sweep();
+            // The sweep this asks for runs while the lanes the edit removed
+            // still play their last 5 s, and before the texts of the tabs
+            // may have caught up: it looks again once those chains end.
+            #[cfg(feature = "vst")]
+            if self.live.is_some() {
+                self.plugins_sweep_again_at = Some(Instant::now() + PLUGIN_SWEEP_AFTER_EDIT);
+            }
             self.current_score = source.to_owned();
             self.current_score_names = protected_names(source);
             self.protection_generation = self.protection_generation.wrapping_add(1);
@@ -874,7 +887,10 @@ impl StudioEngine {
 
     /// Unloads the plugins nothing asks for, one time for each quiet spell,
     /// with the idle sweep of the sounds: after the same idle time, and
-    /// again after [`Self::ask_idle_sweep`]. The sweep keeps the plugins
+    /// again after [`Self::ask_idle_sweep`]. While the score plays, an edit
+    /// of it owes one more sweep once the chains it removed have ended,
+    /// [`PLUGIN_SWEEP_AFTER_EDIT`] later, and a sweep that left a copy the
+    /// output still plays owes one [`PLUGIN_SWEEP_AGAIN`] later. The sweep keeps the plugins
     /// the reference column shows, and each plugin a text names: a text of
     /// a tab, the score in play, an armed launch or a held edit. A plugin
     /// call keeps its plugin by a part of the name too. Another string
@@ -934,11 +950,14 @@ impl StudioEngine {
             self.close_piano_output();
         }
         rustel_runtime::vst::unload_unused(&keep);
-        // A lane the score no longer has plays its copies to the end of
-        // their chains, 5 s of play after the edit, and the host keeps
-        // their plugins loaded until the output gives them back. The sweep
-        // looks again then, not at the next Stop.
-        if self.live.is_some() && rustel_runtime::vst::engine_holds_unkept(&keep) {
+        // The host keeps a plugin while the output plays a copy of it, as
+        // the copy of a removed lane plays to the end of its chain. While
+        // the score plays, the sweep looks again until the output gave
+        // such a copy back, not at the next Stop.
+        if self.live.is_some()
+            && self.plugins_sweep_again_at.is_none()
+            && rustel_runtime::vst::engine_holds_unkept(&keep)
+        {
             self.plugins_sweep_again_at = Some(now + PLUGIN_SWEEP_AGAIN);
         }
     }
@@ -1707,7 +1726,7 @@ mod tests {
         let idle = Instant::now() + Duration::from_secs(5);
         engine.unload_idle_plugins(idle);
         assert!(engine.plugins_swept);
-        let again = idle + PLUGIN_SWEEP_AGAIN;
+        let again = idle + PLUGIN_SWEEP_AFTER_EDIT;
         engine.plugins_sweep_again_at = Some(again);
         engine.unload_idle_plugins(idle);
         assert_eq!(
@@ -1715,8 +1734,14 @@ mod tests {
             Some(again),
             "not before its time"
         );
+        assert!(engine.plugins_swept);
+        // A preview just now holds the sweep itself back: what is owed shows.
+        engine.last_preview_at = again;
         engine.unload_idle_plugins(again);
         assert_eq!(engine.plugins_sweep_again_at, None);
+        assert!(!engine.plugins_swept, "the sweep is owed again");
+        // Once the idle time passed, the owed sweep runs.
+        engine.unload_idle_plugins(again + Duration::from_secs(2));
         assert!(engine.plugins_swept, "the sweep ran again");
     }
 
