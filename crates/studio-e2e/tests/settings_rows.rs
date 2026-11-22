@@ -1043,10 +1043,13 @@ fn a_source_turned_off_and_on_again_reruns_the_refused_update() {
     select_row(&mut studio, &format!("▸ {origin}"));
 
     studio.press(KeyCode::Char(' '), KeyModifiers::NONE);
-    studio.settle();
-    // The selected row: the header names the map too while it loads.
-    let row = row_with(&mut studio, &format!("▸ {origin}"));
-    assert!(row.contains("samples  off"), "{}", studio.rows().join("\n"));
+    // The row turns off once the turn that takes the grant back has run.
+    studio.pump_until(Duration::from_secs(5), "the source turns off", |studio| {
+        studio
+            .rows()
+            .iter()
+            .any(|row| row.contains(&origin) && row.contains("samples  off"))
+    });
     studio.press(KeyCode::Esc, KeyModifiers::NONE);
     studio.settle();
     studio.set_score(&format!(
