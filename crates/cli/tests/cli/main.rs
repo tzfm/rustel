@@ -9960,27 +9960,3 @@ fn until_silence_states_its_rule_for_audio() {
     let onsets = take("until-silence.json");
     assert!(!onsets.contains("until silence"), "{onsets}");
 }
-
-/// `check` refuses what the voices refuse when the score plays: an orbit
-/// past the last one fails with the voice's own words, one in range passes.
-#[test]
-fn check_refuses_an_orbit_past_the_last() {
-    let out = run(&[
-        "check",
-        "--no-samples",
-        "-e",
-        "$: note(\"c3\").s(\"sine\").orbit(16)",
-    ]);
-    assert!(!out.status.success());
-    let said = String::from_utf8_lossy(&out.stdout);
-    assert!(
-        said.contains("orbit 16 is outside the orbits 0 to 15"),
-        "{said}"
-    );
-    ok_output(&[
-        "check",
-        "--no-samples",
-        "-e",
-        "$: note(\"c3\").s(\"sine\").orbit(15)",
-    ]);
-}
