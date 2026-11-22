@@ -5474,6 +5474,33 @@ fn talkit_speaks_a_number() {
     assert!(loud, "the bounce is silent");
 }
 
+/// A strum at cycle zero moves the first voice of the chord before the
+/// export begins. It plays from the first frame, with no refused voice.
+#[test]
+fn a_strum_at_cycle_zero_plays_its_first_voice() {
+    let path = scratch("strum-at-zero.wav");
+    let out = run(&[
+        "export",
+        "-e",
+        r#"note("c2,g4").strum(0.1).s("sine")"#,
+        "--cycles",
+        "2",
+        "-o",
+        path.to_str().expect("UTF-8 path"),
+    ]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "{stderr}");
+    assert!(!stderr.contains("voice_refused"), "{stderr}");
+    let wav = std::fs::read(&path).expect("wav");
+    let _ = std::fs::remove_file(&path);
+    // The g4 starts at 0.2 s: before it, only the c2 can sound. 16-bit
+    // stereo after the 44-byte header, so 0.1 s is 19 200 bytes.
+    assert!(
+        wav[44..44 + 19_200].iter().any(|byte| *byte != 0),
+        "the first voice is silent"
+    );
+}
+
 /// The command line prints recoverable notices on stderr, which a library
 /// Session does only when its host opts in. A notice that every note raises
 /// prints once, with the number of onsets.

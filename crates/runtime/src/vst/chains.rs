@@ -2048,7 +2048,8 @@ impl RenderPlan {
     /// The frame the onset at `place` starts on in the clock of the render:
     /// its onset frame and the pre-roll, less its lead.
     pub(crate) fn aimed(&self, place: usize, onset: &crate::OnsetEventJson) -> u64 {
-        let frame = crate::render::onset_frame_at(onset.target_time, self.rate);
+        // An onset before the render begins plays from its first frame.
+        let frame = crate::render::onset_frame_at(onset.target_time.max(0.0), self.rate);
         let frame = frame.saturating_add(self.preroll);
         frame.saturating_sub(u64::from(self.lead(place)))
     }
