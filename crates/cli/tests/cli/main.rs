@@ -10002,6 +10002,8 @@ fn an_export_into_a_missing_folder_names_the_output() {
     let said = String::from_utf8_lossy(&out.stderr);
     assert!(
         said.contains("cannot write") && said.contains("out.wav"),
+        "{said}"
+    );
 }
 
 /// A pickF name its lookup does not hold says which name, beside the error
