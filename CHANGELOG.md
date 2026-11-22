@@ -11,6 +11,7 @@
 - A `pickF` or `pick` name its lookup does not hold says which name is missing, beside the error strudel.cc throws for it.
 - Fixed: a refused orbit, bus or input channel names the last one allowed (`orbit 16 is outside the orbits 0 to 15`), instead of a range that read as if 16 were allowed.
 - Fixed: Enter on a preset or a parameter of the plugin in a `vsti("name"` call still being typed writes the options object and closes the call, instead of doing nothing.
+- Fixed: an export, a replay export or a stems export that cannot write a file names that file, instead of a bare "No such file or directory".
 - Vim mode: `J` and `gJ` join lines, as in Vim. The shipped `$` label jumps move from `J` and `K` to `]$` and `[$`.
 - `rustel check` names a note that a `gm_*` soundfont has no note for, such as `note("c2").s("gm_clarinet")`, instead of finding no issues while the note plays as silence.
 - `rustel check` and `rustel query` take `--prebake setup.js`, so a score calling a prebake's helpers checks clean.

@@ -9984,6 +9984,28 @@ fn a_cc_channel_outside_1_to_16_is_refused() {
     }
 }
 
+/// An export into a folder that does not exist names the file it could not
+/// write, as a missing source names the source.
+#[test]
+fn an_export_into_a_missing_folder_names_the_output() {
+    let path = scratch("no-such-folder").join("deeper").join("out.wav");
+    let out = run(&[
+        "export",
+        "-e",
+        "$: note(\"c3\").s(\"sine\").gain(.2)",
+        "--cycles",
+        "1",
+        "-o",
+        path.to_str().expect("utf-8 path"),
+    ]);
+    assert_eq!(out.status.code(), Some(4));
+    let said = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        said.contains("cannot write") && said.contains("out.wav"),
+        "{said}"
+    );
+}
+
 /// A pickF name its lookup does not hold says which name, beside the error
 /// strudel.cc throws for it.
 #[test]

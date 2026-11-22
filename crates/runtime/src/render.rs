@@ -871,7 +871,7 @@ pub fn encode_mp3(path: impl AsRef<Path>, sample_rate: u32, pcm: &[f32]) -> io::
         .map_err(|error| io::Error::other(format!("mp3 flush: {error}")))?;
     // SAFETY: as above, within the same reservation.
     unsafe { mp3.set_len(mp3.len() + flushed) };
-    std::fs::write(path, &mp3)?;
+    std::fs::write(&path, &mp3).map_err(|error| cannot_write(path.as_ref(), error))?;
     Ok(quantised.len() / 2)
 }
 
@@ -1710,7 +1710,7 @@ pub fn write_silent_wav(
         ));
     }
     let data_bytes = data_bytes as u32;
-    let mut file = File::create(path)?;
+    let mut file = File::create(&path).map_err(|error| cannot_write(path.as_ref(), error))?;
 
     // RIFF header
     file.write_all(b"RIFF")?;
@@ -1745,8 +1745,17 @@ pub fn write_silent_wav(
 
 /// Write a raw onset dump as JSON.
 pub fn write_onset_dump(path: impl AsRef<Path>, onsets: &[OnsetEventJson]) -> io::Result<()> {
-    let file = File::create(path)?;
+    let file = File::create(&path).map_err(|error| cannot_write(path.as_ref(), error))?;
     serde_json::to_writer_pretty(file, onsets).map_err(io::Error::other)
+}
+
+/// An error writing `path`, with the path in it: "No such file or
+/// directory" alone sends a person hunting for which path it was.
+fn cannot_write(path: &Path, error: io::Error) -> io::Error {
+    io::Error::new(
+        error.kind(),
+        format!("cannot write {}: {error}", path.display()),
+    )
 }
 
 #[cfg(test)]
