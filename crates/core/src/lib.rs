@@ -3671,7 +3671,9 @@ impl PickLookup {
         }
     }
 
-    fn select(&self, value: &Value, index_mode: PickIndexMode) -> Option<&Pattern> {
+    /// The pattern `value` picks, or the key it looked up and did not find,
+    /// as the lookup read it.
+    fn select(&self, value: &Value, index_mode: PickIndexMode) -> Result<&Pattern, String> {
         // Property access coerces the actual JavaScript selector.
         // `pure(['1']).pick(['a', 'b'])` therefore selects `b`; treating an
         // opaque JS-owned array as an ordinary object turns it into NaN and
@@ -3703,18 +3705,20 @@ impl PickLookup {
                 // JavaScript property access turns -0 into "0". Every other
                 // negative, NaN, infinite or out-of-range number misses.
                 if !numeric.is_finite() || numeric < 0.0 || numeric > usize::MAX as f64 {
-                    return None;
+                    return Err(numeric.to_string());
                 }
                 let index = numeric as usize;
                 entries
                     .iter()
                     .find_map(|(candidate, pattern)| (*candidate == index).then_some(pattern))
+                    .ok_or_else(|| index.to_string())
             }
             Self::Object { entries, .. } => {
                 let key = pick_property_key(value);
                 entries
                     .iter()
                     .find_map(|(candidate, pattern)| (candidate == &key).then_some(pattern))
+                    .ok_or(key)
             }
         }
     }
@@ -4204,12 +4208,13 @@ fn query_pick(
             // carriers are removed before their selected value is dereferenced.
             continue;
         }
-        let Some(inner_pattern) = lookup.select(&outer.value, index_mode) else {
-            // `lookup[key]` is `undefined`; the selected value becomes a hap
-            // normally and fails only when the join reaches it.
-            // The text strudel.cc throws, after the key it did not find: the
-            // JavaScript words alone name no part of the score.
-            signal_query_error(|| {
+        let inner_pattern = match lookup.select(&outer.value, index_mode) {
+            Ok(pattern) => pattern,
+            Err(key) => {
+                // `lookup[key]` is `undefined`; the selected value becomes a
+                // hap normally and fails only when the join reaches it. The
+                // text strudel.cc throws comes after the key it did not find:
+                // the JavaScript words alone name no part of the score.
                 let thrown = match mode {
                     JoinMode::Squeeze => {
                         "Cannot read properties of undefined (reading '_focusSpan')"
@@ -4219,9 +4224,9 @@ fn query_pick(
                     }
                     _ => "x.value.query is not a function",
                 };
-                format!("no {:?} in the pick lookup ({thrown})", outer.value.show())
-            });
-            return Vec::new();
+                signal_query_error(|| format!("no {key:?} in the pick lookup ({thrown})"));
+                return Vec::new();
+            }
         };
         match mode {
             JoinMode::Inner | JoinMode::Outer | JoinMode::Mix => {
