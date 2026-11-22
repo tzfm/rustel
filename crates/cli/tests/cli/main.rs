@@ -5474,47 +5474,47 @@ fn talkit_speaks_a_number() {
     assert!(loud, "the bounce is silent");
 }
 
-/// The command line prints recoverable notices on stderr, which a library
-/// Session does only when its host opts in. A notice that every note raises
-/// prints once, with the number of onsets.
 /// A note or freq that is not a finite number, such as the log2 of 0, is a
-/// refused voice, not a note played at the synth's default pitch.
+/// refused voice that sounds nothing, as on strudel.cc, not a note at the
+/// default pitch of the voice.
 #[test]
 fn a_pitch_that_is_not_a_finite_number_is_refused() {
     let path = scratch("non-finite-pitch.wav");
-    for (score, said) in [
-        (
-            r#"note(run(2).add(-1).log2()).s("triangle")"#,
-            [r#"not a note: \"NaN\""#, r#"not a note: \"-Infinity\""#],
-        ),
-        (
-            r#"freq(run(2).add(-1).log2()).s("triangle")"#,
-            ["freq must be a finite number"; 2],
-        ),
+    for (score, name) in [
+        (r#"note(run(1).log2()).s("triangle")"#, "note"),
+        (r#"note(run(1).add(-1).log2()).s("triangle")"#, "note"),
+        (r#"freq(run(1).log2().mul(-1)).s("triangle")"#, "freq"),
+        (r#"freq(run(1).log2()).s("bd")"#, "freq"),
     ] {
         let out = run(&[
-            "export",
+            "render",
             "-e",
             score,
-            "--cycles",
+            "--duration",
             "1",
+            "--format",
+            "scalar-wav",
             "-o",
             path.to_str().expect("UTF-8 path"),
         ]);
         let stderr = String::from_utf8_lossy(&out.stderr);
         assert!(out.status.success(), "{score}: {stderr}");
-        for said in said {
-            assert!(
-                stderr
-                    .lines()
-                    .any(|line| line.starts_with(r#"{"voice_refused":"#) && line.contains(said)),
-                "{score}: {stderr}"
-            );
-        }
+        let refused = format!("{name} must be a finite number");
+        assert!(
+            stderr
+                .lines()
+                .any(|line| line.starts_with(r#"{"voice_refused":"#) && line.contains(&refused)),
+            "{score}: {stderr}"
+        );
+        let wav = std::fs::read(&path).expect("wav");
+        assert!(wav[44..].iter().all(|byte| *byte == 0), "{score} sounds");
     }
     let _ = std::fs::remove_file(&path);
 }
 
+/// The command line prints recoverable notices on stderr, which a library
+/// Session does only when its host opts in. A notice that every note raises
+/// prints once, with the number of onsets.
 #[test]
 fn render_prints_recoverable_notices_on_stderr() {
     let path = scratch("refused-voice.wav");

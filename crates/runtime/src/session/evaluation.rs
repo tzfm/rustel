@@ -1823,8 +1823,9 @@ impl Session {
                     // queried window, so keep time out of the verdict.
                     target_time: 0.0,
                     cps: None,
-                    value: ValueJson::for_voice(&hap.value),
+                    value: ValueJson::from_value(&hap.value),
                     value_show: String::new(),
+                    non_finite_pitch: None,
                     ui_visuals: hap.ui_visuals_context(),
                     log_line: None,
                 };

@@ -113,6 +113,11 @@ fn scalar_event_at(
     floor: f64,
 ) -> Result<rustel_audio::OnsetEvent, rustel_voice::VoiceError> {
     let cps = onset.cps_or(cps);
+    if let Some(name) = onset.non_finite_pitch {
+        return Err(rustel_voice::VoiceError::InvalidControl(format!(
+            "{name} must be a finite number"
+        )));
+    }
     let value = match &onset.value {
         crate::ValueJson::Null => serde_json::Value::Null,
         crate::ValueJson::Bool(flag) => serde_json::Value::Bool(*flag),
@@ -1849,6 +1854,7 @@ mod stretch_chain_tests {
                 cps: None,
                 value: crate::ValueJson::Raw(value),
                 value_show: String::new(),
+                non_finite_pitch: None,
                 log_line: None,
             }];
             let ordered = super::musical_order(&onsets, rate);
@@ -2354,6 +2360,7 @@ mod tests {
             cps: None,
             value: crate::ValueJson::Raw(value),
             value_show: String::new(),
+            non_finite_pitch: None,
             log_line: None,
         }
     }

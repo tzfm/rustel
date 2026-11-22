@@ -337,6 +337,7 @@ mod tests {
             cps: None,
             value: ValueJson::Raw(value),
             value_show: String::new(),
+            non_finite_pitch: None,
             log_line: None,
         }
     }
