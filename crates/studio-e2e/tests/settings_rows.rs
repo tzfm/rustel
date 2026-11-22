@@ -1013,6 +1013,10 @@ fn a_source_turned_off_and_on_again_reruns_the_refused_update() {
     studio.chord("ctrl+s");
     studio.settle();
     open_permissions(&mut studio);
+    // The row comes once the engine has refused the map.
+    studio.pump_until(Duration::from_secs(10), "the source is refused", |studio| {
+        studio.rows().iter().any(|row| row.contains(&origin))
+    });
     select_row(&mut studio, &format!("▸ {origin}"));
     studio.press(KeyCode::Enter, KeyModifiers::NONE);
     studio.settle();
@@ -1039,8 +1043,13 @@ fn a_source_turned_off_and_on_again_reruns_the_refused_update() {
     select_row(&mut studio, &format!("▸ {origin}"));
 
     studio.press(KeyCode::Char(' '), KeyModifiers::NONE);
-    studio.settle();
-    assert!(row_with(&mut studio, &origin).contains("samples  off"));
+    // The row turns off once the turn that takes the grant back has run.
+    studio.pump_until(Duration::from_secs(5), "the source turns off", |studio| {
+        studio
+            .rows()
+            .iter()
+            .any(|row| row.contains(&origin) && row.contains("samples  off"))
+    });
     studio.press(KeyCode::Esc, KeyModifiers::NONE);
     studio.settle();
     studio.set_score(&format!(
