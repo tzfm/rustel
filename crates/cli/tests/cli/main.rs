@@ -9983,3 +9983,16 @@ fn a_cc_channel_outside_1_to_16_is_refused() {
         ok_output(&["query", "-e", &score(channel)]);
     }
 }
+
+/// A pickF name its lookup does not hold says which name, beside the error
+/// strudel.cc throws for it.
+#[test]
+fn a_pick_name_not_in_the_lookup_is_named() {
+    let out = run(&["query", "-e", "$: s(\"bd sd\").pickF(\"a z\", {a: rev})"]);
+    assert!(!out.status.success());
+    let said = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        said.contains("no \"z\" in the pick lookup (x.value.query is not a function)"),
+        "{said}"
+    );
+}
