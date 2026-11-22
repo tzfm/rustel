@@ -1069,13 +1069,11 @@ fn a_source_turned_off_and_on_again_reruns_the_refused_update() {
         "samples('{origin}/map.json')\n$: s(\"sn sn\").gain(0.03)"
     ));
     studio.chord("ctrl+s");
-    // Read off the screen: a notice about the layer still playing can take
-    // the status line over.
+    // The check marks the sound on the screen before the engine answers. A
+    // permission given before that answer has no refused update to re-run,
+    // so wait for the refusal itself.
     studio.pump_until(Duration::from_secs(10), "the update is refused", |studio| {
-        studio
-            .rows()
-            .iter()
-            .any(|row| row.contains("unknown sound \"sn\""))
+        studio.update_stands_refused()
     });
 
     open_permissions(&mut studio);
