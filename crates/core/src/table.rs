@@ -3146,7 +3146,7 @@ fn picked(
     let mut picked: Option<Work> = None;
     for layer in &selectors.layers {
         for entry in &layer.entries {
-            let tables = lookup.select(&entry.value, index_mode)?.tables()?;
+            let tables = lookup.select(&entry.value, index_mode).ok()?.tables()?;
             if mode != JoinMode::Restart {
                 period = lcm(period, tables.period()?)?;
             }
@@ -3179,7 +3179,7 @@ fn picked(
         for outer in layer.repeated(period)? {
             let mut met = Vec::new();
             let whole = outer.whole?;
-            let tables = lookup.select(&outer.value, index_mode)?.tables()?;
+            let tables = lookup.select(&outer.value, index_mode).ok()?.tables()?;
             let by = match mode {
                 JoinMode::Restart => whole.begin,
                 JoinMode::Reset => whole.begin.cycle_pos(),
