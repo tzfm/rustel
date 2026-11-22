@@ -3022,10 +3022,15 @@ mod tests {
         /// prebake pointed at that folder so a test never reads, or writes,
         /// the config folder of whoever is running it.
         pub(in crate::app) fn app_over(directory: &std::path::Path) -> App {
+            app_over_score(directory, "$: s(\"bd\")\n")
+        }
+
+        /// [`app_over`] with its one scene holding `score`.
+        pub(in crate::app) fn app_over_score(directory: &std::path::Path, score: &str) -> App {
             // Before anything reads a preference or opens a log: a test must not
             // touch the real one. See `config::isolate_for_tests`.
             super::super::super::config::isolate_for_tests();
-            std::fs::write(directory.join("first.strudel"), "$: s(\"bd\")\n").expect("scene file");
+            std::fs::write(directory.join("first.strudel"), score).expect("scene file");
             let scenes = SceneSet::open(directory, "first").expect("scenes");
             let options = StudioOptions {
                 path: Some(directory.to_path_buf()),

@@ -687,7 +687,9 @@ mod tests {
         #[test]
         fn a_permit_that_unblocked_a_refused_update_runs_it_again() {
             let directory = tempfile::tempdir().expect("temp dir");
-            let mut app = app_over(directory.path());
+            // No sample names: the re-run's check must not hang on how far
+            // the default sound banks have come in.
+            let mut app = app_over_score(directory.path(), "$: note(\"c3\")\n");
             // Space takes the switch back, as a player does who wants no
             // native code this run.
             app.toggle_row(csound_row(&app));
