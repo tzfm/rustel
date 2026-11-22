@@ -1297,6 +1297,9 @@ struct App {
     local_files_asked: bool,
     /// The source the permissions page's edit prompt is cutting down.
     editing_source: Option<String>,
+    /// `samples()` sources to look up that the engine's full queue turned
+    /// away. A refused one reaches the permissions page only by a look-up.
+    lookups_owed: Vec<String>,
     /// The page's sample grants changed and the engine does not have them yet.
     sample_grants_owed: bool,
     /// The library's count of policies taken before the grants still on
@@ -1895,6 +1898,7 @@ impl App {
             blocked_samples: Vec::new(),
             local_files_asked: false,
             editing_source: None,
+            lookups_owed: Vec::new(),
             sample_grants_owed: false,
             sample_grants_sent_at: None,
             refused_update_owed: false,
@@ -3018,10 +3022,15 @@ mod tests {
         /// prebake pointed at that folder so a test never reads, or writes,
         /// the config folder of whoever is running it.
         pub(in crate::app) fn app_over(directory: &std::path::Path) -> App {
+            app_over_score(directory, "$: s(\"bd\")\n")
+        }
+
+        /// [`app_over`] with its one scene holding `score`.
+        pub(in crate::app) fn app_over_score(directory: &std::path::Path, score: &str) -> App {
             // Before anything reads a preference or opens a log: a test must not
             // touch the real one. See `config::isolate_for_tests`.
             super::super::super::config::isolate_for_tests();
-            std::fs::write(directory.join("first.strudel"), "$: s(\"bd\")\n").expect("scene file");
+            std::fs::write(directory.join("first.strudel"), score).expect("scene file");
             let scenes = SceneSet::open(directory, "first").expect("scenes");
             let options = StudioOptions {
                 path: Some(directory.to_path_buf()),
