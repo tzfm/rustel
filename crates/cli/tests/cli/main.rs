@@ -9984,8 +9984,8 @@ fn a_cc_channel_outside_1_to_16_is_refused() {
     }
 }
 
-/// An export into a folder that does not exist names the output it could
-/// not write, as a missing source names the source.
+/// An export into a folder that does not exist names the file it could not
+/// write, as a missing source names the source.
 #[test]
 fn an_export_into_a_missing_folder_names_the_output() {
     let path = scratch("no-such-folder").join("deeper").join("out.wav");
@@ -10000,6 +10000,8 @@ fn an_export_into_a_missing_folder_names_the_output() {
     ]);
     assert_eq!(out.status.code(), Some(4));
     let said = String::from_utf8_lossy(&out.stderr);
-    assert!(said.contains("cannot write the output"), "{said}");
-    assert!(said.contains("out.wav"), "{said}");
+    assert!(
+        said.contains("cannot write") && said.contains("out.wav"),
+        "{said}"
+    );
 }

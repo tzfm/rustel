@@ -2845,17 +2845,7 @@ fn run_command(
                 session.set_render_tail(RENDER_TAIL_CEILING_SECS);
             }
             session.set_stems_export(stems);
-            // As a source that will not open: the error names the file, so
-            // a folder that is missing is not a hunt through the arguments.
-            let report = session
-                .render(duration, &output, format.into())
-                .map_err(|error| match error {
-                    RuntimeError::Io(error) => RuntimeError::Io(std::io::Error::new(
-                        error.kind(),
-                        format!("cannot write the output {}: {error}", output.display()),
-                    )),
-                    error => error,
-                })?;
+            let report = session.render(duration, &output, format.into())?;
             if json_asked() {
                 outln!(
                     "{}",
