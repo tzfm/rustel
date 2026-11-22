@@ -329,10 +329,7 @@ pub(crate) fn plays_locally(onset: &OnsetEventJson) -> bool {
 /// frames. An onset that goes to MIDI is not one of them.
 fn musical_order(onsets: &[OnsetEventJson], sample_rate: u32) -> Vec<&OnsetEventJson> {
     let mut ordered: Vec<_> = onsets.iter().filter(|onset| plays_locally(onset)).collect();
-    // An onset before the render begins plays from its first frame: see
-    // `rustel_voice::resolve_voice_with_origin`. It sorts there, not after
-    // the last onset as a time no frame can hold.
-    ordered.sort_by_key(|onset| onset_frame_at(onset.target_time.max(0.0), sample_rate));
+    ordered.sort_by_key(|onset| onset_frame_at(onset.target_time, sample_rate));
     ordered
 }
 

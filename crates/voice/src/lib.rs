@@ -725,28 +725,6 @@ mod tests {
         assert_eq!(early, 0, "a first-beat stretch must clamp, not underflow");
     }
 
-    /// An onset a shift moved before the render, as a strum moves the first
-    /// voice of a chord at cycle zero, starts on the first frame and ends
-    /// where it would have, as a Web Audio start in the past does.
-    #[test]
-    fn an_onset_before_the_render_starts_on_its_first_frame() {
-        let early = super::resolve_voice(
-            &serde_json::json!({ "note": "c3" }),
-            1,
-            2.0,
-            -0.2,
-            48_000,
-            0.5,
-        )
-        .expect("an early onset plays");
-        assert_eq!(early.onset_frame, 0);
-        assert!(
-            (early.duration_secs - 1.8).abs() < 1e-6,
-            "{}",
-            early.duration_secs
-        );
-    }
-
     /// A soundfont with no note of its own plays c3, an octave above the
     /// sampler's default. The two defaults live in different places
     /// upstream, and using the sampler's for both put every noteless
@@ -3191,18 +3169,10 @@ fn resolve_voice_at(
     // reference's does. Separate `.FX()` stretch stages keep their delay.
     // A compensated onset before the render begins starts at `floor`.
     let source_time = target_time;
-    let mut duration_secs = duration_secs;
     let target_time = if value.get("stretch").is_some_and(|value| !value.is_null()) {
         let lag_secs =
             f64::from(rustel_audio::stretch::QUANTUM_LAG_FRAMES) / f64::from(sample_rate);
         (target_time - STRETCH_LATENCY_SECS - lag_secs).max(floor)
-    } else if target_time < floor {
-        // An onset a shift moved before the render begins, as a strum
-        // moves the first voice of a chord at cycle zero, starts at
-        // `floor` and ends where it would have: a Web Audio start in the
-        // past starts at once, and its stop keeps its time.
-        duration_secs = (duration_secs - (floor - target_time)).max(0.0);
-        floor
     } else {
         target_time
     };
