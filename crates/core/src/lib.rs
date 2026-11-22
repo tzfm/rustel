@@ -4207,14 +4207,19 @@ fn query_pick(
         let Some(inner_pattern) = lookup.select(&outer.value, index_mode) else {
             // `lookup[key]` is `undefined`; the selected value becomes a hap
             // normally and fails only when the join reaches it.
-            signal_query_error(|| match mode {
-                JoinMode::Squeeze => {
-                    "Cannot read properties of undefined (reading '_focusSpan')".into()
-                }
-                JoinMode::Reset | JoinMode::Restart => {
-                    "Cannot read properties of undefined (reading 'late')".into()
-                }
-                _ => "x.value.query is not a function".into(),
+            // The text strudel.cc throws, after the key it did not find: the
+            // JavaScript words alone name no part of the score.
+            signal_query_error(|| {
+                let thrown = match mode {
+                    JoinMode::Squeeze => {
+                        "Cannot read properties of undefined (reading '_focusSpan')"
+                    }
+                    JoinMode::Reset | JoinMode::Restart => {
+                        "Cannot read properties of undefined (reading 'late')"
+                    }
+                    _ => "x.value.query is not a function",
+                };
+                format!("no {:?} in the pick lookup ({thrown})", outer.value.show())
             });
             return Vec::new();
         };

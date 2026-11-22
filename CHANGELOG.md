@@ -7,6 +7,7 @@
 - Changed: `.midi()` sends a pattern to MIDI in place of local audio, as on strudel.cc. A `ccn`/`ccv` pattern sent to MIDI no longer plays a sound. To hear a pattern and send it to MIDI, use `stack(p, p.midi())`.
 - Fixed: `cc(id, channel)` from `midin()` refuses a channel that is not a whole number from 1 to 16, instead of reading silence or cutting 1.5 to channel 1.
 - Fixed: a `vsti` note ends 1 ms early, as a MIDI note does, so a plugin such as TripleCheese no longer clicks where one note follows the next.
+- A `pickF` or `pick` name its lookup does not hold says which name is missing, beside the error strudel.cc throws for it.
 - Fixed: Enter on a preset or a parameter of the plugin in a `vsti("name"` call still being typed writes the options object and closes the call, instead of doing nothing.
 - Vim mode: `J` and `gJ` join lines, as in Vim. The shipped `$` label jumps move from `J` and `K` to `]$` and `[$`.
 - `rustel check` names a note that a `gm_*` soundfont has no note for, such as `note("c2").s("gm_clarinet")`, instead of finding no issues while the note plays as silence.
