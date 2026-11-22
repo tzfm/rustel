@@ -138,14 +138,14 @@ pub fn check_score_with(
     // The linter judges only the sources the loader has finished publishing.
     let mut diagnostics = lint::lint_with(source, false, library, context);
     if eval_error.is_none()
-        && library.is_some()
         && !cancellation.load(Ordering::Relaxed)
         && let Some(report) = &first_cycle
     {
-        diagnostics.extend(notes_outside_their_fonts(
+        diagnostics.extend(voice_findings(
             report,
             session,
             source,
+            library.is_some(),
             cancellation,
         ));
     }
@@ -161,28 +161,36 @@ pub fn check_score_with(
     }
 }
 
-/// The notes of the first cycle that a soundfont has no zone for: they play
-/// as silence, as on strudel.cc, and the check says so with the words a
-/// render uses. Each note is resolved as a voice resolves it, so the sound
-/// is the one that plays. The fonts the cycle names are fetched first, for
-/// at most a few seconds; a font that does not come in, or a `samples()`
-/// still on its way that may name the sound, is not judged.
-fn notes_outside_their_fonts(
+/// What the voices of the first cycle refuse, resolved as playback resolves
+/// them: a control out of its range, such as `orbit(16)`, which Studio's
+/// update refuses too, and - with `samples` - a note a soundfont has no zone
+/// for, which plays as silence, as on strudel.cc. A note sent to a plugin,
+/// Csound or speech is the host's to judge, and is left alone. The fonts the
+/// cycle names are fetched first, for at most a few seconds; a font that
+/// does not come in, or a `samples()` still on its way that may name the
+/// sound, is not judged.
+fn voice_findings(
     report: &crate::hap_json::QueryReport,
     session: &Session,
     source: &str,
+    samples: bool,
     cancellation: &AtomicBool,
 ) -> Vec<Diagnostic> {
-    let Some(samples) = session.sample_library() else {
-        return Vec::new();
+    let library = session.sample_library().filter(|_| samples);
+    let lookup: &dyn rustel_voice::SampleLookup = match &library {
+        Some(library) => library.as_ref(),
+        None => &rustel_voice::BundledOnly,
     };
     let cps = session.config().cps;
+    let hosted = ["vst", "vsti", "csound", "csoundm", "talkit"];
     let onsets: Vec<_> = report
         .haps
         .iter()
         .filter(|hap| hap.has_onset)
         .filter_map(|hap| match &hap.value {
-            crate::hap_json::ValueJson::Raw(value @ serde_json::Value::Object(_)) => {
+            crate::hap_json::ValueJson::Raw(value @ serde_json::Value::Object(object))
+                if !hosted.iter().any(|key| object.contains_key(*key)) =>
+            {
                 Some((value, hap.context.first().copied()))
             }
             _ => None,
@@ -190,14 +198,7 @@ fn notes_outside_their_fonts(
         .collect();
     let resolve = |value| {
         rustel_voice::resolve_voice_with_samples_detailed(
-            value,
-            0,
-            0.25,
-            0.0,
-            0.0,
-            48_000,
-            cps,
-            samples.as_ref(),
+            value, 0, 0.25, 0.0, 0.0, 48_000, cps, lookup,
         )
     };
     // Asking is what starts the fetch.
@@ -207,19 +208,23 @@ fn notes_outside_their_fonts(
             Err(rustel_voice::VoiceError::SampleLoading(_))
         ) || loading
     });
-    if loading {
-        samples.wait_until_idle_cancellable(Duration::from_secs(5), || {
+    if let Some(library) = &library
+        && loading
+    {
+        library.wait_until_idle_cancellable(Duration::from_secs(5), || {
             cancellation.load(Ordering::Relaxed)
         });
     }
-    if samples.manifests_pending() > 0 {
-        return Vec::new();
-    }
+    let fonts = library
+        .as_ref()
+        .is_some_and(|library| library.manifests_pending() == 0);
     let mut said = std::collections::HashSet::new();
     let mut diagnostics = Vec::new();
     for (value, at) in onsets {
-        let Err(rustel_voice::VoiceError::NoteOutsideFont(message)) = resolve(value) else {
-            continue;
+        let message = match resolve(value) {
+            Err(rustel_voice::VoiceError::InvalidControl(message)) => message,
+            Err(rustel_voice::VoiceError::NoteOutsideFont(message)) if fonts => message,
+            _ => continue,
         };
         if !said.insert(message.clone()) {
             continue;
