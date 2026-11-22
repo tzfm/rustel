@@ -250,6 +250,7 @@ impl App {
         self.send_import_origins();
         self.send_sample_grants();
         self.send_csound();
+        self.send_owed_lookups();
         self.note_refused_samples();
         // A permit that unblocked a refused update re-runs it here, once
         // the sends above have put the permission in the engine's hands -

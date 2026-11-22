@@ -342,7 +342,7 @@ impl App {
 
     /// Ask the engine for every `samples("…")` a scene names that the
     /// library has not been asked for yet.
-    pub(super) fn look_up_imports(&self, scene_id: SceneId) {
+    pub(super) fn look_up_imports(&mut self, scene_id: SceneId) {
         // Without a library handle yet, the engine's own library keeps the
         // ask from being repeated.
         self.ask_for_imports(scene_id, |library, spec| {
@@ -353,7 +353,7 @@ impl App {
     /// Ask again for every `samples()` source a scene imports: a source a
     /// permission has just allowed is fetched now. One already in, on its
     /// way, or resting after a failure is left as it stands.
-    pub(super) fn ask_for_imports_again(&self, scene_id: SceneId) {
+    pub(super) fn ask_for_imports_again(&mut self, scene_id: SceneId) {
         self.ask_for_imports(scene_id, |_, _| true);
     }
 
@@ -361,14 +361,14 @@ impl App {
     /// failure has rested, so a failure the network caused recovers by
     /// itself. Typing never asks: an update does, and the poll does in the
     /// `background`, where a failure in a row rests longer.
-    pub(super) fn retry_failed_imports(&self, scene_id: SceneId, background: bool) {
+    pub(super) fn retry_failed_imports(&mut self, scene_id: SceneId, background: bool) {
         self.ask_for_imports(scene_id, |library, spec| {
             library.is_some_and(|library| library.samples_source_rested(spec, background))
         });
     }
 
     fn ask_for_imports(
-        &self,
+        &mut self,
         scene_id: SceneId,
         due: impl Fn(Option<&rustel_runtime::samples::SampleLibrary>, &str) -> bool,
     ) {
@@ -380,10 +380,20 @@ impl App {
             .into_iter()
             .flatten()
         {
-            if due(library.as_deref(), &spec) {
-                self.worker.try_look_up_samples(&spec);
+            if due(library.as_deref(), &spec)
+                && !self.worker.try_look_up_samples(&spec)
+                && !self.lookups_owed.contains(&spec)
+            {
+                self.lookups_owed.push(spec);
             }
         }
+    }
+
+    /// Ask again for the look-ups the engine's queue turned away.
+    pub(super) fn send_owed_lookups(&mut self) {
+        let worker = &self.worker;
+        self.lookups_owed
+            .retain(|spec| !worker.try_look_up_samples(spec));
     }
 
     /// Ask the library where every sound a scene names stands - which also

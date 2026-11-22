@@ -1297,6 +1297,9 @@ struct App {
     local_files_asked: bool,
     /// The source the permissions page's edit prompt is cutting down.
     editing_source: Option<String>,
+    /// `samples()` sources to look up that the engine's full queue turned
+    /// away. A refused one reaches the permissions page only by a look-up.
+    lookups_owed: Vec<String>,
     /// The page's sample grants changed and the engine does not have them yet.
     sample_grants_owed: bool,
     /// The library's count of policies taken before the grants still on
@@ -1895,6 +1898,7 @@ impl App {
             blocked_samples: Vec::new(),
             local_files_asked: false,
             editing_source: None,
+            lookups_owed: Vec::new(),
             sample_grants_owed: false,
             sample_grants_sent_at: None,
             refused_update_owed: false,

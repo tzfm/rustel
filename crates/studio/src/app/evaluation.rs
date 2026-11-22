@@ -245,12 +245,12 @@ impl App {
     /// prebake path, which differ only in what the checker is told the text
     /// is and in what the message says was not taken.
     pub(super) fn refuse_unclean(&mut self, revision: Revision, source: &Arc<str>) -> bool {
-        let scene = self.scenes.current();
-        let (id, prebake) = (scene.id, scene.prebake());
         // An import whose failure has rested a few seconds is asked for
         // again. This update is still refused for it; the next one is not,
         // once it is in.
-        self.retry_failed_imports(id, false);
+        self.retry_failed_imports(self.scenes.current().id, false);
+        let scene = self.scenes.current();
+        let (id, prebake) = (scene.id, scene.prebake());
         let mini = self.options.mini && scene.is_score();
         let context = self.lint_context_for(scene);
         let library = self.worker.library();
