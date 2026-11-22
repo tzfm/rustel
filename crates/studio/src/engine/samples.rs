@@ -97,9 +97,11 @@ impl StudioEngine {
             self.ask_idle_sweep();
             // The sweep this asks for runs while the lanes the edit removed
             // still play their last 5 s, and before the texts of the tabs
-            // may have caught up: it looks again once those chains end.
+            // may have caught up: it looks again once those chains end. A
+            // start counts too: it may take over the copies of a parked
+            // output.
             #[cfg(feature = "vst")]
-            if self.live.is_some() {
+            {
                 self.plugins_sweep_again_at = Some(Instant::now() + PLUGIN_SWEEP_AFTER_EDIT);
             }
             self.current_score = source.to_owned();
@@ -902,8 +904,9 @@ impl StudioEngine {
     /// the plugin of each copy an open scene keeps while it does not play.
     /// The chains of a closed score end first: see
     /// [`rustel_runtime::Session::end_closed_plugin_document`].
-    /// The host keeps each plugin with a running copy, so an unload waits
-    /// for the output of its score to close. A stop parks the output with
+    /// The host keeps each plugin with a running copy until the output
+    /// gives the copy back: a playing output gives back the copy of a chain
+    /// that ended, and a stopped one at its close. A stop parks the output with
     /// the copies of its score. The sweep closes a parked output that holds
     /// a copy of a plugin the sweep unloads, so the copies end first. In
     /// Piano mode the output stays open, and the sweep runs again when
