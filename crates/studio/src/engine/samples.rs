@@ -1,5 +1,10 @@
 use super::*;
 
+/// How long a sweep that kept a plugin for a copy still playing waits
+/// before it looks again: see [`StudioEngine::unload_idle_plugins`].
+#[cfg(feature = "vst")]
+const PLUGIN_SWEEP_AGAIN: std::time::Duration = std::time::Duration::from_secs(2);
+
 impl StudioEngine {
     /// Fetch the map of a `samples("…")` a score names, ahead of the
     /// score's evaluation, under the session's own grant.
@@ -889,6 +894,12 @@ impl StudioEngine {
     /// Piano mode closes.
     #[cfg(feature = "vst")]
     pub(super) fn unload_idle_plugins(&mut self, now: Instant) {
+        if let Some(at) = self.plugins_sweep_again_at
+            && now >= at
+        {
+            self.plugins_sweep_again_at = None;
+            self.plugins_swept = false;
+        }
         if self.plugins_swept
             || self.unused_sample_idle.is_zero()
             || now.saturating_duration_since(self.last_preview_at) < self.unused_sample_idle
@@ -923,6 +934,13 @@ impl StudioEngine {
             self.close_piano_output();
         }
         rustel_runtime::vst::unload_unused(&keep);
+        // A lane the score no longer has plays its copies to the end of
+        // their chains, 5 s of play after the edit, and the host keeps
+        // their plugins loaded until the output gives them back. The sweep
+        // looks again then, not at the next Stop.
+        if self.live.is_some() && rustel_runtime::vst::engine_holds_unkept(&keep) {
+            self.plugins_sweep_again_at = Some(now + PLUGIN_SWEEP_AGAIN);
+        }
     }
 
     /// True when the parked output closes with no sound lost: no score
@@ -1671,6 +1689,35 @@ mod tests {
             !library.knows_ready_for_test(URL),
             "a sound whose PCM is gone must be unknown again, or nothing ever decodes it a second time"
         );
+    }
+
+    /// A sweep that kept a plugin for a copy a removed lane still played
+    /// looks again when its time comes, in the same quiet spell, and not
+    /// before.
+    #[cfg(feature = "vst")]
+    #[test]
+    fn a_plugin_sweep_owed_again_runs_in_the_same_quiet_spell() {
+        let mut engine = StudioEngine::new(StudioConfig {
+            output: Some("silent".into()),
+            preview_budget_bytes: 0,
+            unused_sample_idle: Duration::from_secs(1),
+            ..StudioConfig::default()
+        })
+        .expect("engine");
+        let idle = Instant::now() + Duration::from_secs(5);
+        engine.unload_idle_plugins(idle);
+        assert!(engine.plugins_swept);
+        let again = idle + PLUGIN_SWEEP_AGAIN;
+        engine.plugins_sweep_again_at = Some(again);
+        engine.unload_idle_plugins(idle);
+        assert_eq!(
+            engine.plugins_sweep_again_at,
+            Some(again),
+            "not before its time"
+        );
+        engine.unload_idle_plugins(again);
+        assert_eq!(engine.plugins_sweep_again_at, None);
+        assert!(engine.plugins_swept, "the sweep ran again");
     }
 
     /// The idle sweep costs a source scan and two of the library's tables.
