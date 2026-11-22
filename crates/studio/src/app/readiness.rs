@@ -18,6 +18,11 @@ pub(super) struct LintKnowledge {
     /// Why the focused scene's imports failed, those that did: a finding
     /// names the reason, and goes when the import is answered.
     import_failures: Vec<String>,
+    /// How many sample maps have come in, and how many sample policies the
+    /// library has taken: a map that comes in brings names, and a source
+    /// turned off takes its names away.
+    maps_in: u64,
+    policies_taken: u64,
     midi_inputs: Option<Vec<String>>,
     midi_outputs: Option<Vec<String>>,
 }
@@ -491,7 +496,9 @@ impl App {
         let knowledge = self.lint_knowledge();
         if knowledge != self.lint_knowledge {
             self.lint_knowledge = knowledge;
-            self.lint_pending = true;
+            // Only the full check reads what the library knows. In the
+            // other modes a check would take down marks an update put up.
+            self.lint_pending |= self.ui_settings.syntax_check == SyntaxCheck::Full;
         }
     }
 
@@ -723,8 +730,9 @@ impl App {
     /// What the checker can judge beyond the score's own text, which grows
     /// after launch: sound and bank names once the sample library has its
     /// banks and every manifest is in (the rule `rustel_runtime::lint` judges them
-    /// by), why the focused scene's imports failed, and MIDI port names once
-    /// the ports have been probed.
+    /// by), why the focused scene's imports failed, the count of maps that
+    /// came in and of sample policies taken, and MIDI port names once the
+    /// ports have been probed.
     fn lint_knowledge(&self) -> LintKnowledge {
         let library = self.worker.library();
         let import_failures = library.as_ref().map_or_else(Vec::new, |library| {
@@ -737,10 +745,16 @@ impl App {
                 })
                 .collect()
         });
+        let maps_in = library.as_ref().map_or(0, |library| library.maps_in());
+        let policies_taken = library
+            .as_ref()
+            .map_or(0, |library| library.policies_taken());
         LintKnowledge {
             sound_names: library
                 .is_some_and(|library| library.manifests_pending() == 0 && library.has_banks()),
             import_failures,
+            maps_in,
+            policies_taken,
             midi_inputs: self.lint_midi_ports(MidiDirection::In),
             midi_outputs: self.lint_midi_ports(MidiDirection::Out),
         }
