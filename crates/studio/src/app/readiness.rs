@@ -315,7 +315,7 @@ impl App {
         {
             self.update_failure = None;
             self.clear_error(ErrorOwner::Evaluation);
-            if status_only_refusal {
+            if status_only_refusal || self.status == super::evaluation::UPDATE_REFUSED {
                 self.status = "ready".into();
             }
         }

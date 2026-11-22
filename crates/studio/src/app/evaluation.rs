@@ -171,6 +171,11 @@ pub(super) struct ReplayBlock {
     pub(super) index: usize,
 }
 
+/// The footer while an update is with the engine.
+const EVALUATING: &str = "evaluating on the native engine…";
+/// The footer once the engine refuses that update.
+pub(super) const UPDATE_REFUSED: &str = "update refused - the last good score keeps playing";
+
 impl App {
     /// Keep the evaluated revision mappable in the audible editor however
     /// many edits follow - a held slider key is one per repeat, and the
@@ -645,7 +650,7 @@ impl App {
             rewind,
             record,
         });
-        self.status = "evaluating on the native engine…".into();
+        self.status = EVALUATING.into();
         self.flush_pending_evaluation();
     }
 
@@ -1191,6 +1196,11 @@ impl App {
                     self.errors.set(ErrorOwner::Evaluation, footer);
                     self.update_failure =
                         sent.as_ref().map(|sent| (sent.scene, sent.editor_revision));
+                    // The line that said the update was on its way is over.
+                    // A status another message has already replaced stays.
+                    if self.status == EVALUATING {
+                        self.status = UPDATE_REFUSED.into();
+                    }
                 }
             }
         }
