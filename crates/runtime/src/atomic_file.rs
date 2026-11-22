@@ -69,8 +69,16 @@ pub(crate) fn replace_file(
 
 /// Replace `path` with `bytes` in one rename.
 pub fn replace_file_bytes(path: &Path, prefix: &str, bytes: &[u8]) -> std::io::Result<()> {
+    // The error names the file the caller asked for, not the temporary
+    // one beside it.
     replace_file(path, prefix, bytes, |pending, target| {
         std::fs::rename(pending, target)
+    })
+    .map_err(|error| {
+        std::io::Error::new(
+            error.kind(),
+            format!("cannot write {}: {error}", path.display()),
+        )
     })
 }
 

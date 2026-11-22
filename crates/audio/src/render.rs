@@ -415,7 +415,8 @@ impl StemTracks {
         let mut files = Vec::with_capacity(crate::scalar::MAX_ORBITS);
         for orbit in 0..crate::scalar::MAX_ORBITS {
             let path = folder.join(format!("{}.wav", orbit + 1));
-            let mut file = File::create(&path).map_err(|error| error.to_string())?;
+            let mut file = File::create(&path)
+                .map_err(|error| format!("cannot write {}: {error}", path.display()))?;
             write_wav_header(&mut file, sample_rate, frames, 2, format)?;
             files.push((path, file));
         }
@@ -561,7 +562,10 @@ fn write_render_wav_events(
         }
     }
 
-    let mut file = File::create(path).map_err(|error| error.to_string())?;
+    // The error names the file: "No such file or directory" alone sends a
+    // person hunting for which path it was.
+    let mut file =
+        File::create(path).map_err(|error| format!("cannot write {}: {error}", path.display()))?;
     write_wav_header(&mut file, sample_rate, frames, CHANNELS, format)?;
 
     // Silence only ends a render once the music has actually started: a score
