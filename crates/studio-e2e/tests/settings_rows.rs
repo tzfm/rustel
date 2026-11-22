@@ -1044,7 +1044,8 @@ fn a_source_turned_off_and_on_again_reruns_the_refused_update() {
 
     studio.press(KeyCode::Char(' '), KeyModifiers::NONE);
     studio.settle();
-    let row = row_with(&mut studio, &origin);
+    // The selected row: the header names the map too while it loads.
+    let row = row_with(&mut studio, &format!("▸ {origin}"));
     assert!(row.contains("samples  off"), "{}", studio.rows().join("\n"));
     studio.press(KeyCode::Esc, KeyModifiers::NONE);
     studio.settle();
