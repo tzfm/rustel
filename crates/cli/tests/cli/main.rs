@@ -5474,17 +5474,18 @@ fn talkit_speaks_a_number() {
     assert!(loud, "the bounce is silent");
 }
 
-/// A note or freq that is not a finite number, such as the log2 of 0, is a
-/// refused voice that sounds nothing, as on strudel.cc, not a note at the
-/// default pitch of the voice.
+/// A pitch no voice can sound is refused and silent, by the rules of
+/// strudel.cc: an infinity for every voice, NaN for a sample. A synth reads
+/// a NaN note as absent and plays its default.
 #[test]
-fn a_pitch_that_is_not_a_finite_number_is_refused() {
+fn a_pitch_that_is_not_a_finite_number_follows_strudel() {
     let path = scratch("non-finite-pitch.wav");
-    for (score, name) in [
-        (r#"note(run(1).log2()).s("triangle")"#, "note"),
-        (r#"note(run(1).add(-1).log2()).s("triangle")"#, "note"),
-        (r#"freq(run(1).log2().mul(-1)).s("triangle")"#, "freq"),
-        (r#"freq(run(1).log2()).s("bd")"#, "freq"),
+    for (score, refused) in [
+        (r#"note(run(1).log2()).s("triangle")"#, Some("note")),
+        (r#"freq(run(1).log2().mul(-1)).s("triangle")"#, Some("freq")),
+        (r#"freq(run(1).log2()).s("bd")"#, Some("freq")),
+        (r#"note(run(1).add(-1).log2()).s("bd")"#, Some("note")),
+        (r#"note(run(1).add(-1).log2()).s("triangle")"#, None),
     ] {
         let out = run(&[
             "render",
@@ -5499,15 +5500,15 @@ fn a_pitch_that_is_not_a_finite_number_is_refused() {
         ]);
         let stderr = String::from_utf8_lossy(&out.stderr);
         assert!(out.status.success(), "{score}: {stderr}");
-        let refused = format!("{name} must be a finite number");
-        assert!(
-            stderr
-                .lines()
-                .any(|line| line.starts_with(r#"{"voice_refused":"#) && line.contains(&refused)),
-            "{score}: {stderr}"
-        );
         let wav = std::fs::read(&path).expect("wav");
-        assert!(wav[44..].iter().all(|byte| *byte == 0), "{score} sounds");
+        let silent = wav[44..].iter().all(|byte| *byte == 0);
+        assert_eq!(silent, refused.is_some(), "{score}: {stderr}");
+        if let Some(name) = refused {
+            let said = format!("{name} must be a finite number");
+            assert!(stderr.contains(&said), "{score}: {stderr}");
+        } else {
+            assert!(!stderr.contains("voice_refused"), "{score}: {stderr}");
+        }
     }
     let _ = std::fs::remove_file(&path);
 }
