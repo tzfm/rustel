@@ -185,7 +185,7 @@ mod classification_tests {
                 value[key] = json!(rejected);
                 let error = refusal(&value, &BundledOnly);
                 assert!(
-                    matches!(&error, VoiceError::InvalidControl(message) if message.contains("outside the supported")),
+                    matches!(&error, VoiceError::InvalidControl(message) if message.contains(&format!("0 to {}", limit - 1))),
                     "wrong category for {value}: {error:?}"
                 );
             }
@@ -274,6 +274,18 @@ mod classification_tests {
         ));
         assert!(detailed(&json!({ "s": "sine", "limit": 0 }), &BundledOnly).is_ok());
         assert!(detailed(&json!({ "s": "sine", "limit": -6 }), &BundledOnly).is_ok());
+    }
+
+    /// A refusal of a number past its range names the last one allowed:
+    /// orbit 16 is past the orbits, which end at 15.
+    #[test]
+    fn a_range_refusal_names_the_last_number_allowed() {
+        let orbit = refusal(&json!({ "s": "sine", "orbit": 16 }), &BundledOnly);
+        assert!(
+            matches!(&orbit, VoiceError::InvalidControl(message) if message == "orbit 16 is outside the orbits 0 to 15"),
+            "{orbit:?}"
+        );
+        assert!(detailed(&json!({ "s": "sine", "orbit": 15 }), &BundledOnly).is_ok());
     }
 
     #[test]
@@ -1058,7 +1070,7 @@ mod tests {
             let err = resolve_voice(&score, 0, 0.5, 0.0, 48_000, 0.5)
                 .expect_err("an out-of-range bus should be refused");
             assert!(
-                err.contains("outside the supported"),
+                err.contains(&format!("outside the buses 0 to {}", out_of_range - 1)),
                 "unexpected refusal for {score}: {err}"
             );
         }
@@ -2925,7 +2937,7 @@ fn resolve_voice_at(
             };
             let orbit = optional_f64(object.get("orbit"), "orbit")?.unwrap_or(1.0);
             if !(0.0..16.0).contains(&orbit) {
-                return Err(format!("orbit {orbit} is outside the supported 0..16 range").into());
+                return Err(format!("orbit {orbit} is outside the orbits 0 to 15").into());
             }
             let modulator_release = optional_f64(object.get("release"), "release")?
                 .unwrap_or(0.01)
@@ -2959,8 +2971,8 @@ fn resolve_voice_at(
                 bus: match optional_f64(object.get("bus"), "bus")? {
                     Some(bus) if !(0.0..rustel_audio::MAX_BUSES as f64).contains(&bus) => {
                         return Err(format!(
-                            "bus {bus} is outside the supported 0..{} range",
-                            rustel_audio::MAX_BUSES
+                            "bus {bus} is outside the buses 0 to {}",
+                            rustel_audio::MAX_BUSES - 1
                         )
                         .into());
                     }
@@ -3442,8 +3454,8 @@ fn synth_source(
             let channel = optional_f64(object.get("n"), "n")?.unwrap_or(0.0);
             if !(0.0..rustel_audio::input::MAX_INPUT_CHANNELS as f64).contains(&channel) {
                 return Err(format!(
-                    "in:{channel} is outside the supported 0..{} input channels",
-                    rustel_audio::input::MAX_INPUT_CHANNELS
+                    "in:{channel} is outside the input channels 0 to {}",
+                    rustel_audio::input::MAX_INPUT_CHANNELS - 1
                 ));
             }
             Ok(Some(rustel_audio::SynthSource::Input {
@@ -3455,8 +3467,8 @@ fn synth_source(
             let bus = optional_f64(object.get("n"), "n")?.unwrap_or(0.0);
             if !(0.0..rustel_audio::MAX_BUSES as f64).contains(&bus) {
                 return Err(format!(
-                    "bus {bus} is outside the supported 0..{} range",
-                    rustel_audio::MAX_BUSES
+                    "bus {bus} is outside the buses 0 to {}",
+                    rustel_audio::MAX_BUSES - 1
                 ));
             }
             Ok(Some(rustel_audio::SynthSource::Bus { bus: bus as u8 }))

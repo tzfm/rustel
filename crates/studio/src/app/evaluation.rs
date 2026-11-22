@@ -2000,11 +2000,11 @@ mod tests {
 
             // The orbit spelling of the same fault.
             let orbit = "the new score could not be played (scalar audio refused every onset of the \
-             replacement's first window (orbit 19999999 is outside the supported 0..16 range)); \
+             replacement's first window (orbit 19999999 is outside the orbits 0 to 15)); \
              putting the last audible score back";
             assert_eq!(
                 player_facing_error(orbit),
-                "orbit 19999999 is outside the supported 0..16 range - putting the last audible \
+                "orbit 19999999 is outside the orbits 0 to 15 - putting the last audible \
              score back"
             );
 
