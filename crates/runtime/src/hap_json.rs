@@ -99,8 +99,11 @@ pub struct QueryReport {
     pub query_threw: Option<String>,
 }
 
-/// The pitch control of `value`, `note` or `freq`, whose number is NaN or
-/// an infinity: see [`OnsetEventJson::non_finite_pitch`].
+/// The pitch control of `value` that a voice reads and that is NaN or an
+/// infinity: see [`OnsetEventJson::non_finite_pitch`]. As on strudel.cc, a
+/// `freq` that is a number other than 0 or NaN sets the pitch, so an
+/// infinite one is refused and a finite one leaves `note` unread; NaN and
+/// 0 leave the pitch to `note`. A talkit voice reads its own pitch.
 pub(crate) fn non_finite_pitch(value: &Value) -> Option<&'static str> {
     let materialized;
     let value = if matches!(value, Value::JsValue(_)) {
@@ -110,12 +113,19 @@ pub(crate) fn non_finite_pitch(value: &Value) -> Option<&'static str> {
         value
     };
     let object = value.as_object()?;
-    ["note", "freq"].into_iter().find(|name| {
-        object
-            .get(name)
-            .and_then(Value::as_f64)
-            .is_some_and(|number| !number.is_finite())
-    })
+    if object.get("talkit").is_some() {
+        return None;
+    }
+    match object.get("freq").and_then(Value::as_f64) {
+        Some(freq) if freq.is_infinite() => return Some("freq"),
+        Some(freq) if freq != 0.0 && !freq.is_nan() => return None,
+        _ => {}
+    }
+    object
+        .get("note")
+        .and_then(Value::as_f64)
+        .filter(|note| !note.is_finite())
+        .map(|_| "note")
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -142,7 +152,7 @@ pub struct OnsetEventJson {
     /// no pitch and plays at its default; the voice refuses the onset
     /// instead. Outputs that are no voice read the value as JSON writes it.
     #[serde(skip)]
-    pub non_finite_pitch: Option<&'static str>,
+    pub(crate) non_finite_pitch: Option<&'static str>,
     #[serde(default, skip_serializing_if = "is_zero")]
     pub ui_visuals: u64,
     /// `.log()`'s text, printed when this onset fires. Absent for the events
@@ -282,4 +292,50 @@ pub struct BenchMetrics {
 
 pub fn fraction_label(f: Fraction) -> String {
     f.show()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn controls(entries: &[(&str, Value)]) -> Value {
+        let mut map = rustel_core::OrderedMap::default();
+        for (name, value) in entries {
+            map.insert((*name).into(), value.clone());
+        }
+        Value::Object(map)
+    }
+
+    /// The pitch a voice reads decides: a finite `freq` leaves a NaN
+    /// `note` unread, NaN and 0 leave the pitch to `note`, and talkit
+    /// reads its own.
+    #[test]
+    fn the_pitch_a_voice_reads_is_the_one_judged() {
+        let nan = Value::F64(f64::NAN);
+        let inf = Value::F64(f64::INFINITY);
+        for (entries, judged) in [
+            (vec![("note", nan.clone())], Some("note")),
+            (vec![("note", Value::F64(f64::NEG_INFINITY))], Some("note")),
+            (vec![("freq", inf.clone())], Some("freq")),
+            (
+                vec![("note", nan.clone()), ("freq", Value::F64(440.0))],
+                None,
+            ),
+            (
+                vec![("note", Value::F64(60.0)), ("freq", nan.clone())],
+                None,
+            ),
+            (
+                vec![("note", nan.clone()), ("freq", Value::F64(0.0))],
+                Some("note"),
+            ),
+            (
+                vec![("note", nan.clone()), ("talkit", Value::Str("la".into()))],
+                None,
+            ),
+            (vec![("note", Value::F64(60.0)), ("gain", inf)], None),
+        ] {
+            assert_eq!(non_finite_pitch(&controls(&entries)), judged, "{entries:?}");
+        }
+    }
 }
