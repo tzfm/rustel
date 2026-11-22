@@ -490,8 +490,20 @@ impl IParamValueQueueTrait for Queue {
         }
     }
 
-    unsafe fn addPoint(&self, _offset: int32, _value: ParamValue, _index: *mut int32) -> tresult {
-        kResultFalse
+    unsafe fn addPoint(&self, offset: int32, value: ParamValue, index: *mut int32) -> tresult {
+        self.push(offset, value);
+        if !index.is_null() {
+            // SAFETY: the thread that runs the block does not write in a
+            // plugin call, and the plugin passes its own index.
+            let points = unsafe { &*self.points.get() };
+            let used = self.used.load(Ordering::Relaxed);
+            let at = points[..used]
+                .iter()
+                .position(|point| point.0 == offset)
+                .unwrap_or(used.saturating_sub(1));
+            unsafe { *index = at as int32 };
+        }
+        kResultOk
     }
 }
 
@@ -515,21 +527,28 @@ impl Changes {
     /// Adds a value of a parameter at a frame of the next block. Returns
     /// false when the block has no room for one more parameter.
     pub(crate) fn push(&self, id: u32, offset: i32, value: f64) -> bool {
+        let Some(slot) = self.slot(id) else {
+            return false;
+        };
+        self.queues[slot].push(offset, value);
+        true
+    }
+
+    /// The queue of `id`, a new one when the block has none yet. None when
+    /// the block has no room for one more parameter.
+    fn slot(&self, id: u32) -> Option<usize> {
         let used = self.used.load(Ordering::Relaxed);
         let slot = self.queues[..used]
             .iter()
             .position(|queue| queue.id.load(Ordering::Relaxed) == id)
             .unwrap_or(used);
-        let Some(queue) = self.queues.get(slot) else {
-            return false;
-        };
+        let queue = self.queues.get(slot)?;
         if slot == used {
             queue.id.store(id, Ordering::Relaxed);
             queue.used.store(0, Ordering::Relaxed);
             self.used.store(used + 1, Ordering::Relaxed);
         }
-        queue.push(offset, value);
-        true
+        Some(slot)
     }
 
     pub(crate) fn clear(&self) {
@@ -554,12 +573,26 @@ impl IParameterChangesTrait for Changes {
         }
     }
 
+    /// A plugin writes the values it changes itself in the output list of
+    /// a block, which the host reads none of. The list is still given, as
+    /// hosts give one: a plugin made with DPF asserts on every block
+    /// without it.
     unsafe fn addParameterData(
         &self,
-        _id: *const ParamID,
-        _index: *mut int32,
+        id: *const ParamID,
+        index: *mut int32,
     ) -> *mut IParamValueQueue {
-        std::ptr::null_mut()
+        if id.is_null() {
+            return std::ptr::null_mut();
+        }
+        // SAFETY: the plugin passes its own id and index for this call.
+        let Some(slot) = self.slot(unsafe { *id }) else {
+            return std::ptr::null_mut();
+        };
+        if !index.is_null() {
+            unsafe { *index = slot as int32 };
+        }
+        pointer(&self.queues[slot])
     }
 }
 
@@ -682,5 +715,39 @@ mod tests {
         state.restart_asked.store(false, Ordering::Release);
         assert_eq!(restart(!RestartFlags_::kLatencyChanged), kResultOk);
         assert!(changed() && !asked());
+    }
+
+    /// A plugin that writes its own parameter values gets a queue for each
+    /// one, reads back what it wrote, and the list is empty again once the
+    /// block is cleared.
+    #[test]
+    fn a_plugin_writes_its_own_values_in_the_output_list() {
+        let list = Changes::new();
+        let changes: vst3::ComPtr<IParameterChanges> =
+            list.to_com_ptr().expect("the parameter changes interface");
+        let (first, second): (ParamID, ParamID) = (7, 9);
+        let (mut at_first, mut at_second) = (-1, -1);
+        // SAFETY: the pointer holds the list for the whole test, and each
+        // call is handed live locals.
+        unsafe {
+            let one = changes.addParameterData(&first, &mut at_first);
+            let other = changes.addParameterData(&second, &mut at_second);
+            assert!(!one.is_null() && !other.is_null() && one != other);
+            assert_eq!((at_first, at_second), (0, 1));
+            assert_eq!(changes.getParameterCount(), 2);
+            assert_eq!(changes.getParameterData(1), other);
+            let queue = vst3::ComRef::from_raw(one).expect("the queue");
+            assert_eq!(queue.getParameterId(), 7);
+            let mut point = -1;
+            assert_eq!(queue.addPoint(32, 0.5, &mut point), kResultOk);
+            assert_eq!(point, 0);
+            assert_eq!(queue.getPointCount(), 1);
+            let (mut offset, mut value) = (0, 0.0);
+            assert_eq!(queue.getPoint(0, &mut offset, &mut value), kResultOk);
+            assert_eq!((offset, value), (32, 0.5));
+        }
+        list.clear();
+        // SAFETY: as above.
+        assert_eq!(unsafe { changes.getParameterCount() }, 0);
     }
 }

@@ -4,6 +4,7 @@
 
 - Scene > Save, and `:w` in Vim mode, save the scene without playing it. `:wq` and `:x` save it and close the tab.
 - A Studio crash saves unsaved edits, as quit does.
+- Fixed: a plugin made with DPF, such as the Dragonfly reverbs, no longer prints an assertion on every audio block: the host gives it a list for the parameter values it changes itself.
 - Changed: `.midi()` sends a pattern to MIDI in place of local audio, as on strudel.cc. A `ccn`/`ccv` pattern sent to MIDI no longer plays a sound. To hear a pattern and send it to MIDI, use `stack(p, p.midi())`.
 - Fixed: `cc(id, channel)` from `midin()` refuses a channel that is not a whole number from 1 to 16, instead of reading silence or cutting 1.5 to channel 1.
 - Fixed: a `vsti` note ends 1 ms early, as a MIDI note does, so a plugin such as TripleCheese no longer clicks where one note follows the next.
