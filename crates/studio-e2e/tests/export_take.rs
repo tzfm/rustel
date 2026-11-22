@@ -86,6 +86,53 @@ fn the_format_flip_retargets_the_file() {
     );
 }
 
+/// A strum at cycle zero moves its first voice before the export. That
+/// voice is silent, as on strudel.cc, and the take is still written.
+#[test]
+fn a_strum_at_cycle_zero_exports_its_file() {
+    let mut studio = hermetic();
+    let set = studio.set_directory().to_path_buf();
+    studio.set_score(
+        "$: note(\"<[a1,c2,e3,g4] [f1,a2,c3,e4]>\").strum(\"<.08 -.06>\").s(\"sine\").gain(0.1)",
+    );
+    studio.chord("ctrl+shift+x");
+    studio.press(KeyCode::Enter, KeyModifiers::NONE);
+    wait_for_export(&mut studio);
+    let status = studio.status().to_owned();
+    assert!(status.starts_with("exported"), "{status}");
+    let takes = std::fs::read_dir(set.join("exports"))
+        .expect("the exports folder")
+        .filter_map(Result::ok)
+        .filter(|take| take.metadata().is_ok_and(|file| file.len() > 44))
+        .count();
+    assert_eq!(takes, 1, "{status}");
+}
+
+/// Live play from cycle zero of a strum wide enough to move its first voice
+/// before the start: the voice is silent and the footer shows no error.
+#[test]
+fn a_strum_at_cycle_zero_plays_with_no_error() {
+    let mut studio = hermetic();
+    studio.set_score("$: note(\"c2,g4\").strum(0.25).s(\"sine\").gain(0.05)");
+    studio.chord("ctrl+s");
+    studio.pump_until(
+        std::time::Duration::from_secs(10),
+        "the score plays",
+        |studio| studio.status().starts_with("playing") || studio.errors().is_some(),
+    );
+    let started = std::time::Instant::now();
+    while started.elapsed() < std::time::Duration::from_secs(3) {
+        studio.pump();
+    }
+    let refusals: Vec<_> = studio
+        .log_texts()
+        .into_iter()
+        .filter(|line| line.contains("unrepresentable") || line.contains("refused"))
+        .collect();
+    assert_eq!(studio.errors(), None, "{refusals:?}");
+    assert!(refusals.is_empty(), "{refusals:?}");
+}
+
 /// Enter renders the scene as written: a real WAV appears in the set's
 /// exports folder, the status says where, and the log remembers.
 #[test]

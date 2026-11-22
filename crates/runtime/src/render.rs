@@ -325,11 +325,11 @@ pub(crate) fn plays_locally(onset: &OnsetEventJson) -> bool {
     crate::midi_onset::midi_route(onset).is_none()
 }
 
-/// Whether an onset falls before the first frame of a render, as the first
-/// voice of a `strum` at cycle zero does. strudel.cc does not schedule a
+/// Whether an onset falls before the first frame of a render or a live
+/// output, as the first voice of a `strum` at cycle zero does. strudel.cc does not schedule a
 /// sound in the past, so it plays nothing and is no refused voice. A time
 /// that is not finite is not one: the voice refuses it.
-fn before_the_render(onset: &OnsetEventJson, sample_rate: u32) -> bool {
+pub(crate) fn before_the_render(onset: &OnsetEventJson, sample_rate: u32) -> bool {
     onset.target_time.is_finite()
         && onset.target_time < 0.0
         && onset_frame_at(onset.target_time, sample_rate) == u64::MAX

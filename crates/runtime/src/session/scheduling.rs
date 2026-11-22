@@ -223,6 +223,10 @@ impl Session {
                     refused = Some(NO_MIDI_MESSAGE.to_string());
                     continue;
                 }
+                // Silent, as on strudel.cc: it says nothing of the update.
+                if crate::render::before_the_render(&onset, sample_rate) {
+                    continue;
+                }
                 match self.live_audio_event(&onset, sample_rate, cps, lookup) {
                     Ok(event) => {
                         self.csound.discard(&event.controls);
@@ -1342,6 +1346,11 @@ impl Session {
                                     }));
                                 }
                                 Some(event)
+                            }
+                            // Silent, as on strudel.cc, and no refusal.
+                            Err(_) if crate::render::before_the_render(onset, sample_rate) => {
+                                dispositions.refused += 1;
+                                None
                             }
                             Err(error) => {
                                 let message = error.to_string();
