@@ -8889,6 +8889,35 @@ fn a_graph_below_the_depth_limit_still_queries() {
 
 // -- check --------------------------------------------------------------
 
+/// A talkit setting the render refuses is a finding of the check, in the
+/// words the render uses, and one the render takes is not.
+#[test]
+fn check_names_a_talkit_setting_the_render_refuses() {
+    for (settings, said) in [
+        ("{pitch: 49}", "pitch takes 50 to 500"),
+        ("{speed: 150.5}", "speed takes a whole number"),
+        ("{q: 'garbled'}", "quality takes natural, monotone or sung"),
+        ("{out: 'x.wav'}", "`out` is not a setting"),
+    ] {
+        let score = format!("talkit('hello there', {settings})");
+        let out = run(&["check", "-e", &score, "--no-samples"]);
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert_eq!(out.status.code(), Some(1), "{score}: {stdout}");
+        assert!(stdout.contains(said), "{score}: {stdout}");
+    }
+    let out = run(&[
+        "check",
+        "-e",
+        "talkit('hello there', {pitch: 200})",
+        "--no-samples",
+    ]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+}
+
 /// The static lint never runs the score, so a name that only fails to
 /// resolve at evaluation time is invisible to it. `check` must still refuse
 /// it, the way `strudel.cc`'s `ReferenceError` would.

@@ -149,6 +149,11 @@ pub fn check_score_with(
             cancellation,
         ));
     }
+    if eval_error.is_none()
+        && let Some(report) = &first_cycle
+    {
+        diagnostics.extend(talkit_settings(report, source));
+    }
     if eval_error.is_none() && cancellation.load(Ordering::Relaxed) {
         eval_error = Some(EvalError {
             message: RuntimeError::Cancelled.to_string(),
@@ -225,6 +230,34 @@ fn notes_outside_their_fonts(
             continue;
         }
         let (from, to) = at.unwrap_or((0, 0));
+        diagnostics.push(Diagnostic {
+            level: Level::Value,
+            message,
+            from: char_floor(source, from),
+            to: char_floor(source, to),
+        });
+    }
+    diagnostics
+}
+
+/// The `talkit` notes of the first cycle whose settings a render refuses:
+/// a pitch or a speed out of its range, a quality, effort, language or
+/// personality the voice does not have, or a key it does not take. The
+/// check says so with the words the render uses, one time each.
+fn talkit_settings(report: &crate::hap_json::QueryReport, source: &str) -> Vec<Diagnostic> {
+    let mut said = std::collections::HashSet::new();
+    let mut diagnostics = Vec::new();
+    for hap in report.haps.iter().filter(|hap| hap.has_onset) {
+        let crate::hap_json::ValueJson::Raw(value) = &hap.value else {
+            continue;
+        };
+        let Some(message) = rustel_voice::talkit_refusal(value) else {
+            continue;
+        };
+        if !said.insert(message.clone()) {
+            continue;
+        }
+        let (from, to) = hap.context.first().copied().unwrap_or((0, 0));
         diagnostics.push(Diagnostic {
             level: Level::Value,
             message,

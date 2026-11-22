@@ -4038,6 +4038,36 @@ fn slice_refusal(begin: f64, end: f64) -> String {
 /// The longest text one `talkit` hap speaks, in characters.
 const MAX_SPEECH_CHARS: usize = 300;
 
+/// The words a render refuses a `talkit` hap with for its settings: the
+/// text and each setting, judged as the voice judges them, without
+/// speaking. `None` for a hap with no `talkit` or with settings the voice
+/// takes. `rustel check` reports these.
+pub fn talkit_refusal(value: &serde_json::Value) -> Option<String> {
+    let object = value.as_object()?;
+    let fields = object.get("talkit")?;
+    let checked = match fields.as_object() {
+        None => Err(VoiceError::InvalidControl(
+            "talkit must be an object with a text field".into(),
+        )),
+        Some(fields) => {
+            let length = fields
+                .get("text")
+                .and_then(serde_json::Value::as_str)
+                .map(|text| text.chars().count());
+            match length {
+                None => Err(VoiceError::InvalidControl(
+                    "talkit text must be text".into(),
+                )),
+                Some(length) if length > MAX_SPEECH_CHARS => Err(VoiceError::InvalidControl(
+                    format!("talkit text is {length} characters; maximum is {MAX_SPEECH_CHARS}"),
+                )),
+                Some(_) => speech_params(object, fields).map(|_| ()),
+            }
+        }
+    };
+    checked.err().map(VoiceError::into_message)
+}
+
 /// The `talkit` hap: the host renders the text to a sample and the sampler
 /// plays it. The spoken word is the source, so `speed` is its playback rate
 /// and `cut`, `release` and `clip` keep their sample meanings. `freq`, `note`
