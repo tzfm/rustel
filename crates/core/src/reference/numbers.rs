@@ -280,6 +280,8 @@ pub const REFERENCE_NUMBERS: &[ReferenceNumber] = &[
     // Effects.
     // "a threshold in dB, clamped to -100..0"
     count("compressor", "threshold", -100.0, 0.0),
+    // "the ceiling in dBFS, at or below 0"; the limiter floors at -60.
+    number("limit", "ceiling", -60.0, 0.0, 0.5),
     // "clamped to 0..0.98"
     number("delayfeedback", "feedback", 0.0, 0.98, 0.01),
     // "Positive times are capped at 1 second"
