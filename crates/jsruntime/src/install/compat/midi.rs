@@ -198,7 +198,21 @@ pub(super) fn install<'js>(
                 ctx.clone(),
                 hr_cc(move |ctx, cc, channel| {
                     let cc = optional_number(&ctx, cc.0.as_ref())?;
+                    let named = channel
+                        .0
+                        .as_ref()
+                        .is_some_and(|value| !value.is_null() && !value.is_undefined());
                     let channel = optional_number(&ctx, channel.0.as_ref())?;
+                    // A channel with no table throws on strudel.cc; one read
+                    // here would stay silent with nothing said.
+                    if named && !(channel.fract() == 0.0 && (1.0..=16.0).contains(&channel)) {
+                        return Err(rquickjs::Exception::throw_message(
+                            &ctx,
+                            &format!(
+                                "cc() reads MIDI channels 1 to 16, got {channel}; leave the channel out to read any channel"
+                            ),
+                        ));
+                    }
                     let port = Arc::clone(&port);
                     // Volatile: the controller's latest value, read at
                     // query time, so no result cache may keep it.

@@ -9960,3 +9960,26 @@ fn until_silence_states_its_rule_for_audio() {
     let onsets = take("until-silence.json");
     assert!(!onsets.contains("until silence"), "{onsets}");
 }
+
+/// `cc(id, channel)` reads channels 1 to 16. Another channel, or a
+/// fraction, is refused with the reason instead of reading silence.
+#[test]
+fn a_cc_channel_outside_1_to_16_is_refused() {
+    let score = |channel: &str| {
+        format!(
+            "const cc = await midin('nothing plugged in')\n$: note(\"c2\").s(\"sawtooth\").lpf(cc(74{channel}).range(200, 8000))"
+        )
+    };
+    for channel in [", 17", ", -1", ", 1.5", ", 0"] {
+        let out = run(&["query", "-e", &score(channel)]);
+        assert!(!out.status.success(), "{channel}");
+        let said = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            said.contains("reads MIDI channels 1 to 16"),
+            "{channel}: {said}"
+        );
+    }
+    for channel in ["", ", 1", ", 16"] {
+        ok_output(&["query", "-e", &score(channel)]);
+    }
+}
