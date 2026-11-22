@@ -1029,11 +1029,15 @@ fn a_source_turned_off_and_on_again_reruns_the_refused_update() {
         "samples('{origin}/map.json')\n$: s(\"sn\").gain(0.02)"
     ));
     studio.chord("ctrl+s");
+    // One retry a second at most: a press each poll stacks updates.
+    let mut pressed = std::time::Instant::now();
     studio.pump_until(Duration::from_secs(20), "the score plays sn", |studio| {
-        if studio.status().contains("refused") {
+        if studio.status().contains("refused") && pressed.elapsed() > Duration::from_secs(1) {
             studio.chord("ctrl+s");
+            pressed = std::time::Instant::now();
         }
-        studio.status().starts_with("updated") || studio.status() == "playing from the top"
+        let status = studio.status();
+        status.starts_with("updated") || status.starts_with("playing")
     });
     open_permissions(&mut studio);
     select_row(&mut studio, &format!("▸ {origin}"));
@@ -1048,8 +1052,8 @@ fn a_source_turned_off_and_on_again_reruns_the_refused_update() {
         "samples('{origin}/map.json')\n$: s(\"sn sn\").gain(0.03)"
     ));
     studio.chord("ctrl+s");
-    // The playing score lost sn too, and its warning can take the status
-    // line. The refusal stays on the footer.
+    // Read off the screen: a notice about the layer still playing can take
+    // the status line over.
     studio.pump_until(Duration::from_secs(10), "the update is refused", |studio| {
         studio
             .rows()
@@ -1062,10 +1066,20 @@ fn a_source_turned_off_and_on_again_reruns_the_refused_update() {
     studio.press(KeyCode::Enter, KeyModifiers::NONE);
     studio.settle();
     studio.press(KeyCode::Esc, KeyModifiers::NONE);
+    // The refused update runs, and the check reads the names the map
+    // brought again: no finding is left standing about the sound.
     studio.pump_until(
         Duration::from_secs(20),
         "the refused update runs",
-        |studio| studio.status().starts_with("updated"),
+        |studio| {
+            let status = studio.status();
+            !status.contains("refused")
+                && !status.contains("updating the score")
+                && studio
+                    .rows()
+                    .iter()
+                    .all(|row| !row.contains("unknown sound"))
+        },
     );
 }
 

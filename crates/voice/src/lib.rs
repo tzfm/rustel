@@ -264,6 +264,18 @@ mod classification_tests {
         ));
     }
 
+    /// A limit is a ceiling at or below full scale: one above it is
+    /// refused and says why, and 0 itself plays.
+    #[test]
+    fn a_limit_above_zero_dbfs_is_refused() {
+        assert!(matches!(
+            refusal(&json!({ "s": "sine", "limit": 3 }), &BundledOnly),
+            VoiceError::InvalidControl(message) if message.contains("above the 0 dBFS ceiling")
+        ));
+        assert!(detailed(&json!({ "s": "sine", "limit": 0 }), &BundledOnly).is_ok());
+        assert!(detailed(&json!({ "s": "sine", "limit": -6 }), &BundledOnly).is_ok());
+    }
+
     #[test]
     fn fm_route_capacity_is_an_invalid_control_not_an_asset_error() {
         let mut value = json!({ "s": "sine" });
@@ -1166,6 +1178,19 @@ mod tests {
             error.contains("has no note at midi 60: it has gaps between midi 48 and 96"),
             "{error}"
         );
+        // A check tells it apart from a font that failed to load.
+        let error = resolve_voice_with_samples_detailed(
+            &serde_json::json!({ "s": "gm_clarinet", "note": 36 }),
+            0,
+            0.5,
+            0.0,
+            0.0,
+            48_000,
+            0.5,
+            &Clarinet,
+        )
+        .expect_err("no zone at 36");
+        assert!(matches!(error, VoiceError::NoteOutsideFont(_)), "{error}");
     }
 
     /// A bank named by digits plays: mini-notation reads `s("808")` as a
@@ -2463,6 +2488,9 @@ pub enum VoiceError {
     SampleLoading(String),
     /// The selected sample or wavetable failed to fetch or decode.
     SampleFailed(String),
+    /// A soundfont that loaded has no zone for the note: it plays silence,
+    /// as on strudel.cc.
+    NoteOutsideFont(String),
     /// No currently loaded sample bank, wavetable or synth resolves this name.
     UnknownSound(String),
 }
@@ -2473,6 +2501,7 @@ impl VoiceError {
             Self::InvalidControl(message)
             | Self::SampleLoading(message)
             | Self::SampleFailed(message)
+            | Self::NoteOutsideFont(message)
             | Self::UnknownSound(message) => message,
         }
     }
@@ -2484,6 +2513,7 @@ impl std::fmt::Display for VoiceError {
             Self::InvalidControl(message)
             | Self::SampleLoading(message)
             | Self::SampleFailed(message)
+            | Self::NoteOutsideFont(message)
             | Self::UnknownSound(message) => message,
         };
         f.write_str(message)
@@ -4318,7 +4348,7 @@ fn sample_controls(
                     } else {
                         format!("it plays midi {low} to {high}")
                     };
-                    return Err(VoiceError::SampleFailed(format!(
+                    return Err(VoiceError::NoteOutsideFont(format!(
                         "sample \"{name}:{n}\" has no note at midi {midi}: {range}"
                     )));
                 }
@@ -6527,6 +6557,12 @@ fn limit_controls(
     let Some(threshold_db) = optional_f64(object.get("limit"), "limit")? else {
         return Ok(None);
     };
+    // A ceiling above full scale would hold nothing back.
+    if threshold_db > 0.0 {
+        return Err(format!(
+            "limit {threshold_db} is above the 0 dBFS ceiling: a limit is at or below 0"
+        ));
+    }
     let character = match object.get("limitchar") {
         None | Some(serde_json::Value::Null) => rustel_audio::LimiterCharacter::default(),
         Some(serde_json::Value::String(name)) => rustel_audio::LimiterCharacter::parse(name)

@@ -99,11 +99,17 @@ pub fn check_score_with(
     // count or a Euclid step past its limit, or a KabelSalat graph that will
     // not build. Query its first cycle, as the first update would, so the
     // check reports what query and export would.
+    let mut first_cycle = None;
     if eval_error.is_none() && !cancellation.load(Ordering::Relaxed) {
         let thrown = match session.query_report(Fraction::ZERO, Fraction::ONE) {
-            Ok(report) => report
-                .query_threw
-                .map(|message| format!("the pattern threw while querying: {message}")),
+            Ok(report) => {
+                let thrown = report
+                    .query_threw
+                    .clone()
+                    .map(|message| format!("the pattern threw while querying: {message}"));
+                first_cycle = Some(report);
+                thrown
+            }
             Err(error) => Some(error.to_string()),
         };
         // A stop that lands during the query is the check's cancellation,
@@ -130,7 +136,19 @@ pub fn check_score_with(
     }
     // Evaluation queues imports under the session's existing sample grants.
     // The linter judges only the sources the loader has finished publishing.
-    let diagnostics = lint::lint_with(source, false, library, context);
+    let mut diagnostics = lint::lint_with(source, false, library, context);
+    if eval_error.is_none()
+        && library.is_some()
+        && !cancellation.load(Ordering::Relaxed)
+        && let Some(report) = &first_cycle
+    {
+        diagnostics.extend(notes_outside_their_fonts(
+            report,
+            session,
+            source,
+            cancellation,
+        ));
+    }
     if eval_error.is_none() && cancellation.load(Ordering::Relaxed) {
         eval_error = Some(EvalError {
             message: RuntimeError::Cancelled.to_string(),
@@ -141,6 +159,90 @@ pub fn check_score_with(
         diagnostics,
         eval_error,
     }
+}
+
+/// The notes of the first cycle that a soundfont has no zone for: they play
+/// as silence, as on strudel.cc, and the check says so with the words a
+/// render uses. Each note is resolved as a voice resolves it, so the sound
+/// is the one that plays. The fonts the cycle names are fetched first, for
+/// at most a few seconds; a font that does not come in, or a `samples()`
+/// still on its way that may name the sound, is not judged.
+fn notes_outside_their_fonts(
+    report: &crate::hap_json::QueryReport,
+    session: &Session,
+    source: &str,
+    cancellation: &AtomicBool,
+) -> Vec<Diagnostic> {
+    let Some(samples) = session.sample_library() else {
+        return Vec::new();
+    };
+    let cps = session.config().cps;
+    let onsets: Vec<_> = report
+        .haps
+        .iter()
+        .filter(|hap| hap.has_onset)
+        .filter_map(|hap| match &hap.value {
+            crate::hap_json::ValueJson::Raw(value @ serde_json::Value::Object(_)) => {
+                Some((value, hap.context.first().copied()))
+            }
+            _ => None,
+        })
+        .collect();
+    let resolve = |value| {
+        rustel_voice::resolve_voice_with_samples_detailed(
+            value,
+            0,
+            0.25,
+            0.0,
+            0.0,
+            48_000,
+            cps,
+            samples.as_ref(),
+        )
+    };
+    // Asking is what starts the fetch.
+    let loading = onsets.iter().fold(false, |loading, (value, _)| {
+        matches!(
+            resolve(value),
+            Err(rustel_voice::VoiceError::SampleLoading(_))
+        ) || loading
+    });
+    if loading {
+        samples.wait_until_idle_cancellable(Duration::from_secs(5), || {
+            cancellation.load(Ordering::Relaxed)
+        });
+    }
+    if samples.manifests_pending() > 0 {
+        return Vec::new();
+    }
+    let mut said = std::collections::HashSet::new();
+    let mut diagnostics = Vec::new();
+    for (value, at) in onsets {
+        let Err(rustel_voice::VoiceError::NoteOutsideFont(message)) = resolve(value) else {
+            continue;
+        };
+        if !said.insert(message.clone()) {
+            continue;
+        }
+        let (from, to) = at.unwrap_or((0, 0));
+        diagnostics.push(Diagnostic {
+            level: Level::Value,
+            message,
+            from: char_floor(source, from),
+            to: char_floor(source, to),
+        });
+    }
+    diagnostics
+}
+
+/// `at`, moved back to the start of the character it falls in, and no
+/// further than the end of `source`.
+fn char_floor(source: &str, at: usize) -> usize {
+    let mut at = at.min(source.len());
+    while !source.is_char_boundary(at) {
+        at -= 1;
+    }
+    at
 }
 
 /// Pull the line number back out of a `" - line N"` or `" - line N, column
@@ -159,6 +261,16 @@ fn extract_reported_line(message: &str) -> Option<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A position inside a character moves back to its start, so a
+    /// finding never cuts the score's text in two.
+    #[test]
+    fn a_finding_starts_on_a_character() {
+        let source = "// 🎵\nnote(\"c2\")";
+        assert_eq!(char_floor(source, 4), 3);
+        assert_eq!(char_floor(source, 3), 3);
+        assert_eq!(char_floor(source, 999), source.len());
+    }
 
     #[test]
     fn extracts_a_line_with_no_column() {
