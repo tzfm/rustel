@@ -41,6 +41,17 @@ fn row_with(studio: &mut Hermetic, label: &str) -> String {
         .unwrap_or_else(|| panic!("no row reads {label:?}:\n{}", studio.rows().join("\n")))
 }
 
+/// Pump until the studio has heard back about a refused sample source: the
+/// refusal lands on its own turn, and a busy machine can take longer than
+/// a settle, so the permissions page would not list it yet.
+fn wait_for_refused_source(studio: &mut Hermetic) {
+    studio.pump_until(Duration::from_secs(10), "the source is refused", |studio| {
+        let status = studio.status();
+        status.contains("is not allowed for samples")
+            || status.contains("not an allowed sample source")
+    });
+}
+
 /// Open the sheet and walk to the permissions page, wherever the sheet
 /// left it - the sheet keeps its page across closes, so a second visit
 /// does not start on the first one. The orchestra switch is on that page
@@ -941,20 +952,22 @@ fn a_refused_sample_folder_is_allowed_with_one_key_and_kept() {
 
     studio.set_score("samples('http://kit.invalid/kit.json')\n$: s(\"bd\")");
     studio.chord("ctrl+s");
-    studio.settle();
+    wait_for_refused_source(&mut studio);
     open_permissions(&mut studio);
     select_row(&mut studio, "▸ http://kit.invalid");
     let refused = row_with(&mut studio, "http://kit.invalid");
     assert!(refused.contains("samples  off"), "{refused}");
     studio.press(KeyCode::Enter, KeyModifiers::NONE);
-    studio.settle();
-    let allowed = row_with(&mut studio, "http://kit.invalid");
-    assert!(allowed.contains("samples  on"), "{allowed}");
+    // Read before the re-run it starts: the fetch of a host that does not
+    // exist then says so on the same line.
     assert!(
         studio.status().contains("http://kit.invalid allowed"),
         "{}",
         studio.status()
     );
+    studio.settle();
+    let allowed = row_with(&mut studio, "http://kit.invalid");
+    assert!(allowed.contains("samples  on"), "{allowed}");
 
     studio.press(KeyCode::Esc, KeyModifiers::NONE);
     studio.settle();
@@ -1094,7 +1107,7 @@ fn a_refused_folder_is_cut_down_to_its_domain_with_e() {
     let mut studio = hermetic();
     studio.set_score("samples('https://kit.invalid/kits/808/kit.json')\n$: s(\"bd\")");
     studio.chord("ctrl+s");
-    studio.settle();
+    wait_for_refused_source(&mut studio);
     open_permissions(&mut studio);
     select_row(&mut studio, "▸ kit.invalid/kits/808/");
     studio.press(KeyCode::Char('e'), KeyModifiers::NONE);
