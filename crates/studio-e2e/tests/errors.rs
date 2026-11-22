@@ -150,3 +150,25 @@ fn select_prebake_row(studio: &mut rustel_studio_e2e::Hermetic) {
         studio.rows().join("\n")
     );
 }
+
+/// An update the engine refuses ends the line that said it was being
+/// evaluated: the footer says it was refused, under the reason.
+#[test]
+fn a_refused_update_no_longer_says_it_is_evaluating() {
+    let mut studio = hermetic();
+    studio.chord("ctrl+s");
+    studio.settle();
+    studio.set_score("$: note(\"c3\").s(\"sine\").gain(0.05).orbit(16)");
+    studio.chord("ctrl+s");
+    studio.pump_until(
+        std::time::Duration::from_secs(10),
+        "the refusal reaches the footer",
+        |studio| studio.errors().is_some(),
+    );
+    let reason = studio.errors().unwrap_or_default();
+    assert!(reason.contains("orbit"), "{reason}");
+    assert_eq!(
+        studio.status(),
+        "update refused - the last good score keeps playing"
+    );
+}
