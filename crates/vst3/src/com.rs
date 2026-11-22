@@ -563,6 +563,92 @@ impl IParameterChangesTrait for Changes {
     }
 }
 
+/// Where a plugin writes the parameter values it changes itself in a block.
+/// The host reads none of them back: a plugin that moves its own value is
+/// heard, and its editor shows it. A list is still given, as hosts give
+/// one: a plugin made with DPF asserts on every block without it.
+pub(crate) struct OutputChanges {
+    queue: ComWrapper<OutputQueue>,
+}
+
+impl OutputChanges {
+    pub(crate) fn new() -> ComWrapper<Self> {
+        ComWrapper::new(Self {
+            queue: ComWrapper::new(OutputQueue {
+                id: AtomicU32::new(0),
+            }),
+        })
+    }
+}
+
+impl Class for OutputChanges {
+    type Interfaces = (IParameterChanges,);
+}
+
+impl IParameterChangesTrait for OutputChanges {
+    unsafe fn getParameterCount(&self) -> int32 {
+        0
+    }
+
+    unsafe fn getParameterData(&self, _index: int32) -> *mut IParamValueQueue {
+        std::ptr::null_mut()
+    }
+
+    unsafe fn addParameterData(
+        &self,
+        id: *const ParamID,
+        index: *mut int32,
+    ) -> *mut IParamValueQueue {
+        if id.is_null() {
+            return std::ptr::null_mut();
+        }
+        // SAFETY: the plugin passes its own id and index for this call.
+        unsafe {
+            self.queue.id.store(*id, Ordering::Relaxed);
+            if !index.is_null() {
+                *index = 0;
+            }
+        }
+        pointer(&self.queue)
+    }
+}
+
+/// The one queue of [`OutputChanges`]: it takes every point and keeps none.
+struct OutputQueue {
+    id: AtomicU32,
+}
+
+impl Class for OutputQueue {
+    type Interfaces = (IParamValueQueue,);
+}
+
+impl IParamValueQueueTrait for OutputQueue {
+    unsafe fn getParameterId(&self) -> ParamID {
+        self.id.load(Ordering::Relaxed)
+    }
+
+    unsafe fn getPointCount(&self) -> int32 {
+        0
+    }
+
+    unsafe fn getPoint(
+        &self,
+        _index: int32,
+        _offset: *mut int32,
+        _value: *mut ParamValue,
+    ) -> tresult {
+        kInvalidArgument
+    }
+
+    unsafe fn addPoint(&self, _offset: int32, _value: ParamValue, index: *mut int32) -> tresult {
+        if !index.is_null() {
+            // SAFETY: the plugin passes its own index for this call.
+            unsafe { *index = 0 };
+        }
+        kResultOk
+    }
+}
+
 /// The note starts and note ends one audio block carries to a plugin.
 pub(crate) const MAX_EVENTS: usize = 256;
 
@@ -682,5 +768,29 @@ mod tests {
         state.restart_asked.store(false, Ordering::Release);
         assert_eq!(restart(!RestartFlags_::kLatencyChanged), kResultOk);
         assert!(changed() && !asked());
+    }
+
+    /// A plugin that writes its own parameter values gets a queue for each
+    /// one, and every point it adds is taken; the list keeps none of them.
+    #[test]
+    fn a_plugin_may_write_its_own_values_and_none_are_kept() {
+        let changes: vst3::ComPtr<IParameterChanges> = OutputChanges::new()
+            .to_com_ptr()
+            .expect("the parameter changes interface");
+        let id: ParamID = 7;
+        let mut index = -1;
+        // SAFETY: the pointer holds the list for the whole test, and each
+        // call is handed live locals.
+        unsafe {
+            let queue = changes.addParameterData(&id, &mut index);
+            assert!(!queue.is_null(), "a queue to write in");
+            assert_eq!(index, 0);
+            let queue = vst3::ComRef::from_raw(queue).expect("the queue");
+            assert_eq!(queue.getParameterId(), 7);
+            let mut point = -1;
+            assert_eq!(queue.addPoint(0, 0.5, &mut point), kResultOk);
+            assert_eq!(queue.getPointCount(), 0);
+            assert_eq!(changes.getParameterCount(), 0);
+        }
     }
 }

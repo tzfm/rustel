@@ -17,7 +17,8 @@ use vst3::Steinberg::*;
 use vst3::{ComPtr, ComWrapper};
 
 use crate::com::{
-    Changes, Events, Handler, HostApp, MAX_CHANGES, MAX_EVENTS, Stream, pointer, wide_to_string,
+    Changes, Events, Handler, HostApp, MAX_CHANGES, MAX_EVENTS, OutputChanges, Stream, pointer,
+    wide_to_string,
 };
 use crate::module::{ClassInfo, Module};
 use crate::{Job, ParamInfo, ParamRole, canonical, preset};
@@ -657,6 +658,7 @@ impl Loaded {
             plugin: Some(self),
             any_thread: true,
             changes: Changes::new(),
+            output_changes: OutputChanges::new(),
             events: Events::new(),
             notes: [HeldNote::default(); MAX_NOTES],
             note_count: 0,
@@ -818,6 +820,8 @@ pub(crate) struct Instance {
     /// [`Instance::set_any_thread`].
     any_thread: bool,
     changes: ComWrapper<Changes>,
+    /// The list a plugin writes its own parameter changes in, unread.
+    output_changes: ComWrapper<OutputChanges>,
     events: ComWrapper<Events>,
     notes: [HeldNote; MAX_NOTES],
     note_count: usize,
@@ -1482,7 +1486,7 @@ impl Instance {
             inputs: self.inputs.as_mut_ptr(),
             outputs: self.outputs.as_mut_ptr(),
             inputParameterChanges: pointer(&self.changes),
-            outputParameterChanges: std::ptr::null_mut(),
+            outputParameterChanges: pointer(&self.output_changes),
             inputEvents: pointer(&self.events),
             outputEvents: std::ptr::null_mut(),
             processContext: &mut context,
