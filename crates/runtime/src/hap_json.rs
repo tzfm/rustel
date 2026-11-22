@@ -59,6 +59,35 @@ impl ValueJson {
     }
 }
 
+impl ValueJson {
+    /// The value an onset hands its voice. JSON has no NaN or infinity, so
+    /// a `note` or `freq` that is not a finite number would arrive as null,
+    /// which a voice reads as no pitch and plays at its default. It arrives
+    /// as its JavaScript text instead, which the voice refuses.
+    pub fn for_voice(value: &Value) -> Self {
+        let mut json = Self::from_value(value);
+        if let (Value::Object(entries), Self::Raw(serde_json::Value::Object(map))) =
+            (value, &mut json)
+        {
+            for key in ["note", "freq"] {
+                if let Some(Value::F64(number)) = entries.get(key)
+                    && !number.is_finite()
+                {
+                    let text = if number.is_nan() {
+                        "NaN"
+                    } else if *number > 0.0 {
+                        "Infinity"
+                    } else {
+                        "-Infinity"
+                    };
+                    map.insert(key.into(), serde_json::Value::String(text.into()));
+                }
+            }
+        }
+        json
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct HapJson {
     pub whole: Option<SpanJson>,
@@ -257,4 +286,28 @@ pub struct BenchMetrics {
 
 pub fn fraction_label(f: Fraction) -> String {
     f.show()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ValueJson;
+    use rustel_core::Value;
+
+    /// A pitch JSON cannot hold reaches the voice as its JavaScript text,
+    /// and every other control as JSON writes it.
+    #[test]
+    fn a_pitch_that_is_not_finite_reaches_the_voice_as_text() {
+        let mut entries = rustel_core::OrderedMap::default();
+        entries.insert("note".into(), Value::F64(f64::NAN));
+        entries.insert("freq".into(), Value::F64(f64::NEG_INFINITY));
+        entries.insert("gain".into(), Value::F64(f64::INFINITY));
+        let value = Value::Object(entries);
+        let ValueJson::Raw(json) = ValueJson::for_voice(&value) else {
+            panic!("an object is raw JSON");
+        };
+        assert_eq!(
+            json,
+            serde_json::json!({ "note": "NaN", "freq": "-Infinity", "gain": null })
+        );
+    }
 }

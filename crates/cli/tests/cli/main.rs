@@ -5477,6 +5477,44 @@ fn talkit_speaks_a_number() {
 /// The command line prints recoverable notices on stderr, which a library
 /// Session does only when its host opts in. A notice that every note raises
 /// prints once, with the number of onsets.
+/// A note or freq that is not a finite number, such as the log2 of 0, is a
+/// refused voice, not a note played at the synth's default pitch.
+#[test]
+fn a_pitch_that_is_not_a_finite_number_is_refused() {
+    let path = scratch("non-finite-pitch.wav");
+    for (score, said) in [
+        (
+            r#"note(run(2).add(-1).log2()).s("triangle")"#,
+            [r#"not a note: \"NaN\""#, r#"not a note: \"-Infinity\""#],
+        ),
+        (
+            r#"freq(run(2).add(-1).log2()).s("triangle")"#,
+            ["freq must be a finite number"; 2],
+        ),
+    ] {
+        let out = run(&[
+            "export",
+            "-e",
+            score,
+            "--cycles",
+            "1",
+            "-o",
+            path.to_str().expect("UTF-8 path"),
+        ]);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(out.status.success(), "{score}: {stderr}");
+        for said in said {
+            assert!(
+                stderr
+                    .lines()
+                    .any(|line| line.starts_with(r#"{"voice_refused":"#) && line.contains(said)),
+                "{score}: {stderr}"
+            );
+        }
+    }
+    let _ = std::fs::remove_file(&path);
+}
+
 #[test]
 fn render_prints_recoverable_notices_on_stderr() {
     let path = scratch("refused-voice.wav");

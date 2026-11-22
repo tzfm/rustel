@@ -192,7 +192,7 @@ impl Session {
                         live_controls: event.live_controls,
                         ui_visuals: event.ui_visuals,
                         cps: event.cps,
-                        value: ValueJson::from_value(&event.value),
+                        value: ValueJson::for_voice(&event.value),
                         value_show: event.value.show(),
                         log_line: event.log_line.as_deref().map(str::to_owned),
                     });
