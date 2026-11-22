@@ -470,6 +470,11 @@ impl App {
                     ErrorOwner::Setup,
                     format!("{}: {message}", sent.scope.tab_name()),
                 );
+                // The chain is over, so the line that said it was being
+                // applied is too.
+                if self.status.starts_with("applying the ") {
+                    self.status = format!("{} refused", sent.scope.tab_name());
+                }
             }
         }
         self.flush_pending_prebake();
