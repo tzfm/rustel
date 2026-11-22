@@ -5996,7 +5996,7 @@ fn modulator_controls(
                     "bmod",
                     &format!(
                         "bus {bus} is outside the buses 0 to {}",
-                    rustel_audio::MAX_BUSES - 1
+                        rustel_audio::MAX_BUSES - 1
                     ),
                 );
                 continue;
