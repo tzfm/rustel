@@ -4,9 +4,11 @@
 
 - Scene > Save, and `:w` in Vim mode, save the scene without playing it. `:wq` and `:x` save it and close the tab.
 - A Studio crash saves unsaved edits, as quit does.
+- Fixed: a plugin made with DPF, such as the Dragonfly reverbs, no longer prints an assertion on every audio block: the host gives it a list for the parameter values it changes itself.
 - Changed: `.midi()` sends a pattern to MIDI in place of local audio, as on strudel.cc. A `ccn`/`ccv` pattern sent to MIDI no longer plays a sound. To hear a pattern and send it to MIDI, use `stack(p, p.midi())`.
 - Fixed: `cc(id, channel)` from `midin()` refuses a channel that is not a whole number from 1 to 16, instead of reading silence or cutting 1.5 to channel 1.
 - Fixed: a `vsti` note ends 1 ms early, as a MIDI note does, so a plugin such as TripleCheese no longer clicks where one note follows the next.
+- Fixed: a refused orbit, bus or input channel names the last one allowed (`orbit 16 is outside the orbits 0 to 15`), instead of a range that read as if 16 were allowed.
 - Fixed: Enter on a preset or a parameter of the plugin in a `vsti("name"` call still being typed writes the options object and closes the call, instead of doing nothing.
 - Fixed: an export, a replay export or a stems export that cannot write a file names that file, instead of a bare "No such file or directory".
 - Vim mode: `J` and `gJ` join lines, as in Vim. The shipped `$` label jumps move from `J` and `K` to `]$` and `[$`.

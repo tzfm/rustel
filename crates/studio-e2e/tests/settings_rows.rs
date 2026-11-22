@@ -1013,6 +1013,10 @@ fn a_source_turned_off_and_on_again_reruns_the_refused_update() {
     studio.chord("ctrl+s");
     studio.settle();
     open_permissions(&mut studio);
+    // The row comes once the engine has refused the map.
+    studio.pump_until(Duration::from_secs(10), "the source is refused", |studio| {
+        studio.rows().iter().any(|row| row.contains(&origin))
+    });
     select_row(&mut studio, &format!("▸ {origin}"));
     studio.press(KeyCode::Enter, KeyModifiers::NONE);
     studio.settle();

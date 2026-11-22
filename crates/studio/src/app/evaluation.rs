@@ -245,12 +245,12 @@ impl App {
     /// prebake path, which differ only in what the checker is told the text
     /// is and in what the message says was not taken.
     pub(super) fn refuse_unclean(&mut self, revision: Revision, source: &Arc<str>) -> bool {
-        let scene = self.scenes.current();
-        let (id, prebake) = (scene.id, scene.prebake());
         // An import whose failure has rested a few seconds is asked for
         // again. This update is still refused for it; the next one is not,
         // once it is in.
-        self.retry_failed_imports(id, false);
+        self.retry_failed_imports(self.scenes.current().id, false);
+        let scene = self.scenes.current();
+        let (id, prebake) = (scene.id, scene.prebake());
         let mini = self.options.mini && scene.is_score();
         let context = self.lint_context_for(scene);
         let library = self.worker.library();
@@ -2000,11 +2000,11 @@ mod tests {
 
             // The orbit spelling of the same fault.
             let orbit = "the new score could not be played (scalar audio refused every onset of the \
-             replacement's first window (orbit 19999999 is outside the supported 0..16 range)); \
+             replacement's first window (orbit 19999999 is outside the orbits 0 to 15)); \
              putting the last audible score back";
             assert_eq!(
                 player_facing_error(orbit),
-                "orbit 19999999 is outside the supported 0..16 range - putting the last audible \
+                "orbit 19999999 is outside the orbits 0 to 15 - putting the last audible \
              score back"
             );
 

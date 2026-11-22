@@ -657,6 +657,7 @@ impl Loaded {
             plugin: Some(self),
             any_thread: true,
             changes: Changes::new(),
+            output_changes: Changes::new(),
             events: Events::new(),
             notes: [HeldNote::default(); MAX_NOTES],
             note_count: 0,
@@ -818,6 +819,8 @@ pub(crate) struct Instance {
     /// [`Instance::set_any_thread`].
     any_thread: bool,
     changes: ComWrapper<Changes>,
+    /// The list a plugin writes its own parameter changes in, unread.
+    output_changes: ComWrapper<Changes>,
     events: ComWrapper<Events>,
     notes: [HeldNote; MAX_NOTES],
     note_count: usize,
@@ -1482,7 +1485,7 @@ impl Instance {
             inputs: self.inputs.as_mut_ptr(),
             outputs: self.outputs.as_mut_ptr(),
             inputParameterChanges: pointer(&self.changes),
-            outputParameterChanges: std::ptr::null_mut(),
+            outputParameterChanges: pointer(&self.output_changes),
             inputEvents: pointer(&self.events),
             outputEvents: std::ptr::null_mut(),
             processContext: &mut context,
@@ -1491,6 +1494,7 @@ impl Instance {
         // memory this instance owns for the full call.
         let result = unsafe { ((*(*processor).vtbl).process)(processor, &mut data) };
         self.changes.clear();
+        self.output_changes.clear();
         if playing {
             self.move_clock(frames);
         }
