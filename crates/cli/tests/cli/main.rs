@@ -9970,7 +9970,7 @@ fn a_cc_channel_outside_1_to_16_is_refused() {
             "const cc = await midin('nothing plugged in')\n$: note(\"c2\").s(\"sawtooth\").lpf(cc(74{channel}).range(200, 8000))"
         )
     };
-    for channel in [", 17", ", -1", ", 1.5", ", 0"] {
+    for channel in [", 17", ", -1", ", 1.5", ", 0", ", true", ", '01'"] {
         let out = run(&["query", "-e", &score(channel)]);
         assert!(!out.status.success(), "{channel}");
         let said = String::from_utf8_lossy(&out.stderr);
