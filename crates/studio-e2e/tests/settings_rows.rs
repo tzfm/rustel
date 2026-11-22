@@ -1013,6 +1013,10 @@ fn a_source_turned_off_and_on_again_reruns_the_refused_update() {
     studio.chord("ctrl+s");
     studio.settle();
     open_permissions(&mut studio);
+    // The row comes once the engine has refused the map.
+    studio.pump_until(Duration::from_secs(10), "the source is refused", |studio| {
+        studio.rows().iter().any(|row| row.contains(&origin))
+    });
     select_row(&mut studio, &format!("▸ {origin}"));
     studio.press(KeyCode::Enter, KeyModifiers::NONE);
     studio.settle();
@@ -1036,15 +1040,21 @@ fn a_source_turned_off_and_on_again_reruns_the_refused_update() {
 
     studio.press(KeyCode::Char(' '), KeyModifiers::NONE);
     studio.settle();
-    assert!(row_with(&mut studio, &origin).contains("samples  off"));
+    let row = row_with(&mut studio, &origin);
+    assert!(row.contains("samples  off"), "{}", studio.rows().join("\n"));
     studio.press(KeyCode::Esc, KeyModifiers::NONE);
     studio.settle();
     studio.set_score(&format!(
         "samples('{origin}/map.json')\n$: s(\"sn sn\").gain(0.03)"
     ));
     studio.chord("ctrl+s");
+    // The playing score lost sn too, and its warning can take the status
+    // line. The refusal stays on the footer.
     studio.pump_until(Duration::from_secs(10), "the update is refused", |studio| {
-        studio.status().contains("unknown sound \"sn\"")
+        studio
+            .rows()
+            .iter()
+            .any(|row| row.contains("unknown sound \"sn\""))
     });
 
     open_permissions(&mut studio);
