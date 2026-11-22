@@ -8916,6 +8916,21 @@ fn check_names_a_talkit_setting_the_render_refuses() {
         "{}",
         String::from_utf8_lossy(&out.stdout)
     );
+    // A note another output plays speaks nothing here, and a finding marks
+    // the line of the call.
+    for score in [
+        "talkit('hello', {pitch: 49}).note('c3').midi(0)",
+        "talkit('hello', {pitch: 49}).osc()",
+        "talkit('hello', {pitch: 49}).vsti('Some Synth')",
+    ] {
+        let out = run(&["check", "-e", score, "--no-samples"]);
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(!stdout.contains("pitch takes"), "{score}: {stdout}");
+    }
+    let score = "// intro\n$: s('bd')\n$: talkit('hello', {pitch: 49})";
+    let out = run(&["check", "-e", score, "--no-samples"]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("line 3"), "{stdout}");
 }
 
 /// The static lint never runs the score, so a name that only fails to
