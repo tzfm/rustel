@@ -3672,7 +3672,8 @@ impl PickLookup {
     }
 
     /// The pattern `value` picks, or the key it looked up and did not find,
-    /// as the lookup read it.
+    /// as the lookup read it. A list reads a name that is no number as NaN;
+    /// that miss gives the name as written.
     fn select(&self, value: &Value, index_mode: PickIndexMode) -> Result<&Pattern, String> {
         // Property access coerces the actual JavaScript selector.
         // `pure(['1']).pick(['a', 'b'])` therefore selects `b`; treating an
