@@ -656,6 +656,10 @@ impl StudioEngine {
             .expect("a held start is live")
             .device
             .clock_seconds();
+        // The held start never sounded, so a cutover armed for it, as by a
+        // reopened output, goes with it: the new start gets a fresh producer.
+        let mut producer = rustel_runtime::LiveFileProducer::unwatched(self.config.poll_interval)?;
+        producer.adopt_recovery_epoch(&self.session);
         #[cfg(feature = "vst")]
         self.session.set_plugin_document(mark.document);
         let generation =
@@ -666,6 +670,7 @@ impl StudioEngine {
         #[cfg(feature = "vst")]
         self.session.end_plugin_leads();
         let live = self.live.as_mut().expect("a held start is live");
+        live.producer = producer;
         let anchor = live.device.clock_seconds()
             + live.device.schedule_lead_seconds()
             + self.config.start_preroll.as_secs_f64();
@@ -2142,6 +2147,28 @@ $: s("supersaw").seg(16)"#;
                 drop(engine);
                 rustel_runtime::vst::pin_standard_folders(Vec::new());
             }
+        }
+
+        /// An output reopened while a start waits, then an update that
+        /// replaces the held start: the update plays once its kick loads.
+        #[test]
+        fn an_update_after_a_reopen_replaces_the_held_start() {
+            let library = loading_kick();
+            let mut engine = studio(LoadMode::Wait, &library);
+            start(&mut engine, "s(\"kick\")");
+            turns_for(&mut engine, Duration::from_millis(50));
+            engine
+                .set_output_buffer_frames(Some(512))
+                .expect("the output reopens");
+            turns_for(&mut engine, Duration::from_millis(50));
+            assert!(engine.start_is_held());
+            engine
+                .evaluate("s(\"kick\").gain(0.8)", false)
+                .expect("the update");
+            let kick = library.finish_loading_sample_for_test();
+            turn_until(&mut engine, "the kick", |engine| {
+                engine.played_by_text.contains(&kick)
+            });
         }
 
         /// A slider moved while a start waits is part of the running score, its
