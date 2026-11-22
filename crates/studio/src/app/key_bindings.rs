@@ -295,6 +295,10 @@ impl App {
                 self.begin_rename();
                 Ok(true)
             }
+            Do::SaveScene => {
+                self.save_scene();
+                Ok(true)
+            }
             Do::CloseScene => {
                 self.close_scene();
                 Ok(true)

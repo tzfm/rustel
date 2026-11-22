@@ -205,7 +205,10 @@ impl App {
         }
         let was_sticky = self.log_panel.as_ref().is_some_and(|panel| panel.sticky);
         self.log_panel = match &self.log_panel {
-            Some(_) => None,
+            Some(_) => {
+                self.status = "log closed".into();
+                None
+            }
             None => {
                 self.log.mark_seen();
                 self.count_for_the_breakdown();
@@ -301,11 +304,11 @@ impl App {
         }
         match code {
             KeyCode::Esc => {
-                self.log_panel = None;
+                self.close_panel(PanelKind::Log);
                 self.settle_focus();
             }
             KeyCode::Char('d' | 'D') if primary && shift => {
-                self.log_panel = None;
+                self.close_panel(PanelKind::Log);
                 self.settle_focus();
             }
             // The selection the mouse pulled through the log goes to the

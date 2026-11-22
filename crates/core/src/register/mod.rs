@@ -1244,8 +1244,6 @@ mod reference_honesty_tests {
             // One `attack:decay:sustain:release` argument, documented as the
             // four envelope components it encodes.
             "adsr",
-            // Documents the receiver's value alongside the control name.
-            "control",
             // One argument documented as its parts.
             "euclidLegato",
             // `amt` plus the `edoSize` it falls back to.

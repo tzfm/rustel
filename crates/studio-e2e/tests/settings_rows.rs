@@ -1019,7 +1019,8 @@ fn a_source_turned_off_and_on_again_reruns_the_refused_update() {
     studio.press(KeyCode::Esc, KeyModifiers::NONE);
     studio.settle();
     // The map is fetched once the source is allowed. An update while it
-    // is on its way may be refused, and the next one plays.
+    // is on its way may be refused, and the next one plays. A start still
+    // waiting for its sounds is replaced and plays from the top.
     studio.set_score(&format!(
         "samples('{origin}/map.json')\n$: s(\"sn\").gain(0.02)"
     ));

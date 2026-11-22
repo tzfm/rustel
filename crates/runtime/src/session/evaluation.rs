@@ -1828,6 +1828,10 @@ impl Session {
                     ui_visuals: hap.ui_visuals_context(),
                     log_line: None,
                 };
+                // A hap sent to MIDI has no native voice to refuse.
+                if !crate::render::plays_locally(&onset) {
+                    return None;
+                }
                 let event = crate::render::scalar_event_detailed(
                     &onset,
                     self.config.sample_rate,

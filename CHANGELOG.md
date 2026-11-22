@@ -2,7 +2,11 @@
 
 ## Unreleased
 
+- Scene > Save, and `:w` in Vim mode, save the scene without playing it. `:wq` and `:x` save it and close the tab.
+- A Studio crash saves unsaved edits, as quit does.
+- Changed: `.midi()` sends a pattern to MIDI in place of local audio, as on strudel.cc. A `ccn`/`ccv` pattern sent to MIDI no longer plays a sound. To hear a pattern and send it to MIDI, use `stack(p, p.midi())`.
 - Fixed: a `vsti` note ends 1 ms early, as a MIDI note does, so a plugin such as TripleCheese no longer clicks where one note follows the next.
+- Fixed: Enter on a preset or a parameter of the plugin in a `vsti("name"` call still being typed writes the options object and closes the call, instead of doing nothing.
 - Vim mode: `J` and `gJ` join lines, as in Vim. The shipped `$` label jumps move from `J` and `K` to `]$` and `[$`.
 - `rustel check` and `rustel query` take `--prebake setup.js`, so a score calling a prebake's helpers checks clean.
 - A sample source can be a repository page such as `https://github.com/user/repo`. It reads as `github:user/repo`, and a web page or a missing map says what to write instead.

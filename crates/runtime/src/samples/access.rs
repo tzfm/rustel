@@ -233,9 +233,22 @@ pub(crate) fn read_local_media(
     let relative = Path::new(path);
     let relative = relative.strip_prefix(".").unwrap_or(relative);
     if !crate::sample_server::relative_sample_path_allowed(relative) {
-        return Err(format!(
-            "{label} {path:?} must be a relative path inside the folder, without `..`"
-        ));
+        // A hidden name is its own refusal, in a path that is otherwise
+        // plain names: a `..` or a root is refused for being one.
+        let plain = relative
+            .components()
+            .all(|part| matches!(part, std::path::Component::Normal(_)));
+        let hidden = plain
+            && relative.components().any(|part| {
+                matches!(part, std::path::Component::Normal(name) if name.to_string_lossy().starts_with('.'))
+            });
+        return Err(if hidden {
+            format!(
+                "{label} {path:?} names a hidden entry, one that starts with `.`, which a score cannot read"
+            )
+        } else {
+            format!("{label} {path:?} must be a relative path inside the folder, without `..`")
+        });
     }
     let (file, length) = root
         .open_score_file(&root.path().join(relative))
@@ -1143,6 +1156,25 @@ mod tests {
                 base_url("https://example.com/kit/"),
                 "https://example.com/kit/"
             );
+        }
+    }
+
+    /// A hidden Hydra file is refused for being hidden, and a path that
+    /// climbs out is refused for its `..`.
+    #[cfg(feature = "hydra")]
+    #[test]
+    fn a_hidden_media_file_is_refused_for_being_hidden() {
+        let folder = tempfile::tempdir().expect("temp dir");
+        std::fs::create_dir(folder.path().join("media")).expect("media folder");
+        std::fs::write(folder.path().join("media/.hid.png"), b"png").expect("hidden file");
+        let root = crate::sample_server::ServedRoot::open(folder.path()).expect("root");
+        let image = sample_fetch::HydraMedia::Image;
+        let hidden = read_local_media(&root, "media/.hid.png", image).unwrap_err();
+        assert!(hidden.contains("names a hidden entry"), "{hidden}");
+        assert!(!hidden.contains("`..`"), "{hidden}");
+        for climbing in ["../x.png", "../.hid.png", "/.hid.png"] {
+            let refused = read_local_media(&root, climbing, image).unwrap_err();
+            assert!(refused.contains("without `..`"), "{climbing}: {refused}");
         }
     }
 }

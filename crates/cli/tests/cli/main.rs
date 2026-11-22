@@ -9932,3 +9932,31 @@ fn a_hydra_array_entry_that_is_not_a_number_is_refused() {
     ]);
     assert!(clean.contains("no issues found"), "{clean}");
 }
+
+/// `--until-silence` states its rule under the length the take came to,
+/// for a format with audio; a format with none states nothing.
+#[test]
+fn until_silence_states_its_rule_for_audio() {
+    let take = |name: &str| {
+        let path = scratch(name);
+        let out = ok_output(&[
+            "export",
+            "-e",
+            "$: s(\"bd\").gain(.3)",
+            "--cycles",
+            "1",
+            "--until-silence",
+            "-o",
+            path.to_str().expect("utf-8 path"),
+        ]);
+        let _ = std::fs::remove_file(&path);
+        String::from_utf8_lossy(&out.stdout).into_owned()
+    };
+    let audio = take("until-silence.wav");
+    assert!(
+        audio.contains("the take ends once the music stays under -60 dBFS for 2 s"),
+        "{audio}"
+    );
+    let onsets = take("until-silence.json");
+    assert!(!onsets.contains("until silence"), "{onsets}");
+}

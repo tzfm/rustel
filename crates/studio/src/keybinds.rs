@@ -106,6 +106,8 @@ pub enum BindAction {
     // Scenes
     NewScene,
     DuplicateScene,
+    /// Write the score, named after its `@title`, without playing it.
+    SaveScene,
     RecordTake,
     /// Record a sample from the audio input into the recordings bank.
     RecordSample,
@@ -137,7 +139,7 @@ pub enum BindAction {
 
 impl BindAction {
     /// Every action, in the order the Keybinds page lists them.
-    pub const ALL: [BindAction; 59] = [
+    pub const ALL: [BindAction; 60] = [
         // Transport
         Self::Evaluate,
         Self::Stop,
@@ -181,6 +183,7 @@ impl BindAction {
         // Scenes
         Self::NewScene,
         Self::DuplicateScene,
+        Self::SaveScene,
         Self::RecordTake,
         Self::RecordSample,
         Self::RenameScene,
@@ -248,6 +251,7 @@ impl BindAction {
             Self::FirstError => "first-error",
             Self::NewScene => "new-scene",
             Self::DuplicateScene => "duplicate-scene",
+            Self::SaveScene => "save-scene",
             Self::RecordTake => "record-take",
             Self::RecordSample => "record-sample",
             Self::RenameScene => "rename-scene",
@@ -320,6 +324,7 @@ impl BindAction {
             Self::FirstError => "first error / locate cursor",
             Self::NewScene => "new scene",
             Self::DuplicateScene => "duplicate scene",
+            Self::SaveScene => "save",
             Self::RecordTake => "record take",
             Self::RecordSample => "record a sample",
             Self::RenameScene => "rename scene",
@@ -421,6 +426,7 @@ impl BindAction {
             Self::FirstError => shift(F(3)),
             Self::NewScene => ctrl(Char('n')),
             Self::DuplicateScene => plain(F(3)),
+            Self::SaveScene => plain(F(12)), // unused: ships unbound; Scene ▸ Save, or :w in Vim
             Self::RecordTake => ctrl_shift(Char('r')),
             // Pressed to start and again to stop, in the middle of playing,
             // so it has to arrive everywhere: a Ctrl letter is one byte
@@ -1169,12 +1175,14 @@ pub const NO_SPARE_KEY: &[BindAction] = &[BindAction::Knobs];
 /// the header's figures too. The prebakes open from the Options menu. They
 /// are looked at now and then, not played, and every plain function key and
 /// Ctrl letter already means something a set is performed with. A player
-/// who wants one learns it in Settings ▸ Keybinds.
+/// who wants one learns it in Settings ▸ Keybinds. Save has
+/// the Scene menu, and `:w` in Vim, for the same reason.
 ///
 /// The panel actions ship with no chord in the table too. Each one answers
 /// to its [`BindAction::panel_letter`] with Alt until a chord is learnt.
 pub const SHIPS_UNBOUND: &[BindAction] = &[
     BindAction::Jobs,
+    BindAction::SaveScene,
     BindAction::Memory,
     BindAction::Visualizers,
     BindAction::OpenGlobalPrebake,

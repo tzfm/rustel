@@ -1246,7 +1246,9 @@ mod tests {
         #[cfg(feature = "midi")]
         #[test]
         fn the_onset_left_out_of_the_audio_keeps_its_midi_intent() {
-            let mut session = playing(r#"note("c3*4").s("sawtooth").stretch(1).midi("out")"#);
+            let mut session = playing(
+                r#"stack(note("c3*4").s("sawtooth").stretch(1), note("c3*4").midi("out"))"#,
+            );
             window(&mut session, 0.0, LiveQueryBudgetMode::InitialPrefill);
             drop(session.take_pending_midi());
             session
@@ -1419,11 +1421,17 @@ mod tests {
         #[cfg(feature = "midi")]
         #[test]
         fn the_plain_event_left_out_of_the_audio_keeps_its_midi_intent() {
-            let mut session = playing(r#"note("c3*4").s("sawtooth").stretch(1).midi("out")"#);
+            let mut session = playing(
+                r#"stack(note("c3*4").s("sawtooth").stretch(1), note("c3*4").midi("out"))"#,
+            );
             window(&mut session, 0.0, LiveQueryBudgetMode::InitialPrefill);
             drop(session.take_pending_midi());
             session
-                .reload_at(r#"note("c3*4").s("sawtooth").midi("out")"#, false, 0.25)
+                .reload_at(
+                    r#"stack(note("c3*4").s("sawtooth"), note("c3*4").midi("out"))"#,
+                    false,
+                    0.25,
+                )
                 .expect("save");
             let second = window(&mut session, 0.25, LiveQueryBudgetMode::ReplacementPrefill);
             assert_eq!(
