@@ -370,7 +370,8 @@ loaded, as `latency 1024 samples`. The last copy of each preset at each
 sample rate counts, also after the copy ends. `rustel vst` shows no latency,
 because it loads no plugin copy. At the cleanup of unused
 samples, Studio unloads a plugin that no chain of the score has and no open
-tab names. The chains keep their plugins also after a Stop, so a plugin from
+tab names. While the score plays, the plugin of a lane you remove
+unloads a few seconds after its chains end, not at the next Stop. The chains keep their plugins also after a Stop, so a plugin from
 a prebake, an import or a name the score computes stays loaded. A plugin
 call in a tab names its plugin, also with a part of the name. Another string
 names a plugin only with its whole name, as in `const fx = 'ott'`.

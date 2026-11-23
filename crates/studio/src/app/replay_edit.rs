@@ -198,7 +198,7 @@ impl App {
         let tab = self.replays.get(&id).ok_or("this replay is closed")?;
         if self.recording_path().as_deref() == Some(tab.path.as_path()) {
             return Err(
-                "this tape is still recording - a block cannot be removed while it is being written · File ▸ New session finishes it",
+                "this tape is still recording - its blocks cannot be edited while it is being written · File ▸ New session finishes it",
             );
         }
         if !tab.writable() {
@@ -634,6 +634,9 @@ mod tests {
             assert!(app.replay_edit.is_none());
             let refusal = app.errors.visible().expect("a refusal is an error");
             assert!(refusal.contains("still recording"), "{refusal}");
+            // T changes a duration: the refusal names no removal.
+            assert!(refusal.contains("cannot be edited"), "{refusal}");
+            assert!(!refusal.contains("removed"), "{refusal}");
             assert_eq!(ReplayTab::open(&original).unwrap().events.len(), 3);
         }
 

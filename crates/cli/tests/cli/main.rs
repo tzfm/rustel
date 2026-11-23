@@ -10045,15 +10045,19 @@ fn an_export_into_a_missing_folder_names_the_output() {
     );
 }
 
-/// A pickF name its lookup does not hold says which name, beside the error
-/// strudel.cc throws for it.
+/// A pickF name its lookup does not hold says which name, without the
+/// JavaScript text, and a list picked by a name names that name.
 #[test]
 fn a_pick_name_not_in_the_lookup_is_named() {
     let out = run(&["query", "-e", "$: s(\"bd sd\").pickF(\"a z\", {a: rev})"]);
     assert!(!out.status.success());
     let said = String::from_utf8_lossy(&out.stderr);
-    assert!(
-        said.contains("no \"z\" in the pick lookup (x.value.query is not a function)"),
-        "{said}"
-    );
+    assert!(said.contains("no \"z\" in the pick lookup"), "{said}");
+    assert!(!said.contains("is not a function"), "{said}");
+    let out = run(&["query", "-e", "$: s(\"bd sd\").pickF(\"a\", [rev])"]);
+    assert!(!out.status.success());
+    let said = String::from_utf8_lossy(&out.stderr);
+    assert!(said.contains("no \"a\" in the pick lookup"), "{said}");
+    assert!(!said.contains("NaN"), "{said}");
+    assert!(!said.contains("x.value"), "{said}");
 }

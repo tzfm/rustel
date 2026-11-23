@@ -8,7 +8,7 @@
 - Changed: `.midi()` sends a pattern to MIDI in place of local audio, as on strudel.cc. A `ccn`/`ccv` pattern sent to MIDI no longer plays a sound. To hear a pattern and send it to MIDI, use `stack(p, p.midi())`.
 - Fixed: `cc(id, channel)` from `midin()` refuses a channel that is not a whole number from 1 to 16, instead of reading silence or cutting 1.5 to channel 1.
 - Fixed: a `vsti` note ends 1 ms early, as a MIDI note does, so a plugin such as TripleCheese no longer clicks where one note follows the next.
-- A `pickF` or `pick` name its lookup does not hold says which name is missing, beside the error strudel.cc throws for it.
+- A `pickF` or `pick` name its lookup does not hold says which name is missing, without the JavaScript error text, also for a list picked by a name.
 - Fixed: a refused orbit, bus or input channel names the last one allowed (`orbit 16 is outside the orbits 0 to 15`), instead of a range that read as if 16 were allowed.
 - Fixed: Enter on a preset or a parameter of the plugin in a `vsti("name"` call still being typed writes the options object and closes the call, instead of doing nothing.
 - Fixed: an export, a replay export or a stems export that cannot write a file names that file, instead of a bare "No such file or directory".
@@ -17,11 +17,12 @@
 - `rustel check` and `rustel query` take `--prebake setup.js`, so a score calling a prebake's helpers checks clean.
 - A sample source can be a repository page such as `https://github.com/user/repo`. It reads as `github:user/repo`, and a web page or a missing map says what to write instead.
 - Fixed: a sample source turned off and on again on the Permissions page brings its sounds back, and the update it refused while off runs again.
+- Fixed: in an export, an infinite `note` or `freq`, such as the log2 of 0, is a refused voice, and so is NaN on a sample, as on strudel.cc, instead of a note at the default pitch. A synth still reads a NaN note as absent.
 - A pattern can set the tempo: `cps("<0.5 1>")` changes it at each onset, unless Link or MIDI clock leads.
 - Fixed: a live output that fell behind and resumed is printed as a warning, not as an error, since the run plays on.
 - Fixed: leaving a Link session or letting go of an incoming MIDI clock plays the score's own tempo again, instead of the bent tempo the follow left until the next update.
 - Fixed: `mouseX` and `mouseY` inside `K()` say they need live control input, instead of a message about scope IDs.
-- Fixed: in an export, an infinite `note` or `freq`, such as the log2 of 0, is a refused voice, and so is NaN on a sample, as on strudel.cc, instead of a note at the default pitch. A synth still reads a NaN note as absent.
+- Fixed: while the score plays, Studio unloads the plugin of a lane you remove once its chains end, instead of keeping it loaded until Stop.
 - Fixed: a `.dict()` name no dictionary has is an error, as on strudel.cc, instead of a lane that plays silence.
 - Fixed: the slider form and the knobs column's value form refuse a step of zero with the reason, as `rustel check` does, instead of writing a step of their own.
 - The reference search also finds entries by extension name, description, tags, parameters and examples, and by words spread across them. These matches come after the usual matches, under more matches.
