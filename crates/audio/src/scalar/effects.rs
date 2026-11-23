@@ -994,8 +994,12 @@ impl ScalarBackend {
         if self.orbit_reverbs.is_empty() {
             self.orbit_reverbs = (0..MAX_ORBITS).map(|_| None).collect();
         }
+        let orbit = orbit.min(MAX_ORBITS - 1);
         reverb.set_dispatch(self.dispatch);
-        self.orbit_reverbs[orbit.min(MAX_ORBITS - 1)].replace(reverb)
+        if self.mode == RenderMode::Live {
+            reverb.spread_tail_hops(self.frame, orbit);
+        }
+        self.orbit_reverbs[orbit].replace(reverb)
     }
 
     /// The reverb an orbit currently has, for producer-side param checks.

@@ -5545,6 +5545,110 @@ fn a_pitch_that_is_not_a_finite_number_follows_strudel() {
     let _ = std::fs::remove_file(&path);
 }
 
+/// An export of an unknown chord says which chord. It stays silent and
+/// exits 0, as strudel.cc logs the chord and plays nothing.
+#[test]
+fn an_export_names_an_unknown_chord() {
+    let path = scratch("unknown-chord.wav");
+    let export = |score: &str| {
+        run(&[
+            "export",
+            "-e",
+            score,
+            "--cycles",
+            "1",
+            "-o",
+            path.to_str().expect("UTF-8 path"),
+        ])
+    };
+    let out = export(r#"chord("C9add9").voicing().s("sine")"#);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "{stderr}");
+    assert!(
+        stderr.contains(r#"cannot voice chord "C9add9""#),
+        "{stderr}"
+    );
+    // A chord the score computes is named too.
+    let out = export(r#"const c = 'C' + '9add9'; chord(c).voicing().s("sine")"#);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "{stderr}");
+    assert!(
+        stderr.contains(r#"cannot voice chord "C9add9""#),
+        "{stderr}"
+    );
+    // A chord that plays is not, nor a word in a comment.
+    for score in [
+        r#"chord("C7").voicing().s("sine")"#,
+        "note(\n  // chord(\n  \"c4 e4\"\n).s(\"sine\")",
+    ] {
+        let out = export(score);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(out.status.success(), "{score}: {stderr}");
+        assert!(!stderr.contains("cannot voice chord"), "{score}: {stderr}");
+    }
+    let _ = std::fs::remove_file(&path);
+}
+
+/// A patterned argument that refuses only in a later cycle fails the check,
+/// and names that cycle.
+#[test]
+fn check_finds_a_refusal_in_a_later_cycle() {
+    let out = run(&[
+        "check",
+        "-e",
+        r#"s("bd*2").euclid(3, "<8 1000000>")"#,
+        "--no-samples",
+    ]);
+    let said = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(!out.status.success(), "{said}");
+    assert!(said.contains("cycle 1"), "{said}");
+    assert!(said.contains("1000000 steps"), "{said}");
+    let out = run(&[
+        "check",
+        "-e",
+        r#"s("bd*2").euclid(3, "<8 16>")"#,
+        "--no-samples",
+    ]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+}
+
+/// A gain that is no number plays at 1 and says so, as on strudel.cc.
+#[test]
+fn a_gain_that_is_no_number_plays_and_says_so() {
+    let path = scratch("gain-no-number.wav");
+    for score in [
+        r#"note("c3").s("sine").gain("0.1..0.4")"#,
+        r#"note("c3").s("sine").gain("0.2:0.4")"#,
+    ] {
+        let out = run(&[
+            "render",
+            "-e",
+            score,
+            "--duration",
+            "1",
+            "--format",
+            "scalar-wav",
+            "-o",
+            path.to_str().expect("UTF-8 path"),
+        ]);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(out.status.success(), "{score}: {stderr}");
+        assert!(!stderr.contains("voice_refused"), "{score}: {stderr}");
+        assert!(stderr.contains("falling back to 1"), "{score}: {stderr}");
+        let wav = std::fs::read(&path).expect("wav");
+        assert!(wav[44..].iter().any(|byte| *byte != 0), "{score} is silent");
+    }
+    let _ = std::fs::remove_file(&path);
+}
+
 /// The command line prints recoverable notices on stderr, which a library
 /// Session does only when its host opts in. A notice that every note raises
 /// prints once, with the number of onsets.

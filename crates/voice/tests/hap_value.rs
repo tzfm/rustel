@@ -123,8 +123,8 @@ fn a_banked_map_resolves_as_its_json_does() {
 fn an_invalid_value_is_refused_as_its_json_is() {
     let cases = [
         (
-            map([("s", text("sine")), ("gain", text("loud"))]),
-            json!({"s": "sine", "gain": "loud"}),
+            map([("s", text("sine")), ("velocity", text("loud"))]),
+            json!({"s": "sine", "velocity": "loud"}),
         ),
         (map([("s", text("nosuch"))]), json!({"s": "nosuch"})),
         (

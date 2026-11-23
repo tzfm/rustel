@@ -290,7 +290,14 @@ impl LiveScalarDevice {
             .iter()
             .flatten()
             .map(|(_, bytes)| bytes)
-            .sum();
+            .sum::<usize>()
+            + self
+                .reverb_responses
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .iter()
+                .map(crate::reverb::ReverbResponse::approx_bytes)
+                .sum::<usize>();
         // The producer cache sees pending installs but forgets older
         // fingerprints after eight; the callback reports its full resident
         // pool, including reverbs leased to voices. Use the larger view.

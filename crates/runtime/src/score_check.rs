@@ -112,6 +112,9 @@ pub fn check_score_with(
             }
             Err(error) => Some(error.to_string()),
         };
+        // A patterned argument can refuse only in a later cycle, as
+        // `euclid(3, "<8 1000000>")` does in its second.
+        let thrown = thrown.or_else(|| later_cycle_refusal(session, cancellation));
         // A stop that lands during the query is the check's cancellation,
         // reported as such below, not a fault of the score.
         if let Some(message) = thrown.filter(|_| !cancellation.load(Ordering::Relaxed)) {
@@ -165,6 +168,31 @@ pub fn check_score_with(
         diagnostics,
         eval_error,
     }
+}
+
+/// How many cycles a check queries for a refusal. A pattern with a longer
+/// period can still refuse past them.
+const CHECKED_CYCLES: i64 = 8;
+
+/// What the first query after cycle zero that fails says, with its cycle.
+fn later_cycle_refusal(session: &mut Session, cancellation: &AtomicBool) -> Option<String> {
+    for cycle in 1..CHECKED_CYCLES {
+        if cancellation.load(Ordering::Relaxed) {
+            return None;
+        }
+        let begin = Fraction::from(cycle as i32);
+        let end = Fraction::from(cycle as i32 + 1);
+        let thrown = match session.query_report(begin, end) {
+            Ok(report) => report
+                .query_threw
+                .map(|message| format!("the pattern threw while querying: {message}")),
+            Err(error) => Some(error.to_string()),
+        };
+        if let Some(message) = thrown {
+            return Some(format!("cycle {cycle}: {message}"));
+        }
+    }
+    None
 }
 
 /// The notes of the first cycle that a soundfont has no zone for: they play

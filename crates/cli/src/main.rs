@@ -2859,6 +2859,12 @@ fn run_command(
             }
             session.set_stems_export(stems);
             let report = session.render(duration, &output, format.into())?;
+            for message in &report.unknown_chords {
+                notice(
+                    serde_json::json!({ "unknown_chord": { "message": message } }),
+                    || format!("warning: {message}"),
+                );
+            }
             if json_asked() {
                 outln!(
                     "{}",

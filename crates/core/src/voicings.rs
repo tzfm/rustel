@@ -406,6 +406,34 @@ fn anchor_midi(value: Option<&Value>) -> Option<f64> {
     }
 }
 
+/// The most chords a bounce names: a score that computes its chord names
+/// could otherwise grow this list without end.
+const MAX_UNKNOWN_CHORDS: usize = 8;
+
+thread_local! {
+    static UNKNOWN_CHORDS: std::cell::RefCell<Vec<String>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Remember a chord `voicing` could not voice, because no dictionary has it
+/// or a control such as `mode` is wrong: strudel.cc logs it and plays
+/// silence.
+fn note_unknown_chord(chord: &str) {
+    UNKNOWN_CHORDS.with(|chords| {
+        let mut chords = chords.borrow_mut();
+        if chords.len() < MAX_UNKNOWN_CHORDS && !chords.iter().any(|known| known == chord) {
+            chords.push(chord.to_owned());
+        }
+    });
+}
+
+/// The chords this thread's queries could not voice since the last call,
+/// each one time. A query can look past what is played, so a chord here is
+/// in the score and may lie outside the bounce.
+pub fn take_unknown_chords() -> Vec<String> {
+    UNKNOWN_CHORDS.with(|chords| std::mem::take(&mut *chords.borrow_mut()))
+}
+
 /// Resolve the voicing for `map`, invoking `emit` with the resulting note
 /// values (or single selected MIDI number when `n` is set) without intermediate
 /// heap vectors in the common case (<= 16 notes).
@@ -1221,7 +1249,7 @@ fn voicing_hap(hap: &crate::Hap, out: &mut Vec<crate::Hap>) {
             return;
         }
     }
-    let _ = resolve_voicing(map, |notes| {
+    if resolve_voicing(map, |notes| {
         // Each note is first, then each control that the voicing does not
         // read. A note that the chord holds takes the place of each note.
         if notes.is_empty() {
@@ -1300,7 +1328,14 @@ fn voicing_hap(hap: &crate::Hap, out: &mut Vec<crate::Hap>) {
             ));
             out.push(item);
         }
-    });
+    })
+    .is_none()
+        && !crate::query_error_pending()
+        && let Some(chord) = value_str(map.get("chord"))
+    {
+        // Upstream: caught throw → `[voicing]: unknown chord` + silence.
+        note_unknown_chord(chord);
+    }
 }
 
 /// Every chord symbol a dictionary knows, sorted by name.

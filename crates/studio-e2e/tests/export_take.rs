@@ -137,6 +137,34 @@ fn a_strum_at_cycle_zero_plays_with_no_error() {
     );
 }
 
+/// A chord no dictionary has is silent in the take, as on strudel.cc. The
+/// export still writes its file, and the status and the log name the chord.
+#[test]
+fn an_export_names_an_unknown_chord() {
+    let mut studio = hermetic();
+    let set = studio.set_directory().to_path_buf();
+    studio.set_score("$: chord(\"C9add9\").voicing().s(\"sine\")");
+    studio.chord("ctrl+shift+x");
+    studio.press(KeyCode::Enter, KeyModifiers::NONE);
+    wait_for_export(&mut studio);
+    let status = studio.status().to_owned();
+    assert!(status.starts_with("exported"), "{status}");
+    assert!(status.contains("cannot voice chord \"C9add9\""), "{status}");
+    assert!(status.contains("click the path"), "{status}");
+    assert!(
+        studio
+            .log_texts()
+            .iter()
+            .any(|line| line.contains("cannot voice chord \"C9add9\"")),
+        "{:?}",
+        studio.log_texts()
+    );
+    let takes = std::fs::read_dir(set.join("exports"))
+        .expect("the exports folder")
+        .count();
+    assert_eq!(takes, 1, "{status}");
+}
+
 /// Enter renders the scene as written: a real WAV appears in the set's
 /// exports folder, the status says where, and the log remembers.
 #[test]

@@ -172,3 +172,31 @@ fn a_refused_update_no_longer_says_it_is_evaluating() {
         "update refused - the last good score keeps playing"
     );
 }
+
+/// A gain that is no number plays at 1, as on strudel.cc, and the log says
+/// so one time for the score, not once for each window it plays.
+#[test]
+fn a_gain_that_is_no_number_is_in_the_log_once() {
+    let said = |studio: &rustel_studio_e2e::Hermetic| {
+        studio
+            .log_texts()
+            .iter()
+            .filter(|line| line.contains("is not a number, falling back to 1"))
+            .count()
+    };
+    let mut studio = hermetic();
+    studio.set_score("$: note(\"c3*4\").s(\"sine\").gain(\"0.1..0.4\")");
+    studio.chord("ctrl+s");
+    studio.pump_until(
+        std::time::Duration::from_secs(20),
+        "the log says the gain fell back",
+        |studio| said(studio) > 0,
+    );
+    let started = std::time::Instant::now();
+    while started.elapsed() < std::time::Duration::from_secs(2) {
+        studio.pump();
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    assert_eq!(said(&studio), 1, "{:?}", studio.log_texts());
+    assert_eq!(studio.errors(), None);
+}
