@@ -271,7 +271,8 @@ impl ManifestContext {
                 .extend(unsupported.into_iter().map(SampleFailure::from));
             return Ok(());
         }
-        catalog::under_current_policy(&self.shared, &source_table, &mut sources, &mut staged);
+        let held_back =
+            catalog::under_current_policy(&self.shared, &source_table, &mut sources, &mut staged);
         let mut custom = self.custom.write().expect("custom banks");
         let additional_banks = staged
             .iter()
@@ -291,6 +292,19 @@ impl ManifestContext {
         // therefore never observe a score URL without the grant attached to
         // it. The publication gate makes both updates precede cancellation.
         source_table.extend(sources);
+        // Marked under the grants, so a policy stored after this finds the
+        // map withdrawn and has it fetched anew.
+        if held_back && let Some(map) = import.and_then(|spec| serde_json::to_string(spec).ok()) {
+            let mut tables = self
+                .shared
+                .source_tables
+                .lock()
+                .expect("samples source tables");
+            if tables.states.contains_key(&map) {
+                tables.withdrawn.insert(map.clone());
+                tables.held_back.insert(map);
+            }
+        }
         drop(source_table);
         {
             // Which import each bank came of, for the browser. A bank an
@@ -836,7 +850,7 @@ impl ManifestContext {
 
     /// A map is in: a checker may now hold the score to the names it brought.
     fn note_source(&self, map: String) {
-        self.shared.note_source_standing(&map, SourceState::Ready);
+        self.shared.note_source_landed(&map);
     }
 
     /// A map could not be read: a checker may say so where it was asked for.
@@ -847,6 +861,12 @@ impl ManifestContext {
     /// quoted. The pack's row says why, and keeps what it brought last
     /// time, while the rows are still those of the adoption that asked.
     fn note_source_failed(&self, map: &str, error: &str, layer: BankLayer) -> bool {
+        self.shared
+            .source_tables
+            .lock()
+            .expect("samples source tables")
+            .held_back
+            .remove(map);
         let previous = self
             .shared
             .note_source_standing(map, SourceState::Failed(error.to_owned()));
@@ -2450,6 +2470,58 @@ pub(super) mod tests {
                     Some("https://samples.example/snares/sd.wav")
                 );
             }
+        }
+
+        /// A source turned off while its map is on its way: the banks are
+        /// held back, so allowing it again fetches the map anew, whether the
+        /// job landed before the grant came back or after.
+        #[test]
+        fn a_map_held_back_by_a_policy_is_fetched_again_once_allowed() {
+            let spec = "http://kit.invalid/map.json";
+            let url = "http://kit.invalid/a.wav";
+            let map = serde_json::to_string(spec).expect("a quoted spec");
+            let mut on = ScoreSampleAccess::denied();
+            on.permit_source("http://kit.invalid").expect("a source");
+            let off = ScoreSampleAccess::denied();
+            let publish = |library: &SampleLibrary| {
+                let budget = library.manifest_budget(MANIFEST_BATCH_TIMEOUT);
+                let grant = on.approve_remote(url).expect("allowed").1;
+                library
+                    .manifest_context()
+                    .publish_score_custom(
+                        vec![(Arc::from(url), grant)],
+                        vec![("kit".to_owned(), Bank::Array(vec![Arc::from(url)]))],
+                        Vec::new(),
+                        &budget,
+                        Some(spec),
+                        BankLayer::Score,
+                    )
+                    .expect("published");
+            };
+
+            // Landed while off: it stands, and the grant forgets it.
+            let library = SampleLibrary::empty_without_loading();
+            library.mark_source_loading(&map);
+            library.withdraw_sources(&off);
+            publish(&library);
+            library.manifest_context().note_source(map.clone());
+            assert!(!library.knows("kit"), "the source is off");
+            assert_eq!(library.samples_source_state(spec), Some(SourceState::Ready));
+            library.withdraw_sources(&on);
+            assert_eq!(library.samples_source_state(spec), None);
+
+            // Allowed before it said so: the new ask keeps its standing.
+            let library = SampleLibrary::empty_without_loading();
+            library.mark_source_loading(&map);
+            library.withdraw_sources(&off);
+            publish(&library);
+            library.withdraw_sources(&on);
+            library.mark_source_loading(&map);
+            library.manifest_context().note_source(map.clone());
+            assert_eq!(
+                library.samples_source_state(spec),
+                Some(SourceState::Loading)
+            );
         }
 
         #[test]

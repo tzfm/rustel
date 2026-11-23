@@ -1120,6 +1120,9 @@ struct SourceTables {
     /// Maps that were in when a policy took their source back. Their
     /// banks went with it, so the source allowed again fetches them anew.
     withdrawn: HashSet<String>,
+    /// Maps whose job published under a policy that held their banks back,
+    /// until that job says it landed.
+    held_back: HashSet<String>,
 }
 
 impl SourceTables {
@@ -1153,6 +1156,7 @@ impl SourceTables {
             self.states.remove(&oldest);
             self.sources.remove(&oldest);
             self.withdrawn.remove(&oldest);
+            self.held_back.remove(&oldest);
         }
         previous
     }
@@ -1320,6 +1324,21 @@ impl Shared {
             self.maps_in.fetch_add(1, Ordering::Release);
         }
         previous
+    }
+
+    /// A job's map is in. One whose banks a policy held back, and whose
+    /// source is allowed again since, brought nothing: the ask after the
+    /// grant owns its standing.
+    fn note_source_landed(&self, map: &str) {
+        {
+            let mut tables = self.source_tables.lock().expect("samples source tables");
+            if tables.held_back.remove(map) && !tables.withdrawn.contains(map) {
+                return;
+            }
+            tables.note(map, SourceState::Ready);
+        }
+        // Release after the map is noted, as in `note_source_standing`.
+        self.maps_in.fetch_add(1, Ordering::Release);
     }
 }
 
