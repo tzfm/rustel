@@ -333,14 +333,16 @@ impl JsRuntime {
     /// Close what a text can write. Every text calls this before its first
     /// statement runs, whether or not it later fails.
     pub(super) fn record_surface_writes(&self, writes: &rustel_transpiler::SurfaceWrites) {
-        self.callback_ir.gate.borrow_mut().record_text(writes);
+        self.callback_ir().gate.borrow_mut().record_text(writes);
     }
 
     /// Whether a compiled callback that no longer stands for its JavaScript
     /// is still alive. A pure graph can then reach the callback, so a query
     /// of any graph needs this runtime's host.
     pub fn compiled_callbacks_need_host(&self) -> bool {
-        self.callback_ir.gate.borrow().stale_lowered_alive()
+        self.callback_ir
+            .get()
+            .is_some_and(|ir| ir.gate.borrow().stale_lowered_alive())
     }
 
     /// Compare every slot an issued program reads with the sealed built-in,
@@ -351,7 +353,12 @@ impl JsRuntime {
     /// against it now, and Auto mode reports it once: a compiled callback
     /// that ran between the change and this check used the built-in.
     pub(super) fn check_lowered_surface(&self) {
-        let (names, intrinsics) = self.callback_ir.gate.borrow().unchecked();
+        // A runtime that made no callback-IR state recorded no write and
+        // lowered no callback, so there is nothing to compare.
+        let Some(ir) = self.callback_ir.get() else {
+            return;
+        };
+        let (names, intrinsics) = ir.gate.borrow().unchecked();
         if names.is_empty() && !intrinsics {
             return;
         }
@@ -371,11 +378,14 @@ impl JsRuntime {
         if changed.is_empty() && !intrinsics_changed {
             return;
         }
-        let report = self.callback_ir.mode.get() == PatternTransformIrMode::Auto;
-        let mut gate = self.callback_ir.gate.borrow_mut();
-        let mut logs = self.logs.borrow_mut();
+        let report = ir.mode.get() == PatternTransformIrMode::Auto;
+        let mut gate = ir.gate.borrow_mut();
+        // A run that reports nothing makes no console buffer.
+        let mut logs = report.then(|| self.logs().borrow_mut());
         let mut warn = |what: &str| {
-            if report && logs.len() < MAX_BUFFERED_LOGS {
+            if let Some(logs) = logs.as_mut()
+                && logs.len() < MAX_BUFFERED_LOGS
+            {
                 logs.push(format!(
                     "[warn] {what} was replaced in a way the runtime could not see in advance. A compiled callback that ran before the replacement was found used the built-in."
                 ));

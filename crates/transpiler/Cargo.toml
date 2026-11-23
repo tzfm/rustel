@@ -17,6 +17,7 @@ oxc_semantic = "0.144.0"
 oxc_span = "0.144.0"
 oxc_syntax = "0.144.0"
 rustel-mini = { path = "../mini" }
+rustel-score = { path = "../score" }
 
 [dev-dependencies]
 oxc_ast = { version = "0.144.0", features = ["serialize"] }

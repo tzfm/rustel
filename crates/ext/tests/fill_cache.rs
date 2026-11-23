@@ -270,9 +270,9 @@ fn a_kept_answer_goes_with_the_compiled_callback_it_applied() {
     let program = PatternTransformProgram::new([])
         .expect("the identity program")
         .with_standings([standing.clone()]);
-    let callback = pure(Value::Function(Box::new(FunctionRef::lowered_js(
-        1, program,
-    ))));
+    let callback = pure(Value::Function(std::sync::Arc::new(
+        FunctionRef::lowered_js(1, program),
+    )));
     let asked = Arc::new(AtomicUsize::new(0));
     let child = rustel_ext::default_registry()
         .get("sometimesBy")

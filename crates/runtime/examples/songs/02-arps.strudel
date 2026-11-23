@@ -1,0 +1,15 @@
+// Fast arpeggios: many haps per cycle through stacked lanes and speeds.
+setcpm(60);
+
+function arp(notes, sound) {
+  return note(notes).s(sound).release(0.2)
+}
+
+stack(
+  arp("<c4 e4 g4 c5 e5 g4 e4 c4>*2", "supersaw").gain(0.8),
+  arp("<a3 c4 e4 a4 c5 a4 e4 c4>", "supersaw").gain(0.5),
+  arp("<c2 c3 g2 c3>", "gm_bass").release(0.3),
+  s("bd*2 ~ bd ~").gain(0.9),
+  s("hh*8").gain(0.25),
+  s("~ [oh:2 ch]*2").gain(0.4)
+)

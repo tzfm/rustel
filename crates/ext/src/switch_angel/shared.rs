@@ -118,7 +118,7 @@ pub(super) fn source_control_pattern<P: PatOps>(name: &str, values: P) -> P {
     let spec = rustel_core::controls::default_control_registry()
         .get(name)
         .unwrap_or_else(|| panic!("the upstream control registry contains {name}"));
-    values.map_control(spec.clone(), false)
+    values.map_control(spec, false)
 }
 
 pub(super) fn apply_control(pattern: &Pattern, name: &str, value: Pattern) -> Pattern {
@@ -136,7 +136,7 @@ pub(super) fn apply_distortion(
     apply_control(
         pattern,
         "distort",
-        rustel_core::pure(Value::List(vec![
+        rustel_core::pure(Value::list(vec![
             amount,
             shape,
             Value::Str(algorithm.into()),
@@ -157,7 +157,7 @@ pub(super) fn value_as_pattern(value: &Value) -> Pattern {
 
 pub(super) fn pure_list(pattern: &Pattern) -> Option<Vec<Value>> {
     match pattern.as_pure()? {
-        Value::List(values) => Some(values),
+        Value::List(values) => Some(values.to_vec()),
         _ => None,
     }
 }

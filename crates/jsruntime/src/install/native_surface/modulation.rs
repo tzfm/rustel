@@ -46,7 +46,7 @@ fn modulator_subcontrol(kind: &str, key: &str) -> String {
 
 fn property_key(value: &Value) -> String {
     match rustel_core::materialize_js_value(value) {
-        Value::Str(value) => value,
+        Value::Str(value) => value.to_string(),
         Value::F64(value) => Value::F64(value).show(),
         Value::Bool(value) => value.to_string(),
         Value::Null => "null".into(),
@@ -61,7 +61,7 @@ fn canonical_control_value(value: &Value) -> Value {
             control_registry()
                 .canonical_name(&value)
                 .unwrap_or(&value)
-                .to_owned(),
+                .into(),
         ),
         value => value,
     }
@@ -74,7 +74,7 @@ fn apply_modulator_value(
     key: &str,
     default: &std::sync::Mutex<Option<Value>>,
 ) -> Value {
-    let Value::List(mut pair) = rustel_core::materialize_js_value(pair) else {
+    let Value::List(pair) = rustel_core::materialize_js_value(pair) else {
         rustel_core::signal_query_error(|| "invalid modulator state".into());
         return Value::Undefined;
     };
@@ -82,14 +82,14 @@ fn apply_modulator_value(
         rustel_core::signal_query_error(|| "invalid modulator state".into());
         return Value::Undefined;
     }
-    let mut controls = match pair.remove(0) {
-        Value::Object(controls) => controls,
+    let mut controls = match &pair[0] {
+        Value::Object(controls) => controls.clone(),
         _ => {
             rustel_core::signal_query_error(|| "modulate expects object-valued haps".into());
             return Value::Undefined;
         }
     };
-    let mut id = pair.remove(0);
+    let mut id = pair[1].clone();
     let default_value = {
         let mut stored = default
             .lock()
@@ -103,19 +103,19 @@ fn apply_modulator_value(
                         control_registry()
                             .canonical_name(name)
                             .unwrap_or(name)
-                            .to_owned(),
+                            .into(),
                     )
                 })
                 .unwrap_or(Value::Undefined);
             if let Value::Str(control) = &value
-                && matches!(control.as_str(), "lfo" | "env" | "bmod")
+                && matches!(&**control, "lfo" | "env" | "bmod")
                 && let Some(Value::Object(modulator)) = controls.get(control)
                 && let Some((last, _)) = modulator
                     .js_entries()
                     .into_iter()
                     .rfind(|(name, _)| *name != "__ids")
             {
-                value = Value::Str(format!("{control}_{last}"));
+                value = Value::Str(format!("{control}_{last}").into());
             }
             *stored = Some(value);
         }
@@ -151,7 +151,7 @@ fn apply_modulator_value(
     }
     modulator.insert(id_key, Value::Object(entry));
     controls.insert(kind.into(), Value::Object(modulator));
-    Value::List(vec![Value::Object(controls), id])
+    Value::list(vec![Value::Object(controls), id])
 }
 
 fn install_modulator<'js>(
@@ -180,7 +180,7 @@ fn install_modulator<'js>(
     }
     let default = std::sync::Arc::new(std::sync::Mutex::new(None));
     let mut output = receiver
-        .fmap(|value| Value::List(vec![value.clone()]))
+        .fmap(|value| Value::list(vec![value.clone()]))
         .app_left_with(id, append_pattern_value);
     for (raw_key, value) in entries {
         let key = modulator_subcontrol(kind, &raw_key);

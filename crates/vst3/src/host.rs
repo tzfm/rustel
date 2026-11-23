@@ -5114,40 +5114,62 @@ mod tests {
         assert!(matches!(first, FoundPreset::Number(_)), "{first:?}");
 
         // A read of the folders opens each file of a folder the player
-        // added. A pipe holds the read there until the other end of the
-        // pipe opens and closes.
+        // added, in the order of the names. A pipe holds the read there
+        // until the other end of the pipe opens and closes.
         let added = root.join("added");
         std::fs::create_dir_all(&added).expect("added folder");
-        let pipe = added.join("Pipe.vstpreset");
-        let made = std::process::Command::new("mkfifo").arg(&pipe).status();
-        assert!(made.is_ok_and(|made| made.success()), "the pipe");
-        let open = || {
+        let pipes = ["One", "Two"].map(|name| added.join(format!("{name}.vstpreset")));
+        for pipe in &pipes {
+            let made = std::process::Command::new("mkfifo").arg(pipe).status();
+            assert!(made.is_ok_and(|made| made.success()), "the pipe");
+        }
+        let [one, two] = &pipes;
+        let open = |pipe: &Path| {
             let (opened, end) = mpsc::channel();
-            let pipe = pipe.clone();
+            let pipe = pipe.to_owned();
             std::thread::spawn(move || {
                 let _ = opened.send(std::fs::OpenOptions::new().write(true).open(pipe));
             });
             let end = end.recv_timeout(WAIT_LIMIT).expect("a read opens the pipe");
             end.expect("the other end of the pipe")
         };
+        // The other end closes when the read is through its open. An end
+        // that closes before leaves the read in its open, where it waits
+        // for one more. A write of more bytes than a pipe holds ends when
+        // the read took its bytes and closed its end.
+        let close = |mut end: std::fs::File| {
+            let (closed, passed) = mpsc::channel();
+            std::thread::spawn(move || {
+                let _ = std::io::Write::write_all(&mut end, &vec![0; 1 << 20]);
+                drop(end);
+                let _ = closed.send(());
+            });
+            let passed = passed.recv_timeout(WAIT_LIMIT);
+            passed.expect("the read goes on past the pipe");
+        };
         // The change of the added folders claims a read of the old root,
         // and the root changes before that read ends.
         let version = host.presets_version();
         host.set_preset_folders(vec![added]);
         host.set_preset_folder(new);
-        // The read of the old root goes on past the pipe, and ends.
-        drop(open());
+        // The read of the old root goes on past the first pipe and holds
+        // at the second one. The other end of the first pipe is closed
+        // then: the read of the new root finds no end that is open there.
+        close(open(one));
+        close(open(two));
         let start = Instant::now();
         while host.presets_version() == version {
             assert!(start.elapsed() < WAIT_LIMIT, "the read of the old root");
             std::thread::sleep(Duration::from_millis(2));
         }
-        // The read of the new root follows, and holds at the pipe.
-        let held = open();
+        // The read of the new root follows, and holds at the first pipe.
+        let held = open(one);
         let during = host.presets(NAME);
         let old_name = host.preset(plugin, "Old");
-        std::fs::remove_file(&pipe).expect("the pipe");
-        drop(held);
+        for pipe in &pipes {
+            std::fs::remove_file(pipe).expect("the pipe");
+        }
+        close(held);
         host.wait_idle();
         assert_eq!(during, None, "an ask waits for the read of the new root");
         assert_eq!(

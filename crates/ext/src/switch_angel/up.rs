@@ -80,7 +80,7 @@ mod tests {
         for right in [
             Value::F64(7.0),
             Value::Str("rev".into()),
-            Value::List(vec![Value::F64(1.0)]),
+            Value::list(vec![Value::F64(1.0)]),
             Value::Null,
             Value::Undefined,
         ] {

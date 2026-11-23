@@ -9,13 +9,14 @@
 //! copy or forge, so it would prove nothing.
 
 use super::*;
+use rustel_core::callback_ir::PatternTransformInstruction;
 use rustel_core::compose::{Alignment, ComposeOp};
 use rustel_core::controls::ControlSpec;
 use rustel_core::register::Registration;
 use rustel_core::value::FunctionRef;
 
 /// The global the transpiler calls for every mini-notation literal.
-const MINI_CALLEE: &str = "m";
+pub(crate) const MINI_CALLEE: &str = "m";
 
 /// The intrinsics that every built-in method reads when it shapes its
 /// arguments, as the holder each one lives on and its name there.
@@ -25,17 +26,30 @@ const INTRINSICS: [(Option<&str>, &str); 3] = [
     (Some("Array"), "isArray"),
 ];
 
-/// What one built-in method does with its receiver and arguments.
-#[derive(Clone)]
+/// What one built-in method does with its receiver and arguments. A
+/// registration and a control are those of the native tables, which live as
+/// long as the process.
+#[derive(Clone, Copy)]
 pub(crate) enum BuiltinMethod {
     /// A registered combinator, installed by `install_combinator`.
-    Registered(Box<Registration>),
+    Registered(&'static Registration),
     /// A control setter.
-    Control(ControlSpec),
+    Control(&'static ControlSpec),
     /// A composition shortcut such as `struct`, or a bare alignment.
     Shortcut { op: ComposeOp, how: Alignment },
     /// A composer accessor such as `add`, called with the default alignment.
     Composer(ComposeOp),
+    /// `pick` or one of its kin, given one lookup of patterns by key.
+    Pick {
+        index: rustel_core::PickIndexMode,
+        join: rustel_core::JoinMode,
+    },
+    /// A visual such as `pianoroll`, given the widget id and the slot the
+    /// transpiler writes for it.
+    Visual,
+    /// `layer` or `superimpose`, given transformers: a stack of what each
+    /// one makes of the receiver, with or without the receiver itself.
+    Layer { keep_original: bool },
 }
 
 impl BuiltinMethod {
@@ -43,83 +57,319 @@ impl BuiltinMethod {
         matches!(self, Self::Composer(_))
     }
 
+    /// What `receiver.name(...arguments)` builds for up to 4 arguments without
+    /// allocating a `Vec<Pattern>` on the heap.
+    pub(crate) fn apply_small(
+        &self,
+        receiver: Pattern,
+        arguments: &mut [Option<Pattern>],
+    ) -> Option<Pattern> {
+        Some(match self {
+            Self::Registered(registration) => {
+                let expected = registration.arity.saturating_sub(1);
+                if arguments.len() != expected {
+                    if expected == 1 && !arguments.is_empty() {
+                        let pats: Vec<Pattern> =
+                            arguments.iter_mut().filter_map(Option::take).collect();
+                        let seq = sequence_patterns(pats);
+                        return Some(registration.call(std::slice::from_ref(&seq), receiver));
+                    }
+                    return None;
+                }
+                match arguments {
+                    [] => registration.call(&[], receiver),
+                    [a] => registration.call(std::slice::from_ref(a.as_ref()?), receiver),
+                    [a, b] => {
+                        let slice = [a.take()?, b.take()?];
+                        registration.call(&slice, receiver)
+                    }
+                    [a, b, c] => {
+                        let slice = [a.take()?, b.take()?, c.take()?];
+                        registration.call(&slice, receiver)
+                    }
+                    [a, b, c, d] => {
+                        let slice = [a.take()?, b.take()?, c.take()?, d.take()?];
+                        registration.call(&slice, receiver)
+                    }
+                    _ => {
+                        let pats: Vec<Pattern> =
+                            arguments.iter_mut().filter_map(Option::take).collect();
+                        registration.call(&pats, receiver)
+                    }
+                }
+            }
+            Self::Control(spec) => match arguments {
+                [] => spec.apply_to(receiver, None),
+                [first] => spec.apply_to(receiver, first.take()),
+                [first, ..] if spec.names.len() <= 1 => spec.apply_to(receiver, first.take()),
+                [a, b] => {
+                    let slice = [a.take()?, b.take()?];
+                    spec.apply_positional(&receiver, &slice)
+                }
+                [a, b, c] => {
+                    let slice = [a.take()?, b.take()?, c.take()?];
+                    spec.apply_positional(&receiver, &slice)
+                }
+                [a, b, c, d] => {
+                    let slice = [a.take()?, b.take()?, c.take()?, d.take()?];
+                    spec.apply_positional(&receiver, &slice)
+                }
+                _ => {
+                    let pats: Vec<Pattern> =
+                        arguments.iter_mut().filter_map(Option::take).collect();
+                    spec.apply_positional(&receiver, &pats)
+                }
+            },
+            Self::Shortcut { op, how } => match arguments {
+                [] => return None,
+                [other] => {
+                    rustel_core::compose::compose_owned(receiver, other.as_ref()?, *op, *how)
+                }
+                _ => {
+                    let pats: Vec<Pattern> =
+                        arguments.iter_mut().filter_map(Option::take).collect();
+                    let other = sequence_patterns(pats);
+                    rustel_core::compose::compose_owned(receiver, &other, *op, *how)
+                }
+            },
+            Self::Composer(op) => match arguments {
+                [] => return None,
+                [other] => rustel_core::compose::compose_owned(
+                    receiver,
+                    other.as_ref()?,
+                    *op,
+                    rustel_core::compose::default_alignment(),
+                ),
+                _ => {
+                    let pats: Vec<Pattern> =
+                        arguments.iter_mut().filter_map(Option::take).collect();
+                    let other = sequence_patterns(pats);
+                    rustel_core::compose::compose_owned(
+                        receiver,
+                        &other,
+                        *op,
+                        rustel_core::compose::default_alignment(),
+                    )
+                }
+            },
+            Self::Pick { .. } | Self::Visual | Self::Layer { .. } => return None,
+        })
+    }
+
+    /// What `receiver.name(...arguments)` builds, as the method builds it.
+    /// `None` where the JavaScript method throws for these arguments, and
+    /// for a method whose arguments are not patterns.
+    pub(crate) fn apply(&self, receiver: Pattern, arguments: crate::MethodArgs) -> Option<Pattern> {
+        use crate::MethodArgs;
+        Some(match self {
+            Self::Registered(registration) => {
+                let expected = registration.arity.saturating_sub(1);
+                if crate::surface::sequences_registered_arguments(expected, arguments.len()) {
+                    let arg = match arguments {
+                        MethodArgs::Zero => return None,
+                        MethodArgs::One(a) => a,
+                        other => sequence_patterns(other.into_vec()),
+                    };
+                    registration.call(std::slice::from_ref(&arg), receiver)
+                } else if arguments.len() == expected {
+                    registration.call(arguments.as_slice(), receiver)
+                } else {
+                    return None;
+                }
+            }
+            Self::Control(spec) => {
+                let args = match arguments {
+                    MethodArgs::Zero => ControlArguments::Single(None),
+                    MethodArgs::One(a) => ControlArguments::Single(Some(a)),
+                    other => control_arguments(spec, other.into_vec(), |_| false),
+                };
+                apply_control_method(spec, receiver, args)
+            }
+            Self::Shortcut { op, how } => {
+                let other = match arguments {
+                    MethodArgs::Zero => return None,
+                    MethodArgs::One(a) => a,
+                    other => sequence_patterns(other.into_vec()),
+                };
+                rustel_core::compose::compose_owned(receiver, &other, *op, *how)
+            }
+            // The accessor reads the default alignment when it is called.
+            Self::Composer(op) => {
+                let other = match arguments {
+                    MethodArgs::Zero => return None,
+                    MethodArgs::One(a) => a,
+                    other => sequence_patterns(other.into_vec()),
+                };
+                rustel_core::compose::compose_owned(
+                    receiver,
+                    &other,
+                    *op,
+                    rustel_core::compose::default_alignment(),
+                )
+            }
+            Self::Pick { .. } | Self::Visual | Self::Layer { .. } => return None,
+        })
+    }
+
+    /// The step of a callback program that builds what
+    /// `receiver.name(...arguments)` builds. `None` as for
+    /// [`Self::transformer_args`].
+    ///
+    /// A registered method whose function slot a transformer fills is its
+    /// own step: the registration applies the argument patterns exactly as
+    /// its method call does, so the program builds the graph the call
+    /// builds.
+    pub(crate) fn step(
+        &self,
+        name: &str,
+        arguments: Vec<Pattern>,
+        holds_transformer: bool,
+    ) -> Option<PatternTransformInstruction> {
+        self.step_args(
+            name,
+            crate::MethodArgs::from_vec(arguments),
+            holds_transformer,
+        )
+    }
+
+    pub(crate) fn step_args(
+        &self,
+        name: &str,
+        arguments: crate::MethodArgs,
+        holds_transformer: bool,
+    ) -> Option<PatternTransformInstruction> {
+        Some(match self {
+            Self::Registered(registration) if holds_transformer => {
+                PatternTransformInstruction::ApplyRegistered {
+                    arguments: registered_method_arguments(registration, arguments.into_vec())?,
+                    // A program owns the registration of each of its steps.
+                    registration: Box::new(Registration::clone(registration)),
+                }
+            }
+            _ => PatternTransformInstruction::Apply(self.transformer_args(name, arguments)?),
+        })
+    }
+
     /// The native transformer that builds what `receiver.name(...arguments)`
-    /// builds. `None` where the JavaScript method throws for these arguments.
+    /// builds. `None` where the JavaScript method throws for these arguments,
+    /// and for a method whose arguments are not patterns.
     ///
     /// Each transformer calls the same native operation as the method, with
     /// the same arguments, so both build the same nodes, contexts and steps.
     /// A transformer claims to keep a pure receiver pure only when every
     /// argument pattern is pure. A mini-notation argument such as
     /// `"x(<3 5>,8)"` is not, and a program refuses such a transformer.
-    pub(crate) fn transformer(&self, name: &str, arguments: Vec<Pattern>) -> Option<FunctionRef> {
+    pub(crate) fn transformer_args(
+        &self,
+        name: &str,
+        arguments: crate::MethodArgs,
+    ) -> Option<FunctionRef> {
+        use crate::{MethodArgs, bound_registered_transformer_args};
         match self {
             Self::Registered(registration) => {
-                let arguments = registered_method_arguments(registration, arguments)?;
-                Some(bound_registered_transformer(
-                    name,
-                    Registration::clone(registration),
-                    arguments,
-                ))
+                let expected = registration.arity.saturating_sub(1);
+                let args =
+                    if crate::surface::sequences_registered_arguments(expected, arguments.len()) {
+                        match arguments {
+                            MethodArgs::Zero => return None,
+                            MethodArgs::One(a) => MethodArgs::One(a),
+                            MethodArgs::Two([a, b]) => {
+                                MethodArgs::One(sequence_patterns(vec![a, b]))
+                            }
+                            MethodArgs::Many(v) => MethodArgs::One(sequence_patterns(v)),
+                        }
+                    } else if arguments.len() == expected {
+                        arguments
+                    } else {
+                        return None;
+                    };
+                Some(bound_registered_transformer_args(name, registration, args))
             }
             Self::Control(spec) => {
-                let spec = spec.clone();
-                // A control composes pure operands into a pure result.
-                let provable_pure = arguments.iter().all(Pattern::is_pure);
-                let arguments = control_arguments(&spec, arguments, |_| false);
+                let spec = *spec;
+                let provable_pure = arguments.as_slice().iter().all(Pattern::is_pure);
+                let arguments = match arguments {
+                    MethodArgs::Zero => ControlArguments::Single(None),
+                    MethodArgs::One(a) => ControlArguments::Single(Some(a)),
+                    other => control_arguments(spec, other.into_vec(), |_| false),
+                };
                 Some(FunctionRef::registered(
                     name,
                     std::sync::Arc::new(move |pattern| {
-                        apply_control_method(&spec, &pattern, arguments.clone())
+                        apply_control_method(spec, pattern, arguments.clone())
                     }),
                     provable_pure,
                 ))
             }
             Self::Shortcut { op, how } => {
                 let (op, how) = (*op, *how);
-                let other = (!arguments.is_empty()).then(|| sequence_patterns(arguments))?;
+                let other = match arguments {
+                    MethodArgs::Zero => return None,
+                    MethodArgs::One(a) => a,
+                    other => sequence_patterns(other.into_vec()),
+                };
                 let provable_pure = other.is_pure();
-                Some(FunctionRef::registered(
+                Some(FunctionRef::compose(
                     name,
-                    std::sync::Arc::new(move |pattern| {
-                        rustel_core::compose::compose(&pattern, &other, op, how)
-                    }),
+                    other,
+                    op,
+                    Some(how),
                     provable_pure,
                 ))
             }
             Self::Composer(op) => {
                 let op = *op;
-                let other = (!arguments.is_empty()).then(|| sequence_patterns(arguments))?;
+                let other = match arguments {
+                    MethodArgs::Zero => return None,
+                    MethodArgs::One(a) => a,
+                    other => sequence_patterns(other.into_vec()),
+                };
                 let provable_pure = other.is_pure();
                 // The accessor reads the default alignment when it is called.
-                Some(FunctionRef::registered(
-                    name,
-                    std::sync::Arc::new(move |pattern| {
-                        rustel_core::compose::compose(
-                            &pattern,
-                            &other,
-                            op,
-                            rustel_core::compose::default_alignment(),
-                        )
-                    }),
-                    provable_pure,
-                ))
+                Some(FunctionRef::compose(name, other, op, None, provable_pure))
             }
+            Self::Pick { .. } | Self::Visual | Self::Layer { .. } => None,
         }
     }
 }
 
-/// The built-in methods recorded by installation.
+/// A global that a score can use without JavaScript.
+#[derive(Clone)]
+pub(crate) enum BuiltinGlobal {
+    /// A free control such as `s`, applied to one value. Carries its static
+    /// spec directly so native calls skip a second control-registry lookup.
+    Control(&'static ControlSpec),
+    /// A list constructor such as `stack` or `cat`.
+    List(ListKind),
+    /// A tempo setter, in cycles per second or per minute.
+    Tempo { per_minute: bool },
+    /// A signal such as `sine`: a pattern held as a value, not called.
+    Signal(Pattern),
+}
+
+/// What a list constructor builds of its patterns.
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum ListKind {
+    Stack,
+    SlowCat,
+    FastCat,
+}
+
+/// The built-in methods and globals recorded by installation.
 #[derive(Default)]
 pub(crate) struct BuiltinMethods {
     methods: BTreeMap<Box<str>, BuiltinMethod>,
+    globals: BTreeMap<&'static str, BuiltinGlobal>,
     sealed: bool,
 }
 
-/// Whether a prototype slot named `name` can be compiled against. The
+/// Whether a prototype slot named `name` can be recorded as `method`. The
 /// wrapper's own `polyJoin` and `query` fields shadow those slots, and a raw
-/// `_name` method takes its arguments unshaped.
-fn compilable(name: &str) -> bool {
-    !name.starts_with('_') && !matches!(name, "polyJoin" | "query")
+/// `_name` method takes its arguments unshaped. A visual's `_name` is the
+/// inline form of the same visual.
+fn recordable(name: &str, method: &BuiltinMethod) -> bool {
+    !matches!(name, "polyJoin" | "query")
+        && (!name.starts_with('_') || matches!(method, BuiltinMethod::Visual))
 }
 
 /// The private record of recorded slots, by name.
@@ -144,7 +394,7 @@ pub(crate) fn record_builtin_method<'js>(
     slot: rquickjs::Value<'js>,
     method: BuiltinMethod,
 ) -> rquickjs::Result<()> {
-    if !compilable(name) {
+    if !recordable(name, &method) {
         return Ok(());
     }
     let methods = host_builtin_methods(ctx)?;
@@ -179,6 +429,385 @@ pub(crate) fn record_builtin_alias<'js>(
     record_builtin_method(ctx, alias, slot, method)
 }
 
+/// The private record of recorded global slots, by name.
+fn global_slots<'js>(ctx: &Ctx<'js>) -> rquickjs::Result<rquickjs::Object<'js>> {
+    let stack = host_stack(ctx)?;
+    let existing: rquickjs::Value = stack.as_object().get(BUILTIN_GLOBAL_SLOTS)?;
+    if let Some(slots) = existing.into_object() {
+        return Ok(slots);
+    }
+    let slots = rquickjs::Object::new(ctx.clone())?;
+    slots.set_prototype(None)?;
+    stack.as_object().set(BUILTIN_GLOBAL_SLOTS, slots.clone())?;
+    Ok(slots)
+}
+
+/// Record that installation put `slot` on the globals as `name`. A later
+/// record of the same name replaces this one, as the later installation
+/// replaces the slot.
+pub(crate) fn record_builtin_global<'js>(
+    ctx: &Ctx<'js>,
+    name: &'static str,
+    slot: rquickjs::Value<'js>,
+    global: BuiltinGlobal,
+) -> rquickjs::Result<()> {
+    global_slots(ctx)?.set(name, slot)?;
+    host_builtin_methods(ctx)?
+        .borrow_mut()
+        .globals
+        .insert(name, global);
+    Ok(())
+}
+
+/// The global `name`, while it is still the slot installation recorded for
+/// it: an own data property of the globals.
+pub(crate) fn prove_builtin_global(ctx: &Ctx<'_>, name: &str) -> Option<BuiltinGlobal> {
+    let methods = host_builtin_methods(ctx).ok()?;
+    let methods = methods.borrow();
+    if !methods.sealed {
+        return None;
+    }
+    let global = methods.globals.get(name)?;
+    let slot: rquickjs::Value = global_slots(ctx).ok()?.get(name).ok()?;
+    (!slot.is_undefined() && holds(ctx, &ctx.globals(), name, false, &slot).ok()?)
+        .then(|| global.clone())
+}
+
+/// What a fresh installation proves, one name a line: `method` or
+/// `global`, the name, then what the name does, by its kind and the native
+/// table that holds it. A test writes this file from an installed realm and
+/// checks it against one, so the list cannot drift from the installation.
+const NATIVE_INVENTORY: &str = include_str!("../../assets/native-inventory.txt");
+
+/// The inventory asset by name: what a realm with no surface yet would
+/// prove once installed. A lookup searches the lines of the asset, which
+/// are in order, and reads the native tables, so the list holds no copy of
+/// either. A score calls the same few names many times, and the next score
+/// calls them again, so each thread keeps what it found for a name.
+pub(crate) struct ListedNames;
+
+use rustel_core::value::name_tag;
+
+#[inline(always)]
+fn tag_slot(tag: u64, mask: usize) -> usize {
+    ((tag.wrapping_mul(0x9e37_79b9_7f4a_7c15)) >> 32) as usize & mask
+}
+
+/// Static flat open-addressed lookup tables pre-populated once from
+/// [`NATIVE_INVENTORY`], avoiding `HashMap` fallback and `memcmp` on all
+/// short (`<= 7`-byte) method and global names.
+struct StaticNames {
+    methods: Box<[(u64, &'static str, Option<BuiltinMethod>)]>,
+    methods_mask: usize,
+    globals: Box<[(u64, &'static str, Option<BuiltinGlobal>)]>,
+    globals_mask: usize,
+}
+
+fn static_names() -> &'static StaticNames {
+    static NAMES: std::sync::OnceLock<StaticNames> = std::sync::OnceLock::new();
+    NAMES.get_or_init(|| {
+        let mut method_list = Vec::with_capacity(1_400);
+        let mut global_list = Vec::with_capacity(600);
+        for line in NATIVE_INVENTORY.lines() {
+            let Some(((section, name), listing)) = inventory_entry(line.trim_end_matches('\r'))
+            else {
+                continue;
+            };
+            match section {
+                "method" => {
+                    if let Some(method) = BuiltinMethod::listed(listing) {
+                        method_list.push((name, method));
+                    }
+                }
+                "global" => {
+                    if let Some(global) = BuiltinGlobal::listed(name, listing) {
+                        global_list.push((name, global));
+                    }
+                }
+                _ => {}
+            }
+        }
+        let m_len = (method_list.len().saturating_mul(2).max(16)).next_power_of_two();
+        let m_mask = m_len - 1;
+        let mut methods: Vec<(u64, &'static str, Option<BuiltinMethod>)> =
+            vec![(0, "", None); m_len];
+        for (name, method) in method_list {
+            let tag = name_tag(name);
+            let mut slot = tag_slot(tag, m_mask);
+            loop {
+                if methods[slot].0 == 0 || (methods[slot].0 == tag && methods[slot].1 == name) {
+                    methods[slot] = (tag, name, Some(method));
+                    break;
+                }
+                slot = (slot + 1) & m_mask;
+            }
+        }
+        let g_len = (global_list.len().saturating_mul(2).max(16)).next_power_of_two();
+        let g_mask = g_len - 1;
+        let mut globals: Vec<(u64, &'static str, Option<BuiltinGlobal>)> =
+            vec![(0, "", None); g_len];
+        for (name, global) in global_list {
+            let tag = name_tag(name);
+            let mut slot = tag_slot(tag, g_mask);
+            loop {
+                if globals[slot].0 == 0 || (globals[slot].0 == tag && globals[slot].1 == name) {
+                    globals[slot] = (tag, name, Some(global));
+                    break;
+                }
+                slot = (slot + 1) & g_mask;
+            }
+        }
+        StaticNames {
+            methods: methods.into_boxed_slice(),
+            methods_mask: m_mask,
+            globals: globals.into_boxed_slice(),
+            globals_mask: g_mask,
+        }
+    })
+}
+
+impl ListedNames {
+    #[inline]
+    pub(crate) fn method(&self, name: &str) -> Option<BuiltinMethod> {
+        let names = static_names();
+        let tag = name_tag(name);
+        let mask = names.methods_mask;
+        let mut slot = tag_slot(tag, mask);
+        loop {
+            let &(entry_tag, entry_name, method) = &names.methods[slot];
+            if entry_tag == 0 {
+                return None;
+            }
+            if entry_tag == tag && ((tag >> 56) != 0xff || entry_name == name) {
+                return method;
+            }
+            slot = (slot + 1) & mask;
+        }
+    }
+
+    #[inline]
+    pub(crate) fn global(&self, name: &str) -> Option<BuiltinGlobal> {
+        let names = static_names();
+        let tag = name_tag(name);
+        let mask = names.globals_mask;
+        let mut slot = tag_slot(tag, mask);
+        loop {
+            let (entry_tag, entry_name, global) = &names.globals[slot];
+            if *entry_tag == 0 {
+                return None;
+            }
+            if *entry_tag == tag && ((tag >> 56) != 0xff || *entry_name == name) {
+                return global.clone();
+            }
+            slot = (slot + 1) & mask;
+        }
+    }
+
+    #[inline]
+    pub(crate) fn is_signal(&self, name: &str) -> bool {
+        let names = static_names();
+        let tag = name_tag(name);
+        let mask = names.globals_mask;
+        let mut slot = tag_slot(tag, mask);
+        loop {
+            let (entry_tag, entry_name, global) = &names.globals[slot];
+            if *entry_tag == 0 {
+                return false;
+            }
+            if *entry_tag == tag && ((tag >> 56) != 0xff || *entry_name == name) {
+                return matches!(global, Some(BuiltinGlobal::Signal(_)));
+            }
+            slot = (slot + 1) & mask;
+        }
+    }
+}
+
+/// The section and the name of a line of the inventory, and what the line
+/// lists for the name.
+fn inventory_entry(line: &str) -> Option<((&str, &str), &str)> {
+    let mut words = line.splitn(3, ' ');
+    Some(((words.next()?, words.next()?), words.next()?))
+}
+
+/// The name as `text` spells it and what `text` lists for it, for `name`
+/// in `section`, found by a search of the lines of `text`, which are in
+/// the order of section and name.
+#[cfg(test)]
+fn listing_in<'t>(text: &'t str, section: &str, name: &str) -> Option<(&'t str, &'t str)> {
+    let (mut low, mut high) = (0, text.len());
+    while low < high {
+        let middle = low + (high - low) / 2;
+        // The line that holds the byte at `middle`.
+        let start = text[..middle].rfind('\n').map_or(0, |end| end + 1);
+        let end = text[middle..]
+            .find('\n')
+            .map_or(text.len(), |end| middle + end);
+        // A checkout can end each line with a carriage return too.
+        let (entry, listing) = inventory_entry(text[start..end].trim_end_matches('\r'))?;
+        match entry.cmp(&(section, name)) {
+            std::cmp::Ordering::Equal => return Some((entry.1, listing)),
+            std::cmp::Ordering::Less => low = end + 1,
+            std::cmp::Ordering::Greater => high = start,
+        }
+    }
+    None
+}
+
+impl BuiltinMethod {
+    /// This method as the inventory lists it: its kind, then what holds it
+    /// in the native tables. `None` for a registration no registry holds.
+    #[cfg(test)]
+    fn listing(&self) -> Option<String> {
+        Some(match self {
+            Self::Registered(registration) => {
+                let name = registry().names().into_iter().find(|name| {
+                    registry()
+                        .get(name)
+                        .is_some_and(|held| held.same_definition(registration))
+                })?;
+                format!("registered {name}")
+            }
+            Self::Control(spec) => format!("control {}", spec.name()),
+            Self::Shortcut { op, how } => format!("shortcut {} {}", op.name(), how.name()),
+            Self::Composer(op) => format!("composer {}", op.name()),
+            Self::Pick { index, join } => format!("pick {index:?} {join:?}"),
+            Self::Visual => "visual".into(),
+            Self::Layer { keep_original } => {
+                format!("layer {}", if *keep_original { "over" } else { "alone" })
+            }
+        })
+    }
+
+    /// The method a listing names, read from the native tables of this
+    /// build. `None` when this build holds no such entry.
+    fn listed(listing: &str) -> Option<Self> {
+        use rustel_core::{JoinMode, PickIndexMode};
+        let mut words = listing.split(' ');
+        Some(match (words.next()?, words.next(), words.next()) {
+            ("registered", Some(name), None) => Self::Registered(registry().get(name)?),
+            ("control", Some(name), None) => Self::Control(control_registry().get(name)?),
+            ("shortcut", Some(op), Some(how)) => Self::Shortcut {
+                op: ComposeOp::from_name(op)?,
+                how: Alignment::from_name(how)?,
+            },
+            ("composer", Some(op), None) => Self::Composer(ComposeOp::from_name(op)?),
+            ("pick", Some(index), Some(join)) => Self::Pick {
+                index: match index {
+                    "Clamp" => PickIndexMode::Clamp,
+                    "Remainder" => PickIndexMode::Remainder,
+                    "Modulo" => PickIndexMode::Modulo,
+                    _ => return None,
+                },
+                join: match join {
+                    "Inner" => JoinMode::Inner,
+                    "Outer" => JoinMode::Outer,
+                    "Mix" => JoinMode::Mix,
+                    "Squeeze" => JoinMode::Squeeze,
+                    "Reset" => JoinMode::Reset,
+                    "Restart" => JoinMode::Restart,
+                    _ => return None,
+                },
+            },
+            ("visual", None, None) => Self::Visual,
+            ("layer", Some("over"), None) => Self::Layer {
+                keep_original: true,
+            },
+            ("layer", Some("alone"), None) => Self::Layer {
+                keep_original: false,
+            },
+            _ => return None,
+        })
+    }
+}
+
+impl BuiltinGlobal {
+    /// This global as the inventory lists it.
+    #[cfg(test)]
+    fn listing(&self) -> String {
+        match self {
+            Self::Control(_) => "control".into(),
+            Self::List(kind) => format!("list {kind:?}"),
+            Self::Tempo { per_minute: true } => "tempo minute".into(),
+            Self::Tempo { per_minute: false } => "tempo second".into(),
+            Self::Signal(_) => "signal".into(),
+        }
+    }
+
+    /// The global `name` that a listing describes, read from the native
+    /// tables of this build.
+    fn listed(name: &str, listing: &str) -> Option<Self> {
+        Some(match listing {
+            "control" => Self::Control(control_registry().get(name)?),
+            "list Stack" => Self::List(ListKind::Stack),
+            "list SlowCat" => Self::List(ListKind::SlowCat),
+            "list FastCat" => Self::List(ListKind::FastCat),
+            "tempo minute" => Self::Tempo { per_minute: true },
+            "tempo second" => Self::Tempo { per_minute: false },
+            "signal" => {
+                // Built once: a signal read by two scores is one pattern.
+                static SIGNALS: std::sync::OnceLock<Vec<(&'static str, Pattern)>> =
+                    std::sync::OnceLock::new();
+                let signals = SIGNALS.get_or_init(rustel_core::signal::signals);
+                let (_, pattern) = signals.iter().find(|(signal, _)| *signal == name)?;
+                Self::Signal(pattern.clone())
+            }
+            _ => return None,
+        })
+    }
+}
+
+/// What `ctx`, fully installed and before any score, proves: the text of
+/// the inventory asset.
+#[cfg(test)]
+fn proven_inventory(ctx: &Ctx<'_>) -> String {
+    let methods = host_builtin_methods(ctx).expect("the inventory");
+    let methods = methods.borrow();
+    let mut lines = Vec::new();
+    for name in methods.methods.keys() {
+        if let Some(method) = prove_builtin_method(ctx, name) {
+            let listing = method
+                .listing()
+                .expect("a registry holds each registration");
+            lines.push(format!("method {name} {listing}\n"));
+        }
+    }
+    for name in methods.globals.keys() {
+        if let Some(global) = prove_builtin_global(ctx, name) {
+            lines.push(format!("global {name} {}\n", global.listing()));
+        }
+    }
+    lines.sort();
+    lines.concat()
+}
+
+/// Record the lane method `p` that installation put on the prototype.
+pub(crate) fn record_lane_method<'js>(
+    ctx: &Ctx<'js>,
+    slot: rquickjs::Value<'js>,
+) -> rquickjs::Result<()> {
+    host_stack(ctx)?.as_object().set(BUILTIN_LANE_METHOD, slot)
+}
+
+/// Whether the prototype's `p` is still the sealed lane method.
+pub(crate) fn prove_lane_method(ctx: &Ctx<'_>) -> bool {
+    let sealed = host_builtin_methods(ctx).is_ok_and(|methods| methods.borrow().sealed);
+    let Some(slot) = host_stack(ctx).ok().and_then(|stack| {
+        stack
+            .as_object()
+            .get::<_, rquickjs::Value>(BUILTIN_LANE_METHOD)
+            .ok()
+    }) else {
+        return false;
+    };
+    let Some(proto) = rquickjs::Class::<NativePatternWrapper>::prototype(ctx)
+        .ok()
+        .flatten()
+    else {
+        return false;
+    };
+    sealed && !slot.is_undefined() && holds(ctx, &proto, "p", false, &slot).unwrap_or(false)
+}
+
 /// Record the global `m` that installation defined.
 pub(crate) fn record_mini_callee<'js>(
     ctx: &Ctx<'js>,
@@ -210,8 +839,8 @@ fn holds<'js>(
 
 /// Finish the inventory once every installation layer has run.
 ///
-/// A name stays only while its prototype slot is the object recorded last
-/// for it, so a method that a later layer replaced drops out. The gate opens
+/// A name stays only while its slot is the object recorded last for it, so
+/// a method or global that a later layer replaced drops out. The gate opens
 /// with the seal.
 pub(crate) fn seal_builtin_methods<'js>(
     ctx: &Ctx<'js>,
@@ -231,6 +860,18 @@ pub(crate) fn seal_builtin_methods<'js>(
     for name in replaced {
         methods.methods.remove(&name);
         slots.remove(&*name)?;
+    }
+    let slots = global_slots(ctx)?;
+    let mut replaced = Vec::new();
+    for name in methods.globals.keys() {
+        let slot: rquickjs::Value = slots.get(*name)?;
+        if !holds(ctx, globals, name, false, &slot)? {
+            replaced.push(*name);
+        }
+    }
+    for name in replaced {
+        methods.globals.remove(name);
+        slots.remove(name)?;
     }
     let stack = host_stack(ctx)?;
     let mini: rquickjs::Value = stack.as_object().get(BUILTIN_MINI_CALLEE)?;
@@ -269,7 +910,7 @@ pub(crate) fn prove_builtin_method(ctx: &Ctx<'_>, name: &str) -> Option<BuiltinM
     let proto = rquickjs::Class::<NativePatternWrapper>::prototype(ctx).ok()??;
     holds(ctx, &proto, name, method.is_accessor(), &slot)
         .ok()?
-        .then(|| method.clone())
+        .then_some(*method)
 }
 
 /// Whether the global `m` is still the sealed mini-notation callee.
@@ -339,7 +980,7 @@ mod tests {
         with_ctx(&runtime, |ctx| {
             for name in [
                 "rev", "fast", "gain", "add", "struct", "s", "vib", "fm", "fmh", "detune", "crush",
-                "speed", "mask", "squeeze", "set",
+                "speed", "mask", "squeeze", "set", "when", "clip", "ply",
             ] {
                 assert!(
                     prove_builtin_method(&ctx, name).is_some(),
@@ -397,6 +1038,69 @@ mod tests {
             assert!(
                 !with_ctx(&runtime, |ctx| prove_surface_intrinsics(&ctx)),
                 "{replace}"
+            );
+        }
+    }
+
+    /// Set `RUSTEL_WRITE_INVENTORY` to write the asset from this realm,
+    /// in a build with every feature.
+    #[test]
+    fn the_inventory_asset_lists_what_a_fresh_installation_proves() {
+        let runtime = JsRuntime::new().expect("runtime");
+        runtime.ensure_surface().expect("the whole surface");
+        let proven = with_ctx(&runtime, |ctx| {
+            assert!(prove_mini_callee(&ctx) && prove_lane_method(&ctx));
+            assert!(prove_surface_intrinsics(&ctx));
+            proven_inventory(&ctx)
+        });
+        if std::env::var_os("RUSTEL_WRITE_INVENTORY").is_some() {
+            let asset = concat!(env!("CARGO_MANIFEST_DIR"), "/assets/native-inventory.txt");
+            std::fs::write(asset, &proven).expect("write the inventory asset");
+        }
+        // A lookup searches the lines, so they are in the order of section
+        // and name, each name once.
+        let entries: Vec<_> = NATIVE_INVENTORY
+            .lines()
+            .map(|line| {
+                inventory_entry(line)
+                    .expect("a section, a name and a listing")
+                    .0
+            })
+            .collect();
+        assert!(entries.windows(2).all(|pair| pair[0] < pair[1]));
+        // Every entry this build can read is one the realm proves, with the
+        // same meaning. A build with fewer features reads fewer entries.
+        let listed = ListedNames;
+        for line in NATIVE_INVENTORY.lines() {
+            let mut words = line.splitn(3, ' ');
+            let (section, name) = (words.next().expect("section"), words.next().expect("name"));
+            let readable = match section {
+                "method" => listed.method(name).is_some(),
+                _ => listed.global(name).is_some(),
+            };
+            assert!(
+                !readable || proven.lines().any(|proven| proven == line),
+                "the realm does not prove `{line}`"
+            );
+        }
+        // With every feature, the asset is the whole of what it proves.
+        #[cfg(all(feature = "extensions", feature = "hydra"))]
+        assert_eq!(
+            proven, NATIVE_INVENTORY,
+            "run this test with RUSTEL_WRITE_INVENTORY=1 to write the asset again"
+        );
+    }
+
+    #[test]
+    fn a_search_reads_lines_that_end_with_a_carriage_return() {
+        let checkout = NATIVE_INVENTORY.replace('\n', "\r\n");
+        for line in NATIVE_INVENTORY.lines() {
+            let ((section, name), listed) =
+                inventory_entry(line).expect("a section, a name and a listing");
+            assert_eq!(
+                listing_in(&checkout, section, name),
+                Some((name, listed)),
+                "{line}"
             );
         }
     }

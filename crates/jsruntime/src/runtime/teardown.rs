@@ -32,6 +32,10 @@ pub(super) fn sever_host_roots<'js>(ctx: &Ctx<'js>, roots: &HostRoots<'js>) {
 
 impl Drop for JsRuntime {
     fn drop(&mut self) {
+        // A runtime that started no script engine has nothing to collect.
+        if self.realm.get().is_none() {
+            return;
+        }
         // A runtime may itself be thread-local and outlive the settings stack
         // during thread teardown. Root severing does not execute score
         // setters, so it must remain independent of that stack.
@@ -69,7 +73,7 @@ impl Drop for JsRuntime {
             }
         });
         for _ in 0..3 {
-            self.rt.run_gc();
+            self.run_gc();
         }
     }
 }

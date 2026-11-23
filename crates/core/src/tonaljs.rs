@@ -28,6 +28,7 @@ use std::collections::HashMap;
 use std::sync::OnceLock;
 
 use crate::tonaljs_scales::SCALE_DICTIONARY;
+use crate::value::SharedStr;
 
 // ---------------------------------------------------------------------------
 // Fifths/octaves coordinates
@@ -91,68 +92,88 @@ pub struct NoteProps {
     pub midi: Option<i64>,
 }
 
-/// Splits a note name into (letter, accidentals, octave, rest). The
-/// accidental run is homogeneous (`#...`, `b...` or `x...`, never mixed);
-/// `x` expands to `##`.
-fn tokenize_note(str: &str) -> (String, String, String, String) {
-    let mut chars = str.chars().peekable();
-    let letter = match chars.peek() {
-        Some(c @ 'a'..='g') | Some(c @ 'A'..='G') => {
-            let up = c.to_ascii_uppercase();
-            chars.next();
-            up.to_string()
+/// Zero-allocation note parser: returns `(letter_ascii_upper, step, alt, oct)`.
+#[inline]
+fn parse_note_parts(src: &str) -> Option<(u8, usize, i64, Option<i64>)> {
+    let bytes = src.as_bytes();
+    let first = *bytes.first()?;
+    if !matches!(first, b'a'..=b'g' | b'A'..=b'G') {
+        return None;
+    }
+    let letter = first.to_ascii_uppercase();
+    let mut pos = 1;
+    let alt: i64 = if pos < bytes.len() {
+        let ac = bytes[pos];
+        if matches!(ac, b'#' | b'b' | b'x') {
+            let start = pos;
+            while pos < bytes.len() && bytes[pos] == ac {
+                pos += 1;
+            }
+            let count = i64::try_from(pos - start).ok()?;
+            match ac {
+                b'b' => -count,
+                b'x' => count.checked_mul(2)?,
+                _ => count,
+            }
+        } else {
+            0
         }
-        _ => String::new(),
+    } else {
+        0
     };
-    let acc_char = match chars.peek() {
-        Some('#') => Some('#'),
-        Some('b') => Some('b'),
-        Some('x') => Some('x'),
-        _ => None,
+    let oct_start = pos;
+    if pos < bytes.len()
+        && bytes[pos] == b'-'
+        && pos + 1 < bytes.len()
+        && bytes[pos + 1].is_ascii_digit()
+    {
+        pos += 1;
+    }
+    while pos < bytes.len() && bytes[pos].is_ascii_digit() {
+        pos += 1;
+    }
+    let oct_slice = &src[oct_start..pos];
+    if !src[pos..].trim_start().is_empty() {
+        return None;
+    }
+    let step = ((letter as i64) + 3).rem_euclid(7) as usize;
+    let oct = if oct_slice.is_empty() {
+        None
+    } else {
+        Some(oct_slice.parse::<i64>().ok()?)
     };
-    let mut acc = String::new();
-    if let Some(ac) = acc_char {
-        while chars.peek() == Some(&ac) {
-            chars.next();
-            acc.push(ac);
-        }
+    Some((letter, step, alt, oct))
+}
+
+/// Parsed note pitch components and fifths/octaves coordinates.
+#[derive(Clone, Copy)]
+struct ParsedNote {
+    step: usize,
+    alt: i64,
+    oct: Option<i64>,
+    coord: (i64, Option<i64>),
+}
+
+/// Zero-allocation note parser returning its fifths/octaves coordinates.
+#[inline]
+fn parse_note_coord(src: &str) -> Option<ParsedNote> {
+    let (_, step, alt, oct) = parse_note_parts(src)?;
+    let coord = coordinates(step, alt, oct, 1)?;
+    // Preserve `note_get`'s height overflow check.
+    if let Some(oct) = oct {
+        let _ = i64::try_from(SIZES[step] as i128 + alt as i128 + 12 * (oct as i128 + 1)).ok()?;
     }
-    let acc = acc.replace('x', "##");
-    let mut oct = String::new();
-    if chars.peek() == Some(&'-') {
-        let mut ahead = chars.clone();
-        ahead.next();
-        if matches!(ahead.peek(), Some('0'..='9')) {
-            chars.next();
-            oct.push('-');
-        }
-    }
-    while matches!(chars.peek(), Some('0'..='9')) {
-        oct.push(chars.next().expect("the iterator yields the element"));
-    }
-    let rest: String = chars.collect::<String>().trim_start().to_string();
-    (letter, acc, oct, rest)
+    Some(ParsedNote {
+        step,
+        alt,
+        oct,
+        coord,
+    })
 }
 
 /// Parses a note name into its algebraic record; `None` on garbage.
 pub fn note_get(name: &str) -> Option<NoteProps> {
-    let (letter, acc, oct_str, rest) = tokenize_note(name);
-    if letter.is_empty() || !rest.is_empty() {
-        return None;
-    }
-    let step = ((letter.as_bytes()[0] as i64) + 3).rem_euclid(7) as usize;
-    // A leading 'b' counts negative; otherwise the run length counts up.
-    let acc_len = i64::try_from(acc.len()).ok()?;
-    let alt = if acc.starts_with('b') {
-        -acc_len
-    } else {
-        acc_len
-    };
-    let oct: Option<i64> = if oct_str.is_empty() {
-        None
-    } else {
-        Some(oct_str.parse().ok()?)
-    };
+    let (letter, step, alt, oct) = parse_note_parts(name)?;
     let coord = coordinates(step, alt, oct, 1)?;
     // height: octless pitch classes sit 99 octaves down (mod 12 first).
     let height = match oct {
@@ -162,10 +183,26 @@ pub fn note_get(name: &str) -> Option<NoteProps> {
         }
     };
     let midi = (0..=127).contains(&height).then_some(height);
-    let pc = format!("{letter}{acc}");
+    let mut pc = String::with_capacity(1 + alt.unsigned_abs().min(8) as usize);
+    pc.push(letter as char);
+    if alt < 0 {
+        for _ in 0..(-alt) {
+            pc.push('b');
+        }
+    } else {
+        for _ in 0..alt {
+            pc.push('#');
+        }
+    }
     let name = match oct {
         // Only degenerate spellings like "c03" print differently than typed.
-        Some(oct) => format!("{pc}{oct}"),
+        Some(oct) => {
+            use std::fmt::Write;
+            let mut s = String::with_capacity(pc.len() + 4);
+            s.push_str(&pc);
+            let _ = write!(s, "{oct}");
+            s
+        }
         None => pc.clone(),
     };
     Some(NoteProps {
@@ -181,18 +218,69 @@ pub fn note_get(name: &str) -> Option<NoteProps> {
     })
 }
 
+/// Formats `(step, alt, oct)` into an inline [`SharedStr`] with zero heap
+/// allocations for ordinary accidentals and octaves.
+#[inline]
+fn note_pitch_shared(step: usize, alt: i64, oct: Option<i64>) -> SharedStr {
+    let abs_alt = alt.unsigned_abs();
+    if abs_alt <= 8 {
+        let mut buf = [0u8; 32];
+        buf[0] = b"CDEFGAB"[step];
+        let mut len = 1;
+        let acc = if alt < 0 { b'b' } else { b'#' };
+        for _ in 0..abs_alt {
+            buf[len] = acc;
+            len += 1;
+        }
+        if let Some(oct) = oct {
+            if (0..10).contains(&oct) {
+                buf[len] = b'0' + oct as u8;
+                len += 1;
+            } else if (-9..0).contains(&oct) {
+                buf[len] = b'-';
+                buf[len + 1] = b'0' + (-oct) as u8;
+                len += 2;
+            } else if (10..100).contains(&oct) {
+                buf[len] = b'0' + (oct / 10) as u8;
+                buf[len + 1] = b'0' + (oct % 10) as u8;
+                len += 2;
+            } else {
+                let mut n = oct.unsigned_abs();
+                if oct < 0 {
+                    buf[len] = b'-';
+                    len += 1;
+                }
+                let start = len;
+                while n > 0 {
+                    buf[len] = b'0' + (n % 10) as u8;
+                    n /= 10;
+                    len += 1;
+                }
+                buf[start..len].reverse();
+            }
+        }
+        if let Ok(s) = std::str::from_utf8(&buf[..len]) {
+            return SharedStr::from(s);
+        }
+    }
+    SharedStr::from(note_pitch_name(step, alt, oct))
+}
+
 /// Prints (step, alt, oct) as a note name.
 fn note_pitch_name(step: usize, alt: i64, oct: Option<i64>) -> String {
     let letter = b"CDEFGAB"[step] as char;
-    let acc = if alt < 0 {
-        "b".repeat((-alt) as usize)
-    } else {
-        "#".repeat(alt as usize)
-    };
-    match oct {
-        Some(oct) => format!("{letter}{acc}{oct}"),
-        None => format!("{letter}{acc}"),
+    let abs_alt = alt.unsigned_abs() as usize;
+    let mut out = String::with_capacity(1 + abs_alt + if oct.is_some() { 3 } else { 0 });
+    out.push(letter);
+    let acc = if alt < 0 { 'b' } else { '#' };
+    for _ in 0..abs_alt {
+        out.push(acc);
     }
+    if let Some(oct) = oct {
+        use std::fmt::Write;
+        let _ = write!(out, "{oct}");
+    }
+    out
 }
 
 /// Coordinate → note name.
@@ -230,11 +318,12 @@ const TYPES: [IntervalType; 7] = [
     IntervalType::Majorable,
 ];
 
-/// Splits an interval name into (number, quality). Two grammars: tonal
-/// ("3M") and shorthand ("M3"). Only the tonal form anchors at the start
-/// and only the shorthand form at the end, so trailing garbage after a
-/// tonal match is ignored.
-fn tokenize_interval(str: &str) -> Option<(i64, String)> {
+/// Splits an interval name into (number, quality) without allocating. Two
+/// grammars: tonal ("3M") and shorthand ("M3"). Only the tonal form anchors
+/// at the start and only the shorthand form at the end, so trailing garbage
+/// after a tonal match is ignored.
+#[inline]
+fn tokenize_interval(str: &str) -> Option<(i64, &str)> {
     let bytes = str.as_bytes();
     // Tonal form: signed digits then a quality run, anchored at the start.
     let mut i = 0;
@@ -258,7 +347,7 @@ fn tokenize_interval(str: &str) -> Option<(i64, String)> {
             _ => None,
         };
         if let Some(len) = quality_len {
-            return Some((num, str[i..i + len].to_string()));
+            return Some((num, &str[i..i + len]));
         }
     }
     // Shorthand form: quality then signed digits, anchored at the end; the
@@ -276,12 +365,36 @@ fn tokenize_interval(str: &str) -> Option<(i64, String)> {
                     && ab[j..].iter().all(|b| b.is_ascii_digit())
                     && let Ok(num) = after.parse::<i64>()
                 {
-                    return Some((num, q.to_string()));
+                    return Some((num, q));
                 }
             }
         }
     }
     None
+}
+
+/// Zero-allocation interval coordinate parse: returns `(f, o, dir, semitones)`.
+#[inline]
+fn parse_interval_coord(src: &str) -> Option<(i64, i64, i64, i64)> {
+    let (num, q) = tokenize_interval(src)?;
+    let magnitude = num.checked_abs()?;
+    let step = ((magnitude - 1).rem_euclid(7)) as usize;
+    let t = TYPES[step];
+    if t == IntervalType::Majorable && q == "P" {
+        return None;
+    }
+    let alt = q_to_alt(t, q)?;
+    let dir: i64 = if num < 0 { -1 } else { 1 };
+    let oct = floor_div(magnitude - 1, 7);
+    let semitones =
+        i64::try_from(dir as i128 * (SIZES[step] as i128 + alt as i128 + 12 * oct as i128)).ok()?;
+    let (f, o) = coordinates(step, alt, Some(oct), dir)?;
+    Some((
+        f,
+        o.expect("interval coordinates always carry octaves"),
+        dir,
+        semitones,
+    ))
 }
 
 /// Quality → alteration within a degree's quality class.
@@ -333,7 +446,7 @@ pub fn interval_get(src: &str) -> Option<IntervalProps> {
     }
     // "5M" is accepted on purpose: "M" on a perfectable degree resolves to
     // alt 0, i.e. the perfect interval.
-    let alt = q_to_alt(t, &q)?;
+    let alt = q_to_alt(t, q)?;
     let dir: i64 = if num < 0 { -1 } else { 1 };
     let oct = floor_div(magnitude - 1, 7);
     let semitones =
@@ -377,7 +490,7 @@ fn interval_name_from_coord(f: i64, o: i64) -> Option<String> {
 
 /// Semitone span of an interval name; `None` on garbage.
 pub fn interval_semitones(name: &str) -> Option<i64> {
-    interval_get(name).map(|i| i.semitones)
+    parse_interval_coord(name).map(|(_, _, _, semitones)| semitones)
 }
 
 /// Names the interval spanning a semitone count ("5P" for 7, "5d" for 6).
@@ -408,23 +521,17 @@ pub(crate) fn exact_semitones(n: f64) -> Option<i64> {
 
 /// Adds two intervals; `None` when either is invalid.
 pub fn interval_add(a: &str, b: &str) -> Option<String> {
-    let a = interval_get(a)?;
-    let b = interval_get(b)?;
+    let (af, ao, _, _) = parse_interval_coord(a)?;
+    let (bf, bo, _, _) = parse_interval_coord(b)?;
     // Stored coords are already signed by dir, so addition is componentwise.
-    interval_name_from_coord(
-        a.coord.0.checked_add(b.coord.0)?,
-        a.coord.1.checked_add(b.coord.1)?,
-    )
+    interval_name_from_coord(af.checked_add(bf)?, ao.checked_add(bo)?)
 }
 
 /// Subtracts two intervals; `None` when either is invalid.
 pub fn interval_subtract(a: &str, b: &str) -> Option<String> {
-    let a = interval_get(a)?;
-    let b = interval_get(b)?;
-    interval_name_from_coord(
-        a.coord.0.checked_sub(b.coord.0)?,
-        a.coord.1.checked_sub(b.coord.1)?,
-    )
+    let (af, ao, _, _) = parse_interval_coord(a)?;
+    let (bf, bo, _, _) = parse_interval_coord(b)?;
+    interval_name_from_coord(af.checked_sub(bf)?, ao.checked_sub(bo)?)
 }
 
 // ---------------------------------------------------------------------------
@@ -434,14 +541,15 @@ pub fn interval_subtract(a: &str, b: &str) -> Option<String> {
 /// Transposes a note by an interval; `""` on any invalid input. Pitch
 /// classes stay pitch classes.
 pub fn note_transpose(note_name: &str, interval_name: &str) -> String {
-    let Some(note) = note_get(note_name) else {
+    let Some(ParsedNote {
+        coord: (nf, no), ..
+    }) = parse_note_coord(note_name)
+    else {
         return String::new();
     };
-    let Some(interval) = interval_get(interval_name) else {
+    let Some((if_, io, _, _)) = parse_interval_coord(interval_name) else {
         return String::new();
     };
-    let (nf, no) = note.coord;
-    let (if_, io, _dir) = interval.coord;
     match no {
         None => nf
             .checked_add(if_)
@@ -579,20 +687,238 @@ pub fn scale_get(src: &str) -> Option<ScaleProps> {
 
 /// Note-shaped test: letter, a `#bsf` run, an optional `-` and digits.
 /// Looser than [`note_get`]; used to phrase scale errors.
+#[inline]
 pub fn is_score_note(value: &str) -> bool {
-    let mut chars = value.chars();
-    if !matches!(chars.next(), Some('a'..='g' | 'A'..='G')) {
+    let bytes = value.as_bytes();
+    if !matches!(bytes.first(), Some(b'a'..=b'g' | b'A'..=b'G')) {
         return false;
     }
-    let rest: Vec<char> = chars.collect();
-    let mut i = 0;
-    while i < rest.len() && matches!(rest[i], '#' | 'b' | 's' | 'f') {
+    let mut i = 1;
+    while i < bytes.len() && matches!(bytes[i], b'#' | b'b' | b's' | b'f') {
         i += 1;
     }
-    if i < rest.len() && rest[i] == '-' {
+    if i < bytes.len() && bytes[i] == b'-' {
         i += 1;
     }
-    rest[i..].iter().all(|c| c.is_ascii_digit())
+    bytes[i..].iter().all(u8::is_ascii_digit)
+}
+
+/// Inline storage for a scale's pre-parsed `(fifths, octaves)` interval
+/// coordinates. Almost every scale has at most 12 notes and needs no heap.
+#[derive(Clone, Debug)]
+enum ScaleIntervals {
+    Inline { len: u8, coords: [(i64, i64); 12] },
+    Heap(Box<[(i64, i64)]>),
+}
+
+impl ScaleIntervals {
+    #[inline]
+    fn as_slice(&self) -> &[(i64, i64)] {
+        match self {
+            Self::Inline { len, coords } => &coords[..usize::from(*len)],
+            Self::Heap(slice) => slice,
+        }
+    }
+}
+
+/// Pre-parsed scale ready for zero-allocation degree and quantization lookups.
+#[derive(Clone, Debug)]
+pub(crate) struct ResolvedScale {
+    tonic_f: i64,
+    tonic_o: i64,
+    root_o0: i64,
+    intervals: ScaleIntervals,
+}
+
+impl ResolvedScale {
+    /// Parse a `"C:major"`-style scale name once, keeping only its tonic
+    /// coordinates and pre-parsed interval coordinates.
+    pub(crate) fn parse(scale_name: &str) -> Result<Self, String> {
+        let (tonic_parts, index) = lookup_scale_colon(scale_name)?;
+        let intervals_raw = SCALE_DICTIONARY[index].2;
+        let (step, alt, oct) = match tonic_parts {
+            Some(tonic) => (tonic.step, tonic.alt, tonic.oct.unwrap_or(3)),
+            None => (0, 0, 3), // C3
+        };
+        let (tonic_f, tonic_o) = coordinates(step, alt, Some(oct), 1)
+            .and_then(|(f, o)| Some((f, o?)))
+            .ok_or_else(|| format!("invalid tonic in scale \"{scale_name}\""))?;
+        let (_, root_o0) = coordinates(step, alt, Some(0), 1)
+            .and_then(|(f, o)| Some((f, o?)))
+            .ok_or_else(|| format!("invalid tonic in scale \"{scale_name}\""))?;
+        let intervals = if intervals_raw.len() <= 12 {
+            let mut coords = [(0i64, 0i64); 12];
+            for (slot, name) in coords.iter_mut().zip(intervals_raw.iter()) {
+                let (if_, io, _, _) =
+                    parse_interval_coord(name).ok_or_else(|| format!("bad interval \"{name}\""))?;
+                *slot = (if_, io);
+            }
+            ScaleIntervals::Inline {
+                len: intervals_raw.len() as u8,
+                coords,
+            }
+        } else {
+            let mut coords = Vec::with_capacity(intervals_raw.len());
+            for name in intervals_raw {
+                let (if_, io, _, _) =
+                    parse_interval_coord(name).ok_or_else(|| format!("bad interval \"{name}\""))?;
+                coords.push((if_, io));
+            }
+            ScaleIntervals::Heap(coords.into_boxed_slice())
+        };
+        Ok(Self {
+            tonic_f,
+            tonic_o,
+            root_o0,
+            intervals,
+        })
+    }
+
+    /// Snaps `note_midi` to the nearest note in this scale, preferring the
+    /// higher note on ties, formatting directly into an inline [`SharedStr`]
+    /// with zero heap allocations.
+    #[inline]
+    pub(crate) fn nearest_note_shared(&self, note_midi: f64) -> SharedStr {
+        let intervals = self.intervals.as_slice();
+        let (if0, io0) = intervals.first().copied().unwrap_or((0, 0));
+        let root_midi = (7 * (self.tonic_f + if0) + 12 * (self.root_o0 + io0) + 12) as f64;
+        let octave_diff = ((note_midi - root_midi) / 12.0).floor();
+        let shift_f = 12.0 * octave_diff;
+        let Some(shift) = exact_semitones(shift_f) else {
+            return SharedStr::from("");
+        };
+        let mut best_index = 0usize;
+        let mut best_diff = f64::INFINITY;
+        for (i, &(if_, io)) in intervals.iter().enumerate() {
+            let m = (7 * (self.tonic_f + if_) + 12 * (self.root_o0 + io) + 12) as f64;
+            let diff = ((m + shift_f) - note_midi).abs();
+            if diff <= best_diff {
+                best_index = i;
+                best_diff = diff;
+            }
+        }
+        // Final entry: octave above root ("8P" = (0, 1)).
+        let oct_midi = (7 * self.tonic_f + 12 * (self.root_o0 + 1) + 12) as f64;
+        if ((oct_midi + shift_f) - note_midi).abs() <= best_diff {
+            best_index = intervals.len();
+        }
+        let (bf, bo) = if best_index < intervals.len() {
+            intervals[best_index]
+        } else {
+            (0, 1)
+        };
+        let shift_oct = shift / 12;
+        let Some(nf) = self.tonic_f.checked_add(bf) else {
+            return SharedStr::from("");
+        };
+        let Some(no) = self
+            .root_o0
+            .checked_add(bo)
+            .and_then(|o| o.checked_add(shift_oct))
+        else {
+            return SharedStr::from("");
+        };
+        match pitch_from_coord(nf, Some(no)) {
+            Some((nstep, nalt, noct)) => note_pitch_shared(nstep, nalt, noct),
+            None => SharedStr::from(""),
+        }
+    }
+
+    /// Note at scale degree `step` (ceil'd), formatted into an inline
+    /// [`SharedStr`] with zero heap allocations for ordinary notes.
+    #[inline]
+    pub(crate) fn step_shared(&self, step: f64) -> Result<SharedStr, String> {
+        let rounded = step.ceil();
+        if !rounded.is_finite() || rounded < i64::MIN as f64 || rounded >= -(i64::MIN as f64) {
+            return Err(format!("scale step \"{step}\" exceeds the native range"));
+        }
+        let step = rounded as i64;
+        let range_error = || format!("scale step \"{step}\" exceeds the native range");
+        let intervals = self.intervals.as_slice();
+        let len = intervals.len() as i64;
+        let octave_offset = floor_div(step, len);
+        let index = step.rem_euclid(len) as usize;
+        // Preserve `octaves_interval(octave_offset)` range check.
+        let base: i64 = if octave_offset <= 0 { -1 } else { 1 };
+        let _ = i64::try_from(base as i128 + octave_offset as i128 * 7)
+            .ok()
+            .ok_or_else(range_error)?;
+        let (if_, io) = intervals[index];
+        let sum_o = io.checked_add(octave_offset).ok_or_else(range_error)?;
+        // Preserve `interval_name_from_coord(if_, sum_o)` range check.
+        let span = 7 * i128::from(if_) + 12 * i128::from(sum_o);
+        let _ = i64::try_from(span).ok().ok_or_else(range_error)?;
+        let (af, ao) = if span < 0 {
+            (
+                if_.checked_neg().ok_or_else(range_error)?,
+                sum_o.checked_neg().ok_or_else(range_error)?,
+            )
+        } else {
+            (if_, sum_o)
+        };
+        let (istep, _, ioct) = pitch_from_coord(af, Some(ao)).ok_or_else(range_error)?;
+        let _ = i64::try_from(istep as i128 + 1 + 7 * i128::from(ioct.expect("oct")))
+            .ok()
+            .ok_or_else(range_error)?;
+        let nf = self.tonic_f.checked_add(if_).ok_or_else(range_error)?;
+        let no = self.tonic_o.checked_add(sum_o).ok_or_else(range_error)?;
+        let (nstep, nalt, noct) = pitch_from_coord(nf, Some(no)).ok_or_else(range_error)?;
+        Ok(note_pitch_shared(nstep, nalt, noct))
+    }
+}
+
+/// Zero-allocation lookup of a `"C:major"`-style scale name in `SCALE_DICTIONARY`,
+/// returning `(parsed_tonic, dictionary_index)`.
+fn lookup_scale_colon(scale_name: &str) -> Result<(Option<ParsedNote>, usize), String> {
+    let lookup_type = |raw: &str| -> Option<usize> {
+        // ASCII fast path avoids allocating a lowercase/colon-replaced String.
+        if raw.is_ascii() && raw.len() <= 64 {
+            let mut buf = [0u8; 64];
+            for (slot, &b) in buf.iter_mut().zip(raw.as_bytes()) {
+                *slot = if b == b':' {
+                    b' '
+                } else {
+                    b.to_ascii_lowercase()
+                };
+            }
+            let key = std::str::from_utf8(&buf[..raw.len()]).ok()?;
+            return scale_index().get(key).copied();
+        }
+        let owned = raw.replace(':', " ").to_lowercase();
+        scale_index().get(owned.as_str()).copied()
+    };
+    let sep = scale_name.find([' ', ':']);
+    let found = match sep {
+        Some(at) => {
+            let head = &scale_name[..at];
+            if let Some(tonic) = parse_note_coord(head) {
+                lookup_type(&scale_name[at + 1..]).map(|idx| (Some(tonic), idx))
+            } else {
+                lookup_type(scale_name).map(|idx| (None, idx))
+            }
+        }
+        None => {
+            if parse_note_coord(scale_name).is_some() {
+                None
+            } else {
+                lookup_type(scale_name).map(|idx| (None, idx))
+            }
+        }
+    };
+    match found {
+        Some(ok) => Ok(ok),
+        None => {
+            let spaced = scale_name.replace(':', " ");
+            let (tonic, _) = scale_tokenize(&spaced);
+            if is_score_note(&spaced) || tonic.is_empty() {
+                Err(format!(
+                    "Scale name {spaced} is incomplete. Make sure to use \":\" instead of spaces, example: .scale(\"C:major\")"
+                ))
+            } else {
+                Err(format!("Invalid scale name \"{spaced}\""))
+            }
+        }
+    }
 }
 
 /// Resolves a `"C:major"`-style scale name (colons become spaces); a bare
@@ -614,35 +940,14 @@ pub fn get_scale(scale_name: &str) -> Result<ScaleProps, String> {
     }
 }
 
-/// Perfect interval spanning `octaves` octaves ("8P" for 1, "-8P" for -1).
-fn octaves_interval(octaves: i64) -> Option<String> {
-    let base: i64 = if octaves <= 0 { -1 } else { 1 };
-    let degree = i64::try_from(base as i128 + octaves as i128 * 7).ok()?;
-    Some(format!("{degree}P"))
-}
-
 /// Note at scale degree `step` (ceil'd); tonic defaults to C, octave to 3.
 pub fn scale_step(step: f64, scale: &str) -> Result<String, String> {
     let rounded = step.ceil();
     if !rounded.is_finite() || rounded < i64::MIN as f64 || rounded >= -(i64::MIN as f64) {
         return Err(format!("scale step \"{step}\" exceeds the native range"));
     }
-    let step = rounded as i64;
-    let resolved = get_scale(scale)?;
-    let tonic = resolved.tonic.as_deref().unwrap_or("C");
-    let tonic_note = note_get(tonic).ok_or_else(|| format!("invalid tonic \"{tonic}\""))?;
-    let oct = tonic_note.oct.unwrap_or(3);
-    let len = resolved.intervals.len() as i64;
-    let octave_offset = floor_div(step, len);
-    let index = step.rem_euclid(len) as usize;
-    let range_error = || format!("scale step \"{step}\" exceeds the native range");
-    let octaves = octaves_interval(octave_offset).ok_or_else(range_error)?;
-    let interval = interval_add(resolved.intervals[index], &octaves).ok_or_else(range_error)?;
-    let transposed = note_transpose(&format!("{}{oct}", tonic_note.pc), &interval);
-    if transposed.is_empty() {
-        return Err(range_error());
-    }
-    Ok(transposed)
+    let resolved = ResolvedScale::parse(scale)?;
+    resolved.step_shared(step).map(|s| s.as_str().to_owned())
 }
 
 /// Walks `offset` degrees through the scale from `note`, bumping the octave
@@ -1075,6 +1380,45 @@ mod tests {
                         scale_offset_walk_reference(scale, offset, &note),
                         "{scale} {note} offset {offset}"
                     );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn resolved_nearest_note_matches_nearest_scale_note() {
+        let midis: Vec<f64> = (-24..=140)
+            .step_by(3)
+            .map(|m| m as f64)
+            .chain([
+                -12.5,
+                0.5,
+                60.5,
+                61.5,
+                63.5,
+                66.5,
+                f64::NAN,
+                f64::INFINITY,
+                f64::NEG_INFINITY,
+                1e300,
+                -1e300,
+            ])
+            .collect();
+        let tonics = ["C", "C#", "Eb4", "F#", "Ab", "B2", "Fb", ""];
+        for (type_name, _, _) in crate::tonaljs_scales::SCALE_DICTIONARY {
+            for tonic in tonics {
+                let name = if tonic.is_empty() {
+                    type_name.to_string()
+                } else {
+                    format!("{tonic}:{type_name}")
+                };
+                let resolved = ResolvedScale::parse(&name);
+                for &midi in &midis {
+                    let expected = nearest_scale_note(&name, midi);
+                    assert_eq!(resolved.is_ok(), expected.is_ok(), "{name} {midi}");
+                    if let (Ok(res), Ok(exp)) = (&resolved, &expected) {
+                        assert_eq!(res.nearest_note_shared(midi).as_str(), exp, "{name} {midi}");
+                    }
                 }
             }
         }

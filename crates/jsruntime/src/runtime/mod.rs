@@ -1,4 +1,6 @@
 use super::*;
+use std::mem;
+use std::sync::Arc;
 
 // ---------------------------------------------------------------------------
 // The runtime
@@ -46,6 +48,9 @@ pub const DEFAULT_JS_MEMORY_LIMIT: usize = 512 * 1024 * 1024;
 /// spawns those threads with `QUERY_WORKER_STACK_BYTES` and asserts the
 /// relation at compile time.
 pub const MAX_JS_STACK_BYTES: usize = 32 * 1024 * 1024;
+
+/// What a query of the active slot answers when no score is in play.
+pub(super) const ACTIVE_SLOT_EMPTY: &str = "active slot is empty";
 
 pub(super) const MAX_SCORE_SAMPLE_EFFECTS: usize = 64;
 pub(super) const MAX_SCORE_SAMPLE_EFFECT_BYTES: usize = 4 * 1024 * 1024;
@@ -126,12 +131,21 @@ impl EffectPolicy {
     }
 }
 
+/// The MIDI input bus and the handle state that goes with it. One cell holds
+/// both, so no reader sees a bus without its handles.
+pub(super) struct MidiInput {
+    pub(super) bus: Arc<rustel_core::midi_in::InputBus>,
+    /// Stable handle state. The query path reads the handle map only and never
+    /// takes the bus's generation lock.
+    pub(super) handles: Rc<RefCell<MidiInputHandles>>,
+}
+
 #[derive(Default)]
 pub(super) struct MidiInputHandles {
     /// Never reuse a JavaScript-visible handle. Old closures may remain rooted
     /// across an evaluation even after their input is no longer active.
     pub(super) next_handle: u64,
-    pub(super) ports: BTreeMap<u64, std::sync::Arc<rustel_core::midi_in::InputPort>>,
+    pub(super) ports: BTreeMap<u64, Arc<rustel_core::midi_in::InputPort>>,
     /// Complete selector -> handle set of the last committed score.
     pub(super) active: BTreeMap<String, u64>,
     /// Handles allocated by successful JavaScript evaluation but not yet
@@ -263,57 +277,69 @@ impl Drop for MidiInputCandidate {
     }
 }
 
+/// Shared `Rc` state bridged into QuickJS closures and interrupt handlers.
+/// Allocated lazily on first JavaScript use so native-only sessions pay zero
+/// heap overhead for script-engine state.
+pub(crate) struct JsBridge {
+    /// The cycle that `getTime()` returns. See [`JsRuntime::set_cycle_time`].
+    pub(crate) cycle_time: Rc<Cell<f64>>,
+    /// The tempo that `getCps()` returns when the evaluation in progress has
+    /// set none. See [`JsRuntime::set_cps`].
+    pub(crate) cps: Rc<Cell<f64>>,
+    pub(super) effect_transaction: Rc<RefCell<EffectTransaction>>,
+    /// Which host effects the current operation permits.
+    pub(super) effect_policy: Rc<Cell<EffectPolicy>>,
+    /// Live bytes and the ceiling, shared with the allocator enforcing them.
+    pub(super) heap: Rc<alloc::HeapBudget>,
+    /// Shared with the interrupt handler. `Some(deadline)` while an evaluation
+    /// is running under a CPU budget; `None` when unbounded.
+    pub(super) deadline: Rc<Cell<Option<std::time::Instant>>>,
+    /// Set once the deadline fires, so the caller can tell an interrupted
+    /// evaluation from a normal error.
+    pub(super) interrupted: Rc<Cell<bool>>,
+    /// Atomic cancellation flag borrowed only while a bounded evaluation is
+    /// running.
+    pub(super) cancel_flag: Rc<Cell<Option<*const std::sync::atomic::AtomicBool>>>,
+    /// Distinguishes caller cancellation from expiry of the elapsed-time
+    /// interrupt deadline.
+    pub(super) cancelled: Rc<Cell<bool>>,
+    /// Structural host-policy refusal raised by any effect callback.
+    pub(super) effect_policy_refusal: Rc<RefCell<Option<String>>>,
+    /// Nesting depth of the outer operation that owns `effect_policy_refusal`.
+    pub(super) effect_policy_owner_depth: Rc<Cell<usize>>,
+}
+
 pub struct JsRuntime {
-    pub(super) rt: Runtime,
-    pub(super) ctx: Context,
+    /// The script engine, from the first use that needs it. The first field,
+    /// so it goes before the state that its values hold.
+    pub(super) realm: OnceCell<Realm>,
     /// Native module settings paired with this QuickJS realm.
     pub(super) core_settings: rustel_core::settings::RuntimeSettings,
     /// The single per-runtime callback id allocator, shared by
-    /// `GraphBuilder::callback` and the host's bridge.
-    ///
-    /// An `Rc<Cell<_>>` has no JS-reachable name. User code could reset a JS
-    /// global between two graph constructions: the second callback would
-    /// reuse the first id, `derive_wrapper` would deduplicate it, and the
-    /// wrong function would run.
-    pub(super) ids: std::rc::Rc<Cell<CallbackId>>,
-    pub(super) logs: std::rc::Rc<RefCell<Vec<String>>>,
+    /// `GraphBuilder::callback` and the host's bridge. Made at the first
+    /// callback a runtime bridges.
+    pub(super) ids: OnceCell<Rc<Cell<CallbackId>>>,
+    /// Buffered console lines, made at the first writer: a runtime whose
+    /// score never logs holds none.
+    pub(super) logs: OnceCell<Rc<RefCell<Vec<String>>>>,
     /// Whether a query error a stack contains stays out of `logs`; see
     /// [`JsRuntime::with_contained_query_errors_unlogged`].
     pub(super) contained_query_errors_unlogged: Cell<bool>,
-    /// The cycle that `getTime()` returns. See [`JsRuntime::set_cycle_time`].
-    pub(crate) cycle_time: std::rc::Rc<Cell<f64>>,
-    /// The tempo that `getCps()` returns when the evaluation in progress has
-    /// set none. See [`JsRuntime::set_cps`].
-    pub(crate) cps: std::rc::Rc<Cell<f64>>,
-    pub(super) loaded_imports: LoadedImports,
+    /// Lazy `Rc` cells shared with QuickJS closures once the script engine starts.
+    pub(crate) bridge: OnceCell<JsBridge>,
+    /// Inline seeds mirrored into [`JsBridge`] when it is first created.
+    pub(super) cycle_time_init: Cell<f64>,
+    pub(super) cps_init: Cell<f64>,
+    pub(super) heap_limit_init: Cell<usize>,
+    pub(super) effect_policy_init: Cell<EffectPolicy>,
+    pub(super) loaded_imports: OnceCell<LoadedImports>,
     /// The names of score imports. See [`JsRuntime::show_imports`].
     pub(super) import_surface: RefCell<ImportSurface>,
-    pub(super) timeline_state: rustel_core::TimelineState,
+    pub(super) timeline_state: OnceCell<rustel_core::TimelineState>,
     /// MIDI inputs this Session's scores have named, and their live values.
-    ///
-    /// Shared with the host, which attaches the platform listeners; the tables
-    /// themselves are dependency-free atomics in core, so nothing here links a
-    /// MIDI stack. JavaScript never holds one - `midin()` hands out an integer
-    /// handle and nothing else.
-    pub(super) midi_in_bus: std::sync::Arc<rustel_core::midi_in::InputBus>,
-    /// Stable handle state. The query path reads the handle map only and never
-    /// takes the bus's generation lock.
-    pub(super) midi_in_handles: std::rc::Rc<RefCell<MidiInputHandles>>,
-    /// Effects owned by the one Session evaluation currently in progress.
-    /// The transaction is private Rust state: JavaScript callbacks may append
-    /// only while the operation policy permits it, and every unsuccessful
-    /// exit drops the whole value rather than leaving work for a later score.
-    /// Hydra chains under construction by the score currently evaluating, and
-    /// which globals the visuals surface has borrowed. Never JavaScript-
-    /// reachable: a score that could reset the arena could make one chain's
-    /// index name another chain's shader.
+    pub(super) midi_in: OnceCell<MidiInput>,
     #[cfg(feature = "hydra")]
-    pub(super) hydra_chains: std::rc::Rc<RefCell<crate::install::HydraChains>>,
-    pub(super) effect_transaction: std::rc::Rc<RefCell<Option<ScoreEffects>>>,
-    /// Which host effects the current operation permits. Setup may register
-    /// and preload samples; score evaluation may also stage tempo. Queries and
-    /// source-compatible raw evaluation temporarily permit none.
-    pub(super) effect_policy: std::rc::Rc<Cell<EffectPolicy>>,
+    pub(super) hydra_chains: OnceCell<std::rc::Rc<RefCell<crate::install::HydraChains>>>,
     /// Haps one query may produce. Configurable so the limit can be tested
     /// through the real host without provoking it at full scale.
     pub(super) hap_budget: Cell<u64>,
@@ -321,59 +347,47 @@ pub struct JsRuntime {
     /// window; reports consume this message through `take_query_throw`.
     pub(super) query_threw: RefCell<Option<String>>,
     /// Callback-IR selection is resolved at the owning runtime rather than in
-    /// a pattern hot loop. `Compatibility` and `DualRun` are test and
-    /// benchmark controls. Ordinary playback uses `Auto`.
-    pub(super) callback_ir: Rc<CallbackIr>,
-    /// Live bytes and the ceiling, shared with the allocator enforcing them.
-    pub(super) heap: std::rc::Rc<alloc::HeapBudget>,
-    /// Shared with the interrupt handler. `Some(deadline)` while an evaluation
-    /// is running under a CPU budget; `None` when unbounded.
-    pub(super) deadline: std::rc::Rc<Cell<Option<std::time::Instant>>>,
-    /// Set once the deadline fires, so the caller can tell an interrupted
-    /// evaluation from a normal error.
-    pub(super) interrupted: std::rc::Rc<Cell<bool>>,
-    /// Atomic cancellation flag borrowed only while a bounded evaluation is
-    /// running. The interrupt handler reads it without waiting for JavaScript
-    /// to reach a query node.
-    pub(super) cancel_flag: std::rc::Rc<Cell<Option<*const std::sync::atomic::AtomicBool>>>,
-    /// Distinguishes caller cancellation from expiry of the elapsed-time
-    /// interrupt deadline.
-    pub(super) cancelled: std::rc::Rc<Cell<bool>>,
+    /// a pattern hot loop. Made at the first use.
+    pub(super) callback_ir: OnceCell<Rc<CallbackIr>>,
+    /// Whether a score the native tier proves skips JavaScript. On by
+    /// default. See [`JsRuntime::set_native_tier`].
+    pub(super) native_tier: Cell<bool>,
+    /// Whether the last score evaluated by the score evaluator ran on the
+    /// native tier.
+    pub(super) evaluated_natively: Cell<bool>,
+    /// Whether the semantic surface and the voicing globals are installed.
+    pub(super) bindings_installed: Cell<bool>,
+    pub(super) voicings_installed: Cell<bool>,
     /// Depth of the bounded synchronous query turn currently using this
-    /// runtime. Only the outer direct query or scheduler tick owns the
-    /// deadline, cancellation pointer, heap flag and pending-job cleanup;
-    /// reentrant `queryHeld` calls inherit that exact boundary.
+    /// runtime.
     pub(super) query_turn_depth: Cell<usize>,
-    /// Depth of any host query scope, including a legacy query inheriting a
-    /// caller-installed raw deadline. Effect refusals use this to reach core's
-    /// structural channel before a scheduler can commit callback silence;
-    /// eager callbacks during graph construction remain outside it.
+    /// Depth of any host query scope.
     pub(super) effect_query_depth: Cell<usize>,
     /// Depth of the generic QuickJS heap-refusal boundary.
-    ///
-    /// Score/setup evaluation can call the opt-in `queryHeld` binding while it
-    /// already owns this flag. A nested legacy query must not clear it and
-    /// thereby launder an allocation denial caught by JavaScript.
     pub(super) heap_boundary_depth: Cell<usize>,
     /// Stable public millisecond value reported for a query-turn deadline
-    /// refusal. Kept apart from the absolute `Instant`: callbacks must publish
-    /// the typed refusal while the core query is still live, before a scheduler
-    /// can commit an interrupted query as silence.
+    /// refusal.
     pub(super) query_limit_millis: Cell<Option<u64>>,
-    /// Structural host-policy refusal raised by any effect callback.
-    ///
-    /// JavaScript is allowed to catch the exception, so outer evaluation and
-    /// query boundaries also inspect this latch before accepting an otherwise
-    /// successful result.
-    pub(super) effect_policy_refusal: std::rc::Rc<RefCell<Option<String>>>,
-    /// Nesting depth of the outer operation that owns
-    /// [`Self::effect_policy_refusal`].
-    ///
-    /// A raw/prebake/score evaluation can call `queryHeld`, and that query can
-    /// itself be where an effect refusal is first raised. The nested query
-    /// must report the policy without clearing it; only depth zero may reset
-    /// and finally consume the latch.
-    pub(super) effect_policy_owner_depth: std::rc::Rc<Cell<usize>>,
+    /// What the last native build of a score kept for the next one. See
+    /// [`native::Memo`].
+    native_memo: RefCell<native::Memo>,
+    /// Pre-allocated shared source handle for an in-flight native evaluation so
+    /// the lane table and the native memo share one `Arc<str>`.
+    pending_source: RefCell<Option<Arc<str>>>,
+    /// The byte of the text of the last score that the native tier left to
+    /// JavaScript where it stopped, when it knows. See
+    /// [`JsRuntime::native_left`].
+    native_left: Cell<Option<u32>>,
+    /// The graph of the native tier that an evaluation staged. No wrapper
+    /// holds a native graph: it has no callback cell, no shadow and no state
+    /// of a script, so the realm has no part in it.
+    pub(super) native_staged: RefCell<Option<Pattern>>,
+    /// The graph of the native tier in play. While it is `Some`, the active
+    /// root of the realm holds no wrapper: one score is in play.
+    pub(super) native_active: RefCell<Option<Pattern>>,
+    /// The graph of the native tier that was in play at the last snapshot.
+    /// While it is `Some`, `last_good_active` is `None`.
+    pub(super) native_last_good: RefCell<Option<Pattern>>,
     /// Last successfully installed active wrapper. A live replacement that
     /// evaluates but then fails its query probe restores this exact wrapper
     /// so the sounding score keeps its Sidecar and callback roots.
@@ -453,17 +467,18 @@ pub(super) struct EffectPolicyOwner {
 
 impl EffectPolicyOwner {
     pub(super) fn enter(runtime: &JsRuntime) -> Self {
-        let previous_depth = runtime.effect_policy_owner_depth.get();
+        let bridge = runtime.bridge();
+        let previous_depth = bridge.effect_policy_owner_depth.get();
         if previous_depth == 0 {
-            runtime.effect_policy_refusal.borrow_mut().take();
+            bridge.effect_policy_refusal.borrow_mut().take();
         }
-        let policy_pending_on_entry = runtime.effect_policy_refusal.borrow().is_some();
-        runtime
+        let policy_pending_on_entry = bridge.effect_policy_refusal.borrow().is_some();
+        bridge
             .effect_policy_owner_depth
             .set(previous_depth.saturating_add(1));
         Self {
-            depth: runtime.effect_policy_owner_depth.clone(),
-            refusal: runtime.effect_policy_refusal.clone(),
+            depth: bridge.effect_policy_owner_depth.clone(),
+            refusal: bridge.effect_policy_refusal.clone(),
             previous_depth,
             policy_pending_on_entry,
         }
@@ -489,40 +504,99 @@ impl Drop for EffectPolicyOwner {
     }
 }
 
+/// The effects of the evaluation in progress. The effects take their heap
+/// room at the first write, so an evaluation that stages nothing allocates
+/// none and the cell of an idle runtime stays small.
+#[derive(Default)]
+pub(crate) enum EffectTransaction {
+    /// No evaluation owns the cell.
+    #[default]
+    Closed,
+    /// An evaluation owns the cell and has written nothing.
+    Open,
+    Written(Box<ScoreEffects>),
+}
+
+impl EffectTransaction {
+    pub(super) fn is_open(&self) -> bool {
+        !matches!(self, Self::Closed)
+    }
+
+    pub(super) fn begin(&mut self) {
+        *self = Self::Open;
+    }
+
+    /// The effects to write to, none outside a transaction.
+    pub(crate) fn effects_mut(&mut self) -> Option<&mut ScoreEffects> {
+        if matches!(self, Self::Open) {
+            *self = Self::Written(Box::default());
+        }
+        match self {
+            Self::Written(effects) => Some(effects),
+            Self::Closed | Self::Open => None,
+        }
+    }
+
+    /// The effects written so far. None before the first write, which is
+    /// the same as the default effects.
+    pub(crate) fn written(&self) -> Option<&ScoreEffects> {
+        match self {
+            Self::Written(effects) => Some(effects),
+            Self::Closed | Self::Open => None,
+        }
+    }
+
+    /// Closes the transaction and gives its effects. None when it was not
+    /// open.
+    pub(super) fn finish(&mut self) -> Option<ScoreEffects> {
+        match mem::take(self) {
+            Self::Closed => None,
+            Self::Open => Some(ScoreEffects::default()),
+            Self::Written(effects) => Some(*effects),
+        }
+    }
+
+    /// Closes the transaction and drops what it holds.
+    pub(super) fn abort(&mut self) {
+        *self = Self::Closed;
+    }
+}
+
 /// One fallible evaluation's private effect accumulator.
 ///
 /// Dropping the owner always discards the accumulator. `finish` is the only
 /// path that moves it to Session, after evaluation and policy validation have
 /// both succeeded.
 pub(super) struct EffectTransactionOwner {
-    transaction: std::rc::Rc<RefCell<Option<ScoreEffects>>>,
-    policy: std::rc::Rc<Cell<EffectPolicy>>,
+    transaction: Rc<RefCell<EffectTransaction>>,
+    policy: Rc<Cell<EffectPolicy>>,
     previous_policy: EffectPolicy,
 }
 
 impl EffectTransactionOwner {
     pub(super) fn enter(runtime: &JsRuntime, policy: EffectPolicy) -> Result<Self, QueryError> {
+        let bridge = runtime.bridge();
         if runtime.effect_query_depth.get() > 0 {
             let message = "JavaScript effect transactions cannot begin during a pattern query";
-            let mut refusal = runtime.effect_policy_refusal.borrow_mut();
+            let mut refusal = bridge.effect_policy_refusal.borrow_mut();
             if refusal.is_none() {
                 *refusal = Some(message.to_string());
             }
             return Err(QueryError::Policy(message.to_string()));
         }
-        if runtime.effect_transaction.borrow().is_some() {
+        if bridge.effect_transaction.borrow().is_open() {
             let message = "nested JavaScript effect transactions are not supported";
-            let mut refusal = runtime.effect_policy_refusal.borrow_mut();
+            let mut refusal = bridge.effect_policy_refusal.borrow_mut();
             if refusal.is_none() {
                 *refusal = Some(message.to_string());
             }
             return Err(QueryError::Policy(message.to_string()));
         }
-        *runtime.effect_transaction.borrow_mut() = Some(ScoreEffects::default());
-        let previous_policy = runtime.effect_policy.replace(policy);
+        bridge.effect_transaction.borrow_mut().begin();
+        let previous_policy = bridge.effect_policy.replace(policy);
         Ok(Self {
-            transaction: runtime.effect_transaction.clone(),
-            policy: runtime.effect_policy.clone(),
+            transaction: bridge.effect_transaction.clone(),
+            policy: bridge.effect_policy.clone(),
             previous_policy,
         })
     }
@@ -530,14 +604,14 @@ impl EffectTransactionOwner {
     pub(super) fn finish(self) -> ScoreEffects {
         self.transaction
             .borrow_mut()
-            .take()
+            .finish()
             .expect("effect transaction owner lost its accumulator")
     }
 }
 
 impl Drop for EffectTransactionOwner {
     fn drop(&mut self) {
-        self.transaction.borrow_mut().take();
+        self.transaction.borrow_mut().abort();
         self.policy.set(self.previous_policy);
     }
 }
@@ -546,7 +620,7 @@ impl Drop for EffectTransactionOwner {
 /// Query-time callbacks use this inside score/setup operations so they cannot
 /// append work to the evaluation that happened to query them.
 pub(super) struct EffectPolicyScope {
-    policy: std::rc::Rc<Cell<EffectPolicy>>,
+    policy: Rc<Cell<EffectPolicy>>,
     previous: EffectPolicy,
 }
 
@@ -574,10 +648,11 @@ impl Drop for EffectQueryScope<'_> {
 
 impl EffectPolicyScope {
     pub(super) fn enter(runtime: &JsRuntime, policy: EffectPolicy) -> Self {
+        let bridge = runtime.bridge();
         Self::enter_state(
             &EffectBoundaryState {
-                policy: runtime.effect_policy.clone(),
-                refusal: runtime.effect_policy_refusal.clone(),
+                policy: bridge.effect_policy.clone(),
+                refusal: bridge.effect_policy_refusal.clone(),
             },
             policy,
         )
@@ -795,12 +870,15 @@ mod import_surface;
 mod imports;
 mod inspection;
 mod lowering_gate;
+mod native;
+mod realm;
 mod teardown;
 
 pub(crate) use lowering_gate::{LoweringDependencies, LoweringGate};
 
 pub use import_surface::ImportScope;
 use import_surface::ImportSurface;
+pub(crate) use realm::Realm;
 
 #[cfg(test)]
 mod caught_panic_tests {
@@ -836,5 +914,84 @@ mod caught_panic_tests {
         runtime
             .eval("globalThis.after = 1;")
             .expect("the realm still works");
+    }
+}
+
+#[cfg(test)]
+mod first_use_tests {
+    use super::*;
+
+    #[test]
+    fn a_line_written_inside_with_logs_dropped_is_dropped_with_no_buffer_before() {
+        let runtime = JsRuntime::deferred(None);
+        assert!(runtime.logs.get().is_none());
+        runtime.with_logs_dropped(|| runtime.logs().borrow_mut().push("quiet".into()));
+        assert!(runtime.take_logs().is_empty(), "a dropped line came back");
+    }
+
+    #[test]
+    fn with_logs_dropped_keeps_the_lines_written_before_it() {
+        let runtime = JsRuntime::deferred(None);
+        runtime.logs().borrow_mut().push("kept".into());
+        runtime.with_logs_dropped(|| runtime.logs().borrow_mut().push("quiet".into()));
+        assert_eq!(runtime.take_logs(), ["kept"]);
+    }
+
+    #[test]
+    fn a_read_of_the_callback_ir_state_makes_none() {
+        let runtime = JsRuntime::deferred(None);
+        assert_eq!(
+            runtime.pattern_transform_ir_mode(),
+            PatternTransformIrMode::Auto
+        );
+        let _ = runtime.pattern_transform_ir_stats();
+        runtime.reset_pattern_transform_ir_stats();
+        assert!(runtime.callback_ir.get().is_none(), "a read made the state");
+    }
+
+    #[test]
+    fn a_new_runtime_keeps_no_text_of_a_native_build() {
+        let runtime = JsRuntime::deferred(None);
+        assert!(runtime.native_source_text().is_none());
+    }
+
+    #[test]
+    fn the_midi_bus_and_its_handles_are_made_together_or_not_at_all() {
+        let runtime = JsRuntime::deferred(None);
+        assert!(!runtime.midi_bus_made());
+        let _handles = runtime.midi_handles();
+        assert!(runtime.midi_bus_made(), "the handles came without the bus");
+        let runtime = JsRuntime::deferred(None);
+        let _bus = runtime.midi_input_bus();
+        assert!(runtime.midi_in.get().is_some());
+    }
+
+    #[test]
+    fn a_transaction_takes_heap_room_at_its_first_write_only() {
+        let mut transaction = EffectTransaction::default();
+        assert!(
+            transaction.effects_mut().is_none(),
+            "a closed transaction took a write"
+        );
+        assert!(transaction.finish().is_none());
+        transaction.begin();
+        assert!(transaction.is_open());
+        assert!(
+            transaction.written().is_none(),
+            "an open transaction took room before a write"
+        );
+        transaction.effects_mut().expect("open").cps = Some(2.0);
+        assert_eq!(
+            transaction.written().and_then(|effects| effects.cps),
+            Some(2.0)
+        );
+        assert_eq!(transaction.finish().expect("open").cps, Some(2.0));
+        assert!(!transaction.is_open());
+        transaction.begin();
+        assert_eq!(transaction.finish(), Some(ScoreEffects::default()));
+        transaction.begin();
+        transaction.effects_mut().expect("open").gamepad = true;
+        transaction.abort();
+        assert!(!transaction.is_open() && transaction.written().is_none());
     }
 }

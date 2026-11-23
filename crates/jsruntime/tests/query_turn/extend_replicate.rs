@@ -370,7 +370,7 @@ fn raw_extend_replicate_are_eager_and_preserve_returned_ownership() {
         "scalar raw extend retained JavaScript"
     );
     assert_eq!(
-        extend.active_pattern().expect("active raw extend").steps,
+        extend.active_pattern().expect("active raw extend").steps(),
         Some(Fraction::int(4))
     );
     let extend_values = query_active(&extend, Fraction::ZERO, Fraction::int(2))
@@ -391,7 +391,7 @@ fn raw_extend_replicate_are_eager_and_preserve_returned_ownership() {
         replicate
             .active_pattern()
             .expect("active raw replicate")
-            .steps,
+            .steps(),
         Some(Fraction::int(4))
     );
     let replicate_values = query_active(&replicate, Fraction::ZERO, Fraction::int(2))
@@ -414,7 +414,7 @@ fn raw_extend_replicate_are_eager_and_preserve_returned_ownership() {
             runtime
                 .active_pattern()
                 .expect("active raw numeric case")
-                .steps,
+                .steps(),
             Some(expected_steps),
             "{method}({factor}) step metadata"
         );

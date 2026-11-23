@@ -43,17 +43,26 @@ impl LiveNumbers {
     }
 }
 
+static EMPTY_LIVE_NUMBERS: std::sync::LazyLock<Arc<[LiveNumber]>> =
+    std::sync::LazyLock::new(|| Arc::from([]));
+
 impl Session {
     /// The numbers of `source` that its evaluations make live. They
     /// replace the numbers given before for the same text. No numbers
     /// evaluates every number as written.
     pub fn set_live_numbers(&mut self, source: &str, numbers: Vec<LiveNumber>) {
+        if numbers.is_empty() && self.live_numbers.texts.is_empty() {
+            return;
+        }
         self.live_numbers
             .set(source_revision(source), Arc::from(numbers));
     }
 
     /// The live numbers of `source`: the numbers last given for this text.
     pub fn live_numbers(&self, source: &str) -> Arc<[LiveNumber]> {
+        if self.live_numbers.texts.is_empty() {
+            return Arc::clone(&EMPTY_LIVE_NUMBERS);
+        }
         self.live_numbers.of(&source_revision(source))
     }
 }

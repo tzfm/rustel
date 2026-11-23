@@ -542,7 +542,7 @@ pub(crate) fn duration_nanos(duration: Duration) -> u64 {
     duration.as_nanos().min(u128::from(u64::MAX)) as u64
 }
 
-#[cfg(any(feature = "device-audio", test))]
+#[cfg(feature = "device-audio")]
 pub(crate) fn seconds_nanos(seconds: f64) -> u64 {
     if !seconds.is_finite() || seconds <= 0.0 {
         0

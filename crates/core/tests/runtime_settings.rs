@@ -74,7 +74,7 @@ fn timeline_root_inherits_the_receiver_runtime() {
     let receiver =
         rustel_core::pure(Value::Str("receiver".into())).with_runtime_settings(receiver_owner);
     let pattern = rustel_core::timeline(time, receiver, TimelineState::default())
-        .fmap(|_| Value::Str(format!("{:?}", rng::rng_mode())));
+        .fmap(|_| Value::Str(format!("{:?}", rng::rng_mode()).into()));
 
     ambient.with(|| {
         assert_eq!(
@@ -148,7 +148,7 @@ fn nested_wrappers_keep_the_snapshot_selected_by_the_outer_query() {
     let transform_resume = Arc::clone(&resume);
     let pause_once = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let transform_once = Arc::clone(&pause_once);
-    let inner = rustel_core::state_signal(|_| Value::Str(format!("{:?}", rng::rng_mode())))
+    let inner = rustel_core::state_signal(|_| Value::Str(format!("{:?}", rng::rng_mode()).into()))
         .with_runtime_settings(settings.clone());
     let exported = inner
         .with_query_time(move |time| {
@@ -204,7 +204,7 @@ fn pure_metadata_keeps_nested_patterns_and_functions_in_the_owner_runtime() {
 
     let nested = rustel_core::pure(Value::object([(
         "nested".into(),
-        Value::List(vec![Value::Pattern(Box::new(PatternValue::new(
+        Value::list(vec![Value::Pattern(Box::new(PatternValue::new(
             7,
             voicing_size_signal(),
         )))]),
@@ -235,8 +235,8 @@ fn pure_metadata_keeps_nested_patterns_and_functions_in_the_owner_runtime() {
             pattern.fmap(move |_| Value::F64(size))
         }),
     );
-    let carrier =
-        rustel_core::pure(Value::Function(Box::new(function))).with_runtime_settings(owner.clone());
+    let carrier = rustel_core::pure(Value::Function(std::sync::Arc::new(function)))
+        .with_runtime_settings(owner.clone());
     assert!(carrier.is_pure());
     let Value::Function(function) = carrier.as_pure().expect("pure function value") else {
         panic!("pure metadata did not contain its Function value");
@@ -297,9 +297,9 @@ fn explicit_scopes_own_unwrapped_pure_and_lookup_extractors() {
         Arc::new(|pattern| pattern.fmap(|_| Value::F64(settings_tuple().2 as f64))),
         Arc::new(|pattern| pattern.fmap(|_| Value::F64(settings_tuple().2 as f64))),
     );
-    let carrier = rustel_core::pure(Value::List(vec![
+    let carrier = rustel_core::pure(Value::list(vec![
         Value::Pattern(Box::new(PatternValue::new(25, voicing_size_signal()))),
-        Value::Function(Box::new(function)),
+        Value::Function(std::sync::Arc::new(function)),
     ]))
     .with_added_context(vec![(1, 2)]);
     let Value::List(extracted) = owner
@@ -367,7 +367,7 @@ fn an_owned_function_keeps_its_lexical_runtime_with_a_foreign_receiver() {
         Arc::new(|pattern| pattern.fmap(|_| Value::F64(settings_tuple().2 as f64))),
     );
     let unowned_function = function.clone();
-    let carrier = rustel_core::pure(Value::Function(Box::new(function)))
+    let carrier = rustel_core::pure(Value::Function(std::sync::Arc::new(function)))
         .with_runtime_settings(function_owner.clone());
     let Value::Function(function) = carrier.as_pure().expect("owned function metadata") else {
         panic!("carrier did not contain its Function");
@@ -774,7 +774,7 @@ fn deeply_nested_metadata_refuses_within_the_bounded_traversal() {
     let settings = RuntimeSettings::default();
     let mut value = Value::Pattern(Box::new(PatternValue::new(19, voicing_size_signal())));
     for _ in 0..=rustel_core::MAX_PATTERN_DEPTH {
-        value = Value::List(vec![value]);
+        value = Value::list(vec![value]);
     }
     let pattern = rustel_core::pure(value).with_runtime_settings(settings);
     let state = State::new(TimeSpan::new(Fraction::ZERO, Fraction::ONE));

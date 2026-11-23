@@ -12,10 +12,6 @@ Software Foundation, either version 3 of the License, or (at your option) any
 later version.
 */
 
-use crate::util::rotate;
-
-type Groups = Vec<Vec<u8>>;
-
 /// Largest Euclidean mask the native runtime will materialise.
 ///
 /// Bounds allocations for the Bjorklund work groups and the pattern layer's
@@ -24,39 +20,32 @@ type Groups = Vec<Vec<u8>>;
 /// allocation-safety backstop for other callers.
 pub const MAX_EUCLID_STEPS: usize = 16_384;
 
-fn zip_concat(left: &[Vec<u8>], right: &[Vec<u8>]) -> Groups {
-    left.iter()
-        .zip(right)
-        .map(|(a, b)| {
-            let mut value = a.clone();
-            value.extend_from_slice(b);
-            value
-        })
-        .collect()
+#[derive(Clone, Copy)]
+struct Op {
+    more_ons: bool,
+    repeat: u16,
 }
 
-fn recurse_owned(
-    mut ons: usize,
-    mut offs: usize,
-    mut xs: Groups,
-    mut ys: Groups,
-) -> (Groups, Groups) {
-    while ons.min(offs) > 1 {
-        if ons > offs {
-            let old_xs = xs;
-            let (paired_xs, rest_xs) = old_xs.split_at(offs);
-            xs = zip_concat(paired_xs, &ys);
-            ys = rest_xs.to_vec();
-            (ons, offs) = (offs, ons - offs);
-        } else {
-            let old_ys = ys;
-            let (paired_ys, rest_ys) = old_ys.split_at(ons);
-            xs = zip_concat(&xs, paired_ys);
-            ys = rest_ys.to_vec();
-            (ons, offs) = (ons, offs - ons);
-        }
+/// Emit one Bjorklund group at `level` directly into `out`.
+///
+/// At level 0, `is_x` is `[1]` and `!is_x` is `[0]` (flipped when `invert_bit`
+/// is 1). Each step `d` combines `x_{d+1} = x_d ++ y_d^{repeat}` and sets
+/// `y_{d+1}` to `x_d` when `more_ons` is true or `y_d` otherwise.
+fn emit_group(level: usize, is_x: bool, ops: &[Op], invert_bit: u8, out: &mut Vec<u8>) {
+    if level == 0 {
+        out.push(u8::from(is_x) ^ invert_bit);
+        return;
     }
-    (xs, ys)
+    let prev = level - 1;
+    let op = ops[prev];
+    if is_x {
+        emit_group(prev, true, ops, invert_bit, out);
+        for _ in 0..op.repeat {
+            emit_group(prev, false, ops, invert_bit, out);
+        }
+    } else {
+        emit_group(prev, op.more_ons, ops, invert_bit, out);
+    }
 }
 
 /// The `bjorklund` euclidean generator, matching strudel.cc exactly.
@@ -69,37 +58,61 @@ pub fn bjorklund(pulses: i32, steps: usize) -> Result<Vec<u8>, String> {
             "bjorklund: steps ({steps}) exceeds native limit ({MAX_EUCLID_STEPS})"
         ));
     }
-    let inverted = pulses < 0;
-    let ons = pulses.unsigned_abs() as usize;
+    let invert_bit = u8::from(pulses < 0);
+    let mut ons = pulses.unsigned_abs() as usize;
     if ons > steps {
         return Err(format!(
             "bjorklund: abs(pulses) ({ons}) exceeds steps ({steps})"
         ));
     }
-    let offs = steps - ons;
-    let ones = vec![vec![1]; ons];
-    let zeros = vec![vec![0]; offs];
-    let (xs, ys) = recurse_owned(ons, offs, ones, zeros);
-    let mut pattern: Vec<u8> = xs
-        .into_iter()
-        .flatten()
-        .chain(ys.into_iter().flatten())
-        .collect();
-    if inverted {
-        for value in &mut pattern {
-            *value = 1 - *value;
+    let mut offs = steps - ons;
+    // Collapsing consecutive `offs -= ons` runs reduces depth to standard
+    // Euclidean division steps, bounded by <= 2 * log_phi(MAX_EUCLID_STEPS) <= 44.
+    let mut ops = [Op {
+        more_ons: false,
+        repeat: 0,
+    }; 64];
+    let mut depth = 0usize;
+    while ons.min(offs) > 1 {
+        if ons > offs {
+            ops[depth] = Op {
+                more_ons: true,
+                repeat: 1,
+            };
+            (ons, offs) = (offs, ons - offs);
+        } else {
+            let k = offs / ons;
+            ops[depth] = Op {
+                more_ons: false,
+                repeat: k as u16,
+            };
+            offs %= ons;
         }
+        depth += 1;
+    }
+    let mut pattern = Vec::with_capacity(steps);
+    for _ in 0..ons {
+        emit_group(depth, true, &ops[..depth], invert_bit, &mut pattern);
+    }
+    for _ in 0..offs {
+        emit_group(depth, false, &ops[..depth], invert_bit, &mut pattern);
     }
     Ok(pattern)
 }
 
 pub fn euclid_rot(pulses: i32, steps: usize, rotation: isize) -> Result<Vec<u8>, String> {
-    let pattern = bjorklund(pulses, steps)?;
-    if rotation == 0 {
-        Ok(pattern)
-    } else {
-        Ok(rotate(&pattern, rotation.saturating_neg()))
+    let mut pattern = bjorklund(pulses, steps)?;
+    if rotation != 0 && !pattern.is_empty() {
+        let n = rotation.saturating_neg();
+        let len = isize::try_from(pattern.len()).unwrap_or(isize::MAX);
+        let at = if n < 0 {
+            len.saturating_add(n).max(0)
+        } else {
+            n.min(len)
+        } as usize;
+        pattern.rotate_left(at);
     }
+    Ok(pattern)
 }
 
 #[cfg(test)]

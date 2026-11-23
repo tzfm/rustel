@@ -8,15 +8,7 @@ Software Foundation, either version 3 of the License, or (at your option) any
 later version.
 */
 
-use std::{
-    collections::BTreeMap,
-    fmt,
-    hash::{Hash, Hasher},
-    sync::{
-        Arc, LazyLock, Mutex,
-        atomic::{AtomicUsize, Ordering},
-    },
-};
+use std::{fmt, hash::Hash, sync::Arc};
 
 /// An insertion-ordered JavaScript object.
 ///
@@ -29,198 +21,5592 @@ pub struct OrderedMap {
     entries: Entries,
 }
 
-/// The entries of a map. Both kinds are shared until a write, which copies
-/// them first.
+/// Maximum inline patch slots carried by a [`Patched`] overlay before
+/// spilling into its optional tail.
+const MAX_PATCHES: usize = 8;
+const INLINE_PATCHES: usize = 3;
+const TAIL_PATCHES: usize = MAX_PATCHES - INLINE_PATCHES;
+
+/// Compact `u16`-keyed storage for maps whose keys are all canonical
+/// built-in control names: low 10 bits hold the 1-based control id and high
+/// 6 bits hold `Table::mark_bit`. Saves 14 bytes per entry vs `(Key, Value)`.
+pub(crate) trait BuiltinEntries: Send + Sync {
+    fn as_slice(&self) -> Slice<'_>;
+    fn keys(&self) -> &[u16];
+    fn parts_mut(&mut self) -> Option<(&[u16], &mut [Value])>;
+}
+
+struct BuiltinMap<const N: usize> {
+    keys: [u16; N],
+    values: [Value; N],
+}
+
+impl<const N: usize> BuiltinEntries for BuiltinMap<N> {
+    #[inline(always)]
+    fn as_slice(&self) -> Slice<'_> {
+        Slice::Builtin(&self.keys, &self.values)
+    }
+
+    #[inline(always)]
+    fn keys(&self) -> &[u16] {
+        &self.keys
+    }
+
+    #[inline(always)]
+    fn parts_mut(&mut self) -> Option<(&[u16], &mut [Value])> {
+        Some((&self.keys, &mut self.values))
+    }
+}
+
+/// Compact pooled storage for immutable built-in control maps whose values are
+/// shared through a score-wide `Arc<[Value]>` pool (`4` bytes per entry instead
+/// of `26` bytes).
+struct PooledBuiltinMap<const N: usize> {
+    pool: Arc<[Value]>,
+    keys: [u16; N],
+    vals: [u16; N],
+}
+
+impl<const N: usize> BuiltinEntries for PooledBuiltinMap<N> {
+    #[inline(always)]
+    fn as_slice(&self) -> Slice<'_> {
+        Slice::Pooled(&self.keys, &self.vals, &self.pool)
+    }
+
+    #[inline(always)]
+    fn keys(&self) -> &[u16] {
+        &self.keys
+    }
+
+    #[inline(always)]
+    fn parts_mut(&mut self) -> Option<(&[u16], &mut [Value])> {
+        None
+    }
+}
+
+pub(crate) const MAX_BUILTIN_MAP_LEN: usize = 24;
+
+/// Pack `keys` and `vals` referencing `pool` into an exact-sized
+/// `Arc<PooledBuiltinMap<N>>` (`1 <= keys.len() <= 24`).
+pub(crate) fn make_pooled_builtin_arc(
+    pool: Arc<[Value]>,
+    keys: &[u16],
+    vals: &[u16],
+) -> Arc<dyn BuiltinEntries> {
+    let count = keys.len();
+    debug_assert_eq!(count, vals.len());
+    macro_rules! build {
+        ($($n:literal),+) => {
+            match count {
+                $(
+                    $n => {
+                        let mut k = [0u16; $n];
+                        k.copy_from_slice(keys);
+                        let mut v = [0u16; $n];
+                        v.copy_from_slice(vals);
+                        Arc::new(PooledBuiltinMap { pool, keys: k, vals: v })
+                    }
+                )+
+                _ => unreachable!("pooled builtin map count out of range"),
+            }
+        };
+    }
+    build!(
+        1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24
+    )
+}
+
+/// Pack `count` `(packed_key, value)` pairs from stack buffers into an exact-sized
+/// `Arc<BuiltinMap<N>>` (`1 <= count <= 24`).
+fn make_builtin_arc(count: usize, keys: &[u16], values: &mut [Value]) -> Arc<dyn BuiltinEntries> {
+    macro_rules! build {
+        ($($n:literal),+) => {
+            match count {
+                $(
+                    $n => {
+                        let mut k = [0u16; $n];
+                        k.copy_from_slice(&keys[..$n]);
+                        let v = std::array::from_fn::<Value, $n, _>(|i| {
+                            std::mem::replace(&mut values[i], Value::Undefined)
+                        });
+                        Arc::new(BuiltinMap { keys: k, values: v })
+                    }
+                )+
+                _ => unreachable!("builtin map count out of range"),
+            }
+        };
+    }
+    build!(
+        1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24
+    )
+}
+
+/// Pack `(keys, values)` by moving values out of `values` into an exact-sized
+/// `Arc<BuiltinMap<N>>` (`1 <= keys.len() <= 24`).
+pub(crate) fn make_builtin_arc_owned(
+    keys: &[u16],
+    values: &mut [Value],
+) -> Arc<dyn BuiltinEntries> {
+    debug_assert_eq!(keys.len(), values.len());
+    make_builtin_arc(keys.len(), keys, values)
+}
+
+/// Pack `count` `(packed_key, value)` pairs by cloning values into an
+/// exact-sized `Arc<BuiltinMap<N>>` (`1 <= count <= 24`).
+pub(crate) fn make_builtin_arc_cloned(keys: &[u16], values: &[Value]) -> Arc<dyn BuiltinEntries> {
+    debug_assert_eq!(keys.len(), values.len());
+    macro_rules! build {
+        ($($n:literal),+) => {
+            match keys.len() {
+                $(
+                    $n => {
+                        let mut k = [0u16; $n];
+                        k.copy_from_slice(&keys[..$n]);
+                        let v = std::array::from_fn::<Value, $n, _>(|i| values[i].clone());
+                        Arc::new(BuiltinMap { keys: k, values: v })
+                    }
+                )+
+                _ => unreachable!("builtin map count out of range"),
+            }
+        };
+    }
+    build!(
+        1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24
+    )
+}
+
+/// Merge a built-in entry map with stack-packed `(keys, values)` using
+/// overwrite (`Set`) semantics. Returns `Err(entries)` when the combined map
+/// exceeds `MAX_BUILTIN_MAP_LEN` or `entries` is pooled.
+///
+/// When `entries` is uniquely owned (`Arc::get_mut`), existing values are moved
+/// into the rebuilt map instead of cloned, avoiding atomic refcount churn on
+/// strings and nested objects.
+pub(crate) fn merge_builtin_with_packed(
+    mut entries: Arc<dyn BuiltinEntries>,
+    other_keys: &[u16],
+    other_vals: &[Value],
+) -> Result<Arc<dyn BuiltinEntries>, Arc<dyn BuiltinEntries>> {
+    let mut other_marks = 0u64;
+    for &ok in other_keys {
+        other_marks |= 1u64 << (ok >> 10);
+    }
+    let (held, fresh, fresh_mask) = {
+        let Slice::Builtin(self_keys_ro, _) = entries.as_slice() else {
+            return Err(entries);
+        };
+        let mut self_marks = 0u64;
+        for &sk in self_keys_ro {
+            self_marks |= 1u64 << (sk >> 10);
+        }
+        let mut fresh_mask = 0u32;
+        let mut fresh = 0usize;
+        for (i, &ok) in other_keys.iter().enumerate() {
+            let bit = 1u64 << (ok >> 10);
+            if (self_marks & bit) == 0 || !self_keys_ro.contains(&ok) {
+                fresh_mask |= 1u32 << i;
+                fresh += 1;
+            }
+        }
+        (self_keys_ro.len(), fresh, fresh_mask)
+    };
+    if fresh == 0
+        && let Some(own) = Arc::get_mut(&mut entries)
+        && let Some((sk, sv)) = own.parts_mut()
+    {
+        for (&k, v) in sk.iter().zip(sv.iter_mut()) {
+            if (other_marks & (1u64 << (k >> 10))) != 0
+                && let Some(pos) = other_keys.iter().position(|&ok| ok == k)
+            {
+                *v = other_vals[pos].clone();
+            }
+        }
+        return Ok(entries);
+    }
+    let total = held + fresh;
+    if total == 0 || total > MAX_BUILTIN_MAP_LEN {
+        return Err(entries);
+    }
+    let mut out_keys = [0u16; MAX_BUILTIN_MAP_LEN];
+    // High bit clear = index into `self_vals`; high bit set = index into `other_vals`.
+    let mut src_idx = [0u8; MAX_BUILTIN_MAP_LEN];
+    {
+        let Slice::Builtin(self_keys_ro, _) = entries.as_slice() else {
+            return Err(entries);
+        };
+        for (i, &k) in self_keys_ro.iter().enumerate() {
+            out_keys[i] = k;
+            src_idx[i] = if (other_marks & (1u64 << (k >> 10))) != 0 {
+                match other_keys.iter().position(|&ok| ok == k) {
+                    Some(pos) => 0x80 | (pos as u8),
+                    None => i as u8,
+                }
+            } else {
+                i as u8
+            };
+        }
+    }
+    let mut dst = held;
+    let mut rem = fresh_mask;
+    while rem != 0 {
+        let i = rem.trailing_zeros() as usize;
+        rem &= rem - 1;
+        out_keys[dst] = other_keys[i];
+        src_idx[dst] = 0x80 | (i as u8);
+        dst += 1;
+    }
+    if let Some(own) = Arc::get_mut(&mut entries)
+        && let Some((_, self_vals_mut)) = own.parts_mut()
+    {
+        macro_rules! build_move {
+            ($($n:literal),+) => {
+                match total {
+                    $(
+                        $n => {
+                            let mut k = [0u16; $n];
+                            k.copy_from_slice(&out_keys[..$n]);
+                            let v = std::array::from_fn::<Value, $n, _>(|i| {
+                                let tag = src_idx[i];
+                                if tag & 0x80 != 0 {
+                                    other_vals[usize::from(tag & 0x7f)].clone()
+                                } else {
+                                    std::mem::replace(
+                                        &mut self_vals_mut[usize::from(tag)],
+                                        Value::Undefined,
+                                    )
+                                }
+                            });
+                            Arc::new(BuiltinMap { keys: k, values: v })
+                        }
+                    )+
+                    _ => unreachable!("builtin map count out of range"),
+                }
+            };
+        }
+        return Ok(build_move!(
+            1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24
+        ));
+    }
+    let Slice::Builtin(_, self_vals_ro) = entries.as_slice() else {
+        return Err(entries);
+    };
+    macro_rules! build_clone {
+        ($($n:literal),+) => {
+            match total {
+                $(
+                    $n => {
+                        let mut k = [0u16; $n];
+                        k.copy_from_slice(&out_keys[..$n]);
+                        let v = std::array::from_fn::<Value, $n, _>(|i| {
+                            let tag = src_idx[i];
+                            if tag & 0x80 != 0 {
+                                other_vals[usize::from(tag & 0x7f)].clone()
+                            } else {
+                                self_vals_ro[usize::from(tag)].clone()
+                            }
+                        });
+                        Arc::new(BuiltinMap { keys: k, values: v })
+                    }
+                )+
+                _ => unreachable!("builtin map count out of range"),
+            }
+        };
+    }
+    Ok(build_clone!(
+        1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24
+    ))
+}
+
+/// Like [`merge_builtin_with_packed`], moving values out of `other_vals` when
+/// merging into a uniquely-targeted map. Leaves `other_vals` untouched on `Err`.
+pub(crate) fn merge_builtin_with_packed_owned(
+    mut entries: Arc<dyn BuiltinEntries>,
+    other_keys: &[u16],
+    other_vals: &mut [Value],
+) -> Result<Arc<dyn BuiltinEntries>, Arc<dyn BuiltinEntries>> {
+    let mut other_marks = 0u64;
+    for &ok in other_keys {
+        other_marks |= 1u64 << (ok >> 10);
+    }
+    let (held, fresh, fresh_mask) = {
+        let Slice::Builtin(self_keys_ro, _) = entries.as_slice() else {
+            return Err(entries);
+        };
+        let mut self_marks = 0u64;
+        for &sk in self_keys_ro {
+            self_marks |= 1u64 << (sk >> 10);
+        }
+        let mut fresh_mask = 0u32;
+        let mut fresh = 0usize;
+        for (i, &ok) in other_keys.iter().enumerate() {
+            let bit = 1u64 << (ok >> 10);
+            if (self_marks & bit) == 0 || !self_keys_ro.contains(&ok) {
+                fresh_mask |= 1u32 << i;
+                fresh += 1;
+            }
+        }
+        (self_keys_ro.len(), fresh, fresh_mask)
+    };
+    if fresh == 0
+        && let Some(own) = Arc::get_mut(&mut entries)
+        && let Some((sk, sv)) = own.parts_mut()
+    {
+        for (&k, v) in sk.iter().zip(sv.iter_mut()) {
+            if (other_marks & (1u64 << (k >> 10))) != 0
+                && let Some(pos) = other_keys.iter().position(|&ok| ok == k)
+            {
+                *v = std::mem::replace(&mut other_vals[pos], Value::Undefined);
+            }
+        }
+        return Ok(entries);
+    }
+    let total = held + fresh;
+    if total == 0 || total > MAX_BUILTIN_MAP_LEN {
+        return Err(entries);
+    }
+    let mut out_keys = [0u16; MAX_BUILTIN_MAP_LEN];
+    let mut src_idx = [0u8; MAX_BUILTIN_MAP_LEN];
+    {
+        let Slice::Builtin(self_keys_ro, _) = entries.as_slice() else {
+            return Err(entries);
+        };
+        for (i, &k) in self_keys_ro.iter().enumerate() {
+            out_keys[i] = k;
+            src_idx[i] = if (other_marks & (1u64 << (k >> 10))) != 0 {
+                match other_keys.iter().position(|&ok| ok == k) {
+                    Some(pos) => 0x80 | (pos as u8),
+                    None => i as u8,
+                }
+            } else {
+                i as u8
+            };
+        }
+    }
+    let mut dst = held;
+    let mut rem = fresh_mask;
+    while rem != 0 {
+        let i = rem.trailing_zeros() as usize;
+        rem &= rem - 1;
+        out_keys[dst] = other_keys[i];
+        src_idx[dst] = 0x80 | (i as u8);
+        dst += 1;
+    }
+    if let Some(own) = Arc::get_mut(&mut entries)
+        && let Some((_, self_vals_mut)) = own.parts_mut()
+    {
+        macro_rules! build_move {
+            ($($n:literal),+) => {
+                match total {
+                    $(
+                        $n => {
+                            let mut k = [0u16; $n];
+                            k.copy_from_slice(&out_keys[..$n]);
+                            let v = std::array::from_fn::<Value, $n, _>(|i| {
+                                let tag = src_idx[i];
+                                if tag & 0x80 != 0 {
+                                    std::mem::replace(
+                                        &mut other_vals[usize::from(tag & 0x7f)],
+                                        Value::Undefined,
+                                    )
+                                } else {
+                                    std::mem::replace(
+                                        &mut self_vals_mut[usize::from(tag)],
+                                        Value::Undefined,
+                                    )
+                                }
+                            });
+                            Arc::new(BuiltinMap { keys: k, values: v })
+                        }
+                    )+
+                    _ => unreachable!("builtin map count out of range"),
+                }
+            };
+        }
+        return Ok(build_move!(
+            1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24
+        ));
+    }
+    let Slice::Builtin(_, self_vals_ro) = entries.as_slice() else {
+        return Err(entries);
+    };
+    macro_rules! build_clone {
+        ($($n:literal),+) => {
+            match total {
+                $(
+                    $n => {
+                        let mut k = [0u16; $n];
+                        k.copy_from_slice(&out_keys[..$n]);
+                        let v = std::array::from_fn::<Value, $n, _>(|i| {
+                            let tag = src_idx[i];
+                            if tag & 0x80 != 0 {
+                                std::mem::replace(
+                                    &mut other_vals[usize::from(tag & 0x7f)],
+                                    Value::Undefined,
+                                )
+                            } else {
+                                self_vals_ro[usize::from(tag)].clone()
+                            }
+                        });
+                        Arc::new(BuiltinMap { keys: k, values: v })
+                    }
+                )+
+                _ => unreachable!("builtin map count out of range"),
+            }
+        };
+    }
+    Ok(build_clone!(
+        1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24
+    ))
+}
+
+/// Build `Entries` from `count` `(Key, Value)` items using a stack buffer of
+/// size `CAP`, packing into `Entries::Builtin` when every key is a canonical
+/// built-in control name.
+fn pack_entries_capped<const CAP: usize>(
+    count: usize,
+    mut next: impl FnMut(usize) -> (Key, Value),
+    made: bool,
+) -> Entries {
+    let mut keys = [0u16; CAP];
+    let mut values = [const { Value::Undefined }; CAP];
+    let mut fallback: Option<Vec<(Key, Value)>> = None;
+    for i in 0..count {
+        let (key, value) = next(i);
+        if let Some(vec) = &mut fallback {
+            vec.push((key, value));
+            continue;
+        }
+        let packed = crate::controls::pack_builtin_key_str(key.as_str());
+        if packed != 0 {
+            keys[i] = packed;
+            values[i] = value;
+        } else {
+            let mut vec = Vec::with_capacity(count);
+            for j in 0..i {
+                let id = keys[j] & 0x03ff;
+                let k = crate::controls::builtin_key_ref_by_id(id)
+                    .expect("packed builtin id")
+                    .clone();
+                let v = std::mem::replace(&mut values[j], Value::Undefined);
+                vec.push((k, v));
+            }
+            vec.push((key, value));
+            fallback = Some(vec);
+        }
+    }
+    match fallback {
+        None => Entries::Builtin(make_builtin_arc(count, &keys, &mut values), made),
+        Some(vec) => {
+            let shares: Shares = vec.into();
+            if made {
+                Entries::Made(shares)
+            } else {
+                Entries::Shared(shares)
+            }
+        }
+    }
+}
+
+macro_rules! static_int_row {
+    ($base:expr) => {
+        [
+            Value::F64(($base) as f64),
+            Value::F64(($base + 1) as f64),
+            Value::F64(($base + 2) as f64),
+            Value::F64(($base + 3) as f64),
+            Value::F64(($base + 4) as f64),
+            Value::F64(($base + 5) as f64),
+            Value::F64(($base + 6) as f64),
+            Value::F64(($base + 7) as f64),
+            Value::F64(($base + 8) as f64),
+            Value::F64(($base + 9) as f64),
+            Value::F64(($base + 10) as f64),
+            Value::F64(($base + 11) as f64),
+            Value::F64(($base + 12) as f64),
+            Value::F64(($base + 13) as f64),
+            Value::F64(($base + 14) as f64),
+            Value::F64(($base + 15) as f64),
+        ]
+    };
+}
+
+/// Static `Value::F64` table for exact integers `-128..=127`, allowing
+/// single-key built-in numeric control maps to avoid heap and `Arc` refcounts.
+static STATIC_INT_VALUES: [[Value; 16]; 16] = [
+    static_int_row!(-128),
+    static_int_row!(-112),
+    static_int_row!(-96),
+    static_int_row!(-80),
+    static_int_row!(-64),
+    static_int_row!(-48),
+    static_int_row!(-32),
+    static_int_row!(-16),
+    static_int_row!(0),
+    static_int_row!(16),
+    static_int_row!(32),
+    static_int_row!(48),
+    static_int_row!(64),
+    static_int_row!(80),
+    static_int_row!(96),
+    static_int_row!(112),
+];
+
+/// Convert an exact `-128..=127` non-negative-zero `Value::F64` to `i8`.
+#[inline(always)]
+pub(crate) fn static_int_of(value: &Value) -> Option<i8> {
+    let Value::F64(x) = *value else {
+        return None;
+    };
+    if x == 0.0 {
+        return (!x.is_sign_negative()).then_some(0);
+    }
+    let i = x as i8;
+    (f64::from(i) == x).then_some(i)
+}
+
+/// Build a 1-element `Arc<[Value]>`, reusing a bounded static handle for exact
+/// small integers (`-24..=24`, excluding `-0.0`) to eliminate transient single-
+/// value slice allocations on numeric atoms and patterns.
+#[inline]
+pub fn arc_single_value(value: Value) -> Arc<[Value]> {
+    if let Value::F64(x) = value {
+        if x == 0.0 {
+            if !x.is_sign_negative() {
+                return static_single_int_arc(24);
+            }
+        } else {
+            let i = x as i8;
+            if (-24..=24).contains(&i) && f64::from(i) == x {
+                return static_single_int_arc((i + 24) as usize);
+            }
+        }
+    }
+    Arc::from([value])
+}
+
+fn static_single_int_arc(idx: usize) -> Arc<[Value]> {
+    static CACHE: [std::sync::OnceLock<Arc<[Value]>>; 49] =
+        [const { std::sync::OnceLock::new() }; 49];
+    Arc::clone(CACHE[idx].get_or_init(|| Arc::from([Value::F64((idx as i32 - 24) as f64)])))
+}
+
+#[inline(always)]
+fn static_int_value(n: i8) -> &'static Value {
+    let idx = (i16::from(n) + 128) as usize;
+    &STATIC_INT_VALUES[idx >> 4][idx & 15]
+}
+
+#[inline(always)]
+fn static_int_layout(id: u16, n: i8) -> Layout<'static> {
+    let key = crate::controls::builtin_key_ref_by_id(id).expect("packed builtin id");
+    Layout::Keyed(key, static_int_value(n), Slice::EMPTY)
+}
+
+/// Build `Entries` from `count` `(Key, Value)` items, packing into
+/// `Entries::Builtin` when `1 <= count <= 24` and every key is a canonical
+/// built-in control name.
+fn pack_entries(count: usize, mut next: impl FnMut(usize) -> (Key, Value), made: bool) -> Entries {
+    if count == 0 {
+        return Entries::Empty;
+    }
+    if count == 1 {
+        let (key, value) = next(0);
+        let packed = crate::controls::pack_builtin_key_str(key.as_str());
+        if packed != 0 {
+            if let Some(n) = static_int_of(&value) {
+                return Entries::StaticInt(packed & 0x03ff, n, made);
+            }
+            let keys = [packed];
+            let mut values = [value];
+            return Entries::Builtin(make_builtin_arc(1, &keys, &mut values), made);
+        }
+        let shares: Shares = Arc::from([(key, value)]);
+        return if made {
+            Entries::Made(shares)
+        } else {
+            Entries::Shared(shares)
+        };
+    }
+    if count <= 8 {
+        return pack_entries_capped::<8>(count, next, made);
+    }
+    if count <= MAX_BUILTIN_MAP_LEN {
+        return pack_entries_capped::<MAX_BUILTIN_MAP_LEN>(count, next, made);
+    }
+    let shares: Shares = (0..count).map(next).collect();
+    if made {
+        Entries::Made(shares)
+    } else {
+        Entries::Shared(shares)
+    }
+}
+
+/// Borrowed slice of either plain `(Key, Value)` pairs or compact `u16`-keyed
+/// built-in control entries.
+#[derive(Clone, Copy)]
+pub(crate) enum Slice<'a> {
+    Plain(&'a [(Key, Value)]),
+    Builtin(&'a [u16], &'a [Value]),
+    Pooled(&'a [u16], &'a [u16], &'a [Value]),
+}
+
+impl<'a> Slice<'a> {
+    pub(crate) const EMPTY: Self = Self::Plain(&[]);
+
+    #[inline(always)]
+    pub(crate) fn len(self) -> usize {
+        match self {
+            Self::Plain(entries) => entries.len(),
+            Self::Builtin(keys, _) | Self::Pooled(keys, _, _) => keys.len(),
+        }
+    }
+
+    #[inline(always)]
+    pub(crate) fn is_empty(self) -> bool {
+        self.len() == 0
+    }
+
+    #[inline(always)]
+    pub(crate) fn at(self, index: usize) -> (&'a Key, &'a Value) {
+        match self {
+            Self::Plain(entries) => {
+                let (key, value) = &entries[index];
+                (key, value)
+            }
+            Self::Builtin(keys, values) => {
+                let key = crate::controls::builtin_key_ref_by_id(keys[index] & 0x03ff)
+                    .expect("packed builtin id");
+                (key, &values[index])
+            }
+            Self::Pooled(keys, vals, pool) => {
+                let key = crate::controls::builtin_key_ref_by_id(keys[index] & 0x03ff)
+                    .expect("packed builtin id");
+                (key, &pool[usize::from(vals[index])])
+            }
+        }
+    }
+
+    #[inline(always)]
+    pub(crate) fn value_at(self, index: usize) -> &'a Value {
+        match self {
+            Self::Plain(entries) => &entries[index].1,
+            Self::Builtin(_, values) => &values[index],
+            Self::Pooled(_, vals, pool) => &pool[usize::from(vals[index])],
+        }
+    }
+
+    #[inline(always)]
+    pub(crate) fn get_str(self, key: &str) -> Option<&'a Value> {
+        match self {
+            Self::Plain(entries) => entries
+                .iter()
+                .find_map(|(name, value)| (name == key).then_some(value)),
+            Self::Builtin(keys, values) => {
+                let want_bit = Table::mark_bit(key);
+                for (i, &packed) in keys.iter().enumerate() {
+                    if (packed >> 10) as u8 == want_bit
+                        && crate::controls::builtin_name_str_by_id(packed & 0x03ff) == Some(key)
+                    {
+                        return Some(&values[i]);
+                    }
+                }
+                None
+            }
+            Self::Pooled(keys, vals, pool) => {
+                let want_bit = Table::mark_bit(key);
+                for (i, &packed) in keys.iter().enumerate() {
+                    if (packed >> 10) as u8 == want_bit
+                        && crate::controls::builtin_name_str_by_id(packed & 0x03ff) == Some(key)
+                    {
+                        return Some(&pool[usize::from(vals[i])]);
+                    }
+                }
+                None
+            }
+        }
+    }
+
+    #[inline(always)]
+    pub(crate) fn position_str(self, key: &str) -> Option<usize> {
+        match self {
+            Self::Plain(entries) => entries.iter().position(|(name, _)| name == key),
+            Self::Builtin(keys, _) | Self::Pooled(keys, _, _) => {
+                let want_bit = Table::mark_bit(key);
+                for (i, &packed) in keys.iter().enumerate() {
+                    if (packed >> 10) as u8 == want_bit
+                        && crate::controls::builtin_name_str_by_id(packed & 0x03ff) == Some(key)
+                    {
+                        return Some(i);
+                    }
+                }
+                None
+            }
+        }
+    }
+
+    #[inline(always)]
+    fn get<K: ?Sized + Named>(self, key: &K) -> Option<&'a Value>
+    where
+        Key: PartialEq<K>,
+    {
+        match self {
+            Self::Plain(entries) => entries
+                .iter()
+                .find_map(|(name, value)| (name == key).then_some(value)),
+            Self::Builtin(..) | Self::Pooled(..) => self.get_str(key.name()),
+        }
+    }
+
+    #[inline(always)]
+    fn position_packed(self, packed: u16, key: &Key) -> Option<usize> {
+        match self {
+            Self::Plain(entries) => entries.iter().position(|(name, _)| name == key),
+            Self::Builtin(keys, _) | Self::Pooled(keys, _, _) => {
+                keys.iter().position(|&k| k == packed)
+            }
+        }
+    }
+
+    #[inline(always)]
+    fn packed_key_at(self, index: usize) -> Option<u16> {
+        match self {
+            Self::Builtin(keys, _) | Self::Pooled(keys, _, _) => Some(keys[index]),
+            Self::Plain(_) => None,
+        }
+    }
+
+    #[inline(always)]
+    fn position<K: ?Sized + Named>(self, key: &K) -> Option<usize>
+    where
+        Key: PartialEq<K>,
+    {
+        match self {
+            Self::Plain(entries) => entries.iter().position(|(name, _)| name == key),
+            Self::Builtin(..) | Self::Pooled(..) => self.position_str(key.name()),
+        }
+    }
+
+    #[inline(always)]
+    pub(crate) fn iter(self) -> SliceIter<'a> {
+        match self {
+            Self::Plain(entries) => SliceIter::Plain(entries.iter()),
+            Self::Builtin(keys, values) => SliceIter::Builtin(
+                keys.iter(),
+                values.iter(),
+                crate::controls::builtin_key_slice(),
+            ),
+            Self::Pooled(keys, vals, pool) => SliceIter::Pooled(
+                keys.iter(),
+                vals.iter(),
+                pool,
+                crate::controls::builtin_key_slice(),
+            ),
+        }
+    }
+
+    #[inline]
+    pub(crate) fn marks(self) -> u64 {
+        match self {
+            Self::Plain(entries) => entries
+                .iter()
+                .fold(0u64, |marks, (name, _)| marks | Table::mark(name.as_str())),
+            Self::Builtin(keys, _) | Self::Pooled(keys, _, _) => keys
+                .iter()
+                .fold(0u64, |marks, &packed| marks | (1u64 << (packed >> 10))),
+        }
+    }
+
+    pub(crate) fn to_shares(self) -> Shares {
+        match self {
+            Self::Plain(entries) => entries
+                .iter()
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect(),
+            Self::Builtin(keys, values) => keys
+                .iter()
+                .zip(values)
+                .map(|(&packed, v)| {
+                    let k = crate::controls::builtin_key_ref_by_id(packed & 0x03ff)
+                        .expect("packed builtin id")
+                        .clone();
+                    (k, v.clone())
+                })
+                .collect(),
+            Self::Pooled(keys, vals, pool) => keys
+                .iter()
+                .zip(vals)
+                .map(|(&packed, &idx)| {
+                    let k = crate::controls::builtin_key_ref_by_id(packed & 0x03ff)
+                        .expect("packed builtin id")
+                        .clone();
+                    (k, pool[usize::from(idx)].clone())
+                })
+                .collect(),
+        }
+    }
+
+    #[inline]
+    pub(crate) fn all_values_data(self) -> bool {
+        match self {
+            Self::Plain(entries) => entries.iter().all(|(_, v)| v.is_data(0)),
+            Self::Builtin(_, values) => values.iter().all(|v| v.is_data(0)),
+            Self::Pooled(_, vals, pool) => {
+                vals.iter().all(|&idx| pool[usize::from(idx)].is_data(0))
+            }
+        }
+    }
+}
+
+#[derive(Clone)]
+pub(crate) enum SliceIter<'a> {
+    Plain(std::slice::Iter<'a, (Key, Value)>),
+    Builtin(
+        std::slice::Iter<'a, u16>,
+        std::slice::Iter<'a, Value>,
+        &'static [Key],
+    ),
+    Pooled(
+        std::slice::Iter<'a, u16>,
+        std::slice::Iter<'a, u16>,
+        &'a [Value],
+        &'static [Key],
+    ),
+}
+
+impl<'a> Iterator for SliceIter<'a> {
+    type Item = (&'a Key, &'a Value);
+
+    #[inline]
+    fn next(&mut self) -> Option<Self::Item> {
+        match self {
+            Self::Plain(iter) => iter.next().map(|(k, v)| (k, v)),
+            Self::Builtin(keys, values, key_table) => {
+                let (&packed, value) = (keys.next()?, values.next()?);
+                let index = usize::from((packed & 0x03ff) - 1);
+                Some((&key_table[index], value))
+            }
+            Self::Pooled(keys, vals, pool, key_table) => {
+                let (&packed, &val_idx) = (keys.next()?, vals.next()?);
+                let index = usize::from((packed & 0x03ff) - 1);
+                Some((&key_table[index], &pool[usize::from(val_idx)]))
+            }
+        }
+    }
+
+    #[inline]
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        let len = match self {
+            Self::Plain(iter) => iter.len(),
+            Self::Builtin(keys, _, _) | Self::Pooled(keys, _, _, _) => keys.len(),
+        };
+        (len, Some(len))
+    }
+}
+
+impl ExactSizeIterator for SliceIter<'_> {}
+
+/// Borrowed `(head_key, head_values, tail_entries)` view of a keyed base table
+/// or direct-keyed sequence layer.
+pub(crate) type KeyedParts<'a> = (&'a Key, &'a [Value], Slice<'a>);
+
+/// Shared base backing a [`Patched`] overlay or a `PatchedTable` head: either
+/// a heap-allocated [`Table`] or a direct-keyed sequence [`Layer`](crate::sequence::Layer).
+#[derive(Clone)]
+pub(crate) enum PatchedBase {
+    Table(Arc<Table>),
+    SeqLayer(Arc<[crate::sequence::Layer]>, u16),
+    Builtin(Arc<dyn BuiltinEntries>),
+    Patched(PooledPatched),
+    /// Detached sentinel used only while a recycled `StepPatchData` rests in
+    /// the thread-local pool so zero score references are retained.
+    Empty,
+}
+
+impl PatchedBase {
+    #[inline(always)]
+    fn layout(&self, row: u32, layer_idx: u16) -> Layout<'_> {
+        match self {
+            Self::Table(table) => table.layout(row),
+            Self::SeqLayer(layers, _) => layers[usize::from(layer_idx)].seq_layout(row),
+            Self::Builtin(entries) => Layout::Plain(entries.as_slice()),
+            Self::Patched(patched) => Layout::Overlay(patched, row, layer_idx),
+            Self::Empty => Layout::Plain(Slice::EMPTY),
+        }
+    }
+
+    #[inline(always)]
+    fn len(&self, row: u32, layer_idx: u16) -> usize {
+        match self {
+            Self::Table(table) => table.layout(row).len(),
+            Self::SeqLayer(layers, _) => layers[usize::from(layer_idx)].seq_len(row),
+            Self::Builtin(entries) => entries.keys().len(),
+            Self::Patched(patched) => patched.len(),
+            Self::Empty => 0,
+        }
+    }
+
+    #[inline(always)]
+    fn at(&self, row: u32, layer_idx: u16, index: usize) -> (&Key, &Value) {
+        match self {
+            Self::Table(table) => table.layout(row).at(index),
+            Self::SeqLayer(layers, _) => layers[usize::from(layer_idx)].seq_at(row, index),
+            Self::Builtin(entries) => entries.as_slice().at(index),
+            Self::Patched(patched) => patched.at(row, layer_idx, index),
+            Self::Empty => unreachable!("Empty PatchedBase is never indexed"),
+        }
+    }
+
+    #[inline(always)]
+    fn marks(&self) -> u64 {
+        match self {
+            Self::Table(table) => table.marks(),
+            Self::SeqLayer(layers, layer_idx) => layers[usize::from(*layer_idx)].seq_marks(),
+            Self::Builtin(entries) => entries.as_slice().marks(),
+            Self::Patched(patched) => patched.marks,
+            Self::Empty => 0,
+        }
+    }
+
+    #[inline(always)]
+    fn has_uniform_keys(&self) -> bool {
+        match self {
+            Self::Table(table) => table.has_uniform_keys(),
+            Self::SeqLayer(layers, layer_idx) => {
+                layers[usize::from(*layer_idx)].seq_has_uniform_keys()
+            }
+            Self::Builtin(_) | Self::Empty => true,
+            Self::Patched(patched) => patched.base.has_uniform_keys(),
+        }
+    }
+
+    #[inline(always)]
+    pub(crate) fn same_source(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Table(a), Self::Table(b)) => Arc::ptr_eq(a, b),
+            (Self::SeqLayer(a, ai), Self::SeqLayer(b, bi)) => {
+                Arc::ptr_eq(a, b)
+                    && (ai == bi || a[usize::from(*ai)].seq_same_key_layout(&b[usize::from(*bi)]))
+            }
+            (Self::Builtin(a), Self::Builtin(b)) => Arc::ptr_eq(a, b),
+            (Self::Patched(a), Self::Patched(b)) => PooledPatched::ptr_eq(a, b),
+            _ => false,
+        }
+    }
+
+    #[inline(always)]
+    fn matches_table(&self, table: &Arc<Table>) -> bool {
+        matches!(self, Self::Table(other) if Arc::ptr_eq(other, table))
+    }
+
+    #[inline(always)]
+    fn matches_seq_layer(&self, layers: &Arc<[crate::sequence::Layer]>, layer_idx: u16) -> bool {
+        match self {
+            Self::SeqLayer(other, other_idx) if Arc::ptr_eq(other, layers) => {
+                *other_idx == layer_idx
+                    || layers[usize::from(layer_idx)]
+                        .seq_same_key_layout(&layers[usize::from(*other_idx)])
+            }
+            _ => false,
+        }
+    }
+
+    #[inline(always)]
+    fn matches_builtin(&self, entries: &Arc<dyn BuiltinEntries>) -> bool {
+        matches!(self, Self::Builtin(other) if Arc::ptr_eq(other, entries))
+    }
+
+    #[inline(always)]
+    fn keyed_parts(&self) -> Option<KeyedParts<'_>> {
+        match self {
+            Self::Table(table) => match &table.heads {
+                Heads::Keyed(Some(key), values) => Some((
+                    key,
+                    values,
+                    Slice::Plain(table.tail.as_deref().unwrap_or(&[])),
+                )),
+                Heads::Keyed(None, _) | Heads::Other(_) => None,
+            },
+            Self::SeqLayer(layers, layer_idx) => layers[usize::from(*layer_idx)].seq_keyed_parts(),
+            Self::Builtin(_) | Self::Patched(_) | Self::Empty => None,
+        }
+    }
+}
+
+#[derive(Clone)]
+struct PatchedTail {
+    keys: [Option<Key>; TAIL_PATCHES],
+    values: [Value; TAIL_PATCHES],
+    reps: [u16; TAIL_PATCHES],
+}
+
+impl PatchedTail {
+    const fn empty() -> Self {
+        Self {
+            keys: [const { None }; TAIL_PATCHES],
+            values: [const { Value::Undefined }; TAIL_PATCHES],
+            reps: [u16::MAX; TAIL_PATCHES],
+        }
+    }
+}
+
+/// Up to [`MAX_PATCHES`] key/value overrides or additions over a shared
+/// dressed [`Table`] or sequence layer row, avoiding flattening `Table::tail`
+/// on dynamic control chains. The row index lives alongside the `Arc<Patched>`
+/// in [`Entries::Patched`] so chord notes from the same uniform-key source can
+/// share one overlay allocation.
+#[derive(Clone)]
+pub(crate) struct Patched {
+    base: PatchedBase,
+    /// Optional built-in map overlaid alongside `base` without materialising
+    /// a flat `BuiltinMap`. Keys that overlap `base` (or prior inline appends)
+    /// live in the patch slots and are masked out in `overlay_skip`.
+    overlay: Option<Arc<dyn BuiltinEntries>>,
+    marks: u64,
+    overlay_skip: u32,
+    base_len: u16,
+    overlay_len: u16,
+    len: u8,
+    appended: u8,
+    has_replace: bool,
+    made: bool,
+    /// When `true`, `overlay` entries appear after `appended` entries
+    /// (`[base, appended, overlay]`) to preserve insertion order when attaching
+    /// a constant overlay onto an already-appended `Patched`.
+    overlay_after_appended: bool,
+    reps: [u16; INLINE_PATCHES],
+    keys: [Option<Key>; INLINE_PATCHES],
+    values: [Value; INLINE_PATCHES],
+    tail: Option<Box<PatchedTail>>,
+}
+
+const _: () = assert!(std::mem::size_of::<Patched>() <= 216);
+
+/// Lock-free, bounded thread-local pool of recycled `Arc<Patched>` allocations.
+/// Returning entries resets all handle fields (`base`, `overlay`, `keys`,
+/// `values`, `tail`) so zero score references are retained between queries.
+struct PatchedPool {
+    slots: [Option<Arc<Patched>>; 24],
+    len: usize,
+}
+
+impl PatchedPool {
+    const fn new() -> Self {
+        Self {
+            slots: [const { None }; 24],
+            len: 0,
+        }
+    }
+}
+
+thread_local! {
+    static PATCHED_POOL: std::cell::RefCell<PatchedPool> =
+        const { std::cell::RefCell::new(PatchedPool::new()) };
+}
+
+impl Patched {
+    #[inline]
+    fn take_from_pool() -> Option<Arc<Self>> {
+        PATCHED_POOL
+            .try_with(|cell| {
+                let mut pool = cell.try_borrow_mut().ok()?;
+                if pool.len == 0 {
+                    return None;
+                }
+                let idx = pool.len - 1;
+                pool.len = idx;
+                pool.slots[idx].take()
+            })
+            .ok()
+            .flatten()
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn return_to_pool(mut arc: Arc<Self>) {
+        let _ = PATCHED_POOL.try_with(|cell| {
+            if let Ok(mut pool) = cell.try_borrow_mut()
+                && pool.len < pool.slots.len()
+                && let Some(data) = Arc::get_mut(&mut arc)
+            {
+                data.base = PatchedBase::Empty;
+                data.overlay = None;
+                data.keys = [const { None }; INLINE_PATCHES];
+                data.values = [const { Value::Undefined }; INLINE_PATCHES];
+                data.tail = None;
+                let idx = pool.len;
+                pool.slots[idx] = Some(arc);
+                pool.len = idx + 1;
+            }
+        });
+    }
+}
+
+/// Zero-overhead `Arc<Patched>` wrapper (same 8-byte size via niche
+/// optimization) that recycles uniquely owned allocations into the thread-local
+/// pool when the last handle drops.
+#[repr(transparent)]
+pub(crate) struct PooledPatched(Option<Arc<Patched>>);
+
+#[cfg(target_pointer_width = "64")]
+const _: () = assert!(std::mem::size_of::<PooledPatched>() == 8);
+
+impl Clone for PooledPatched {
+    #[inline(always)]
+    fn clone(&self) -> Self {
+        Self(self.0.as_ref().map(Arc::clone))
+    }
+}
+
+impl std::ops::Deref for PooledPatched {
+    type Target = Patched;
+
+    #[inline(always)]
+    fn deref(&self) -> &Patched {
+        self.0.as_deref().expect("live pooled patched")
+    }
+}
+
+impl Drop for PooledPatched {
+    #[inline]
+    fn drop(&mut self) {
+        if let Some(arc) = self.0.take()
+            && Arc::strong_count(&arc) == 1
+        {
+            Patched::return_to_pool(arc);
+        }
+    }
+}
+
+impl PooledPatched {
+    #[inline]
+    pub(crate) fn new(patched: Patched) -> Self {
+        if let Some(mut arc) = Patched::take_from_pool()
+            && let Some(slot) = Arc::get_mut(&mut arc)
+        {
+            *slot = patched;
+            return Self(Some(arc));
+        }
+        Self(Some(Arc::new(patched)))
+    }
+
+    #[inline(always)]
+    fn get_mut(&mut self) -> Option<&mut Patched> {
+        self.0.as_mut().and_then(Arc::get_mut)
+    }
+
+    #[inline(always)]
+    fn strong_count(&self) -> usize {
+        self.0.as_ref().map_or(0, Arc::strong_count)
+    }
+
+    #[inline(always)]
+    fn as_ptr(&self) -> usize {
+        self.0.as_ref().map_or(0, |arc| Arc::as_ptr(arc) as usize)
+    }
+
+    #[inline(always)]
+    fn ptr_eq(a: &Self, b: &Self) -> bool {
+        match (&a.0, &b.0) {
+            (Some(x), Some(y)) => Arc::ptr_eq(x, y),
+            _ => false,
+        }
+    }
+}
+
+/// Shared header for compact multi-slot numeric overlays (`StepPatchData<N>`).
+/// Stores 1-based built-in control key IDs (`[u16; 4]`) instead of owned `Key`
+/// handles, shrinking the header from 136 B to 48 B and eliminating 4 atomic
+/// `Key` clones/drops per overlay.
+#[derive(Clone)]
+pub(crate) struct StepPatchHead {
+    base: PatchedBase,
+    marks: u64,
+    key_ids: [u16; 4],
+    reps: [u16; 4],
+    base_len: u16,
+    n_keys: u8,
+    appended: u8,
+    made: bool,
+}
+
+/// Fixed-capacity multi-slot numeric overlay storing up to 16 values over one
+/// [`PatchedBase`] (432 B, 448 B with `Arc`). Using a single size class avoids
+/// allocator size-class fragmentation and keeps every overlay in one warm
+/// thread-local pool.
+#[derive(Clone)]
+pub(crate) struct StepPatchData {
+    head: StepPatchHead,
+    values: [Value; 16],
+}
+
+#[cfg(target_pointer_width = "64")]
+const _: () = assert!(std::mem::size_of::<StepPatchHead>() <= 56);
+#[cfg(target_pointer_width = "64")]
+const _: () = assert!(std::mem::size_of::<StepPatchData>() <= 448);
+
+/// Lock-free, bounded thread-local pool of recycled `Arc<StepPatchData>`
+/// allocations. Returning entries clears `head.base` to `PatchedBase::Empty`
+/// and resets `values` so zero score references are retained.
+struct StepPatchPool {
+    slots: [Option<Arc<StepPatchData>>; 24],
+    len: usize,
+}
+
+impl StepPatchPool {
+    const fn new() -> Self {
+        Self {
+            slots: [const { None }; 24],
+            len: 0,
+        }
+    }
+}
+
+thread_local! {
+    static STEP_PATCH_POOL: std::cell::RefCell<StepPatchPool> =
+        const { std::cell::RefCell::new(StepPatchPool::new()) };
+}
+
+impl StepPatchData {
+    #[inline]
+    fn take_from_pool() -> Option<Arc<Self>> {
+        STEP_PATCH_POOL
+            .try_with(|cell| {
+                let mut pool = cell.try_borrow_mut().ok()?;
+                if pool.len == 0 {
+                    return None;
+                }
+                let idx = pool.len - 1;
+                pool.len = idx;
+                pool.slots[idx].take()
+            })
+            .ok()
+            .flatten()
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn return_to_pool(mut arc: Arc<Self>) {
+        let _ = STEP_PATCH_POOL.try_with(|cell| {
+            if let Ok(mut pool) = cell.try_borrow_mut()
+                && pool.len < pool.slots.len()
+                && let Some(data) = Arc::get_mut(&mut arc)
+            {
+                data.head.base = PatchedBase::Empty;
+                debug_assert!(
+                    data.values
+                        .iter()
+                        .all(|v| matches!(v, Value::F64(_) | Value::Undefined)),
+                    "StepPatchData must only hold scalar F64/Undefined slots"
+                );
+                let idx = pool.len;
+                pool.slots[idx] = Some(arc);
+                pool.len = idx + 1;
+            }
+        });
+    }
+}
+
+/// Zero-overhead `Arc<StepPatchData>` wrapper (same 8-byte size via niche
+/// optimization) that recycles uniquely owned allocations into the thread-local
+/// pool when the last handle drops.
+#[repr(transparent)]
+pub(crate) struct PooledStepPatch(Option<Arc<StepPatchData>>);
+
+#[cfg(target_pointer_width = "64")]
+const _: () = assert!(std::mem::size_of::<PooledStepPatch>() == 8);
+
+impl Clone for PooledStepPatch {
+    #[inline(always)]
+    fn clone(&self) -> Self {
+        Self(self.0.as_ref().map(Arc::clone))
+    }
+}
+
+impl std::ops::Deref for PooledStepPatch {
+    type Target = StepPatchData;
+
+    #[inline(always)]
+    fn deref(&self) -> &StepPatchData {
+        self.0.as_deref().expect("live pooled step patch")
+    }
+}
+
+impl Drop for PooledStepPatch {
+    #[inline]
+    fn drop(&mut self) {
+        if let Some(arc) = self.0.take()
+            && Arc::strong_count(&arc) == 1
+        {
+            StepPatchData::return_to_pool(arc);
+        }
+    }
+}
+
+impl PooledStepPatch {
+    #[inline(always)]
+    fn new(arc: Arc<StepPatchData>) -> Self {
+        Self(Some(arc))
+    }
+
+    #[inline(always)]
+    fn get_mut(&mut self) -> Option<&mut StepPatchData> {
+        self.0.as_mut().and_then(Arc::get_mut)
+    }
+
+    #[inline(always)]
+    fn ptr_eq(a: &Self, b: &Self) -> bool {
+        match (&a.0, &b.0) {
+            (Some(x), Some(y)) => Arc::ptr_eq(x, y),
+            _ => false,
+        }
+    }
+}
+
+/// Reference-counted handle to a 16-value [`StepPatchData`].
+#[derive(Clone)]
+pub(crate) struct StepPatch(PooledStepPatch);
+
+/// Builder for [`StepPatch`], writing values directly into the uniquely owned
+/// `Arc<StepPatchData>` so finishing moves the handle with zero stack copy.
+pub(crate) struct StepPatchBuilder(StepPatch);
+
+impl StepPatchBuilder {
+    #[inline(always)]
+    pub(crate) fn set_slot(&mut self, slot: usize, vals: &[f64]) {
+        let data = self.0.0.get_mut().expect("unique step patch builder");
+        let n_keys = usize::from(data.head.n_keys);
+        debug_assert_eq!(vals.len(), n_keys);
+        let offset = slot * n_keys;
+        for (k, &v) in vals.iter().enumerate() {
+            data.values[offset + k] = Value::F64(v);
+        }
+    }
+
+    #[inline(always)]
+    pub(crate) fn set_single_slot(&mut self, slot: usize, val: f64) {
+        let data = self.0.0.get_mut().expect("unique step patch builder");
+        debug_assert_eq!(data.head.n_keys, 1);
+        data.values[slot] = Value::F64(val);
+    }
+
+    #[inline(always)]
+    pub(crate) fn values_mut(&mut self) -> &mut [Value; 16] {
+        &mut self
+            .0
+            .0
+            .get_mut()
+            .expect("unique step patch builder")
+            .values
+    }
+
+    #[inline(always)]
+    pub(crate) fn finish(self) -> StepPatch {
+        self.0
+    }
+}
+
+impl StepPatch {
+    pub(crate) const MAX_KEYS: usize = 4;
+    pub(crate) const MAX_VALUES: usize = 16;
+    pub(crate) const MAX_ROW: u32 = u32::MAX >> 4;
+
+    /// Build a multi-slot numeric overlay for one fixed `row` of `base` (even
+    /// when `base` does not have uniform keys across rows). Callers must only
+    /// attach the resulting `StepPatch` to maps with that same `row` unless
+    /// `base.has_uniform_keys()` is true.
+    pub(crate) fn new_for_row(
+        base: PatchedBase,
+        row: u32,
+        layer_idx: u16,
+        keys: &[&Key],
+        made: bool,
+        total_values: usize,
+    ) -> Option<StepPatchBuilder> {
+        if total_values > Self::MAX_VALUES {
+            return None;
+        }
+        let head = StepPatchHead::new_for_row(base, row, layer_idx, keys, made)?;
+        Self::from_head(head)
+    }
+
+    /// Variant of [`Self::new_for_row`] when the caller already has 1-based
+    /// built-in control `key_ids`, avoiding per-chord string lookups.
+    pub(crate) fn new_for_row_ids(
+        base: PatchedBase,
+        row: u32,
+        layer_idx: u16,
+        key_ids: &[u16],
+        keys: &[&Key],
+        made: bool,
+        total_values: usize,
+    ) -> Option<StepPatchBuilder> {
+        if total_values > Self::MAX_VALUES {
+            return None;
+        }
+        let head = StepPatchHead::new_for_row_ids(base, row, layer_idx, key_ids, keys, made)?;
+        Self::from_head(head)
+    }
+
+    #[inline]
+    fn from_head(head: StepPatchHead) -> Option<StepPatchBuilder> {
+        if let Some(mut arc) = StepPatchData::take_from_pool()
+            && let Some(data) = Arc::get_mut(&mut arc)
+        {
+            data.head = head;
+            return Some(StepPatchBuilder(StepPatch(PooledStepPatch::new(arc))));
+        }
+        let arc = Arc::new(StepPatchData {
+            head,
+            values: [const { Value::Undefined }; 16],
+        });
+        Some(StepPatchBuilder(StepPatch(PooledStepPatch::new(arc))))
+    }
+
+    #[inline(always)]
+    fn ptr_eq(&self, other: &Self) -> bool {
+        PooledStepPatch::ptr_eq(&self.0, &other.0)
+    }
+
+    #[inline(always)]
+    pub(crate) fn pack(row: u32, slot: usize) -> u32 {
+        debug_assert!(row <= Self::MAX_ROW && slot < 16);
+        (row << 4) | (slot as u32)
+    }
+
+    #[inline(always)]
+    pub(crate) fn unpack(packed: u32) -> (u32, usize) {
+        (packed >> 4, (packed & 0xF) as usize)
+    }
+}
+
+impl StepPatchHead {
+    #[inline(always)]
+    fn key_ref(id: u16) -> &'static Key {
+        crate::controls::builtin_key_ref_by_id(id).expect("valid built-in step patch key")
+    }
+
+    fn new_for_row(
+        base: PatchedBase,
+        row: u32,
+        layer_idx: u16,
+        keys: &[&Key],
+        made: bool,
+    ) -> Option<Self> {
+        let n_keys = keys.len();
+        if n_keys == 0 || n_keys > StepPatch::MAX_KEYS || row > StepPatch::MAX_ROW {
+            return None;
+        }
+        let mut ids = [0u16; StepPatch::MAX_KEYS];
+        for (i, &key) in keys.iter().enumerate() {
+            let id = crate::controls::builtin_id_of_name(key.as_str());
+            if id == 0 {
+                return None;
+            }
+            ids[i] = id;
+        }
+        Self::new_for_row_ids(base, row, layer_idx, &ids[..n_keys], keys, made)
+    }
+
+    fn new_for_row_ids(
+        base: PatchedBase,
+        row: u32,
+        layer_idx: u16,
+        key_ids_in: &[u16],
+        keys: &[&Key],
+        made: bool,
+    ) -> Option<Self> {
+        let n_keys = key_ids_in.len();
+        if n_keys == 0
+            || n_keys > StepPatch::MAX_KEYS
+            || keys.len() != n_keys
+            || row > StepPatch::MAX_ROW
+        {
+            return None;
+        }
+        let base_layout = base.layout(row, layer_idx);
+        let base_len = u16::try_from(base_layout.len()).ok()?;
+        let base_marks = base.marks();
+        let mut marks = base_marks;
+        let mut key_ids = [0u16; 4];
+        let mut reps = [u16::MAX; 4];
+        let mut appended = 0u8;
+        for i in 0..n_keys {
+            let id = key_ids_in[i];
+            if id == 0 {
+                return None;
+            }
+            key_ids[i] = id;
+            let mark_bit = crate::controls::builtin_mark_bit_by_id(id);
+            let mark = 1u64 << mark_bit;
+            marks |= mark;
+            if base_marks & mark != 0 {
+                let pos = match base_layout {
+                    Layout::Plain(Slice::Builtin(bkeys, _) | Slice::Pooled(bkeys, _, _)) => {
+                        let packed = id | (u16::from(mark_bit) << 10);
+                        bkeys.iter().position(|&k| k == packed)
+                    }
+                    _ => base_layout.position(keys[i]),
+                };
+                if let Some(pos) = pos {
+                    reps[i] = u16::try_from(pos).ok()?;
+                } else {
+                    appended = appended.checked_add(1)?;
+                }
+            } else {
+                appended = appended.checked_add(1)?;
+            }
+        }
+        Some(Self {
+            base,
+            marks,
+            key_ids,
+            reps,
+            base_len,
+            n_keys: n_keys as u8,
+            appended,
+            made,
+        })
+    }
+
+    #[inline(always)]
+    fn len(&self) -> usize {
+        usize::from(self.base_len) + usize::from(self.appended)
+    }
+
+    #[inline(always)]
+    fn at<'a>(
+        &'a self,
+        values: &'a [Value],
+        packed: u32,
+        layer_idx: u16,
+        index: usize,
+    ) -> (&'a Key, &'a Value) {
+        let (row, slot) = StepPatch::unpack(packed);
+        let base_len = usize::from(self.base_len);
+        let n_keys = usize::from(self.n_keys);
+        let offset = slot * n_keys;
+        if index < base_len {
+            for k in 0..n_keys {
+                if usize::from(self.reps[k]) == index {
+                    return (Self::key_ref(self.key_ids[k]), &values[offset + k]);
+                }
+            }
+            return self.base.layout(row, layer_idx).at(index);
+        }
+        let mut rem = index - base_len;
+        for k in 0..n_keys {
+            if self.reps[k] == u16::MAX {
+                if rem == 0 {
+                    return (Self::key_ref(self.key_ids[k]), &values[offset + k]);
+                }
+                rem -= 1;
+            }
+        }
+        unreachable!("step patch index out of bounds")
+    }
+
+    #[inline(always)]
+    fn get<'a, K: ?Sized + Named>(
+        &'a self,
+        values: &'a [Value],
+        packed: u32,
+        layer_idx: u16,
+        key: &K,
+    ) -> Option<&'a Value>
+    where
+        Key: PartialEq<K>,
+    {
+        if self.marks & Table::mark(key.name()) == 0 {
+            return None;
+        }
+        let (row, slot) = StepPatch::unpack(packed);
+        let n_keys = usize::from(self.n_keys);
+        let offset = slot * n_keys;
+        for k in 0..n_keys {
+            if Self::key_ref(self.key_ids[k]) == key {
+                return Some(&values[offset + k]);
+            }
+        }
+        self.base.layout(row, layer_idx).get(key)
+    }
+
+    #[inline(always)]
+    fn position<K: ?Sized + Named>(&self, packed: u32, layer_idx: u16, key: &K) -> Option<usize>
+    where
+        Key: PartialEq<K>,
+    {
+        if self.marks & Table::mark(key.name()) == 0 {
+            return None;
+        }
+        let (row, _) = StepPatch::unpack(packed);
+        let n_keys = usize::from(self.n_keys);
+        let mut appended_before = 0usize;
+        for k in 0..n_keys {
+            if Self::key_ref(self.key_ids[k]) == key {
+                return if self.reps[k] != u16::MAX {
+                    Some(usize::from(self.reps[k]))
+                } else {
+                    Some(usize::from(self.base_len) + appended_before)
+                };
+            }
+            if self.reps[k] == u16::MAX {
+                appended_before += 1;
+            }
+        }
+        self.base.layout(row, layer_idx).position(key)
+    }
+
+    /// Promote one `(row, slot)` view into an owned mutable [`Patched`] so
+    /// downstream constant/wave overlays can stack without flattening `base`.
+    fn to_patched(&self, values: &[Value], packed: u32, layer_idx: u16) -> Option<(Patched, u32)> {
+        let (row, slot) = StepPatch::unpack(packed);
+        let mut patched = Patched::empty(self.base.clone(), row, layer_idx, self.made)?;
+        let n_keys = usize::from(self.n_keys);
+        let offset = slot * n_keys;
+        for k in 0..n_keys {
+            let key = Self::key_ref(self.key_ids[k]);
+            let _ = patched.try_set(row, layer_idx, key, values[offset + k].clone(), true);
+        }
+        Some((patched, row))
+    }
+}
+
+impl Patched {
+    #[inline(always)]
+    fn slot_at(&self, i: usize) -> (&Key, &Value, u16) {
+        if i < INLINE_PATCHES {
+            (
+                self.keys[i].as_ref().expect("inline patch key"),
+                &self.values[i],
+                self.reps[i],
+            )
+        } else {
+            let tail = self.tail.as_deref().expect("tail patch present");
+            let j = i - INLINE_PATCHES;
+            (
+                tail.keys[j].as_ref().expect("tail patch key"),
+                &tail.values[j],
+                tail.reps[j],
+            )
+        }
+    }
+
+    #[inline(always)]
+    fn slot_val_mut(&mut self, i: usize) -> &mut Value {
+        if i < INLINE_PATCHES {
+            &mut self.values[i]
+        } else {
+            &mut self.tail.as_deref_mut().expect("tail patch present").values[i - INLINE_PATCHES]
+        }
+    }
+
+    #[inline(always)]
+    fn push_slot(&mut self, key: Key, value: Value, rep: u16) {
+        let i = usize::from(self.len);
+        if i < INLINE_PATCHES {
+            self.keys[i] = Some(key);
+            self.values[i] = value;
+            self.reps[i] = rep;
+        } else {
+            let tail = self
+                .tail
+                .get_or_insert_with(|| Box::new(PatchedTail::empty()));
+            let j = i - INLINE_PATCHES;
+            tail.keys[j] = Some(key);
+            tail.values[j] = value;
+            tail.reps[j] = rep;
+        }
+        self.len += 1;
+    }
+
+    #[inline(always)]
+    fn find_slot<K: ?Sized>(&self, key: &K) -> Option<usize>
+    where
+        Key: PartialEq<K>,
+    {
+        let len = usize::from(self.len);
+        let inline_n = len.min(INLINE_PATCHES);
+        for (i, slot) in self.keys.iter().enumerate().take(inline_n) {
+            if slot.as_ref().is_some_and(|k| k == key) {
+                return Some(i);
+            }
+        }
+        if len > INLINE_PATCHES
+            && let Some(tail) = self.tail.as_deref()
+        {
+            for (j, slot) in tail.keys.iter().enumerate().take(len - INLINE_PATCHES) {
+                if slot.as_ref().is_some_and(|k| k == key) {
+                    return Some(INLINE_PATCHES + j);
+                }
+            }
+        }
+        None
+    }
+
+    fn empty(base: PatchedBase, row: u32, layer_idx: u16, made: bool) -> Option<Self> {
+        let base_len = u16::try_from(base.len(row, layer_idx)).ok()?;
+        let marks = base.marks();
+        Some(Self {
+            base,
+            overlay: None,
+            marks,
+            overlay_skip: 0,
+            base_len,
+            overlay_len: 0,
+            len: 0,
+            appended: 0,
+            has_replace: false,
+            made,
+            overlay_after_appended: false,
+            reps: [u16::MAX; INLINE_PATCHES],
+            keys: [const { None }; INLINE_PATCHES],
+            values: [const { Value::Undefined }; INLINE_PATCHES],
+            tail: None,
+        })
+    }
+
+    /// Build a single-slot numeric overlay directly from a non-nested base.
+    pub(crate) fn new_single_slot(
+        base: PatchedBase,
+        row: u32,
+        layer_idx: u16,
+        keys: &[&Key],
+        vals: &[f64],
+    ) -> Option<PooledPatched> {
+        if matches!(base, PatchedBase::Patched(_)) || keys.len() > MAX_PATCHES {
+            return None;
+        }
+        let mut patched = Self::empty(base, row, layer_idx, true)?;
+        for (&key, &num) in keys.iter().zip(vals.iter()) {
+            patched
+                .try_set(row, layer_idx, key, Value::F64(num), true)
+                .ok()?;
+        }
+        Some(PooledPatched::new(patched))
+    }
+
+    #[inline(always)]
+    fn overlay_raw_index(&self, visible_idx: usize) -> usize {
+        if self.overlay_skip == 0 {
+            return visible_idx;
+        }
+        let mut rem = visible_idx;
+        let mut mask = !self.overlay_skip;
+        loop {
+            let pos = mask.trailing_zeros() as usize;
+            if rem == 0 {
+                return pos;
+            }
+            mask &= mask - 1;
+            rem -= 1;
+        }
+    }
+
+    #[inline(always)]
+    fn overlay_visible_index(&self, raw_pos: usize) -> Option<usize> {
+        if self.overlay_skip == 0 {
+            return Some(raw_pos);
+        }
+        if (self.overlay_skip >> raw_pos) & 1 != 0 {
+            return None;
+        }
+        let skipped_before = (self.overlay_skip & ((1u32 << raw_pos) - 1)).count_ones() as usize;
+        Some(raw_pos - skipped_before)
+    }
+
+    /// Build a zero-copy overlay over `base`, routing any keys that overlap
+    /// `base` into inline replacement slots so flat `BuiltinMap` materialisation
+    /// is avoided even when a large constant chain overrides a few base keys.
+    fn with_overlay(
+        base: PatchedBase,
+        row: u32,
+        layer_idx: u16,
+        overlay: Arc<dyn BuiltinEntries>,
+        made: bool,
+    ) -> Option<Self> {
+        let base_len = u16::try_from(base.len(row, layer_idx)).ok()?;
+        let ov_slice = overlay.as_slice();
+        let raw_len = ov_slice.len();
+        if raw_len > 32 {
+            return None;
+        }
+        let base_marks = base.marks();
+        let ov_marks = ov_slice.marks();
+        let mut out = Self {
+            base,
+            overlay: None,
+            marks: base_marks | ov_marks,
+            overlay_skip: 0,
+            base_len,
+            overlay_len: 0,
+            len: 0,
+            appended: 0,
+            has_replace: false,
+            made,
+            overlay_after_appended: false,
+            reps: [u16::MAX; INLINE_PATCHES],
+            keys: [const { None }; INLINE_PATCHES],
+            values: [const { Value::Undefined }; INLINE_PATCHES],
+            tail: None,
+        };
+        let mut overlay_skip = 0u32;
+        let mut base_hits = [(0u8, 0u16); MAX_PATCHES];
+        let mut n_base_hits = 0usize;
+        if base_marks & ov_marks != 0 {
+            let base_layout = out.base.layout(row, layer_idx);
+            for ov_pos in 0..raw_len {
+                let packed = ov_slice.packed_key_at(ov_pos);
+                let mark = match packed {
+                    Some(p) => 1u64 << (p >> 10),
+                    None => Table::mark(ov_slice.at(ov_pos).0.as_str()),
+                };
+                if base_marks & mark != 0 {
+                    let (ov_key, _) = ov_slice.at(ov_pos);
+                    let found = match packed {
+                        Some(p) => base_layout.position_packed(p, ov_key),
+                        None => base_layout.position(ov_key),
+                    };
+                    if let Some(base_idx) = found {
+                        if n_base_hits >= MAX_PATCHES {
+                            return None;
+                        }
+                        base_hits[n_base_hits] = (ov_pos as u8, base_idx as u16);
+                        n_base_hits += 1;
+                        overlay_skip |= 1u32 << ov_pos;
+                    }
+                }
+            }
+            for &(ov_pos, base_idx) in &base_hits[..n_base_hits] {
+                let (ov_key, ov_val) = ov_slice.at(usize::from(ov_pos));
+                out.push_slot(ov_key.clone(), ov_val.clone(), base_idx);
+                out.has_replace = true;
+            }
+        }
+        out.overlay = Some(overlay);
+        out.overlay_skip = overlay_skip;
+        out.overlay_len = u16::try_from(raw_len - overlay_skip.count_ones() as usize).ok()?;
+        Some(out)
+    }
+
+    /// Attach a built-in overlay onto an existing `Patched` that does not yet
+    /// carry an overlay. Returns `false` leaving `self` untouched when base
+    /// overlaps would exceed `MAX_PATCHES`.
+    fn attach_overlay(
+        &mut self,
+        row: u32,
+        layer_idx: u16,
+        overlay: Arc<dyn BuiltinEntries>,
+        made: bool,
+    ) -> bool {
+        if self.overlay.is_some() {
+            return false;
+        }
+        let ov_slice = overlay.as_slice();
+        let raw_len = ov_slice.len();
+        if raw_len > 32 {
+            return false;
+        }
+        let ov_marks = ov_slice.marks();
+        let base_marks = self.base.marks();
+        let cur_len = usize::from(self.len);
+        let mut overlay_skip = 0u32;
+        // Single-pass overlap check: record matching existing patch slots and
+        // new base replacements on the stack so we verify slot budget before
+        // mutating `self` without scanning `ov_slice` or `base_layout` twice.
+        let mut slot_hits = [(0u8, 0u8); MAX_PATCHES];
+        let mut n_slot_hits = 0usize;
+        let mut base_hits = [(0u8, 0u16); MAX_PATCHES];
+        let mut n_base_hits = 0usize;
+        if self.marks & ov_marks != 0 {
+            let base_layout = self.base.layout(row, layer_idx);
+            for ov_pos in 0..raw_len {
+                let packed = ov_slice.packed_key_at(ov_pos);
+                let mark = match packed {
+                    Some(p) => 1u64 << (p >> 10),
+                    None => Table::mark(ov_slice.at(ov_pos).0.as_str()),
+                };
+                if self.marks & mark == 0 {
+                    continue;
+                }
+                let (ov_key, _) = ov_slice.at(ov_pos);
+                if let Some(idx) = self.find_slot(ov_key) {
+                    slot_hits[n_slot_hits] = (ov_pos as u8, idx as u8);
+                    n_slot_hits += 1;
+                    overlay_skip |= 1u32 << ov_pos;
+                    continue;
+                }
+                if base_marks & mark != 0 {
+                    let found = match packed {
+                        Some(p) => base_layout.position_packed(p, ov_key),
+                        None => base_layout.position(ov_key),
+                    };
+                    if let Some(base_idx) = found {
+                        if cur_len + n_base_hits >= MAX_PATCHES {
+                            return false;
+                        }
+                        base_hits[n_base_hits] = (ov_pos as u8, base_idx as u16);
+                        n_base_hits += 1;
+                        overlay_skip |= 1u32 << ov_pos;
+                    }
+                }
+            }
+            for &(ov_pos, idx) in &slot_hits[..n_slot_hits] {
+                let (_, ov_val) = ov_slice.at(usize::from(ov_pos));
+                *self.slot_val_mut(usize::from(idx)) = ov_val.clone();
+            }
+            for &(ov_pos, base_idx) in &base_hits[..n_base_hits] {
+                let (ov_key, ov_val) = ov_slice.at(usize::from(ov_pos));
+                self.push_slot(ov_key.clone(), ov_val.clone(), base_idx);
+                self.has_replace = true;
+            }
+        }
+        let visible = raw_len - overlay_skip.count_ones() as usize;
+        let Ok(overlay_len) = u16::try_from(visible) else {
+            return false;
+        };
+        self.overlay = Some(overlay);
+        self.overlay_skip = overlay_skip;
+        self.overlay_len = overlay_len;
+        self.overlay_after_appended = self.appended > 0;
+        self.marks |= ov_marks;
+        if !made {
+            self.made = false;
+        }
+        true
+    }
+
+    fn of_one(
+        base: PatchedBase,
+        row: u32,
+        layer_idx: u16,
+        key: Key,
+        value: Value,
+        replace: Option<usize>,
+        made: bool,
+    ) -> Option<Self> {
+        let base_len = u16::try_from(base.len(row, layer_idx)).ok()?;
+        let rep = match replace {
+            Some(at) => u16::try_from(at).ok()?,
+            None => u16::MAX,
+        };
+        let marks = base.marks() | Table::mark(key.as_str());
+        let appended = u8::from(rep == u16::MAX);
+        let has_replace = rep != u16::MAX;
+        let mut keys = [const { None }; INLINE_PATCHES];
+        let mut values = [const { Value::Undefined }; INLINE_PATCHES];
+        let mut reps = [u16::MAX; INLINE_PATCHES];
+        keys[0] = Some(key);
+        values[0] = value;
+        reps[0] = rep;
+        Some(Self {
+            base,
+            overlay: None,
+            marks,
+            overlay_skip: 0,
+            base_len,
+            overlay_len: 0,
+            len: 1,
+            appended,
+            has_replace,
+            made,
+            overlay_after_appended: false,
+            reps,
+            keys,
+            values,
+            tail: None,
+        })
+    }
+
+    #[inline(always)]
+    fn len(&self) -> usize {
+        usize::from(self.base_len) + usize::from(self.overlay_len) + usize::from(self.appended)
+    }
+
+    #[inline(always)]
+    fn at(&self, row: u32, layer_idx: u16, index: usize) -> (&Key, &Value) {
+        let base_len = usize::from(self.base_len);
+        let overlay_len = usize::from(self.overlay_len);
+        let appended = usize::from(self.appended);
+        let n = usize::from(self.len);
+        if self.has_replace {
+            for i in 0..n {
+                let (k, v, rep) = self.slot_at(i);
+                if usize::from(rep) == index {
+                    return (k, v);
+                }
+            }
+        }
+        if index < base_len {
+            return self.base.at(row, layer_idx, index);
+        }
+        if !self.overlay_after_appended {
+            let fixed_len = base_len + overlay_len;
+            if index < fixed_len {
+                let raw = self.overlay_raw_index(index - base_len);
+                return self
+                    .overlay
+                    .as_deref()
+                    .expect("overlay_len > 0 implies overlay")
+                    .as_slice()
+                    .at(raw);
+            }
+            let mut want = index - fixed_len;
+            for i in 0..n {
+                let (k, v, rep) = self.slot_at(i);
+                if rep == u16::MAX {
+                    if want == 0 {
+                        return (k, v);
+                    }
+                    want -= 1;
+                }
+            }
+        } else {
+            let app_end = base_len + appended;
+            if index < app_end {
+                let mut want = index - base_len;
+                for i in 0..n {
+                    let (k, v, rep) = self.slot_at(i);
+                    if rep == u16::MAX {
+                        if want == 0 {
+                            return (k, v);
+                        }
+                        want -= 1;
+                    }
+                }
+            } else {
+                let raw = self.overlay_raw_index(index - app_end);
+                return self
+                    .overlay
+                    .as_deref()
+                    .expect("overlay_len > 0 implies overlay")
+                    .as_slice()
+                    .at(raw);
+            }
+        }
+        unreachable!("overlay index out of bounds")
+    }
+
+    #[inline(always)]
+    fn get<K: ?Sized + Named>(&self, row: u32, layer_idx: u16, key: &K) -> Option<&Value>
+    where
+        Key: PartialEq<K>,
+    {
+        if self.marks & Table::mark(key.name()) == 0 {
+            return None;
+        }
+        if let Some(idx) = self.find_slot(key) {
+            return Some(self.slot_at(idx).1);
+        }
+        if let Some(overlay) = &self.overlay
+            && let Some(val) = overlay.as_slice().get_str(key.name())
+        {
+            return Some(val);
+        }
+        match &self.base {
+            PatchedBase::Table(table) => {
+                if table.marks() & Table::mark(key.name()) == 0 {
+                    return None;
+                }
+                table.layout(row).get(key)
+            }
+            PatchedBase::SeqLayer(layers, _) => {
+                layers[usize::from(layer_idx)].seq_get(row, key.name())
+            }
+            PatchedBase::Builtin(entries) => entries.as_slice().get_str(key.name()),
+            PatchedBase::Patched(patched) => patched.get(row, layer_idx, key),
+            PatchedBase::Empty => None,
+        }
+    }
+
+    #[inline(always)]
+    fn position<K: ?Sized + Named>(&self, row: u32, layer_idx: u16, key: &K) -> Option<usize>
+    where
+        Key: PartialEq<K>,
+    {
+        if self.marks & Table::mark(key.name()) == 0 {
+            return None;
+        }
+        let base_len = usize::from(self.base_len);
+        let app_base = if self.overlay_after_appended {
+            base_len
+        } else {
+            base_len + usize::from(self.overlay_len)
+        };
+        let mut append_pos = 0usize;
+        for i in 0..usize::from(self.len) {
+            let (k, _, rep) = self.slot_at(i);
+            if k == key {
+                return Some(if rep == u16::MAX {
+                    app_base + append_pos
+                } else {
+                    usize::from(rep)
+                });
+            }
+            if rep == u16::MAX {
+                append_pos += 1;
+            }
+        }
+        if let Some(overlay) = &self.overlay
+            && let Some(raw_pos) = overlay.as_slice().position_str(key.name())
+            && let Some(vis) = self.overlay_visible_index(raw_pos)
+        {
+            let ov_base = if self.overlay_after_appended {
+                base_len + usize::from(self.appended)
+            } else {
+                base_len
+            };
+            return Some(ov_base + vis);
+        }
+        match &self.base {
+            PatchedBase::Table(table) => {
+                if table.marks() & Table::mark(key.name()) == 0 {
+                    return None;
+                }
+                table.layout(row).position(key)
+            }
+            PatchedBase::SeqLayer(layers, _) => {
+                layers[usize::from(layer_idx)].seq_position(row, key.name())
+            }
+            PatchedBase::Builtin(entries) => entries.as_slice().position_str(key.name()),
+            PatchedBase::Patched(patched) => patched.position(row, layer_idx, key),
+            PatchedBase::Empty => None,
+        }
+    }
+
+    fn find_fixed_position(&self, row: u32, layer_idx: u16, key: &Key, mark: u64) -> u16 {
+        if self.base.marks() & mark != 0
+            && let Some(idx) = self.base.layout(row, layer_idx).position(key)
+        {
+            return idx as u16;
+        }
+        if let Some(overlay) = &self.overlay
+            && let Some(raw_pos) = overlay.as_slice().position_str(key.as_str())
+            && let Some(vis) = self.overlay_visible_index(raw_pos)
+        {
+            let ov_base = if self.overlay_after_appended {
+                self.base_len + u16::from(self.appended)
+            } else {
+                self.base_len
+            };
+            return ov_base + vis as u16;
+        }
+        u16::MAX
+    }
+
+    fn try_set(
+        &mut self,
+        row: u32,
+        layer_idx: u16,
+        key: &Key,
+        value: Value,
+        data_only: bool,
+    ) -> Result<(), Value> {
+        if let Some(idx) = self.find_slot(key) {
+            *self.slot_val_mut(idx) = value;
+            if !data_only {
+                self.made = false;
+            }
+            return Ok(());
+        }
+        if usize::from(self.len) >= MAX_PATCHES {
+            return Err(value);
+        }
+        let mark = Table::mark(key.as_str());
+        let replace = self.find_fixed_position(row, layer_idx, key, mark);
+        if replace == u16::MAX && self.overlay_after_appended {
+            return Err(value);
+        }
+        self.push_slot(key.clone(), value, replace);
+        if replace == u16::MAX {
+            self.appended += 1;
+        } else {
+            self.has_replace = true;
+        }
+        self.marks |= mark;
+        if !data_only {
+            self.made = false;
+        }
+        Ok(())
+    }
+
+    fn try_merge_one(
+        &mut self,
+        row: u32,
+        layer_idx: u16,
+        key: &Key,
+        other: &Value,
+        change: impl FnOnce(&Value, &Value) -> Value,
+    ) -> bool {
+        if let Some(idx) = self.find_slot(key) {
+            let slot_val = self.slot_val_mut(idx);
+            *slot_val = change(slot_val, other);
+            self.made = false;
+            return true;
+        }
+        if usize::from(self.len) >= MAX_PATCHES {
+            return false;
+        }
+        let mark = Table::mark(key.as_str());
+        let (value, replace) = if self.base.marks() & mark != 0
+            && let layout = self.base.layout(row, layer_idx)
+            && let Some(idx) = layout.position(key)
+        {
+            (change(layout.at(idx).1, other), idx as u16)
+        } else if let Some(overlay) = &self.overlay
+            && let ov = overlay.as_slice()
+            && let Some(raw_pos) = ov.position_str(key.as_str())
+            && let Some(vis) = self.overlay_visible_index(raw_pos)
+        {
+            let ov_base = if self.overlay_after_appended {
+                self.base_len + u16::from(self.appended)
+            } else {
+                self.base_len
+            };
+            (change(ov.at(raw_pos).1, other), ov_base + vis as u16)
+        } else {
+            if self.overlay_after_appended {
+                return false;
+            }
+            (other.clone(), u16::MAX)
+        };
+        self.push_slot(key.clone(), value, replace);
+        if replace == u16::MAX {
+            self.appended += 1;
+        } else {
+            self.has_replace = true;
+        }
+        self.marks |= mark;
+        self.made = false;
+        true
+    }
+
+    fn has_patch_for(&self, key: &Key) -> bool {
+        self.find_slot(key).is_some()
+    }
+
+    #[inline]
+    fn can_accept_key(&self, row: u32, layer_idx: u16, key: &Key) -> bool {
+        !self.overlay_after_appended
+            || self.has_patch_for(key)
+            || self.find_fixed_position(row, layer_idx, key, Table::mark(key.as_str())) != u16::MAX
+    }
+}
+
+/// Reusable per-timestamp or per-run overlay cache for chord/stacked haps
+/// sharing uniform-key [`Table`], `SeqLayer`, or [`Patched`] overlays.
+type PatchedCacheEntry = (PooledPatched, u32, PooledPatched);
+type StepPatchCacheEntry = (StepPatch, u32, PooledPatched);
+
+#[derive(Default)]
+pub(crate) struct SharedWaveCache {
+    dressed: [Option<(u32, PooledPatched)>; 8],
+    dressed_next: u8,
+    patched: [Option<PatchedCacheEntry>; 8],
+    patched_next: u8,
+    step_patched: [Option<StepPatchCacheEntry>; 2],
+    step_patched_next: u8,
+}
+
+impl SharedWaveCache {
+    const ANY_ROW: u32 = u32::MAX;
+
+    #[inline]
+    fn row_tag(uniform: bool, row: u32) -> u32 {
+        if uniform { Self::ANY_ROW } else { row }
+    }
+
+    #[inline]
+    fn get_table(&self, table: &Arc<Table>, row_tag: u32) -> Option<&PooledPatched> {
+        self.dressed
+            .iter()
+            .flatten()
+            .find_map(|(tag, c)| (*tag == row_tag && c.base.matches_table(table)).then_some(c))
+    }
+
+    #[inline]
+    fn get_seq_layer(
+        &self,
+        layers: &Arc<[crate::sequence::Layer]>,
+        layer_idx: u16,
+        row_tag: u32,
+    ) -> Option<&PooledPatched> {
+        self.dressed.iter().flatten().find_map(|(tag, c)| {
+            (*tag == row_tag && c.base.matches_seq_layer(layers, layer_idx)).then_some(c)
+        })
+    }
+
+    #[inline]
+    fn get_builtin(&self, entries: &Arc<dyn BuiltinEntries>) -> Option<&PooledPatched> {
+        self.dressed.iter().flatten().find_map(|(tag, c)| {
+            (*tag == Self::ANY_ROW && c.base.matches_builtin(entries)).then_some(c)
+        })
+    }
+
+    #[inline]
+    fn put_dressed(&mut self, row_tag: u32, arc: PooledPatched) {
+        let slot = usize::from(self.dressed_next) & 7;
+        self.dressed[slot] = Some((row_tag, arc));
+        self.dressed_next = self.dressed_next.wrapping_add(1);
+    }
+
+    #[inline]
+    fn get_patched(&self, prev: &PooledPatched, row_tag: u32) -> Option<&PooledPatched> {
+        self.patched.iter().flatten().find_map(|(k, tag, v)| {
+            (*tag == row_tag && PooledPatched::ptr_eq(k, prev)).then_some(v)
+        })
+    }
+
+    #[inline]
+    fn put_patched(&mut self, prev: PooledPatched, row_tag: u32, out: PooledPatched) {
+        let slot = usize::from(self.patched_next) & 7;
+        self.patched[slot] = Some((prev, row_tag, out));
+        self.patched_next = self.patched_next.wrapping_add(1);
+    }
+
+    #[inline]
+    fn get_step_patch(&self, sp: &StepPatch, slot_key: u32) -> Option<&PooledPatched> {
+        self.step_patched
+            .iter()
+            .flatten()
+            .find_map(|(k, tag, v)| (*tag == slot_key && k.ptr_eq(sp)).then_some(v))
+    }
+
+    #[inline]
+    fn put_step_patch(&mut self, sp: StepPatch, slot_key: u32, out: PooledPatched) {
+        let slot = usize::from(self.step_patched_next) & 1;
+        self.step_patched[slot] = Some((sp, slot_key, out));
+        self.step_patched_next = self.step_patched_next.wrapping_add(1);
+    }
+}
+
+/// The entries of a map, in one allocation that holds them and no more.
+/// Both kinds are shared until a write, which copies them first.
 #[derive(Clone)]
 enum Entries {
     /// A clone is a reference count step.
-    Shared(Arc<Vec<(Key, Value)>>),
-    /// Kept for the life of the process, so a clone copies a pointer. See
-    /// [`OrderedMap::interned`].
-    Interned(&'static Vec<(Key, Value)>),
+    Shared(Arc<[(Key, Value)]>),
+    /// Shared entries a compose made of data values only, so the map holds
+    /// data until it is written again. See [`compose::compose_data_in_place`].
+    Made(Arc<[(Key, Value)]>),
+    /// Compact `u16`-keyed entries for canonical built-in controls `(entries, made)`.
+    Builtin(Arc<dyn BuiltinEntries>, bool),
+    /// Single canonical built-in control holding an exact `-128..=127` integer
+    /// value without heap allocation or `Arc` refcounts: `(id, value, made)`.
+    StaticInt(u16, i8, bool),
+    /// No entries and no allocation: what a fresh map holds.
+    Empty,
+    /// The entries of one step of a layer, which the other steps share:
+    /// see [`Table`]. The map holds a handle of the table and the step.
+    Dressed(Arc<Table>, u32),
+    /// Direct view of one step of a direct-keyed sequence layer without
+    /// allocating an intermediate [`Table`]: `(layers, row, layer_idx)`.
+    SeqLayer(Arc<[crate::sequence::Layer]>, u32, u16),
+    /// A small overlay of up to [`MAX_PATCHES`] entries over a dressed row,
+    /// carrying `layer_idx` for shared `SeqLayer` bases (0 otherwise).
+    Patched(PooledPatched, u32, u16),
+    /// A compact 16-value multi-slot numeric overlay: `(patch, (row << 4) | slot, layer_idx)`.
+    StepPatch(PooledStepPatch, u32, u16),
 }
 
-/// The entries a copy of shared entries has room for beyond its own, at
-/// least.
-const COPY_ROOM: usize = 4;
+#[cfg(target_pointer_width = "64")]
+const _: () = assert!(std::mem::size_of::<OrderedMap>() == 24);
 
-/// The entries of every empty map, so a fresh map allocates nothing.
-static EMPTY: Vec<(Key, Value)> = Vec::new();
+/// What the steps of one layer share when each reads as a map: its own
+/// entries first (the head), then the entries that a set of controls
+/// gives every step (the tail). This is the map that a compose of the set
+/// onto the head makes, as long as no key is in both.
+pub(crate) struct Table {
+    /// The head of each step. Two variants allow Rust to niche-optimize into 32 B.
+    heads: Heads,
+    /// The entries of the set, none for a layer with no set.
+    tail: Option<Arc<[(Key, Value)]>>,
+    /// Low 63 bits hold key presence marks; bit 63 is `MADE_BIT` (compose of data).
+    marks_and_made: u64,
+}
+
+#[cfg(target_pointer_width = "64")]
+const _: () = assert!(std::mem::size_of::<Table>() == 56);
+
+/// The entries of one map, shared.
+type Shares = Arc<[(Key, Value)]>;
+
+struct PatchedHeads {
+    base: Shares,
+    key: Key,
+    replace: usize,
+    values: Arc<[Value]>,
+}
+
+struct PatchedKeyedHeads {
+    head_key: Key,
+    head_value: Value,
+    key: Key,
+    values: Arc<[Value]>,
+}
+
+struct PatchedTableHeads {
+    base: PatchedBase,
+    key: Key,
+    values: Arc<[Value]>,
+}
+
+/// Rare head layouts kept behind one `Box` so [`Heads`] has two variants and
+/// niche-optimizes to 32 bytes.
+enum OtherHeads {
+    /// The entries of the map of each step.
+    Maps(Box<[Shares]>),
+    /// One shared base map with one key replaced at `replace` (or appended
+    /// when `replace == base.len()`) per step.
+    Patched(PatchedHeads),
+    /// A dressed `Keyed` step `(head_key, head_value)` plus shared `Table::tail`
+    /// with one appended `(key, values[index])` per step.
+    PatchedKeyed(PatchedKeyedHeads),
+    /// Shared across chord notes from one `Heads::Keyed` base table: row index
+    /// packs `(base_row << 16) | step_index`.
+    PatchedTable(PatchedTableHeads),
+    /// Layer read cache with pre-combined spilling contexts.
+    LayerWithContexts {
+        values: LayerCachedValues,
+        contexts: Box<[crate::Locations]>,
+    },
+}
+
+pub(crate) enum LayerCachedValues {
+    Held,
+    Made(Arc<[Value]>),
+    Shared(Arc<Table>),
+}
+
+/// Decoded view of a `Layer::values_read` entry.
+pub(crate) enum LayerReadView<'a> {
+    Held,
+    Made(&'a [Value]),
+    Shared(&'a Arc<Table>),
+}
+
+/// The head of each step of a [`Table`].
+enum Heads {
+    /// `Some(key)` = the value of each step under one key; `None` = non-table
+    /// precomputed layer values (`Table::layer_made`), keeping `Heads` at 2
+    /// variants so it niche-optimizes into 32 B with no `Box` allocation.
+    Keyed(Option<Key>, Arc<[Value]>),
+    /// Rare layouts behind one `Box`.
+    Other(Box<OtherHeads>),
+}
+
+impl Table {
+    const MADE_BIT: u64 = 1u64 << 63;
+
+    #[inline(always)]
+    fn marks(&self) -> u64 {
+        self.marks_and_made & !Self::MADE_BIT
+    }
+
+    #[inline(always)]
+    fn is_made(&self) -> bool {
+        self.marks_and_made & Self::MADE_BIT != 0
+    }
+
+    /// Wrap non-table precomputed layer values inside a `Table` cell for `Layer`.
+    pub(crate) fn layer_made(values: Arc<[Value]>) -> Self {
+        Self {
+            heads: Heads::Keyed(None, values),
+            tail: None,
+            marks_and_made: 0,
+        }
+    }
+
+    /// Wrap layer values plus pre-combined spilling contexts for `Layer`.
+    pub(crate) fn layer_with_contexts(
+        values: LayerCachedValues,
+        contexts: Box<[crate::Locations]>,
+    ) -> Self {
+        Self {
+            heads: Heads::Other(Box::new(OtherHeads::LayerWithContexts { values, contexts })),
+            tail: None,
+            marks_and_made: 0,
+        }
+    }
+
+    /// Decode a `Layer::values_read` cell into its values view and optional contexts.
+    #[inline]
+    pub(crate) fn as_layer_read(
+        self: &Arc<Self>,
+    ) -> (LayerReadView<'_>, Option<&[crate::Locations]>) {
+        match &self.heads {
+            Heads::Keyed(None, values) => (LayerReadView::Made(values), None),
+            Heads::Keyed(Some(_), _) => (LayerReadView::Shared(self), None),
+            Heads::Other(other) => match &**other {
+                OtherHeads::LayerWithContexts { values, contexts } => {
+                    let view = match values {
+                        LayerCachedValues::Held => LayerReadView::Held,
+                        LayerCachedValues::Made(vals) => LayerReadView::Made(vals),
+                        LayerCachedValues::Shared(table) => LayerReadView::Shared(table),
+                    };
+                    (view, Some(contexts))
+                }
+                _ => (LayerReadView::Shared(self), None),
+            },
+        }
+    }
+
+    /// Whether every row of this table shares identical key positions, so a
+    /// [`Patched`] overlay built for one row applies unchanged to any other.
+    #[inline]
+    fn has_uniform_keys(&self) -> bool {
+        !matches!(&self.heads, Heads::Other(o) if matches!(&**o, OtherHeads::Maps(_)))
+    }
+
+    /// The table of `values` under `key`, with `set` after: `None` where
+    /// a map would not read the same as the compose of `set` onto the
+    /// value. That is no value or no data, a set that is no data, a key
+    /// that `set` also holds, and, with no key, a value that is no map.
+    pub(crate) fn new(
+        values: &Arc<[Value]>,
+        key: Option<Key>,
+        set: Option<&OrderedMap>,
+    ) -> Option<Self> {
+        if values.is_empty() || u32::try_from(values.len()).is_err() {
+            return None;
+        }
+        // An empty set is no set, in whatever form its map holds nothing.
+        let made = set.is_some();
+        let set = set.filter(|set| !set.is_empty());
+        if set.is_some_and(|set| !set.pairs().all(|(_, value)| value.is_data(0))) {
+            return None;
+        }
+        let tail: Option<Arc<[(Key, Value)]>> = set.and_then(|set| match &set.entries {
+            Entries::Shared(entries) | Entries::Made(entries) => Some(Arc::clone(entries)),
+            Entries::Empty => None,
+            Entries::Builtin(..)
+            | Entries::StaticInt(..)
+            | Entries::Dressed(..)
+            | Entries::SeqLayer(..)
+            | Entries::Patched(..)
+            | Entries::StepPatch(..) => Some(set.layout().to_shares()),
+        });
+        let held = |name: &Key| {
+            tail.as_deref()
+                .is_some_and(|tail| tail.iter().any(|(held, _)| held == name))
+        };
+        let heads = match key {
+            Some(key) => {
+                if held(&key) || !values.iter().all(|value| value.is_data(0)) {
+                    return None;
+                }
+                Heads::Keyed(Some(key), Arc::clone(values))
+            }
+            // Without a set there is nothing to share.
+            None if set.is_none() => return None,
+            None => {
+                let mut maps = Vec::with_capacity(values.len());
+                for value in values.iter() {
+                    let Value::Object(map) = value else {
+                        return None;
+                    };
+                    let entries: Arc<[(Key, Value)]> = match &map.entries {
+                        Entries::Shared(entries) | Entries::Made(entries) => Arc::clone(entries),
+                        Entries::Empty => Arc::from([]),
+                        // The entries of a dressed or compact map, copied once.
+                        Entries::Builtin(..)
+                        | Entries::StaticInt(..)
+                        | Entries::Dressed(..)
+                        | Entries::SeqLayer(..)
+                        | Entries::Patched(..)
+                        | Entries::StepPatch(..) => map.layout().to_shares(),
+                    };
+                    let bare = entries.is_empty() && tail.is_none();
+                    if bare || entries.iter().any(|(name, _)| held(name)) || !value.is_data(0) {
+                        return None;
+                    }
+                    maps.push(entries);
+                }
+                Heads::Other(Box::new(OtherHeads::Maps(maps.into())))
+            }
+        };
+        let mut table = Self {
+            heads,
+            tail,
+            marks_and_made: 0,
+        };
+        table.marks_and_made = table.marks_of_keys() | if made { Self::MADE_BIT } else { 0 };
+        Some(table)
+    }
+
+    /// Build a single `Table` that appends `(key, values[step_idx])` onto any
+    /// row of a keyed `base` ([`Table`] or direct-keyed sequence layer),
+    /// allowing all chord notes sharing `base` to reuse one allocation.
+    pub(crate) fn patched_keyed_table(
+        base: &PatchedBase,
+        key: Key,
+        values: Arc<[Value]>,
+    ) -> Option<Self> {
+        if values.is_empty() || values.len() > 0xffff {
+            return None;
+        }
+        let (head_key, head_values, base_tail) = base.keyed_parts()?;
+        if head_values.len() > 0xffff || head_key == &key {
+            return None;
+        }
+        let mark = Self::mark(&key);
+        if base.marks() & mark != 0 && base_tail.position_str(key.as_str()).is_some() {
+            return None;
+        }
+        let marks = base.marks() | mark;
+        Some(Self {
+            heads: Heads::Other(Box::new(OtherHeads::PatchedTable(PatchedTableHeads {
+                base: base.clone(),
+                key,
+                values,
+            }))),
+            tail: None,
+            marks_and_made: marks | Self::MADE_BIT,
+        })
+    }
+
+    /// Map view for a `(base_row, step_idx)` pair on a `patched_keyed_table`.
+    #[inline]
+    pub(crate) fn map_packed(self: &Arc<Self>, base_row: u32, step_idx: usize) -> OrderedMap {
+        OrderedMap {
+            entries: Entries::Dressed(Arc::clone(self), (base_row << 16) | (step_idx as u32)),
+        }
+    }
+
+    /// A table of data maps sharing `base`, each setting `key` to one of
+    /// `values` (all data values). Replaces `key` in place when `base` holds
+    /// it, or appends `key` at the end.
+    pub(crate) fn patched(base: &OrderedMap, key: Key, values: Arc<[Value]>) -> Option<Self> {
+        if values.is_empty() || u32::try_from(values.len()).is_err() {
+            return None;
+        }
+        // Fast path: appending a new key onto a dressed `Keyed` table or
+        // direct-keyed sequence layer keeps the shared `tail` slice intact
+        // with zero `to_shares()` copy.
+        if let Entries::Dressed(base_table, base_idx) = &base.entries
+            && let Heads::Keyed(Some(head_key), head_values) = &base_table.heads
+            && head_key != &key
+            && (base_table.marks() & Self::mark(&key) == 0
+                || base_table
+                    .tail
+                    .as_deref()
+                    .is_none_or(|tail| !tail.iter().any(|(name, _)| name == &key)))
+        {
+            let marks = base_table.marks() | Self::mark(&key);
+            return Some(Self {
+                heads: Heads::Other(Box::new(OtherHeads::PatchedKeyed(PatchedKeyedHeads {
+                    head_key: head_key.clone(),
+                    head_value: head_values[*base_idx as usize].clone(),
+                    key,
+                    values,
+                }))),
+                tail: base_table.tail.clone(),
+                marks_and_made: marks | Self::MADE_BIT,
+            });
+        }
+        if let Entries::SeqLayer(layers, base_idx, layer_idx) = &base.entries {
+            let layer = &layers[usize::from(*layer_idx)];
+            if let Some((head_key, head_values, base_tail)) = layer.seq_keyed_parts()
+                && head_key != &key
+                && (layer.seq_marks() & Self::mark(&key) == 0
+                    || base_tail.position_str(key.as_str()).is_none())
+            {
+                let marks = layer.seq_marks() | Self::mark(&key);
+                return Some(Self {
+                    heads: Heads::Other(Box::new(OtherHeads::PatchedKeyed(PatchedKeyedHeads {
+                        head_key: head_key.clone(),
+                        head_value: head_values[*base_idx as usize].clone(),
+                        key,
+                        values,
+                    }))),
+                    tail: layer.seq_tail_arc(),
+                    marks_and_made: marks | Self::MADE_BIT,
+                });
+            }
+        }
+        let entries: Shares = match &base.entries {
+            Entries::Shared(entries) | Entries::Made(entries) => Arc::clone(entries),
+            Entries::Empty => Arc::from([]),
+            Entries::Builtin(..)
+            | Entries::StaticInt(..)
+            | Entries::Dressed(..)
+            | Entries::SeqLayer(..)
+            | Entries::Patched(..)
+            | Entries::StepPatch(..) => base.layout().to_shares(),
+        };
+        let replace = entries
+            .iter()
+            .position(|(name, _)| name == &key)
+            .unwrap_or(entries.len());
+        let mut table = Self {
+            heads: Heads::Other(Box::new(OtherHeads::Patched(PatchedHeads {
+                base: entries,
+                key,
+                replace,
+                values,
+            }))),
+            tail: None,
+            marks_and_made: 0,
+        };
+        table.marks_and_made = table.marks_of_keys() | Self::MADE_BIT;
+        Some(table)
+    }
+
+    /// Bit position (`0..63`) of a key name's bloom mark.
+    #[inline(always)]
+    pub(crate) const fn mark_bit(name: &str) -> u8 {
+        let bytes = name.as_bytes();
+        if bytes.is_empty() {
+            return 0;
+        }
+        let first = bytes[0];
+        let last = bytes[bytes.len() - 1];
+        let middle = bytes[bytes.len() / 2];
+        let mixed = (bytes.len() as u32 & 0xff)
+            | ((first as u32) << 8)
+            | ((last as u32) << 16)
+            | ((middle as u32) << 24);
+        ((mixed.wrapping_mul(0x9E37_79B1) >> 26) % 63) as u8
+    }
+
+    /// The mark of a key name: one of 63 bits (leaving bit 63 for `MADE_BIT`),
+    /// from the length and the first, middle and last bytes, which is all that
+    /// a lookup of a name that most steps lack needs to rule it out.
+    #[inline(always)]
+    pub(crate) fn mark(name: &str) -> u64 {
+        1u64 << Self::mark_bit(name)
+    }
+
+    /// The marks of every key name that a step of this table holds.
+    fn marks_of_keys(&self) -> u64 {
+        let of = |entries: &[(Key, Value)]| {
+            entries
+                .iter()
+                .fold(0, |marks, (name, _)| marks | Self::mark(name))
+        };
+        let tail = self.tail.as_deref().map_or(0, of);
+        tail | match &self.heads {
+            Heads::Keyed(Some(key), _) => Self::mark(key),
+            Heads::Keyed(None, _) => 0,
+            Heads::Other(other) => match &**other {
+                OtherHeads::Maps(maps) => maps.iter().fold(0, |marks, map| marks | of(map)),
+                OtherHeads::Patched(p) => of(&p.base) | Self::mark(&p.key),
+                OtherHeads::PatchedKeyed(p) => Self::mark(&p.head_key) | Self::mark(&p.key),
+                OtherHeads::PatchedTable(p) => p.base.marks() | Self::mark(&p.key),
+                OtherHeads::LayerWithContexts { .. } => 0,
+            },
+        }
+    }
+
+    /// The value of step `index` as a map, for a step that the table holds.
+    #[inline]
+    pub(crate) fn has_row(&self, index: usize) -> bool {
+        let held = match &self.heads {
+            Heads::Keyed(Some(_), values) => values.len(),
+            Heads::Keyed(None, _) => return false,
+            Heads::Other(other) => match &**other {
+                OtherHeads::Maps(maps) => maps.len(),
+                OtherHeads::Patched(p) => p.values.len(),
+                OtherHeads::PatchedKeyed(p) => p.values.len(),
+                OtherHeads::PatchedTable(p) => p.values.len(),
+                OtherHeads::LayerWithContexts { .. } => return false,
+            },
+        };
+        index < held
+    }
+
+    #[inline]
+    pub(crate) fn map(self: &Arc<Self>, index: usize) -> Option<OrderedMap> {
+        let held = match &self.heads {
+            Heads::Keyed(Some(_), values) => values.len(),
+            Heads::Keyed(None, _) => return None,
+            Heads::Other(other) => match &**other {
+                OtherHeads::Maps(maps) => maps.len(),
+                OtherHeads::Patched(p) => p.values.len(),
+                OtherHeads::PatchedKeyed(p) => p.values.len(),
+                OtherHeads::PatchedTable(p) => p.values.len(),
+                OtherHeads::LayerWithContexts { .. } => return None,
+            },
+        };
+        // The table holds no more steps than a u32 counts.
+        (index < held).then(|| OrderedMap {
+            entries: Entries::Dressed(Arc::clone(self), index as u32),
+        })
+    }
+
+    #[inline(always)]
+    fn layout(&self, index: u32) -> Layout<'_> {
+        let tail = Slice::Plain(self.tail.as_deref().unwrap_or(&[]));
+        match &self.heads {
+            Heads::Keyed(Some(key), values) => Layout::Keyed(key, &values[index as usize], tail),
+            Heads::Keyed(None, _) => {
+                unreachable!("layer-internal cache cannot be read as OrderedMap")
+            }
+            Heads::Other(other) => match &**other {
+                OtherHeads::Maps(maps) => Layout::Split(Slice::Plain(&maps[index as usize]), tail),
+                OtherHeads::Patched(p) => {
+                    Layout::Patched(&p.base, p.replace, &p.key, &p.values[index as usize])
+                }
+                OtherHeads::PatchedKeyed(p) => Layout::KeyedExtra(
+                    &p.head_key,
+                    &p.head_value,
+                    tail,
+                    &p.key,
+                    &p.values[index as usize],
+                ),
+                OtherHeads::PatchedTable(p) => {
+                    let base_row = (index >> 16) as usize;
+                    let step_idx = (index & 0xffff) as usize;
+                    let (hk, hvals, base_tail) =
+                        p.base.keyed_parts().expect("PatchedTable wraps keyed base");
+                    Layout::KeyedExtra(hk, &hvals[base_row], base_tail, &p.key, &p.values[step_idx])
+                }
+                OtherHeads::LayerWithContexts { .. } => {
+                    unreachable!("layer-internal cache cannot be read as OrderedMap")
+                }
+            },
+        }
+    }
+}
+
+/// The text of a key name, for the lookups that a key or a string asks.
+trait Named {
+    fn name(&self) -> &str;
+}
+
+impl Named for Key {
+    #[inline(always)]
+    fn name(&self) -> &str {
+        self.as_str()
+    }
+}
+
+impl Named for str {
+    #[inline(always)]
+    fn name(&self) -> &str {
+        self
+    }
+}
+
+/// How a map lays its entries out, in the order of the map.
+#[derive(Clone, Copy)]
+pub(crate) enum Layout<'a> {
+    /// All the entries in one slice.
+    Plain(Slice<'a>),
+    /// One entry of a key and its value, then a slice.
+    Keyed(&'a Key, &'a Value, Slice<'a>),
+    /// A slice, then another.
+    Split(Slice<'a>, Slice<'a>),
+    /// A slice with index `replace` overridden by `(key, value)` (or appended
+    /// when `replace == base.len()`).
+    Patched(&'a [(Key, Value)], usize, &'a Key, &'a Value),
+    /// One leading entry, a shared middle slice, and one appended entry.
+    KeyedExtra(&'a Key, &'a Value, Slice<'a>, &'a Key, &'a Value),
+    /// A small overlay on top of a dressed table or sequence layer row.
+    Overlay(&'a Patched, u32, u16),
+    /// A multi-slot numeric overlay on top of a dressed table or sequence layer row.
+    StepOverlay(&'a StepPatchHead, &'a [Value], u32, u16),
+}
+
+impl<'a> Layout<'a> {
+    #[inline]
+    fn len(self) -> usize {
+        match self {
+            Self::Plain(entries) => entries.len(),
+            Self::Keyed(_, _, tail) => 1 + tail.len(),
+            Self::Split(head, tail) => head.len() + tail.len(),
+            Self::Patched(base, replace, _, _) => base.len() + usize::from(replace == base.len()),
+            Self::KeyedExtra(_, _, tail, _, _) => 2 + tail.len(),
+            Self::Overlay(patched, _, _) => patched.len(),
+            Self::StepOverlay(step, _, _, _) => step.len(),
+        }
+    }
+
+    #[inline]
+    fn pairs(self) -> Pairs<'a> {
+        let inner = match self {
+            Self::Plain(entries) => PairsInner::Plain(entries.iter()),
+            Self::Keyed(key, value, tail) => PairsInner::Keyed(key, value, tail.iter()),
+            Self::Split(head, tail) => PairsInner::Split(head.iter(), tail.iter()),
+            Self::Patched(base, replace, key, value) => PairsInner::Patched(
+                base[..replace].iter(),
+                Some((key, value)),
+                base.get(replace + 1..).unwrap_or(&[]).iter(),
+            ),
+            Self::KeyedExtra(hk, hv, tail, ek, ev) => {
+                PairsInner::KeyedExtra(Some((hk, hv)), tail.iter(), Some((ek, ev)))
+            }
+            Self::Overlay(patched, row, layer_idx) => PairsInner::Overlay {
+                patched,
+                row,
+                layer_idx,
+                index: 0,
+                total: patched.len(),
+            },
+            Self::StepOverlay(step, values, packed, layer_idx) => PairsInner::StepOverlay {
+                step,
+                values,
+                packed,
+                layer_idx,
+                index: 0,
+                total: step.len(),
+            },
+        };
+        Pairs(inner)
+    }
+
+    /// The entry at `index`.
+    #[inline]
+    fn at(self, index: usize) -> (&'a Key, &'a Value) {
+        let pair = |(key, value): &'a (Key, Value)| (key, value);
+        match self {
+            Self::Plain(entries) => entries.at(index),
+            Self::Keyed(key, value, tail) => match index {
+                0 => (key, value),
+                _ => tail.at(index - 1),
+            },
+            Self::Split(head, tail) => match index.checked_sub(head.len()) {
+                None => head.at(index),
+                Some(index) => tail.at(index),
+            },
+            Self::Patched(base, replace, key, value) => match index == replace {
+                true => (key, value),
+                false => pair(&base[index]),
+            },
+            Self::KeyedExtra(hk, hv, tail, ek, ev) => {
+                if index == 0 {
+                    (hk, hv)
+                } else if index <= tail.len() {
+                    tail.at(index - 1)
+                } else {
+                    (ek, ev)
+                }
+            }
+            Self::Overlay(patched, row, layer_idx) => patched.at(row, layer_idx, index),
+            Self::StepOverlay(step, values, packed, layer_idx) => {
+                step.at(values, packed, layer_idx, index)
+            }
+        }
+    }
+
+    /// The place of the entry of `key` when its packed built-in key ID is known.
+    #[inline(always)]
+    fn position_packed(self, packed: u16, key: &Key) -> Option<usize> {
+        match self {
+            Self::Plain(entries) => entries.position_packed(packed, key),
+            Self::Keyed(name, _, tail) => match name == key {
+                true => Some(0),
+                false => tail.position_packed(packed, key).map(|at| at + 1),
+            },
+            Self::Split(head, tail) => head
+                .position_packed(packed, key)
+                .or_else(|| tail.position_packed(packed, key).map(|at| at + head.len())),
+            Self::Patched(base, replace, name, _) => match name == key {
+                true => Some(replace),
+                false => Slice::Plain(base).position(key),
+            },
+            Self::KeyedExtra(hk, _, tail, ek, _) => {
+                if hk == key {
+                    Some(0)
+                } else if ek == key {
+                    Some(1 + tail.len())
+                } else {
+                    tail.position_packed(packed, key).map(|at| at + 1)
+                }
+            }
+            Self::Overlay(patched, row, layer_idx) => patched.position(row, layer_idx, key),
+            Self::StepOverlay(step, _, step_packed, layer_idx) => {
+                step.position(step_packed, layer_idx, key)
+            }
+        }
+    }
+
+    /// The place of the entry of `key`.
+    #[inline(always)]
+    fn position<K: ?Sized + Named>(self, key: &K) -> Option<usize>
+    where
+        Key: PartialEq<K>,
+    {
+        match self {
+            Self::Plain(entries) => entries.position(key),
+            Self::Keyed(name, _, tail) => match name == key {
+                true => Some(0),
+                false => tail.position(key).map(|at| at + 1),
+            },
+            Self::Split(head, tail) => head
+                .position(key)
+                .or_else(|| tail.position(key).map(|at| at + head.len())),
+            Self::Patched(base, replace, name, _) => match name == key {
+                true => Some(replace),
+                false => Slice::Plain(base).position(key),
+            },
+            Self::KeyedExtra(hk, _, tail, ek, _) => {
+                if hk == key {
+                    Some(0)
+                } else if ek == key {
+                    Some(1 + tail.len())
+                } else {
+                    tail.position(key).map(|at| at + 1)
+                }
+            }
+            Self::Overlay(patched, row, layer_idx) => patched.position(row, layer_idx, key),
+            Self::StepOverlay(step, _, packed, layer_idx) => step.position(packed, layer_idx, key),
+        }
+    }
+
+    #[inline(always)]
+    fn get<K: ?Sized + Named>(self, key: &K) -> Option<&'a Value>
+    where
+        Key: PartialEq<K>,
+    {
+        match self {
+            Self::Plain(entries) => entries.get(key),
+            Self::Keyed(name, value, tail) => match name == key {
+                true => Some(value),
+                false => tail.get(key),
+            },
+            Self::Split(head, tail) => head.get(key).or_else(|| tail.get(key)),
+            Self::Patched(base, _, name, value) => match name == key {
+                true => Some(value),
+                false => Slice::Plain(base).get(key),
+            },
+            Self::KeyedExtra(hk, hv, tail, ek, ev) => {
+                if ek == key {
+                    Some(ev)
+                } else if hk == key {
+                    Some(hv)
+                } else {
+                    tail.get(key)
+                }
+            }
+            Self::Overlay(patched, row, layer_idx) => patched.get(row, layer_idx, key),
+            Self::StepOverlay(step, values, packed, layer_idx) => {
+                step.get(values, packed, layer_idx, key)
+            }
+        }
+    }
+}
+
+impl Layout<'_> {
+    /// The entries in one allocation. Iterators that know their length
+    /// collect into one allocation of the exact size, with no list first.
+    pub(crate) fn to_shares(self) -> Shares {
+        let pair = |(key, value): (&Key, &Value)| (key.clone(), value.clone());
+        match self {
+            Self::Plain(entries) => entries.to_shares(),
+            Self::Keyed(key, value, tail) => std::iter::once((key.clone(), value.clone()))
+                .chain(tail.iter().map(pair))
+                .collect(),
+            Self::Split(head, tail) => head.iter().chain(tail.iter()).map(pair).collect(),
+            Self::Patched(base, replace, key, value) => base[..replace]
+                .iter()
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .chain(std::iter::once((key.clone(), value.clone())))
+                .chain(
+                    base.get(replace + 1..)
+                        .unwrap_or(&[])
+                        .iter()
+                        .map(|(k, v)| (k.clone(), v.clone())),
+                )
+                .collect(),
+            Self::KeyedExtra(hk, hv, tail, ek, ev) => std::iter::once((hk.clone(), hv.clone()))
+                .chain(tail.iter().map(pair))
+                .chain(std::iter::once((ek.clone(), ev.clone())))
+                .collect(),
+            Self::Overlay(patched, row, layer_idx) => (0..patched.len())
+                .map(|index| {
+                    let (key, value) = patched.at(row, layer_idx, index);
+                    (key.clone(), value.clone())
+                })
+                .collect(),
+            Self::StepOverlay(step, values, packed, layer_idx) => (0..step.len())
+                .map(|index| {
+                    let (key, value) = step.at(values, packed, layer_idx, index);
+                    (key.clone(), value.clone())
+                })
+                .collect(),
+        }
+    }
+
+    /// Materialize this layout into compact `Entries::Builtin` when possible,
+    /// otherwise `Entries::Made` / `Entries::Shared`.
+    fn to_entries(self, made: bool) -> Entries {
+        let len = self.len();
+        pack_entries(
+            len,
+            |index| {
+                let (k, v) = self.at(index);
+                (k.clone(), v.clone())
+            },
+            made,
+        )
+    }
+
+    /// The entries with `at` replaced by `value` (or `(key, value)` appended
+    /// when `at` is `None`), packed into `Entries::Builtin` when possible.
+    fn with_entries(self, key: &Key, at: Option<usize>, value: Value, made: bool) -> Entries {
+        let base_len = self.len();
+        let total = base_len + usize::from(at.is_none());
+        let mut slot = Some(value);
+        pack_entries(
+            total,
+            |index| {
+                if index == base_len {
+                    (key.clone(), slot.take().expect("the value goes in once"))
+                } else {
+                    let (name, held) = self.at(index);
+                    if at == Some(index) {
+                        (name.clone(), slot.take().expect("the value goes in once"))
+                    } else {
+                        (name.clone(), held.clone())
+                    }
+                }
+            },
+            made,
+        )
+    }
+}
+
+/// The entries of a map, in order.
+#[derive(Clone)]
+pub struct Pairs<'a>(PairsInner<'a>);
+
+#[derive(Clone)]
+enum PairsInner<'a> {
+    /// The entries left in one slice.
+    Plain(SliceIter<'a>),
+    /// One entry, then the entries left in a slice.
+    Keyed(&'a Key, &'a Value, SliceIter<'a>),
+    /// The entries left in a slice, then those in another.
+    Split(SliceIter<'a>, SliceIter<'a>),
+    /// Prefix slice, one overridden/appended entry, then suffix slice.
+    Patched(
+        std::slice::Iter<'a, (Key, Value)>,
+        Option<(&'a Key, &'a Value)>,
+        std::slice::Iter<'a, (Key, Value)>,
+    ),
+    /// Leading entry, shared middle slice, then appended entry.
+    KeyedExtra(
+        Option<(&'a Key, &'a Value)>,
+        SliceIter<'a>,
+        Option<(&'a Key, &'a Value)>,
+    ),
+    /// Entries from a patched overlay over a dressed table or sequence layer row.
+    Overlay {
+        patched: &'a Patched,
+        row: u32,
+        layer_idx: u16,
+        index: usize,
+        total: usize,
+    },
+    /// Entries from a multi-slot numeric overlay over a dressed table or sequence layer row.
+    StepOverlay {
+        step: &'a StepPatchHead,
+        values: &'a [Value],
+        packed: u32,
+        layer_idx: u16,
+        index: usize,
+        total: usize,
+    },
+}
+
+impl<'a> Iterator for Pairs<'a> {
+    type Item = (&'a Key, &'a Value);
+
+    #[inline]
+    fn next(&mut self) -> Option<Self::Item> {
+        match &mut self.0 {
+            PairsInner::Plain(entries) => entries.next(),
+            PairsInner::Keyed(key, value, tail) => {
+                let (key, value) = (*key, *value);
+                self.0 = PairsInner::Plain(tail.clone());
+                Some((key, value))
+            }
+            PairsInner::Split(head, tail) => head.next().or_else(|| tail.next()),
+            PairsInner::Patched(head, middle, tail) => {
+                if let Some((k, v)) = head.next() {
+                    return Some((k, v));
+                }
+                if let Some(pair) = middle.take() {
+                    return Some(pair);
+                }
+                tail.next().map(|(k, v)| (k, v))
+            }
+            PairsInner::KeyedExtra(head, middle, extra) => {
+                if let Some(pair) = head.take() {
+                    return Some(pair);
+                }
+                if let Some(pair) = middle.next() {
+                    return Some(pair);
+                }
+                extra.take()
+            }
+            PairsInner::Overlay {
+                patched,
+                row,
+                layer_idx,
+                index,
+                total,
+            } => {
+                if *index >= *total {
+                    return None;
+                }
+                let pair = patched.at(*row, *layer_idx, *index);
+                *index += 1;
+                Some(pair)
+            }
+            PairsInner::StepOverlay {
+                step,
+                values,
+                packed,
+                layer_idx,
+                index,
+                total,
+            } => {
+                if *index >= *total {
+                    return None;
+                }
+                let pair = step.at(values, *packed, *layer_idx, *index);
+                *index += 1;
+                Some(pair)
+            }
+        }
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        let len = match &self.0 {
+            PairsInner::Plain(entries) => entries.len(),
+            PairsInner::Keyed(_, _, tail) => 1 + tail.len(),
+            PairsInner::Split(head, tail) => head.len() + tail.len(),
+            PairsInner::Patched(head, middle, tail) => {
+                head.len() + usize::from(middle.is_some()) + tail.len()
+            }
+            PairsInner::KeyedExtra(head, middle, extra) => {
+                usize::from(head.is_some()) + middle.len() + usize::from(extra.is_some())
+            }
+            PairsInner::Overlay { index, total, .. }
+            | PairsInner::StepOverlay { index, total, .. } => total.saturating_sub(*index),
+        };
+        (len, Some(len))
+    }
+}
+
+impl ExactSizeIterator for Pairs<'_> {}
+
+/// The entries that a map held, for the map that takes their place: they
+/// move where no other map shares them, and are copied otherwise.
+enum Held<'a> {
+    Own(&'a mut [(Key, Value)]),
+    View(Layout<'a>),
+}
+
+impl Held<'_> {
+    /// Whether the held entries have an entry of `key`.
+    fn holds(&self, key: &Key) -> bool {
+        match self {
+            Self::Own(entries) => entries.iter().any(|(name, _)| name == key),
+            Self::View(layout) => layout.position(key).is_some(),
+        }
+    }
+
+    /// The entry at `index`, to hold in the new map.
+    fn take(&mut self, index: usize) -> (Key, Value) {
+        match self {
+            // A handle of the key, and the value itself.
+            Self::Own(entries) => {
+                let (key, value) = &mut entries[index];
+                (key.clone(), std::mem::replace(value, Value::Undefined))
+            }
+            Self::View(layout) => {
+                let (key, value) = layout.at(index);
+                (key.clone(), value.clone())
+            }
+        }
+    }
+}
 
 impl Default for OrderedMap {
     fn default() -> Self {
         Self {
-            entries: Entries::Interned(&EMPTY),
+            entries: Entries::Empty,
         }
     }
 }
 
 impl PartialEq for OrderedMap {
     fn eq(&self, other: &Self) -> bool {
-        self.entries() == other.entries()
+        if let (Layout::Plain(Slice::Plain(a)), Layout::Plain(Slice::Plain(b))) =
+            (self.layout(), other.layout())
+        {
+            return a == b;
+        }
+        if let (Layout::Plain(Slice::Builtin(ak, av)), Layout::Plain(Slice::Builtin(bk, bv))) =
+            (self.layout(), other.layout())
+        {
+            return ak == bk && av == bv;
+        }
+        self.len() == other.len()
+            && self
+                .pairs()
+                .zip(other.pairs())
+                .all(|((a_key, a), (b_key, b))| a_key == b_key && a == b)
     }
 }
 
 impl fmt::Debug for OrderedMap {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // The list of pairs that a plain map prints as its entries.
         f.debug_struct("OrderedMap")
-            .field("entries", self.entries())
+            .field("entries", &DebugPairs(self))
             .finish()
     }
 }
 
-/// About the most bytes [`OrderedMap::interned`] keeps: each map's entries
-/// and its place in the store. Past it, maps stay shared and interning stops.
-const INTERN_BUDGET: usize = 16 << 20;
+/// The entries of a map as a list, for [`fmt::Debug`].
+struct DebugPairs<'a>(&'a OrderedMap);
 
-/// The bytes one kept map costs besides its entries: the boxed list and
-/// its slot in a shard.
-const KEPT_MAP_BYTES: usize = std::mem::size_of::<Vec<(Key, Value)>>()
-    + std::mem::size_of::<(u64, Vec<Kept>)>()
-    + std::mem::size_of::<Kept>();
-
-/// The entries of one interned map.
-type Kept = &'static Vec<(Key, Value)>;
-
-/// Interned maps by content hash, in one of 16 shards so that builders on
-/// several threads rarely wait for one another.
-type Shard = Mutex<BTreeMap<u64, Vec<Kept>>>;
-
-static INTERNED: LazyLock<[Shard; 16]> =
-    LazyLock::new(|| std::array::from_fn(|_| Mutex::new(BTreeMap::new())));
-static INTERNED_BYTES: AtomicUsize = AtomicUsize::new(0);
-
-/// FNV-1a: the same hash in every run, for keys that are only ever compared
-/// within this process.
-struct Fnv(u64);
-
-impl Default for Fnv {
-    fn default() -> Self {
-        Self(0xcbf2_9ce4_8422_2325)
-    }
-}
-
-impl Hasher for Fnv {
-    fn finish(&self) -> u64 {
-        self.0
-    }
-
-    fn write(&mut self, bytes: &[u8]) {
-        for byte in bytes {
-            self.0 ^= u64::from(*byte);
-            self.0 = self.0.wrapping_mul(0x0000_0100_0000_01b3);
-        }
+impl fmt::Debug for DebugPairs<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_list().entries(self.0.pairs()).finish()
     }
 }
 
 impl OrderedMap {
-    fn entries(&self) -> &Vec<(Key, Value)> {
+    #[inline(always)]
+    fn layout(&self) -> Layout<'_> {
         match &self.entries {
-            Entries::Shared(entries) => entries,
-            Entries::Interned(entries) => entries,
-        }
-    }
-
-    /// The entries to write, with room for `additional` more. Entries
-    /// another map shares are copied first, once, with that room and a
-    /// little more, since a map that is written once is often written again.
-    fn entries_mut(&mut self, additional: usize) -> &mut Vec<(Key, Value)> {
-        let unique = match &mut self.entries {
-            Entries::Shared(entries) => Arc::get_mut(entries).is_some(),
-            Entries::Interned(_) => false,
-        };
-        if !unique {
-            let mut copy = Vec::with_capacity(self.len() + additional.max(COPY_ROOM));
-            copy.extend_from_slice(self.entries());
-            self.entries = Entries::Shared(Arc::new(copy));
-        }
-        match &mut self.entries {
-            Entries::Shared(entries) => {
-                let entries = Arc::make_mut(entries);
-                entries.reserve(additional);
-                entries
+            Entries::Shared(entries) | Entries::Made(entries) => {
+                Layout::Plain(Slice::Plain(entries))
             }
-            Entries::Interned(_) => unreachable!("an interned map was just copied"),
+            Entries::Builtin(entries, _) => Layout::Plain(entries.as_slice()),
+            Entries::StaticInt(id, n, _) => static_int_layout(*id, *n),
+            Entries::Empty => Layout::Plain(Slice::EMPTY),
+            Entries::Dressed(table, index) => table.layout(*index),
+            Entries::SeqLayer(layers, row, layer_idx) => {
+                layers[usize::from(*layer_idx)].seq_layout(*row)
+            }
+            Entries::Patched(patched, row, layer_idx) => Layout::Overlay(patched, *row, *layer_idx),
+            Entries::StepPatch(step, packed, layer_idx) => {
+                Layout::StepOverlay(&step.head, &step.values, *packed, *layer_idx)
+            }
         }
     }
 
-    /// Room for `additional` more entries, so that adding them grows the
-    /// map at most once.
-    pub fn reserve(&mut self, additional: usize) {
-        if additional > 0 {
-            self.entries_mut(additional);
+    /// Map view directly referencing one step of a direct-keyed sequence layer.
+    #[inline(always)]
+    pub(crate) fn from_seq_layer(
+        layers: &Arc<[crate::sequence::Layer]>,
+        layer_idx: u16,
+        row: u32,
+    ) -> Self {
+        Self {
+            entries: Entries::SeqLayer(Arc::clone(layers), row, layer_idx),
         }
     }
 
-    /// An equal map that every caller shares for the life of the process, so
-    /// that cloning it copies a pointer and dropping it does nothing.
-    ///
-    /// For the maps a precomputed table hands out with every hap. `None`
-    /// for a map that holds a script object, pattern, function or hap list,
-    /// or once [`INTERN_BUDGET`] is spent. Such a map stays shared.
-    pub(crate) fn interned(&self) -> Option<OrderedMap> {
-        if let Entries::Interned(_) = self.entries {
-            return Some(self.clone());
+    /// Zero-allocation map holding one canonical built-in control with an exact
+    /// `-128..=127` integer value.
+    #[inline(always)]
+    pub(crate) fn from_static_int(id: u16, value: i8, made: bool) -> Self {
+        Self {
+            entries: Entries::StaticInt(id, value, made),
         }
-        let entries = self.entries();
-        // As deep as the map's own data check reads them, so that a kept map
-        // is data. See `Value::is_data`.
-        if !entries.iter().all(|(_, value)| value.is_data(1)) {
-            return None;
+    }
+
+    #[inline(always)]
+    pub(crate) fn pairs(&self) -> Pairs<'_> {
+        self.layout().pairs()
+    }
+
+    /// This map with its entries in a plain map of its own, which a write
+    /// needs and a set that a dress holds does not pin a table with.
+    pub(crate) fn undressed(mut self) -> Self {
+        self.undress();
+        self
+    }
+
+    /// Copy an overlay map into a compact flat representation so long-lived
+    /// graph nodes do not retain `Patched` overlays or pin source tables.
+    pub(crate) fn undress_patched(&mut self) {
+        match &self.entries {
+            Entries::Patched(patched, row, layer_idx) => {
+                self.entries = Layout::Overlay(patched, *row, *layer_idx).to_entries(patched.made);
+            }
+            Entries::StepPatch(step, packed, layer_idx) => {
+                self.entries = Layout::StepOverlay(&step.head, &step.values, *packed, *layer_idx)
+                    .to_entries(step.head.made);
+            }
+            _ => {}
         }
-        let mut hasher = Fnv::default();
-        for (key, value) in entries {
-            key.hash(&mut hasher);
-            hash_data(value, &mut hasher);
+    }
+
+    /// If this map can back a [`StepPatch`] overlay for its own row (whether
+    /// or not all rows share uniform keys), return `(base, row, layer_idx, uniform)`.
+    #[inline]
+    pub(crate) fn step_base(&self) -> Option<(PatchedBase, u32, u16, bool)> {
+        match &self.entries {
+            Entries::Dressed(table, row) if *row <= StepPatch::MAX_ROW => Some((
+                PatchedBase::Table(Arc::clone(table)),
+                *row,
+                0,
+                table.has_uniform_keys(),
+            )),
+            Entries::SeqLayer(layers, row, layer_idx) if *row <= StepPatch::MAX_ROW => Some((
+                PatchedBase::SeqLayer(Arc::clone(layers), *layer_idx),
+                *row,
+                *layer_idx,
+                layers[usize::from(*layer_idx)].seq_has_uniform_keys(),
+            )),
+            Entries::Builtin(entries, _) => {
+                Some((PatchedBase::Builtin(Arc::clone(entries)), 0, 0, true))
+            }
+            Entries::Patched(patched, row, layer_idx)
+                if !matches!(patched.base, PatchedBase::Patched(_))
+                    && *row <= StepPatch::MAX_ROW =>
+            {
+                Some((
+                    PatchedBase::Patched(patched.clone()),
+                    *row,
+                    *layer_idx,
+                    patched.base.has_uniform_keys(),
+                ))
+            }
+            _ => None,
         }
-        let hash = hasher.finish();
-        // FNV-1a mixes its high bits best. Its low bits see only the low
-        // bits of each byte, so `1.0` and `2.0` would share a shard.
-        let shard = &INTERNED[(hash >> 60) as usize];
-        let mut shard = shard
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if let Some(found) = shard.get(&hash).and_then(|kept| {
-            kept.iter()
-                .copied()
-                .find(|kept| same_entries(kept, entries))
-        }) {
+    }
+
+    /// Check if this map shares the same [`PatchedBase`] as `base`,
+    /// returning `(row, layer_idx)` when `row <= StepPatch::MAX_ROW`.
+    #[inline]
+    pub(crate) fn matches_step_base(&self, base: &PatchedBase) -> Option<(u32, u16)> {
+        match (&self.entries, base) {
+            (Entries::Dressed(table, row), PatchedBase::Table(other))
+                if Arc::ptr_eq(table, other) && *row <= StepPatch::MAX_ROW =>
+            {
+                Some((*row, 0))
+            }
+            (
+                Entries::SeqLayer(layers, row, layer_idx),
+                PatchedBase::SeqLayer(other_layers, other_idx),
+            ) if *row <= StepPatch::MAX_ROW
+                && Arc::ptr_eq(layers, other_layers)
+                && (*layer_idx == *other_idx
+                    || layers[usize::from(*layer_idx)]
+                        .seq_same_key_layout(&layers[usize::from(*other_idx)])) =>
+            {
+                Some((*row, *layer_idx))
+            }
+            (Entries::Builtin(entries, _), PatchedBase::Builtin(other))
+                if Arc::ptr_eq(entries, other) =>
+            {
+                Some((0, 0))
+            }
+            (Entries::Patched(patched, row, layer_idx), PatchedBase::Patched(other))
+                if PooledPatched::ptr_eq(patched, other) && *row <= StepPatch::MAX_ROW =>
+            {
+                Some((*row, *layer_idx))
+            }
+            _ => None,
+        }
+    }
+
+    /// Construct a map pointing at `(row, layer_idx, slot)` of a shared [`StepPatch`].
+    #[inline(always)]
+    pub(crate) fn from_step_patch(
+        patch: &StepPatch,
+        row: u32,
+        layer_idx: u16,
+        slot: usize,
+    ) -> Self {
+        let packed = StepPatch::pack(row, slot);
+        Self {
+            entries: Entries::StepPatch(patch.0.clone(), packed, layer_idx),
+        }
+    }
+
+    /// Point this map at `(row, layer_idx, slot)` of a shared [`StepPatch`].
+    #[inline(always)]
+    pub(crate) fn set_step_patch(
+        &mut self,
+        patch: &StepPatch,
+        row: u32,
+        layer_idx: u16,
+        slot: usize,
+    ) {
+        let packed = StepPatch::pack(row, slot);
+        self.entries = Entries::StepPatch(patch.0.clone(), packed, layer_idx);
+    }
+
+    /// Point this map at `(row, layer_idx)` of a shared [`Patched`] overlay.
+    #[inline(always)]
+    pub(crate) fn set_patched(&mut self, patch: &PooledPatched, row: u32, layer_idx: u16) {
+        self.entries = Entries::Patched(patch.clone(), row, layer_idx);
+    }
+
+    /// If this map is backed by a dressed [`Table`] or direct-keyed sequence
+    /// layer, return `(base, row)`.
+    #[inline]
+    pub(crate) fn dressed_base(&self) -> Option<(PatchedBase, u32)> {
+        match &self.entries {
+            Entries::Dressed(table, row) => Some((PatchedBase::Table(Arc::clone(table)), *row)),
+            Entries::SeqLayer(layers, row, layer_idx) => {
+                Some((PatchedBase::SeqLayer(Arc::clone(layers), *layer_idx), *row))
+            }
+            _ => None,
+        }
+    }
+
+    /// The entries of a dressed map copied into a flat one, which keeps
+    /// whether a compose made them of data.
+    fn undress(&mut self) {
+        match &self.entries {
+            Entries::Dressed(table, index) => {
+                self.entries = table.layout(*index).to_entries(table.is_made());
+            }
+            Entries::SeqLayer(layers, row, layer_idx) => {
+                let layer = &layers[usize::from(*layer_idx)];
+                self.entries = layer.seq_layout(*row).to_entries(layer.seq_is_made());
+            }
+            Entries::Patched(patched, row, layer_idx) => {
+                self.entries = Layout::Overlay(patched, *row, *layer_idx).to_entries(patched.made);
+            }
+            Entries::StepPatch(step, packed, layer_idx) => {
+                self.entries = Layout::StepOverlay(&step.head, &step.values, *packed, *layer_idx)
+                    .to_entries(step.head.made);
+            }
+            _ => {}
+        }
+    }
+
+    /// The entries to write where they are. Entries another map shares
+    /// are copied first, once.
+    pub(crate) fn entries_mut(&mut self) -> &mut [(Key, Value)] {
+        self.undress();
+        // A map a compose made of data holds that guarantee only until it is
+        // written again; the compose re-marks its own writes.
+        match &self.entries {
+            Entries::Made(entries) => {
+                let entries = Arc::clone(entries);
+                self.entries = Entries::Shared(entries);
+            }
+            Entries::Builtin(entries, _) => {
+                self.entries = Entries::Shared(entries.as_slice().to_shares());
+            }
+            Entries::StaticInt(id, n, _) => {
+                self.entries = Entries::Shared(static_int_layout(*id, *n).to_shares());
+            }
+            _ => {}
+        }
+        let Entries::Shared(entries) = &mut self.entries else {
+            return &mut [];
+        };
+        if Arc::get_mut(entries).is_none() {
+            *entries = Arc::from(&entries[..]);
+        }
+        Arc::get_mut(entries).expect("entries that no other map shares")
+    }
+
+    /// Replace entry at `at` with `value`, keeping `Entries::Builtin` compact
+    /// and mutating in place when uniquely owned.
+    fn replace_at(&mut self, at: usize, value: Value, made: bool) {
+        if let Entries::StaticInt(id, cur, is_made) = &mut self.entries {
+            debug_assert_eq!(at, 0);
+            if let Some(n) = static_int_of(&value) {
+                *cur = n;
+                *is_made = made;
+                return;
+            }
+            let key_id = *id;
+            let name = crate::controls::builtin_name_str_by_id(key_id).expect("packed builtin id");
+            let packed = crate::controls::pack_builtin_key_str(name);
+            let keys = [packed];
+            let mut values = [value];
+            self.entries = Entries::Builtin(make_builtin_arc(1, &keys, &mut values), made);
+            return;
+        }
+        if let Entries::Builtin(b, is_made) = &mut self.entries {
+            if let Some(own) = Arc::get_mut(b)
+                && let Some((_, vals_mut)) = own.parts_mut()
+            {
+                vals_mut[at] = value;
+                *is_made = made;
+                return;
+            }
+            let slice = b.as_slice();
+            let keys_slice = b.keys();
+            let count = keys_slice.len();
+            let mut keys = [0u16; MAX_BUILTIN_MAP_LEN];
+            let mut values = [const { Value::Undefined }; MAX_BUILTIN_MAP_LEN];
+            keys[..count].copy_from_slice(keys_slice);
+            let mut slot = Some(value);
+            for (i, dst) in values.iter_mut().enumerate().take(count) {
+                *dst = if i == at {
+                    slot.take().expect("replace_at writes once")
+                } else {
+                    slice.at(i).1.clone()
+                };
+            }
+            self.entries = Entries::Builtin(make_builtin_arc(count, &keys, &mut values), made);
+            return;
+        }
+        self.entries_mut()[at].1 = value;
+        if made {
+            self.mark_made_of_data();
+        }
+    }
+
+    /// The compact built-in entries when this map is already stored as `Builtin`.
+    #[inline]
+    pub(crate) fn as_builtin(&self) -> Option<&Arc<dyn BuiltinEntries>> {
+        match &self.entries {
+            Entries::Builtin(entries, _) => Some(entries),
+            _ => None,
+        }
+    }
+
+    /// Pointer/row identity for graph-backed immutable maps (`strong_count >= 2`)
+    /// so query-local memoization never risks address reuse of temporary maps.
+    #[inline]
+    pub(crate) fn stable_identity(&self) -> Option<(usize, u64)> {
+        match &self.entries {
+            Entries::SeqLayer(layers, row, layer_idx) if Arc::strong_count(layers) >= 2 => Some((
+                Arc::as_ptr(layers) as *const () as usize,
+                (u64::from(*layer_idx) << 32) | u64::from(*row),
+            )),
+            Entries::Dressed(table, row) if Arc::strong_count(table) >= 2 => {
+                Some((Arc::as_ptr(table) as usize, u64::from(*row)))
+            }
+            Entries::Builtin(entries, _) if Arc::strong_count(entries) >= 2 => {
+                Some((Arc::as_ptr(entries) as *const () as usize, 0))
+            }
+            Entries::Shared(entries) | Entries::Made(entries)
+                if Arc::strong_count(entries) >= 2 =>
+            {
+                Some((Arc::as_ptr(entries) as *const () as usize, 0))
+            }
+            Entries::Patched(patched, row, layer_idx) if patched.strong_count() >= 2 => Some((
+                patched.as_ptr(),
+                (u64::from(*layer_idx) << 32) | u64::from(*row),
+            )),
+            Entries::StaticInt(id, n, _) => Some((4, (u64::from(*id) << 8) | u64::from(*n as u8))),
+            _ => None,
+        }
+    }
+
+    /// Borrowed flat entries when this map is empty or already undressed.
+    #[inline]
+    pub(crate) fn as_flat_slice(&self) -> Option<Slice<'_>> {
+        match &self.entries {
+            Entries::Empty => Some(Slice::EMPTY),
+            Entries::Shared(entries) | Entries::Made(entries) => Some(Slice::Plain(entries)),
+            Entries::Builtin(entries, _) => Some(entries.as_slice()),
+            _ => None,
+        }
+    }
+
+    /// Replace compact built-in entries through a post-eval deduplicator,
+    /// returning `true` when the `Arc` pointer changed.
+    #[inline]
+    pub(crate) fn dedup_builtin(
+        &mut self,
+        f: impl FnOnce(&Arc<dyn BuiltinEntries>, bool) -> Option<Arc<dyn BuiltinEntries>>,
+    ) -> bool {
+        if let Entries::Builtin(entries, made) = &mut self.entries
+            && let Some(next) = f(entries, *made)
+            && !Arc::ptr_eq(entries, &next)
+        {
+            *entries = next;
+            return true;
+        }
+        false
+    }
+
+    /// Return a cloned map with replaced compact built-in entries only when
+    /// `f` returns a distinct canonical `Arc`, avoiding any `Arc` refcount
+    /// traffic when the map is unchanged.
+    #[inline]
+    pub(crate) fn dedup_builtin_cloned(
+        &self,
+        f: impl FnOnce(&Arc<dyn BuiltinEntries>, bool) -> Option<Arc<dyn BuiltinEntries>>,
+    ) -> Option<Self> {
+        if let Entries::Builtin(entries, made) = &self.entries
+            && let Some(next) = f(entries, *made)
+            && !Arc::ptr_eq(entries, &next)
+        {
             return Some(Self {
-                entries: Entries::Interned(found),
+                entries: Entries::Builtin(next, *made),
             });
         }
-        let bytes = entries
-            .iter()
-            .map(|(key, value)| key.len() + data_bytes(value))
-            .sum::<usize>()
-            + std::mem::size_of::<(Key, Value)>() * entries.len()
-            + KEPT_MAP_BYTES;
-        if INTERNED_BYTES.fetch_add(bytes, Ordering::Relaxed) + bytes > INTERN_BUDGET {
-            INTERNED_BYTES.fetch_sub(bytes, Ordering::Relaxed);
+        None
+    }
+
+    /// The single packed `(key, value)` when this map is a 1-entry data-only
+    /// `Entries::Builtin` or `Entries::StaticInt` whose key is not `"value"`.
+    #[inline]
+    pub(crate) fn single_packed_entry(&self) -> Option<(u16, &Value)> {
+        if let Entries::StaticInt(id, n, _) = &self.entries {
+            if crate::controls::builtin_key_ref_by_id(*id).is_some_and(|k| k.as_str() != "value") {
+                let packed = *id | (u16::from(crate::controls::builtin_mark_bit_by_id(*id)) << 10);
+                return Some((packed, static_int_value(*n)));
+            }
             return None;
         }
-        let kept: Kept = Box::leak(Box::new(entries.clone()));
-        shard.entry(hash).or_default().push(kept);
-        Some(Self {
-            entries: Entries::Interned(kept),
+        if let Entries::Builtin(entries, made) = &self.entries {
+            let keys = entries.keys();
+            if keys.len() == 1 {
+                let val = entries.as_slice().at(0).1;
+                if *made || val.is_data(0) {
+                    let id = keys[0] & 0x03ff;
+                    if crate::controls::builtin_key_ref_by_id(id)
+                        .is_some_and(|k| k.as_str() != "value")
+                    {
+                        return Some((keys[0], val));
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    /// Reconstruct a 1-entry data-only built-in map from a packed key and value.
+    #[inline]
+    pub(crate) fn from_single_packed(packed_key: u16, value: Value) -> Self {
+        if let Some(n) = static_int_of(&value) {
+            return Self {
+                entries: Entries::StaticInt(packed_key & 0x03ff, n, true),
+            };
+        }
+        Self {
+            entries: Entries::Builtin(
+                Arc::new(BuiltinMap {
+                    keys: [packed_key],
+                    values: [value],
+                }),
+                true,
+            ),
+        }
+    }
+
+    /// Construct a data-only built-in map directly from packed keys and owned
+    /// values (`1 <= keys.len() <= 24`).
+    pub(crate) fn from_packed_builtin(keys: &[u16], values: &mut [Value]) -> Self {
+        if keys.len() == 1
+            && let Some(n) = static_int_of(&values[0])
+        {
+            values[0] = Value::Undefined;
+            return Self {
+                entries: Entries::StaticInt(keys[0] & 0x03ff, n, true),
+            };
+        }
+        Self {
+            entries: Entries::Builtin(make_builtin_arc(keys.len(), keys, values), true),
+        }
+    }
+
+    /// Merge stack-packed data built-in controls into this map in place when it
+    /// is backed by `Entries::Builtin` or `Entries::StaticInt` and the combined
+    /// key count fits within `MAX_BUILTIN_MAP_LEN`.
+    pub(crate) fn merge_packed_builtin(&mut self, keys: &[u16], vals: &[Value]) -> bool {
+        if let Entries::StaticInt(id, n, _) = self.entries {
+            let k0 = id | (u16::from(crate::controls::builtin_mark_bit_by_id(id)) << 10);
+            if keys.len() == 1 && keys[0] == k0 {
+                if let Some(n2) = static_int_of(&vals[0]) {
+                    self.entries = Entries::StaticInt(id, n2, true);
+                    return true;
+                }
+                self.entries = Entries::Builtin(
+                    Arc::new(BuiltinMap {
+                        keys: [k0],
+                        values: [vals[0].clone()],
+                    }),
+                    true,
+                );
+                return true;
+            }
+            if let Ok(merged) =
+                Self::from_single_and_packed(k0, static_int_value(n).clone(), keys, vals)
+            {
+                *self = merged;
+                return true;
+            }
+            return false;
+        }
+        if !matches!(self.entries, Entries::Builtin(..)) {
+            return false;
+        }
+        let prev = std::mem::replace(&mut self.entries, Entries::Empty);
+        let Entries::Builtin(entries, made) = prev else {
+            unreachable!();
+        };
+        match merge_builtin_with_packed(entries, keys, vals) {
+            Ok(merged) => {
+                self.entries = Entries::Builtin(merged, true);
+                true
+            }
+            Err(entries) => {
+                self.entries = Entries::Builtin(entries, made);
+                false
+            }
+        }
+    }
+
+    /// Build a data-only built-in map from a single existing `(k0, v0)` merged
+    /// with stack-packed `(other_keys, other_vals)` using overwrite semantics.
+    pub(crate) fn from_single_and_packed(
+        k0: u16,
+        v0: Value,
+        other_keys: &[u16],
+        other_vals: &[Value],
+    ) -> Result<Self, Value> {
+        let mut out_keys = [0u16; MAX_BUILTIN_MAP_LEN];
+        let mut src_idx = [0u8; MAX_BUILTIN_MAP_LEN];
+        let mut len = 1usize;
+        out_keys[0] = k0;
+        let mut replaced_k0 = None;
+        for (i, &ok) in other_keys.iter().enumerate() {
+            if ok == k0 {
+                replaced_k0 = Some(i as u8);
+            } else {
+                if len >= MAX_BUILTIN_MAP_LEN {
+                    return Err(v0);
+                }
+                out_keys[len] = ok;
+                src_idx[len] = 0x80 | (i as u8);
+                len += 1;
+            }
+        }
+        if len == 1
+            && let Some(pos) = replaced_k0
+            && let Some(n) = static_int_of(&other_vals[usize::from(pos)])
+        {
+            return Ok(Self {
+                entries: Entries::StaticInt(k0 & 0x03ff, n, true),
+            });
+        }
+        let mut first_val = Some(v0);
+        if let Some(pos) = replaced_k0 {
+            src_idx[0] = 0x80 | pos;
+        }
+        macro_rules! build {
+            ($($n:literal),+) => {
+                match len {
+                    $(
+                        $n => {
+                            let mut k = [0u16; $n];
+                            k.copy_from_slice(&out_keys[..$n]);
+                            let v = std::array::from_fn::<Value, $n, _>(|i| {
+                                let tag = src_idx[i];
+                                if tag & 0x80 != 0 {
+                                    other_vals[usize::from(tag & 0x7f)].clone()
+                                } else {
+                                    first_val.take().expect("k0 value")
+                                }
+                            });
+                            Arc::new(BuiltinMap { keys: k, values: v })
+                        }
+                    )+
+                    _ => return Err(first_val.take().unwrap_or(Value::Undefined)),
+                }
+            };
+        }
+        let arc: Arc<dyn BuiltinEntries> = build!(
+            1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24
+        );
+        Ok(Self {
+            entries: Entries::Builtin(arc, true),
         })
     }
 
-    /// Whether cloning this map copies a pointer and dropping it does
-    /// nothing.
-    pub(crate) fn is_interned(&self) -> bool {
-        matches!(self.entries, Entries::Interned(_))
+    /// Reconstruct a 2-entry data-only built-in map from two disjoint packed
+    /// keys and values.
+    #[inline]
+    pub(crate) fn from_two_packed(k0: u16, v0: Value, k1: u16, v1: Value) -> Self {
+        Self {
+            entries: Entries::Builtin(
+                Arc::new(BuiltinMap {
+                    keys: [k0, k1],
+                    values: [v0, v1],
+                }),
+                true,
+            ),
+        }
+    }
+
+    /// Reconstruct a data-only built-in map from `k0: v0`, a built-in `tail`
+    /// slice, and `k1: v1` (all keys disjoint, total length `<= MAX_BUILTIN_MAP_LEN`).
+    pub(crate) fn from_keyed_tail_and_packed(
+        k0: u16,
+        v0: Value,
+        tail: Slice<'_>,
+        k1: u16,
+        v1: Value,
+    ) -> Self {
+        let tail_len = tail.len();
+        let count = tail_len + 2;
+        let mut keys = [0u16; MAX_BUILTIN_MAP_LEN];
+        let mut values = [const { Value::Undefined }; MAX_BUILTIN_MAP_LEN];
+        keys[0] = k0;
+        values[0] = v0;
+        match tail {
+            Slice::Builtin(tkeys, tvals) => {
+                keys[1..1 + tail_len].copy_from_slice(tkeys);
+                for (dst, src) in values[1..1 + tail_len].iter_mut().zip(tvals.iter()) {
+                    *dst = src.clone();
+                }
+            }
+            Slice::Pooled(tkeys, tvals, pool) => {
+                keys[1..1 + tail_len].copy_from_slice(tkeys);
+                for (dst, &idx) in values[1..1 + tail_len].iter_mut().zip(tvals.iter()) {
+                    *dst = pool[usize::from(idx)].clone();
+                }
+            }
+            Slice::Plain(_) => unreachable!("expected built-in tail slice"),
+        }
+        keys[1 + tail_len] = k1;
+        values[1 + tail_len] = v1;
+        Self {
+            entries: Entries::Builtin(make_builtin_arc(count, &keys, &mut values), true),
+        }
+    }
+
+    /// Reconstruct a data-only map from compact built-in entries.
+    #[inline]
+    pub(crate) fn from_made_builtin(entries: Arc<dyn BuiltinEntries>) -> Self {
+        Self {
+            entries: Entries::Builtin(entries, true),
+        }
+    }
+
+    /// Reconstruct a map from `Layout` directly into `Entries::Builtin` or flat shares.
+    #[inline]
+    pub(crate) fn from_layout(layout: Layout<'_>, made: bool) -> Self {
+        Self {
+            entries: layout.to_entries(made),
+        }
+    }
+
+    /// A map of `entries`, each of another key, in their order.
+    pub(crate) fn of_keys(entries: impl IntoIterator<Item = (Key, Value)>) -> Self {
+        let mut iter = entries.into_iter();
+        let (lo, hi) = iter.size_hint();
+        if hi == Some(lo) {
+            return Self {
+                entries: pack_entries(lo, |_| iter.next().expect("exact len"), false),
+            };
+        }
+        let vec: Vec<(Key, Value)> = iter.collect();
+        let len = vec.len();
+        let mut iter = vec.into_iter();
+        Self {
+            entries: pack_entries(len, |_| iter.next().expect("exact len"), false),
+        }
+    }
+
+    /// Put `count` entries in the place of the entries of this map: `entry`
+    /// gives each in turn, from the entries that the map held. One
+    /// allocation holds the new entries.
+    fn rebuild(
+        &mut self,
+        count: usize,
+        mut entry: impl FnMut(&mut Held<'_>, usize) -> (Key, Value),
+    ) {
+        let mut taken = std::mem::replace(&mut self.entries, Entries::Empty);
+        let mut held = match &mut taken {
+            Entries::Shared(entries) | Entries::Made(entries) => match Arc::get_mut(entries) {
+                Some(own) => Held::Own(own),
+                None => Held::View(Layout::Plain(Slice::Plain(entries))),
+            },
+            Entries::Builtin(entries, _) => Held::View(Layout::Plain(entries.as_slice())),
+            Entries::StaticInt(id, n, _) => Held::View(static_int_layout(*id, *n)),
+            Entries::Empty => Held::View(Layout::Plain(Slice::EMPTY)),
+            Entries::Dressed(table, index) => Held::View(table.layout(*index)),
+            Entries::SeqLayer(layers, row, layer_idx) => {
+                Held::View(layers[usize::from(*layer_idx)].seq_layout(*row))
+            }
+            Entries::Patched(patched, row, layer_idx) => {
+                Held::View(Layout::Overlay(patched, *row, *layer_idx))
+            }
+            Entries::StepPatch(step, packed, layer_idx) => Held::View(Layout::StepOverlay(
+                &step.head,
+                &step.values,
+                *packed,
+                *layer_idx,
+            )),
+        };
+        self.entries = pack_entries(count, |index| entry(&mut held, index), false);
+    }
+
+    /// Add `entry`, of a key that the map does not hold, after the others.
+    /// One allocation holds the new entries: the old ones move where no
+    /// other map shares them, and are copied otherwise.
+    fn append(&mut self, entry: (Key, Value)) {
+        if let Entries::Patched(patched, _, _) = &mut self.entries
+            && let Some(own) = patched.get_mut()
+            && !own.overlay_after_appended
+            && usize::from(own.len) < MAX_PATCHES
+        {
+            let (key, value) = entry;
+            let mark = Table::mark(key.as_str());
+            own.push_slot(key, value, u16::MAX);
+            own.appended += 1;
+            own.marks |= mark;
+            own.made = false;
+            return;
+        }
+        if let Entries::Dressed(table, index) = &self.entries
+            && let Some(patched) = Patched::of_one(
+                PatchedBase::Table(Arc::clone(table)),
+                *index,
+                0,
+                entry.0.clone(),
+                entry.1.clone(),
+                None,
+                false,
+            )
+        {
+            self.entries = Entries::Patched(PooledPatched::new(patched), *index, 0);
+            return;
+        }
+        if let Entries::SeqLayer(layers, row, layer_idx) = &self.entries
+            && let Some(patched) = Patched::of_one(
+                PatchedBase::SeqLayer(Arc::clone(layers), *layer_idx),
+                *row,
+                *layer_idx,
+                entry.0.clone(),
+                entry.1.clone(),
+                None,
+                false,
+            )
+        {
+            self.entries = Entries::Patched(PooledPatched::new(patched), *row, *layer_idx);
+            return;
+        }
+        if let Entries::Builtin(b, _) = &self.entries {
+            let keys_slice = b.keys();
+            let count = keys_slice.len();
+            let packed = crate::controls::pack_builtin_key_str(entry.0.as_str());
+            if count < MAX_BUILTIN_MAP_LEN && packed != 0 {
+                let slice = b.as_slice();
+                let mut keys = [0u16; MAX_BUILTIN_MAP_LEN];
+                let mut values = [const { Value::Undefined }; MAX_BUILTIN_MAP_LEN];
+                keys[..count].copy_from_slice(keys_slice);
+                keys[count] = packed;
+                for (i, dst) in values.iter_mut().enumerate().take(count) {
+                    *dst = slice.at(i).1.clone();
+                }
+                values[count] = entry.1;
+                self.entries =
+                    Entries::Builtin(make_builtin_arc(count + 1, &keys, &mut values), false);
+                return;
+            }
+        }
+        self.entries = match std::mem::replace(&mut self.entries, Entries::Empty) {
+            Entries::Shared(mut entries) | Entries::Made(mut entries) => {
+                let held: Shares = match Arc::get_mut(&mut entries) {
+                    // A handle of the key, and the value itself.
+                    Some(own) => own
+                        .iter_mut()
+                        .map(|(key, value)| {
+                            (key.clone(), std::mem::replace(value, Value::Undefined))
+                        })
+                        .chain(std::iter::once(entry))
+                        .collect(),
+                    None => entries
+                        .iter()
+                        .cloned()
+                        .chain(std::iter::once(entry))
+                        .collect(),
+                };
+                Entries::Shared(held)
+            }
+            Entries::Builtin(entries, _) => {
+                let (key, value) = entry;
+                Layout::Plain(entries.as_slice()).with_entries(&key, None, value, false)
+            }
+            Entries::StaticInt(id, n, _) => {
+                let (key, value) = entry;
+                static_int_layout(id, n).with_entries(&key, None, value, false)
+            }
+            Entries::Empty => {
+                let mut entry = Some(entry);
+                pack_entries(1, |_| entry.take().expect("one entry"), false)
+            }
+            Entries::Dressed(table, index) => {
+                let (key, value) = entry;
+                table.layout(index).with_entries(&key, None, value, false)
+            }
+            Entries::SeqLayer(layers, row, layer_idx) => {
+                let (key, value) = entry;
+                layers[usize::from(layer_idx)]
+                    .seq_layout(row)
+                    .with_entries(&key, None, value, false)
+            }
+            Entries::Patched(patched, row, layer_idx) => {
+                let (key, value) = entry;
+                Layout::Overlay(&patched, row, layer_idx).with_entries(&key, None, value, false)
+            }
+            Entries::StepPatch(step, packed, layer_idx) => {
+                let (key, value) = entry;
+                Layout::StepOverlay(&step.head, &step.values, packed, layer_idx)
+                    .with_entries(&key, None, value, false)
+            }
+        };
+    }
+
+    /// [`Self::merge`] producing flat entries directly without creating a
+    /// temporary [`Patched`] overlay (for build-time folds that would
+    /// otherwise immediately undress the overlay).
+    /// Fast `u16`-keyed merge when both `self` and `other` hold built-in control
+    /// entries and the combined count stays within `MAX_BUILTIN_ENTRIES` (24).
+    /// Avoids `Key` conversion, string hashing, and `Layout::position` lookups.
+    fn try_merge_builtin_pair(
+        &mut self,
+        other: &Self,
+        change: &mut impl FnMut(&Value, &Value) -> Value,
+    ) -> bool {
+        let (Entries::Builtin(self_b, self_made), Entries::Builtin(other_b, _)) =
+            (&mut self.entries, &other.entries)
+        else {
+            return false;
+        };
+        let Slice::Builtin(other_keys, other_vals) = other_b.as_slice() else {
+            return false;
+        };
+        let (held, fresh, fresh_mask) = {
+            let Slice::Builtin(self_keys_ro, _) = self_b.as_slice() else {
+                return false;
+            };
+            let mut fresh_mask = 0u32;
+            let mut fresh = 0usize;
+            for (i, &ok) in other_keys.iter().enumerate() {
+                if !self_keys_ro.contains(&ok) {
+                    fresh_mask |= 1u32 << i;
+                    fresh += 1;
+                }
+            }
+            (self_keys_ro.len(), fresh, fresh_mask)
+        };
+        if fresh == 0
+            && let Some(own) = Arc::get_mut(self_b)
+            && let Some((sk, sv)) = own.parts_mut()
+        {
+            for (&k, v) in sk.iter().zip(sv.iter_mut()) {
+                if let Some(pos) = other_keys.iter().position(|&ok| ok == k) {
+                    *v = change(v, &other_vals[pos]);
+                }
+            }
+            *self_made = false;
+            return true;
+        }
+        let total = held + fresh;
+        if total == 0 || total > MAX_BUILTIN_MAP_LEN {
+            return false;
+        }
+        let mut out_keys = [0u16; MAX_BUILTIN_MAP_LEN];
+        let mut out_vals = [const { Value::Undefined }; MAX_BUILTIN_MAP_LEN];
+        {
+            let Slice::Builtin(self_keys_ro, self_vals_ro) = self_b.as_slice() else {
+                return false;
+            };
+            for i in 0..held {
+                let k = self_keys_ro[i];
+                out_keys[i] = k;
+                out_vals[i] = match other_keys.iter().position(|&ok| ok == k) {
+                    Some(pos) => change(&self_vals_ro[i], &other_vals[pos]),
+                    None => self_vals_ro[i].clone(),
+                };
+            }
+        }
+        let mut dst = held;
+        let mut rem = fresh_mask;
+        while rem != 0 {
+            let i = rem.trailing_zeros() as usize;
+            rem &= rem - 1;
+            out_keys[dst] = other_keys[i];
+            out_vals[dst] = other_vals[i].clone();
+            dst += 1;
+        }
+        self.entries = Entries::Builtin(make_builtin_arc(total, &out_keys, &mut out_vals), false);
+        true
+    }
+
+    pub(crate) fn merge_flat(
+        &mut self,
+        other: &Self,
+        mut change: impl FnMut(&Value, &Value) -> Value,
+    ) {
+        if other.is_empty() {
+            return;
+        }
+        if self.try_merge_builtin_pair(other, &mut change) {
+            return;
+        }
+        if other.len() == 1
+            && let Some((key, value)) = other.pairs().next()
+        {
+            let at = self.position(key);
+            match (&self.entries, at) {
+                (Entries::Dressed(table, row), at) => {
+                    let row = *row;
+                    let value = match at {
+                        Some(at) => change(table.layout(row).at(at).1, value),
+                        None => value.clone(),
+                    };
+                    self.entries = table.layout(row).with_entries(key, at, value, false);
+                }
+                (Entries::SeqLayer(layers, row, layer_idx), at) => {
+                    let row = *row;
+                    let layout = layers[usize::from(*layer_idx)].seq_layout(row);
+                    let value = match at {
+                        Some(at) => change(layout.at(at).1, value),
+                        None => value.clone(),
+                    };
+                    self.entries = layout.with_entries(key, at, value, false);
+                }
+                (Entries::Patched(..) | Entries::StepPatch(..), at) => {
+                    let value = match at {
+                        Some(at) => change(self.layout().at(at).1, value),
+                        None => value.clone(),
+                    };
+                    self.entries = self.layout().with_entries(key, at, value, false);
+                }
+                (_, Some(at)) => {
+                    let next = change(self.layout().at(at).1, value);
+                    self.replace_at(at, next, false);
+                }
+                (_, None) => self.append((key.clone(), value.clone())),
+            }
+            return;
+        }
+        let of = |key: &Key| other.layout().get(key);
+        let fresh = other
+            .pairs()
+            .filter(|(key, _)| self.position(*key).is_none())
+            .count();
+        if fresh == 0 {
+            if let Entries::Builtin(b, is_made) = &mut self.entries {
+                if let Some(own) = Arc::get_mut(b)
+                    && let Some((keys, values)) = own.parts_mut()
+                {
+                    let other_layout = other.layout();
+                    for (&packed, value) in keys.iter().zip(values.iter_mut()) {
+                        if let Some(name) = crate::controls::builtin_name_str_by_id(packed & 0x03ff)
+                            && let Some(other_val) = other_layout.get(name)
+                        {
+                            *value = change(value, other_val);
+                        }
+                    }
+                    *is_made = false;
+                    return;
+                }
+            } else {
+                for (key, value) in self.entries_mut() {
+                    if let Some(other) = of(key) {
+                        *value = change(value, other);
+                    }
+                }
+                return;
+            }
+        }
+        let held = self.len();
+        let mut more = other.pairs();
+        self.rebuild(held + fresh, |entries, index| {
+            if index < held {
+                let (key, value) = entries.take(index);
+                return match of(&key) {
+                    Some(other) => (key, change(&value, other)),
+                    None => (key, value),
+                };
+            }
+            let (key, value) = more
+                .find(|(key, _)| !entries.holds(key))
+                .expect("a key that the map did not hold");
+            (key.clone(), value.clone())
+        });
+    }
+
+    /// Each entry of `other` in this map. An entry of a key that the map
+    /// holds changes the value of that key where it is, to what `change`
+    /// makes of the value and the one of `other`. The other entries come
+    /// after, in the order of `other`.
+    pub(crate) fn merge(&mut self, other: &Self, mut change: impl FnMut(&Value, &Value) -> Value) {
+        // Nothing to add changes nothing, and a dressed map stays dressed.
+        if other.is_empty() {
+            return;
+        }
+        if self.try_merge_builtin_pair(other, &mut change) {
+            return;
+        }
+        // A control that sets one key, which most chains do: one lookup, and
+        // one write.
+        let other_len = other.len();
+        if other_len == 1
+            && let Some((key, value)) = other.pairs().next()
+        {
+            return self.merge_one(key, value, change);
+        }
+        // Small merges onto a dressed or uniquely-owned patched map stay in
+        // the inline overlay without flattening `Table::tail`.
+        if other_len <= MAX_PATCHES {
+            match &mut self.entries {
+                Entries::Dressed(table, row) => {
+                    let row = *row;
+                    if let Some(mut patched) =
+                        Patched::empty(PatchedBase::Table(Arc::clone(table)), row, 0, false)
+                    {
+                        for (key, value) in other.pairs() {
+                            let ok = patched.try_merge_one(row, 0, key, value, &mut change);
+                            debug_assert!(ok);
+                        }
+                        self.entries = Entries::Patched(PooledPatched::new(patched), row, 0);
+                        return;
+                    }
+                }
+                Entries::SeqLayer(layers, row, layer_idx) => {
+                    let row = *row;
+                    let layer_idx = *layer_idx;
+                    if let Some(mut patched) = Patched::empty(
+                        PatchedBase::SeqLayer(Arc::clone(layers), layer_idx),
+                        row,
+                        layer_idx,
+                        false,
+                    ) {
+                        for (key, value) in other.pairs() {
+                            let ok = patched.try_merge_one(row, layer_idx, key, value, &mut change);
+                            debug_assert!(ok);
+                        }
+                        self.entries =
+                            Entries::Patched(PooledPatched::new(patched), row, layer_idx);
+                        return;
+                    }
+                }
+                Entries::Patched(patched, row, layer_idx) => {
+                    let row = *row;
+                    let layer_idx = *layer_idx;
+                    if let Some(own) = patched.get_mut() {
+                        let extra = other.pairs().filter(|(k, _)| !own.has_patch_for(k)).count();
+                        if usize::from(own.len) + extra <= MAX_PATCHES
+                            && (!own.overlay_after_appended
+                                || other
+                                    .pairs()
+                                    .all(|(k, _)| own.can_accept_key(row, layer_idx, k)))
+                        {
+                            for (key, value) in other.pairs() {
+                                let ok = own.try_merge_one(row, layer_idx, key, value, &mut change);
+                                debug_assert!(ok);
+                            }
+                            return;
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        let of = |key: &Key| other.layout().get(key);
+        let fresh = other
+            .pairs()
+            .filter(|(key, _)| self.position(*key).is_none())
+            .count();
+        if fresh == 0 {
+            if let Entries::Builtin(b, is_made) = &mut self.entries {
+                if let Some(own) = Arc::get_mut(b)
+                    && let Some((keys, values)) = own.parts_mut()
+                {
+                    let other_layout = other.layout();
+                    for (&packed, value) in keys.iter().zip(values.iter_mut()) {
+                        if let Some(name) = crate::controls::builtin_name_str_by_id(packed & 0x03ff)
+                            && let Some(other_val) = other_layout.get(name)
+                        {
+                            *value = change(value, other_val);
+                        }
+                    }
+                    *is_made = false;
+                    return;
+                }
+            } else {
+                for (key, value) in self.entries_mut() {
+                    if let Some(other) = of(key) {
+                        *value = change(value, other);
+                    }
+                }
+                return;
+            }
+        }
+        let held = self.len();
+        let mut more = other.pairs();
+        self.rebuild(held + fresh, |entries, index| {
+            if index < held {
+                let (key, value) = entries.take(index);
+                return match of(&key) {
+                    Some(other) => (key, change(&value, other)),
+                    None => (key, value),
+                };
+            }
+            // The next entry of `other` whose key the map did not hold.
+            let (key, value) = more
+                .find(|(key, _)| !entries.holds(key))
+                .expect("a key that the map did not hold");
+            (key.clone(), value.clone())
+        });
+    }
+
+    /// [`Self::merge`] of the one entry `key` and `other`.
+    fn merge_one(
+        &mut self,
+        key: &Key,
+        other: &Value,
+        mut change: impl FnMut(&Value, &Value) -> Value,
+    ) {
+        if let Entries::Patched(patched, row, layer_idx) = &mut self.entries
+            && let (row, layer_idx) = (*row, *layer_idx)
+            && let Some(own) = patched.get_mut()
+            && own.try_merge_one(row, layer_idx, key, other, &mut change)
+        {
+            return;
+        }
+        if let Entries::Dressed(table, row) = &self.entries {
+            let row = *row;
+            let at = self.position(key);
+            let value = match at {
+                Some(at) => change(table.layout(row).at(at).1, other),
+                None => other.clone(),
+            };
+            if let Some(patched) = Patched::of_one(
+                PatchedBase::Table(Arc::clone(table)),
+                row,
+                0,
+                key.clone(),
+                value.clone(),
+                at,
+                false,
+            ) {
+                self.entries = Entries::Patched(PooledPatched::new(patched), row, 0);
+                return;
+            }
+            self.entries = table.layout(row).with_entries(key, at, value, false);
+            return;
+        }
+        if let Entries::SeqLayer(layers, row, layer_idx) = &self.entries {
+            let row = *row;
+            let layer_idx = *layer_idx;
+            let at = self.position(key);
+            let layout = layers[usize::from(layer_idx)].seq_layout(row);
+            let value = match at {
+                Some(at) => change(layout.at(at).1, other),
+                None => other.clone(),
+            };
+            if let Some(patched) = Patched::of_one(
+                PatchedBase::SeqLayer(Arc::clone(layers), layer_idx),
+                row,
+                layer_idx,
+                key.clone(),
+                value.clone(),
+                at,
+                false,
+            ) {
+                self.entries = Entries::Patched(PooledPatched::new(patched), row, layer_idx);
+                return;
+            }
+            self.entries = layout.with_entries(key, at, value, false);
+            return;
+        }
+        let at = self.position(key);
+        match (&self.entries, at) {
+            (Entries::Patched(..) | Entries::StepPatch(..), at) => {
+                let value = match at {
+                    Some(at) => change(self.layout().at(at).1, other),
+                    None => other.clone(),
+                };
+                self.entries = self.layout().with_entries(key, at, value, false);
+            }
+            (_, Some(at)) => {
+                let value = change(self.layout().at(at).1, other);
+                self.replace_at(at, value, false);
+            }
+            (_, None) => self.append((key.clone(), other.clone())),
+        }
+    }
+
+    /// The place of the entry of `key`. A dressed map rules out a name that
+    /// no step of its table holds without a scan.
+    #[inline(always)]
+    fn position<K: ?Sized + Named>(&self, key: &K) -> Option<usize>
+    where
+        Key: PartialEq<K>,
+    {
+        match &self.entries {
+            Entries::Empty => None,
+            Entries::Shared(entries) | Entries::Made(entries) => {
+                Slice::Plain(entries).position(key)
+            }
+            Entries::Builtin(entries, _) => entries.as_slice().position_str(key.name()),
+            Entries::StaticInt(id, _, _) => {
+                (crate::controls::builtin_name_str_by_id(*id) == Some(key.name())).then_some(0)
+            }
+            Entries::Dressed(table, index) => match table.marks() & Table::mark(key.name()) {
+                0 => None,
+                _ => table.layout(*index).position(key),
+            },
+            Entries::SeqLayer(layers, row, layer_idx) => {
+                layers[usize::from(*layer_idx)].seq_position(*row, key.name())
+            }
+            Entries::Patched(patched, row, layer_idx) => patched.position(*row, *layer_idx, key),
+            Entries::StepPatch(step, packed, layer_idx) => {
+                step.head.position(*packed, *layer_idx, key)
+            }
+        }
+    }
+
+    /// Whether the map's own storage answers for its data-ness: an empty
+    /// map holds nothing else, and a made map was made of data values only.
+    #[inline]
+    pub(crate) fn holds_only_data(&self) -> bool {
+        match &self.entries {
+            Entries::Empty | Entries::Made(_) => true,
+            Entries::Builtin(_, made) | Entries::StaticInt(_, _, made) => *made,
+            Entries::Dressed(table, _) => table.is_made(),
+            Entries::SeqLayer(layers, _, layer_idx) => {
+                layers[usize::from(*layer_idx)].seq_is_made()
+            }
+            Entries::Patched(patched, _, _) => patched.made,
+            Entries::StepPatch(step, _, _) => step.head.made,
+            Entries::Shared(_) => false,
+        }
+    }
+
+    /// Whether the map's storage tells that it holds data only, with no
+    /// walk of its entries. A table also holds data only when no compose
+    /// made it: it refuses a value that is no data.
+    #[inline]
+    pub(crate) fn is_known_data(&self) -> bool {
+        matches!(
+            self.entries,
+            Entries::Dressed(..) | Entries::SeqLayer(..) | Entries::StaticInt(..)
+        ) || self.holds_only_data()
+    }
+
+    /// A hash of this map's data that agrees with [`Self::same_data`].
+    #[cfg(test)]
+    pub(crate) fn data_hash(&self) -> u64 {
+        let mut hasher = WordHasher::default();
+        hash_data_entries(self.layout(), &mut hasher);
+        std::hash::Hasher::finish(&hasher)
+    }
+
+    /// Whether two maps hold the same keys and the same data, in order and
+    /// down to the bits of every number. `==` makes `0.0` equal to `-0.0`,
+    /// which divide apart, and a NaN unequal to itself.
+    pub(crate) fn same_data(&self, other: &Self) -> bool {
+        match (&self.entries, &other.entries) {
+            (Entries::Dressed(a, at), Entries::Dressed(b, to)) if Arc::ptr_eq(a, b) && at == to => {
+                // The same step of one table is one map.
+                return true;
+            }
+            (Entries::SeqLayer(a, at, ai), Entries::SeqLayer(b, to, bi))
+                if Arc::ptr_eq(a, b) && at == to && ai == bi =>
+            {
+                return true;
+            }
+            (Entries::Builtin(a, _), Entries::Builtin(b, _)) if Arc::ptr_eq(a, b) => {
+                return true;
+            }
+            (Entries::StaticInt(ai, an, _), Entries::StaticInt(bi, bn, _)) => {
+                return ai == bi && an == bn;
+            }
+            (Entries::Shared(a) | Entries::Made(a), Entries::Shared(b) | Entries::Made(b))
+                if Arc::ptr_eq(a, b) =>
+            {
+                return true;
+            }
+            _ => {}
+        }
+        same_entries(self.pairs(), other.pairs())
+    }
+
+    /// Whether the map holds no allocation, so a clone copies nothing.
+    #[cfg(test)]
+    pub(crate) fn owns_no_heap(&self) -> bool {
+        matches!(self.entries, Entries::Empty | Entries::StaticInt(..))
+    }
+
+    /// Mark this map, whose writes a compose of data values just finished,
+    /// as holding data only. A map another writer shares, or an empty one,
+    /// is left alone: the guarantee belongs to this compose's own unique
+    /// copy.
+    pub(crate) fn mark_made_of_data(&mut self) {
+        let current = std::mem::replace(&mut self.entries, Entries::Empty);
+        self.entries = match current {
+            Entries::Shared(entries) if Arc::strong_count(&entries) == 1 => Entries::Made(entries),
+            Entries::Builtin(entries, false) if Arc::strong_count(&entries) == 1 => {
+                Entries::Builtin(entries, true)
+            }
+            Entries::StaticInt(id, n, _) => Entries::StaticInt(id, n, true),
+            Entries::Patched(mut patched, row, layer_idx) => {
+                if let Some(own) = patched.get_mut() {
+                    own.made = true;
+                }
+                Entries::Patched(patched, row, layer_idx)
+            }
+            other => other,
+        };
     }
     pub fn new() -> Self {
         Self::default()
     }
 
-    pub fn from_entries(entries: impl IntoIterator<Item = (String, Value)>) -> Self {
-        let mut out = Self::new();
-        for (key, value) in entries {
-            out.insert(key, value);
+    /// Set `key` to `value`, a data value, in this map of data: a `set` of
+    /// the map of that one entry, with no such map. The map then holds
+    /// data only.
+    pub(crate) fn set_data(&mut self, key: &Key, mut value: Value) {
+        if let Entries::Patched(patched, row, layer_idx) = &mut self.entries
+            && let (row, layer_idx) = (*row, *layer_idx)
+            && let Some(own) = patched.get_mut()
+        {
+            match own.try_set(row, layer_idx, key, value, true) {
+                Ok(()) => return,
+                Err(returned) => value = returned,
+            }
         }
-        out
+        if let Entries::Patched(prev, row, layer_idx) = &self.entries
+            && !matches!(prev.base, PatchedBase::Patched(_))
+        {
+            let row = *row;
+            let layer_idx = *layer_idx;
+            let at = self.position(key);
+            if let Some(patched) = Patched::of_one(
+                PatchedBase::Patched(prev.clone()),
+                row,
+                layer_idx,
+                key.clone(),
+                value.clone(),
+                at,
+                true,
+            ) {
+                self.entries = Entries::Patched(PooledPatched::new(patched), row, layer_idx);
+                return;
+            }
+        }
+        let sp_promoted = match &self.entries {
+            Entries::StepPatch(sp, packed, layer_idx) => sp
+                .head
+                .to_patched(&sp.values, *packed, *layer_idx)
+                .map(|(p, r)| (p, r, *layer_idx)),
+            _ => None,
+        };
+        if let Some((mut patched, row, layer_idx)) = sp_promoted
+            && patched
+                .try_set(row, layer_idx, key, value.clone(), true)
+                .is_ok()
+        {
+            self.entries = Entries::Patched(PooledPatched::new(patched), row, layer_idx);
+            return;
+        }
+        if let Entries::Dressed(table, row) = &self.entries {
+            let row = *row;
+            let at = self.position(key);
+            if let Some(patched) = Patched::of_one(
+                PatchedBase::Table(Arc::clone(table)),
+                row,
+                0,
+                key.clone(),
+                value.clone(),
+                at,
+                true,
+            ) {
+                self.entries = Entries::Patched(PooledPatched::new(patched), row, 0);
+                return;
+            }
+            self.entries = table.layout(row).with_entries(key, at, value, true);
+            return;
+        }
+        if let Entries::SeqLayer(layers, row, layer_idx) = &self.entries {
+            let row = *row;
+            let layer_idx = *layer_idx;
+            let at = self.position(key);
+            if let Some(patched) = Patched::of_one(
+                PatchedBase::SeqLayer(Arc::clone(layers), layer_idx),
+                row,
+                layer_idx,
+                key.clone(),
+                value.clone(),
+                at,
+                true,
+            ) {
+                self.entries = Entries::Patched(PooledPatched::new(patched), row, layer_idx);
+                return;
+            }
+            self.entries = layers[usize::from(layer_idx)]
+                .seq_layout(row)
+                .with_entries(key, at, value, true);
+            return;
+        }
+        if let Entries::Patched(..) | Entries::StepPatch(..) = &self.entries {
+            self.entries = self
+                .layout()
+                .with_entries(key, self.position(key), value, true);
+            return;
+        }
+        match self.position(key) {
+            Some(index) => self.replace_at(index, value, true),
+            None => {
+                self.append((key.clone(), value));
+                self.mark_made_of_data();
+            }
+        }
+    }
+
+    /// Set several numeric data controls, reusing one [`Patched`] allocation
+    /// across chord haps that share a [`Table`], [`Patched`], or [`StepPatch`]
+    /// overlay at the same sample.
+    pub(crate) fn set_data_many_cached(
+        &mut self,
+        patches: &[(&Key, f64)],
+        cache: &mut SharedWaveCache,
+    ) {
+        if !patches.is_empty() && patches.len() <= MAX_PATCHES {
+            match &mut self.entries {
+                Entries::Dressed(table, row) => {
+                    let row = *row;
+                    let tag = SharedWaveCache::row_tag(table.has_uniform_keys(), row);
+                    if let Some(cached) = cache.get_table(table, tag) {
+                        self.entries = Entries::Patched(cached.clone(), row, 0);
+                        return;
+                    }
+                    if let Some(mut patched) =
+                        Patched::empty(PatchedBase::Table(Arc::clone(table)), row, 0, true)
+                    {
+                        for (key, num) in patches {
+                            let _ = patched.try_set(row, 0, key, Value::F64(*num), true);
+                        }
+                        let arc = PooledPatched::new(patched);
+                        cache.put_dressed(tag, arc.clone());
+                        self.entries = Entries::Patched(arc, row, 0);
+                        return;
+                    }
+                }
+                Entries::SeqLayer(layers, row, layer_idx) => {
+                    let row = *row;
+                    let layer_idx = *layer_idx;
+                    let tag = SharedWaveCache::row_tag(
+                        layers[usize::from(layer_idx)].seq_has_uniform_keys(),
+                        row,
+                    );
+                    if let Some(cached) = cache.get_seq_layer(layers, layer_idx, tag) {
+                        self.entries = Entries::Patched(cached.clone(), row, layer_idx);
+                        return;
+                    }
+                    if let Some(mut patched) = Patched::empty(
+                        PatchedBase::SeqLayer(Arc::clone(layers), layer_idx),
+                        row,
+                        layer_idx,
+                        true,
+                    ) {
+                        for (key, num) in patches {
+                            let _ = patched.try_set(row, layer_idx, key, Value::F64(*num), true);
+                        }
+                        let arc = PooledPatched::new(patched);
+                        cache.put_dressed(tag, arc.clone());
+                        self.entries = Entries::Patched(arc, row, layer_idx);
+                        return;
+                    }
+                }
+                Entries::Patched(prev, row, layer_idx) => {
+                    let row = *row;
+                    let layer_idx = *layer_idx;
+                    let tag = SharedWaveCache::row_tag(prev.base.has_uniform_keys(), row);
+                    if prev.strong_count() > 1 {
+                        if let Some(cached_out) = cache.get_patched(prev, tag) {
+                            self.entries = Entries::Patched(cached_out.clone(), row, layer_idx);
+                            return;
+                        }
+                        let mut extra = 0usize;
+                        for (i, (key, _)) in patches.iter().enumerate() {
+                            if !prev.has_patch_for(key)
+                                && !patches[..i].iter().any(|(other, _)| other == key)
+                            {
+                                extra += 1;
+                            }
+                        }
+                        if usize::from(prev.len) + extra <= MAX_PATCHES
+                            && (!prev.overlay_after_appended
+                                || patches
+                                    .iter()
+                                    .all(|(k, _)| prev.can_accept_key(row, layer_idx, k)))
+                        {
+                            let mut next = (**prev).clone();
+                            for (key, num) in patches {
+                                let ok = next
+                                    .try_set(row, layer_idx, key, Value::F64(*num), true)
+                                    .is_ok();
+                                debug_assert!(ok);
+                            }
+                            next.made = true;
+                            let arc = PooledPatched::new(next);
+                            cache.put_patched(prev.clone(), tag, arc.clone());
+                            self.entries = Entries::Patched(arc, row, layer_idx);
+                            return;
+                        }
+                    } else if let Some(own) = prev.get_mut() {
+                        let mut extra = 0usize;
+                        for (i, (key, _)) in patches.iter().enumerate() {
+                            if !own.has_patch_for(key)
+                                && !patches[..i].iter().any(|(other, _)| other == key)
+                            {
+                                extra += 1;
+                            }
+                        }
+                        if usize::from(own.len) + extra <= MAX_PATCHES
+                            && (!own.overlay_after_appended
+                                || patches
+                                    .iter()
+                                    .all(|(k, _)| own.can_accept_key(row, layer_idx, k)))
+                        {
+                            for (key, num) in patches {
+                                let ok = own
+                                    .try_set(row, layer_idx, key, Value::F64(*num), true)
+                                    .is_ok();
+                                debug_assert!(ok);
+                            }
+                            own.made = true;
+                            return;
+                        }
+                    }
+                    if !matches!(prev.base, PatchedBase::Patched(_))
+                        && let Some(mut wrapped) =
+                            Patched::empty(PatchedBase::Patched(prev.clone()), row, layer_idx, true)
+                    {
+                        for (key, num) in patches {
+                            let _ = wrapped.try_set(row, layer_idx, key, Value::F64(*num), true);
+                        }
+                        let arc = PooledPatched::new(wrapped);
+                        cache.put_patched(prev.clone(), tag, arc.clone());
+                        self.entries = Entries::Patched(arc, row, layer_idx);
+                        return;
+                    }
+                }
+                Entries::StepPatch(sp, packed, layer_idx) => {
+                    let packed = *packed;
+                    let layer_idx = *layer_idx;
+                    let (row, slot) = StepPatch::unpack(packed);
+                    let slot_key = if sp.head.base.has_uniform_keys() {
+                        slot as u32
+                    } else {
+                        packed
+                    };
+                    let handle = StepPatch(sp.clone());
+                    if let Some(cached) = cache.get_step_patch(&handle, slot_key) {
+                        self.entries = Entries::Patched(cached.clone(), row, layer_idx);
+                        return;
+                    }
+                    if let Some((mut patched, p_row)) =
+                        sp.head.to_patched(&sp.values, packed, layer_idx)
+                        && patches.iter().all(|(key, num)| {
+                            patched
+                                .try_set(p_row, layer_idx, key, Value::F64(*num), true)
+                                .is_ok()
+                        })
+                    {
+                        let arc = PooledPatched::new(patched);
+                        cache.put_step_patch(handle, slot_key, arc.clone());
+                        self.entries = Entries::Patched(arc, p_row, layer_idx);
+                        return;
+                    }
+                }
+                Entries::Builtin(entries, _) => {
+                    if let Some(cached) = cache.get_builtin(entries) {
+                        self.entries = Entries::Patched(cached.clone(), 0, 0);
+                        return;
+                    }
+                    if let Some(mut patched) =
+                        Patched::empty(PatchedBase::Builtin(Arc::clone(entries)), 0, 0, true)
+                    {
+                        for (key, num) in patches {
+                            let _ = patched.try_set(0, 0, key, Value::F64(*num), true);
+                        }
+                        let arc = PooledPatched::new(patched);
+                        cache.put_dressed(SharedWaveCache::ANY_ROW, arc.clone());
+                        self.entries = Entries::Patched(arc, 0, 0);
+                        return;
+                    }
+                }
+                _ => {}
+            }
+        }
+        self.set_data_many(patches);
+    }
+
+    /// Fast single-key `set` into a data object, sharing a `Patched` overlay
+    /// across chord haps through `cache`.
+    pub(crate) fn set_data_single_cached(
+        &mut self,
+        key: &Key,
+        value: &Value,
+        cache: Option<&mut SharedWaveCache>,
+    ) {
+        if let Some(cache) = cache {
+            match &mut self.entries {
+                Entries::Dressed(table, row) => {
+                    let row = *row;
+                    let tag = SharedWaveCache::row_tag(table.has_uniform_keys(), row);
+                    if let Some(cached) = cache.get_table(table, tag) {
+                        self.entries = Entries::Patched(cached.clone(), row, 0);
+                        return;
+                    }
+                    if let Some(mut patched) =
+                        Patched::empty(PatchedBase::Table(Arc::clone(table)), row, 0, true)
+                        && patched.try_set(row, 0, key, value.clone(), true).is_ok()
+                    {
+                        let arc = PooledPatched::new(patched);
+                        cache.put_dressed(tag, arc.clone());
+                        self.entries = Entries::Patched(arc, row, 0);
+                        return;
+                    }
+                }
+                Entries::SeqLayer(layers, row, layer_idx) => {
+                    let row = *row;
+                    let layer_idx = *layer_idx;
+                    let tag = SharedWaveCache::row_tag(
+                        layers[usize::from(layer_idx)].seq_has_uniform_keys(),
+                        row,
+                    );
+                    if let Some(cached) = cache.get_seq_layer(layers, layer_idx, tag) {
+                        self.entries = Entries::Patched(cached.clone(), row, layer_idx);
+                        return;
+                    }
+                    if let Some(mut patched) = Patched::empty(
+                        PatchedBase::SeqLayer(Arc::clone(layers), layer_idx),
+                        row,
+                        layer_idx,
+                        true,
+                    ) && patched
+                        .try_set(row, layer_idx, key, value.clone(), true)
+                        .is_ok()
+                    {
+                        let arc = PooledPatched::new(patched);
+                        cache.put_dressed(tag, arc.clone());
+                        self.entries = Entries::Patched(arc, row, layer_idx);
+                        return;
+                    }
+                }
+                Entries::Patched(prev, row, layer_idx) => {
+                    let row = *row;
+                    let layer_idx = *layer_idx;
+                    let tag = SharedWaveCache::row_tag(prev.base.has_uniform_keys(), row);
+                    if prev.strong_count() > 1 {
+                        if let Some(cached_out) = cache.get_patched(prev, tag) {
+                            self.entries = Entries::Patched(cached_out.clone(), row, layer_idx);
+                            return;
+                        }
+                        let extra = usize::from(!prev.has_patch_for(key));
+                        if usize::from(prev.len) + extra <= MAX_PATCHES
+                            && prev.can_accept_key(row, layer_idx, key)
+                        {
+                            let mut next = (**prev).clone();
+                            let ok = next
+                                .try_set(row, layer_idx, key, value.clone(), true)
+                                .is_ok();
+                            debug_assert!(ok);
+                            next.made = true;
+                            let arc = PooledPatched::new(next);
+                            cache.put_patched(prev.clone(), tag, arc.clone());
+                            self.entries = Entries::Patched(arc, row, layer_idx);
+                            return;
+                        }
+                    } else if let Some(own) = prev.get_mut() {
+                        let extra = usize::from(!own.has_patch_for(key));
+                        if usize::from(own.len) + extra <= MAX_PATCHES
+                            && own.can_accept_key(row, layer_idx, key)
+                        {
+                            let ok = own
+                                .try_set(row, layer_idx, key, value.clone(), true)
+                                .is_ok();
+                            debug_assert!(ok);
+                            own.made = true;
+                            return;
+                        }
+                    }
+                    if !matches!(prev.base, PatchedBase::Patched(_))
+                        && let Some(mut wrapped) =
+                            Patched::empty(PatchedBase::Patched(prev.clone()), row, layer_idx, true)
+                    {
+                        let _ = wrapped.try_set(row, layer_idx, key, value.clone(), true);
+                        let arc = PooledPatched::new(wrapped);
+                        cache.put_patched(prev.clone(), tag, arc.clone());
+                        self.entries = Entries::Patched(arc, row, layer_idx);
+                        return;
+                    }
+                }
+                Entries::StepPatch(sp, packed, layer_idx) => {
+                    let packed = *packed;
+                    let layer_idx = *layer_idx;
+                    let (row, slot) = StepPatch::unpack(packed);
+                    let slot_key = if sp.head.base.has_uniform_keys() {
+                        slot as u32
+                    } else {
+                        packed
+                    };
+                    let handle = StepPatch(sp.clone());
+                    if let Some(cached) = cache.get_step_patch(&handle, slot_key) {
+                        self.entries = Entries::Patched(cached.clone(), row, layer_idx);
+                        return;
+                    }
+                    if let Some((mut patched, p_row)) =
+                        sp.head.to_patched(&sp.values, packed, layer_idx)
+                        && patched
+                            .try_set(p_row, layer_idx, key, value.clone(), true)
+                            .is_ok()
+                    {
+                        let arc = PooledPatched::new(patched);
+                        cache.put_step_patch(handle, slot_key, arc.clone());
+                        self.entries = Entries::Patched(arc, p_row, layer_idx);
+                        return;
+                    }
+                }
+                Entries::Builtin(entries, _) => {
+                    if let Some(cached) = cache.get_builtin(entries) {
+                        self.entries = Entries::Patched(cached.clone(), 0, 0);
+                        return;
+                    }
+                    if let Some(mut patched) =
+                        Patched::empty(PatchedBase::Builtin(Arc::clone(entries)), 0, 0, true)
+                        && patched.try_set(0, 0, key, value.clone(), true).is_ok()
+                    {
+                        let arc = PooledPatched::new(patched);
+                        cache.put_dressed(SharedWaveCache::ANY_ROW, arc.clone());
+                        self.entries = Entries::Patched(arc, 0, 0);
+                        return;
+                    }
+                }
+                _ => {}
+            }
+        }
+        self.set_data(key, value.clone());
+        self.mark_made_of_data();
+    }
+
+    pub(crate) fn merge_set_data_cached(
+        &mut self,
+        other: &Self,
+        mut cache: Option<&mut SharedWaveCache>,
+    ) {
+        if other.is_empty() {
+            return;
+        }
+        let other_len = other.len();
+        if other_len >= 2
+            && let Some(ov_entries) = other.as_builtin()
+        {
+            match &mut self.entries {
+                Entries::Dressed(table, row) => {
+                    let row = *row;
+                    let tag = SharedWaveCache::row_tag(table.has_uniform_keys(), row);
+                    if let Some(c) = cache.as_deref()
+                        && let Some(cached) = c.get_table(table, tag)
+                    {
+                        self.entries = Entries::Patched(cached.clone(), row, 0);
+                        return;
+                    }
+                    if let Some(patched) = Patched::with_overlay(
+                        PatchedBase::Table(Arc::clone(table)),
+                        row,
+                        0,
+                        Arc::clone(ov_entries),
+                        true,
+                    ) {
+                        let arc = PooledPatched::new(patched);
+                        if let Some(c) = cache.as_deref_mut() {
+                            c.put_dressed(tag, arc.clone());
+                        }
+                        self.entries = Entries::Patched(arc, row, 0);
+                        return;
+                    }
+                }
+                Entries::SeqLayer(layers, row, layer_idx) => {
+                    let row = *row;
+                    let layer_idx = *layer_idx;
+                    let tag = SharedWaveCache::row_tag(
+                        layers[usize::from(layer_idx)].seq_has_uniform_keys(),
+                        row,
+                    );
+                    if let Some(c) = cache.as_deref()
+                        && let Some(cached) = c.get_seq_layer(layers, layer_idx, tag)
+                    {
+                        self.entries = Entries::Patched(cached.clone(), row, layer_idx);
+                        return;
+                    }
+                    if let Some(patched) = Patched::with_overlay(
+                        PatchedBase::SeqLayer(Arc::clone(layers), layer_idx),
+                        row,
+                        layer_idx,
+                        Arc::clone(ov_entries),
+                        true,
+                    ) {
+                        let arc = PooledPatched::new(patched);
+                        if let Some(c) = cache.as_deref_mut() {
+                            c.put_dressed(tag, arc.clone());
+                        }
+                        self.entries = Entries::Patched(arc, row, layer_idx);
+                        return;
+                    }
+                }
+                Entries::Patched(prev, row, layer_idx) => {
+                    let row = *row;
+                    let layer_idx = *layer_idx;
+                    let tag = SharedWaveCache::row_tag(prev.base.has_uniform_keys(), row);
+                    if prev.overlay.is_none() {
+                        if prev.strong_count() > 1 {
+                            if let Some(c) = cache.as_deref()
+                                && let Some(cached_out) = c.get_patched(prev, tag)
+                            {
+                                self.entries = Entries::Patched(cached_out.clone(), row, layer_idx);
+                                return;
+                            }
+                            let mut next = (**prev).clone();
+                            if next.attach_overlay(row, layer_idx, Arc::clone(ov_entries), true) {
+                                next.made = true;
+                                let arc = PooledPatched::new(next);
+                                if let Some(c) = cache.as_deref_mut() {
+                                    c.put_patched(prev.clone(), tag, arc.clone());
+                                }
+                                self.entries = Entries::Patched(arc, row, layer_idx);
+                                return;
+                            }
+                        } else if let Some(own) = prev.get_mut()
+                            && own.attach_overlay(row, layer_idx, Arc::clone(ov_entries), true)
+                        {
+                            own.made = true;
+                            return;
+                        }
+                    }
+                    if !matches!(prev.base, PatchedBase::Patched(_)) {
+                        if let Some(c) = cache.as_deref()
+                            && let Some(cached_out) = c.get_patched(prev, tag)
+                        {
+                            self.entries = Entries::Patched(cached_out.clone(), row, layer_idx);
+                            return;
+                        }
+                        if let Some(patched) = Patched::with_overlay(
+                            PatchedBase::Patched(prev.clone()),
+                            row,
+                            layer_idx,
+                            Arc::clone(ov_entries),
+                            true,
+                        ) {
+                            let arc = PooledPatched::new(patched);
+                            if let Some(c) = cache.as_deref_mut() {
+                                c.put_patched(prev.clone(), tag, arc.clone());
+                            }
+                            self.entries = Entries::Patched(arc, row, layer_idx);
+                            return;
+                        }
+                    }
+                }
+                Entries::Builtin(entries, _) => {
+                    if let Some(c) = cache.as_deref()
+                        && let Some(cached) = c.get_builtin(entries)
+                    {
+                        self.entries = Entries::Patched(cached.clone(), 0, 0);
+                        return;
+                    }
+                    if let Some(patched) = Patched::with_overlay(
+                        PatchedBase::Builtin(Arc::clone(entries)),
+                        0,
+                        0,
+                        Arc::clone(ov_entries),
+                        true,
+                    ) {
+                        let arc = PooledPatched::new(patched);
+                        if let Some(c) = cache.as_deref_mut() {
+                            c.put_dressed(SharedWaveCache::ANY_ROW, arc.clone());
+                        }
+                        self.entries = Entries::Patched(arc, 0, 0);
+                        return;
+                    }
+                }
+                Entries::StepPatch(sp, packed, layer_idx) => {
+                    let packed = *packed;
+                    let layer_idx = *layer_idx;
+                    let (row, slot) = StepPatch::unpack(packed);
+                    let slot_key = if sp.head.base.has_uniform_keys() {
+                        slot as u32
+                    } else {
+                        packed
+                    };
+                    let handle = StepPatch(sp.clone());
+                    if let Some(c) = cache.as_deref()
+                        && let Some(cached) = c.get_step_patch(&handle, slot_key)
+                    {
+                        self.entries = Entries::Patched(cached.clone(), row, layer_idx);
+                        return;
+                    }
+                    if let Some((mut patched, p_row)) =
+                        sp.head.to_patched(&sp.values, packed, layer_idx)
+                        && patched.attach_overlay(p_row, layer_idx, Arc::clone(ov_entries), true)
+                    {
+                        patched.made = true;
+                        let arc = PooledPatched::new(patched);
+                        if let Some(c) = cache.as_deref_mut() {
+                            c.put_step_patch(handle, slot_key, arc.clone());
+                        }
+                        self.entries = Entries::Patched(arc, p_row, layer_idx);
+                        return;
+                    }
+                }
+                _ => {}
+            }
+        }
+        if other_len <= MAX_PATCHES {
+            match &mut self.entries {
+                Entries::Dressed(table, row) => {
+                    let row = *row;
+                    let tag = SharedWaveCache::row_tag(table.has_uniform_keys(), row);
+                    if let Some(c) = cache.as_deref()
+                        && let Some(cached) = c.get_table(table, tag)
+                    {
+                        self.entries = Entries::Patched(cached.clone(), row, 0);
+                        return;
+                    }
+                    if let Some(mut patched) =
+                        Patched::empty(PatchedBase::Table(Arc::clone(table)), row, 0, true)
+                    {
+                        for (key, value) in other.pairs() {
+                            let ok = patched.try_set(row, 0, key, value.clone(), true).is_ok();
+                            debug_assert!(ok);
+                        }
+                        let arc = PooledPatched::new(patched);
+                        if let Some(c) = cache.as_deref_mut() {
+                            c.put_dressed(tag, arc.clone());
+                        }
+                        self.entries = Entries::Patched(arc, row, 0);
+                        return;
+                    }
+                }
+                Entries::SeqLayer(layers, row, layer_idx) => {
+                    let row = *row;
+                    let layer_idx = *layer_idx;
+                    let tag = SharedWaveCache::row_tag(
+                        layers[usize::from(layer_idx)].seq_has_uniform_keys(),
+                        row,
+                    );
+                    if let Some(c) = cache.as_deref()
+                        && let Some(cached) = c.get_seq_layer(layers, layer_idx, tag)
+                    {
+                        self.entries = Entries::Patched(cached.clone(), row, layer_idx);
+                        return;
+                    }
+                    if let Some(mut patched) = Patched::empty(
+                        PatchedBase::SeqLayer(Arc::clone(layers), layer_idx),
+                        row,
+                        layer_idx,
+                        true,
+                    ) {
+                        for (key, value) in other.pairs() {
+                            let ok = patched
+                                .try_set(row, layer_idx, key, value.clone(), true)
+                                .is_ok();
+                            debug_assert!(ok);
+                        }
+                        let arc = PooledPatched::new(patched);
+                        if let Some(c) = cache.as_deref_mut() {
+                            c.put_dressed(tag, arc.clone());
+                        }
+                        self.entries = Entries::Patched(arc, row, layer_idx);
+                        return;
+                    }
+                }
+                Entries::Patched(prev, row, layer_idx) => {
+                    let row = *row;
+                    let layer_idx = *layer_idx;
+                    let tag = SharedWaveCache::row_tag(prev.base.has_uniform_keys(), row);
+                    if prev.strong_count() > 1 {
+                        if let Some(c) = cache.as_deref()
+                            && let Some(cached_out) = c.get_patched(prev, tag)
+                        {
+                            self.entries = Entries::Patched(cached_out.clone(), row, layer_idx);
+                            return;
+                        }
+                        let extra = other
+                            .pairs()
+                            .filter(|(k, _)| !prev.has_patch_for(k))
+                            .count();
+                        if usize::from(prev.len) + extra <= MAX_PATCHES
+                            && (!prev.overlay_after_appended
+                                || other
+                                    .pairs()
+                                    .all(|(k, _)| prev.can_accept_key(row, layer_idx, k)))
+                        {
+                            let mut next = (**prev).clone();
+                            for (key, value) in other.pairs() {
+                                let ok = next
+                                    .try_set(row, layer_idx, key, value.clone(), true)
+                                    .is_ok();
+                                debug_assert!(ok);
+                            }
+                            next.made = true;
+                            let arc = PooledPatched::new(next);
+                            if let Some(c) = cache {
+                                c.put_patched(prev.clone(), tag, arc.clone());
+                            }
+                            self.entries = Entries::Patched(arc, row, layer_idx);
+                            return;
+                        }
+                    } else if let Some(own) = prev.get_mut() {
+                        let extra = other.pairs().filter(|(k, _)| !own.has_patch_for(k)).count();
+                        if usize::from(own.len) + extra <= MAX_PATCHES
+                            && (!own.overlay_after_appended
+                                || other
+                                    .pairs()
+                                    .all(|(k, _)| own.can_accept_key(row, layer_idx, k)))
+                        {
+                            for (key, value) in other.pairs() {
+                                let ok = own
+                                    .try_set(row, layer_idx, key, value.clone(), true)
+                                    .is_ok();
+                                debug_assert!(ok);
+                            }
+                            own.made = true;
+                            return;
+                        }
+                    }
+                    if !matches!(prev.base, PatchedBase::Patched(_))
+                        && let Some(mut wrapped) =
+                            Patched::empty(PatchedBase::Patched(prev.clone()), row, layer_idx, true)
+                    {
+                        for (key, value) in other.pairs() {
+                            let _ = wrapped.try_set(row, layer_idx, key, value.clone(), true);
+                        }
+                        let arc = PooledPatched::new(wrapped);
+                        if let Some(c) = cache {
+                            c.put_patched(prev.clone(), tag, arc.clone());
+                        }
+                        self.entries = Entries::Patched(arc, row, layer_idx);
+                        return;
+                    }
+                }
+                _ => {}
+            }
+        }
+        self.merge(other, |_, value| value.clone());
+        self.mark_made_of_data();
+    }
+
+    /// Set several numeric data controls in one pass, allocating at most once.
+    /// Later entries in `patches` win over earlier ones of the same key while
+    /// preserving insertion order.
+    pub(crate) fn set_data_many(&mut self, patches: &[(&Key, f64)]) {
+        match patches {
+            [] => {}
+            [(key, value)] => self.set_data(key, Value::F64(*value)),
+            _ => {
+                if patches.len() <= MAX_PATCHES {
+                    match &mut self.entries {
+                        Entries::Dressed(table, row) => {
+                            let row = *row;
+                            if let Some(mut patched) =
+                                Patched::empty(PatchedBase::Table(Arc::clone(table)), row, 0, true)
+                            {
+                                for (key, num) in patches {
+                                    let _ = patched.try_set(row, 0, key, Value::F64(*num), true);
+                                }
+                                self.entries =
+                                    Entries::Patched(PooledPatched::new(patched), row, 0);
+                                return;
+                            }
+                        }
+                        Entries::SeqLayer(layers, row, layer_idx) => {
+                            let row = *row;
+                            let layer_idx = *layer_idx;
+                            if let Some(mut patched) = Patched::empty(
+                                PatchedBase::SeqLayer(Arc::clone(layers), layer_idx),
+                                row,
+                                layer_idx,
+                                true,
+                            ) {
+                                for (key, num) in patches {
+                                    let _ = patched.try_set(
+                                        row,
+                                        layer_idx,
+                                        key,
+                                        Value::F64(*num),
+                                        true,
+                                    );
+                                }
+                                self.entries =
+                                    Entries::Patched(PooledPatched::new(patched), row, layer_idx);
+                                return;
+                            }
+                        }
+                        Entries::Patched(patched, row, layer_idx) => {
+                            let row = *row;
+                            let layer_idx = *layer_idx;
+                            if let Some(own) = patched.get_mut() {
+                                let mut extra = 0usize;
+                                for (i, (key, _)) in patches.iter().enumerate() {
+                                    if !own.has_patch_for(key)
+                                        && !patches[..i].iter().any(|(prev, _)| prev == key)
+                                    {
+                                        extra += 1;
+                                    }
+                                }
+                                if usize::from(own.len) + extra <= MAX_PATCHES
+                                    && (!own.overlay_after_appended
+                                        || patches
+                                            .iter()
+                                            .all(|(k, _)| own.can_accept_key(row, layer_idx, k)))
+                                {
+                                    for (key, num) in patches {
+                                        let ok = own
+                                            .try_set(row, layer_idx, key, Value::F64(*num), true)
+                                            .is_ok();
+                                        debug_assert!(ok);
+                                    }
+                                    return;
+                                }
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                let layout = self.layout();
+                let base_len = layout.len();
+                // For each patch, record whether it appends a new key after the
+                // base entries, and skip earlier duplicates of a fresh key.
+                let mut append_indices = [0usize; 8];
+                let mut append_len = 0usize;
+                for (i, (key, _)) in patches.iter().enumerate() {
+                    if self.position(*key).is_some() {
+                        continue;
+                    }
+                    if patches[..i].iter().any(|(prev, _)| prev == key) {
+                        continue;
+                    }
+                    append_indices[append_len] = i;
+                    append_len += 1;
+                }
+                if append_len == 0 {
+                    match &mut self.entries {
+                        Entries::Builtin(b, is_made) => {
+                            if let Some(own) = Arc::get_mut(b)
+                                && let Some((keys, values)) = own.parts_mut()
+                            {
+                                for (key, num) in patches {
+                                    let packed =
+                                        crate::controls::pack_builtin_key_str(key.as_str());
+                                    if let Some(at) = keys.iter().position(|&k| k == packed) {
+                                        values[at] = Value::F64(*num);
+                                    }
+                                }
+                                *is_made = true;
+                                return;
+                            }
+                        }
+                        Entries::Shared(entries) | Entries::Made(entries) => {
+                            if let Some(own) = Arc::get_mut(entries) {
+                                for (key, num) in patches {
+                                    if let Some((_, val)) = own.iter_mut().find(|(k, _)| k == *key)
+                                    {
+                                        *val = Value::F64(*num);
+                                    }
+                                }
+                                self.mark_made_of_data();
+                                return;
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                let mut taken = std::mem::replace(&mut self.entries, Entries::Empty);
+                let mut held = match &mut taken {
+                    Entries::Shared(entries) | Entries::Made(entries) => {
+                        match Arc::get_mut(entries) {
+                            Some(own) => Held::Own(own),
+                            None => Held::View(Layout::Plain(Slice::Plain(entries))),
+                        }
+                    }
+                    Entries::Builtin(entries, _) => Held::View(Layout::Plain(entries.as_slice())),
+                    Entries::StaticInt(id, n, _) => Held::View(static_int_layout(*id, *n)),
+                    Entries::Empty => Held::View(Layout::Plain(Slice::EMPTY)),
+                    Entries::Dressed(table, index) => Held::View(table.layout(*index)),
+                    Entries::SeqLayer(layers, row, layer_idx) => {
+                        Held::View(layers[usize::from(*layer_idx)].seq_layout(*row))
+                    }
+                    Entries::Patched(patched, row, layer_idx) => {
+                        Held::View(Layout::Overlay(patched, *row, *layer_idx))
+                    }
+                    Entries::StepPatch(step, packed, layer_idx) => Held::View(Layout::StepOverlay(
+                        &step.head,
+                        &step.values,
+                        *packed,
+                        *layer_idx,
+                    )),
+                };
+                let count = base_len + append_len;
+                self.entries = pack_entries(
+                    count,
+                    |index| {
+                        if index < base_len {
+                            let (key, value) = held.take(index);
+                            if let Some((_, num)) = patches.iter().rev().find(|(k, _)| **k == key) {
+                                (key, Value::F64(*num))
+                            } else {
+                                (key, value)
+                            }
+                        } else {
+                            let patch_idx = append_indices[index - base_len];
+                            let key = patches[patch_idx].0;
+                            let (_, num) = patches
+                                .iter()
+                                .rev()
+                                .find(|(k, _)| *k == key)
+                                .expect("patch key is present");
+                            (key.clone(), Value::F64(*num))
+                        }
+                    },
+                    true,
+                );
+            }
+        }
+    }
+
+    /// A map of one entry: the control of one value, which a graph holds
+    /// for each step.
+    pub(crate) fn of_one(key: Key, value: Value) -> Self {
+        let packed = crate::controls::pack_builtin_key_str(key.as_str());
+        if packed != 0 {
+            if let Some(n) = static_int_of(&value) {
+                return Self {
+                    entries: Entries::StaticInt(packed & 0x03ff, n, false),
+                };
+            }
+            return Self {
+                entries: Entries::Builtin(
+                    Arc::new(BuiltinMap {
+                        keys: [packed],
+                        values: [value],
+                    }),
+                    false,
+                ),
+            };
+        }
+        Self {
+            entries: Entries::Shared(Arc::new([(key, value)])),
+        }
+    }
+
+    pub fn from_entries(entries: impl IntoIterator<Item = (String, Value)>) -> Self {
+        // The entries in one list first: a later entry of a key takes the
+        // place of the value of that key.
+        let mut held: Vec<(Key, Value)> = Vec::new();
+        for (key, value) in entries {
+            match held.iter_mut().find(|(name, _)| *name == *key) {
+                Some((_, current)) => *current = value,
+                None => held.push((Key::from(key), value)),
+            }
+        }
+        let len = held.len();
+        let mut iter = held.into_iter();
+        Self {
+            entries: pack_entries(len, |_| iter.next().expect("exact len"), false),
+        }
     }
 
     pub fn insert(&mut self, key: String, value: Value) -> Option<Value> {
@@ -230,26 +5616,93 @@ impl OrderedMap {
     /// [`Self::insert`] of a key that another map or a control already
     /// holds, which the map then shares.
     pub fn insert_key(&mut self, key: Key, value: Value) -> Option<Value> {
-        let entries = self.entries_mut(0);
-        if let Some((_, current)) = entries.iter_mut().find(|(name, _)| *name == key) {
-            return Some(std::mem::replace(current, value));
+        if let Entries::Patched(patched, row, layer_idx) = &mut self.entries
+            && let (row, layer_idx) = (*row, *layer_idx)
+            && let Some(own) = patched.get_mut()
+        {
+            if let Some(idx) = own.find_slot(&key) {
+                own.made = false;
+                return Some(std::mem::replace(own.slot_val_mut(idx), value));
+            }
+            if usize::from(own.len) < MAX_PATCHES {
+                let mark = Table::mark(key.as_str());
+                let (old, replace) = if own.base.marks() & mark != 0
+                    && let layout = own.base.layout(row, layer_idx)
+                    && let Some(idx) = layout.position(&key)
+                {
+                    (Some(layout.at(idx).1.clone()), idx as u16)
+                } else if let Some(overlay) = &own.overlay
+                    && let ov = overlay.as_slice()
+                    && let Some(pos) = ov.position_str(key.as_str())
+                {
+                    (Some(ov.at(pos).1.clone()), own.base_len + pos as u16)
+                } else {
+                    (None, u16::MAX)
+                };
+                own.push_slot(key, value, replace);
+                if replace == u16::MAX {
+                    own.appended += 1;
+                } else {
+                    own.has_replace = true;
+                }
+                own.marks |= mark;
+                own.made = false;
+                return old;
+            }
         }
-        entries.push((key, value));
-        None
-    }
-
-    /// `key`'s value replaced by what `make` makes of it where it is, or
-    /// `make(None)` added last when the map has no such key.
-    pub(crate) fn upsert(&mut self, key: &Key, make: impl FnOnce(Option<&Value>) -> Value) {
-        let entries = self.entries_mut(0);
-        match entries.iter().position(|(name, _)| name == key) {
+        if let Entries::Dressed(table, row) = &self.entries {
+            let row = *row;
+            let at = self.position(&key);
+            let old = at.map(|idx| table.layout(row).at(idx).1.clone());
+            if let Some(patched) = Patched::of_one(
+                PatchedBase::Table(Arc::clone(table)),
+                row,
+                0,
+                key.clone(),
+                value.clone(),
+                at,
+                false,
+            ) {
+                self.entries = Entries::Patched(PooledPatched::new(patched), row, 0);
+                return old;
+            }
+            self.entries = table.layout(row).with_entries(&key, at, value, false);
+            return old;
+        }
+        if let Entries::SeqLayer(layers, row, layer_idx) = &self.entries {
+            let row = *row;
+            let layer_idx = *layer_idx;
+            let at = self.position(&key);
+            let layout = layers[usize::from(layer_idx)].seq_layout(row);
+            let old = at.map(|idx| layout.at(idx).1.clone());
+            if let Some(patched) = Patched::of_one(
+                PatchedBase::SeqLayer(Arc::clone(layers), layer_idx),
+                row,
+                layer_idx,
+                key.clone(),
+                value.clone(),
+                at,
+                false,
+            ) {
+                self.entries = Entries::Patched(PooledPatched::new(patched), row, layer_idx);
+                return old;
+            }
+            self.entries = layout.with_entries(&key, at, value, false);
+            return old;
+        }
+        match self.position(&key) {
             Some(index) => {
-                let value = make(Some(&entries[index].1));
-                entries[index].1 = value;
+                if matches!(self.entries, Entries::Builtin(..)) {
+                    let old = self.layout().at(index).1.clone();
+                    self.replace_at(index, value, false);
+                    Some(old)
+                } else {
+                    Some(std::mem::replace(&mut self.entries_mut()[index].1, value))
+                }
             }
             None => {
-                let value = make(None);
-                entries.push((key.clone(), value));
+                self.append((key, value));
+                None
             }
         }
     }
@@ -259,53 +5712,79 @@ impl OrderedMap {
         self.insert(entry.0, entry.1);
     }
 
+    #[inline]
     pub fn get(&self, key: &str) -> Option<&Value> {
-        self.entries()
-            .iter()
-            .find_map(|(name, value)| (name == key).then_some(value))
+        match &self.entries {
+            Entries::Empty => None,
+            Entries::Shared(entries) | Entries::Made(entries) => Slice::Plain(entries).get_str(key),
+            Entries::Builtin(entries, _) => entries.as_slice().get_str(key),
+            Entries::StaticInt(id, n, _) => (crate::controls::builtin_name_str_by_id(*id)
+                == Some(key))
+            .then(|| static_int_value(*n)),
+            Entries::Dressed(table, index) => match table.marks() & Table::mark(key) {
+                0 => None,
+                _ => table.layout(*index).get(key),
+            },
+            Entries::SeqLayer(layers, row, layer_idx) => {
+                layers[usize::from(*layer_idx)].seq_get(*row, key)
+            }
+            Entries::Patched(patched, row, layer_idx) => patched.get(*row, *layer_idx, key),
+            Entries::StepPatch(step, packed, layer_idx) => {
+                step.head.get(&step.values, *packed, *layer_idx, key)
+            }
+        }
     }
 
     pub fn get_mut(&mut self, key: &str) -> Option<&mut Value> {
-        if !self.contains_key(key) {
-            return None;
-        }
-        self.entries_mut(0)
-            .iter_mut()
-            .find_map(|(name, value)| (name == key).then_some(value))
+        let index = self.position(key)?;
+        Some(&mut self.entries_mut()[index].1)
     }
 
     pub fn remove(&mut self, key: &str) -> Option<Value> {
-        if !self.contains_key(key) {
-            return None;
-        }
-        let entries = self.entries_mut(0);
-        let index = entries.iter().position(|(name, _)| name == key)?;
-        Some(entries.remove(index).1)
+        let at = self.position(key)?;
+        let removed = std::mem::replace(&mut self.entries_mut()[at].1, Value::Undefined);
+        // The entries but the one at `at`.
+        self.rebuild(self.len() - 1, |entries, index| {
+            entries.take(index + usize::from(index >= at))
+        });
+        Some(removed)
     }
 
+    #[inline]
     pub fn contains_key(&self, key: &str) -> bool {
-        self.entries().iter().any(|(name, _)| name == key)
+        self.get(key).is_some()
     }
 
+    #[inline]
     pub fn len(&self) -> usize {
-        self.entries().len()
+        match &self.entries {
+            Entries::Empty => 0,
+            Entries::Shared(entries) | Entries::Made(entries) => entries.len(),
+            Entries::Builtin(entries, _) => entries.keys().len(),
+            Entries::StaticInt(..) => 1,
+            Entries::Dressed(table, index) => table.layout(*index).len(),
+            Entries::SeqLayer(layers, row, layer_idx) => {
+                layers[usize::from(*layer_idx)].seq_len(*row)
+            }
+            Entries::Patched(patched, _, _) => patched.len(),
+            Entries::StepPatch(step, _, _) => step.head.len(),
+        }
     }
 
     pub fn is_empty(&self) -> bool {
-        self.entries().is_empty()
+        self.len() == 0
     }
 
+    #[inline]
     pub fn iter(&self) -> impl Iterator<Item = (&str, &Value)> {
-        self.entries()
-            .iter()
-            .map(|(name, value)| (name.as_str(), value))
+        self.pairs().map(|(name, value)| (name.as_str(), value))
     }
 
     /// ECMAScript `Object.keys` order.
     pub fn js_entries(&self) -> Vec<(&str, &Value)> {
         let mut integer = Vec::new();
         let mut strings = Vec::new();
-        for (position, (key, value)) in self.entries().iter().enumerate() {
+        for (position, (key, value)) in self.pairs().enumerate() {
             if let Some(index) = array_index(key) {
                 integer.push((index, key.as_str(), value));
             } else {
@@ -323,21 +5802,33 @@ impl OrderedMap {
 
 impl<'a> IntoIterator for &'a OrderedMap {
     type Item = (&'a Key, &'a Value);
-    type IntoIter =
-        std::iter::Map<std::slice::Iter<'a, (Key, Value)>, fn(&(Key, Value)) -> (&Key, &Value)>;
+    type IntoIter = Pairs<'a>;
 
     fn into_iter(self) -> Self::IntoIter {
-        fn pair(entry: &(Key, Value)) -> (&Key, &Value) {
-            (&entry.0, &entry.1)
-        }
-        self.entries().iter().map(pair)
+        self.pairs()
     }
 }
 
 /// A key of an [`OrderedMap`]. Every copy of a map, and every map that a
 /// control makes, shares its key's one allocation.
-#[derive(Clone, PartialEq, Eq, Hash)]
+#[derive(Clone, Eq)]
 pub struct Key(Arc<str>);
+
+impl PartialEq for Key {
+    fn eq(&self, other: &Self) -> bool {
+        // Maps that share a key's allocation answer by pointer; only keys
+        // from different allocations compare their text.
+        Arc::ptr_eq(&self.0, &other.0) || self.0 == other.0
+    }
+}
+
+impl Hash for Key {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        // By text, so equal keys hash equal whether or not they share an
+        // allocation.
+        self.0.hash(state)
+    }
+}
 
 impl Key {
     pub fn as_str(&self) -> &str {
@@ -433,11 +5924,29 @@ fn array_index(key: &str) -> Option<u32> {
 #[derive(Clone)]
 pub struct FunctionRef {
     id: u64,
-    name: Option<std::sync::Arc<str>>,
+    name: Option<SharedStr>,
     kind: FunctionKind,
     /// The first runtime that exposed this callable as metadata. An outer
     /// container must not replace the realm already owned by a nested value.
     runtime_settings: Option<crate::settings::RuntimeSettings>,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) enum OffLayerOp<'a> {
+    Compose {
+        other: &'a crate::Pattern,
+        op: crate::compose::ComposeOp,
+        align: Option<crate::compose::Alignment>,
+    },
+    ComposeNumber {
+        op: crate::compose::ComposeOp,
+        value: f64,
+        align: Option<crate::compose::Alignment>,
+    },
+    ControlNumber {
+        spec: &'static crate::controls::ControlSpec,
+        value: f64,
+    },
 }
 
 #[derive(Clone)]
@@ -448,6 +5957,9 @@ enum FunctionKind {
         >,
         any: std::sync::Arc<dyn Fn(crate::Pattern) -> crate::Pattern + Send + Sync>,
     },
+    /// A compiled native pattern-transform program (e.g. a native arrow chain)
+    /// stored directly without closure wrappers.
+    NativeProgram(std::sync::Arc<crate::callback_ir::PatternTransformProgram>),
     /// An opaque JavaScript function. Resolved through the callback host.
     Js(crate::CallbackId),
     /// A bounded native candidate whose exact JavaScript callable remains
@@ -472,6 +5984,49 @@ enum FunctionKind {
         apply: std::sync::Arc<dyn Fn(crate::Pattern) -> crate::Pattern + Send + Sync>,
         provable_pure: bool,
     },
+    /// Inline compose transformer (`add(p)`, `mulIn(p)`, etc.), avoiding a
+    /// heap-allocated `Arc<dyn Fn>` closure.
+    Compose {
+        other: crate::Pattern,
+        op: crate::compose::ComposeOp,
+        align: Option<crate::compose::Alignment>,
+        provable_pure: bool,
+    },
+    /// Inline numeric compose transformer (`add(7)`, `sub(12)`, etc.), avoiding
+    /// both `Node::Pure` and `Arc<dyn Fn>` heap allocations.
+    ComposeNumber {
+        op: crate::compose::ComposeOp,
+        value: f64,
+        align: Option<crate::compose::Alignment>,
+    },
+    /// Inline bound 1-arg scalar registered transformer (e.g. `fast(2)`),
+    /// avoiding both `Node::Pure` and `Arc<dyn Fn>` heap allocations.
+    BoundScalar {
+        registration: &'static crate::register::Registration,
+        arg: Value,
+        provable_pure: bool,
+    },
+    /// Inline bound 1-arg pattern registered transformer, avoiding an
+    /// `Arc<dyn Fn>` closure allocation.
+    BoundOne {
+        registration: &'static crate::register::Registration,
+        arg: crate::Pattern,
+        provable_pure: bool,
+    },
+    /// Inline single numeric control transformer (`x => x.gain(0.5)`),
+    /// avoiding an `Arc<dyn Fn>` closure allocation.
+    ControlNumber {
+        spec: &'static crate::controls::ControlSpec,
+        value: f64,
+    },
+    /// Inline two-number control chain transformer (`x => x.lpf(800).gain(0.5)`),
+    /// avoiding an `Arc<dyn Fn>` closure allocation.
+    ControlTwoNumbers {
+        s0: &'static crate::controls::ControlSpec,
+        v0: f64,
+        s1: &'static crate::controls::ControlSpec,
+        v1: f64,
+    },
 }
 
 static NEXT_FUNCTION_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
@@ -490,10 +6045,27 @@ impl FunctionRef {
     ) -> Self {
         Self {
             id: NEXT_FUNCTION_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
-            name: name.map(std::sync::Arc::from),
+            name: name.map(SharedStr::from),
             kind: FunctionKind::Native { pure, any },
             runtime_settings: None,
         }
+    }
+
+    /// A native transformer backed directly by a [`PatternTransformProgram`],
+    /// avoiding extra closure `Arc` allocations.
+    pub fn native_program(program: crate::callback_ir::PatternTransformProgram) -> Self {
+        Self {
+            id: NEXT_FUNCTION_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+            name: None,
+            kind: FunctionKind::NativeProgram(std::sync::Arc::new(program)),
+            runtime_settings: None,
+        }
+    }
+
+    /// Clear any display name (for anonymous arrows that wrap a single native
+    /// transformer directly).
+    pub fn clear_name(&mut self) {
+        self.name = None;
     }
 
     /// A partially applied registered combinator, as `fast(2)` produces.
@@ -507,11 +6079,119 @@ impl FunctionRef {
     ) -> Self {
         Self {
             id: NEXT_FUNCTION_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
-            name: Some(std::sync::Arc::from(name)),
+            name: (!name.is_empty()).then(|| SharedStr::from(name)),
             kind: FunctionKind::Registered {
                 apply,
                 provable_pure,
             },
+            runtime_settings: None,
+        }
+    }
+
+    /// An inline compose transformer (`add(other)`, `mulIn(other)`, etc.) with
+    /// no closure allocation.
+    pub fn compose(
+        name: &str,
+        other: crate::Pattern,
+        op: crate::compose::ComposeOp,
+        align: Option<crate::compose::Alignment>,
+        provable_pure: bool,
+    ) -> Self {
+        Self {
+            id: NEXT_FUNCTION_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+            name: (!name.is_empty()).then(|| SharedStr::from(name)),
+            kind: FunctionKind::Compose {
+                other,
+                op,
+                align,
+                provable_pure,
+            },
+            runtime_settings: None,
+        }
+    }
+
+    /// An inline numeric compose transformer (`add(7)`, `sub(12)`, etc.) with
+    /// no `Node::Pure` or closure allocation.
+    pub fn compose_number(
+        name: &str,
+        op: crate::compose::ComposeOp,
+        value: f64,
+        align: Option<crate::compose::Alignment>,
+    ) -> Self {
+        Self {
+            id: NEXT_FUNCTION_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+            name: (!name.is_empty()).then(|| SharedStr::from(name)),
+            kind: FunctionKind::ComposeNumber { op, value, align },
+            runtime_settings: None,
+        }
+    }
+
+    /// An inline bound 1-arg scalar registered transformer with no closure
+    /// allocation.
+    pub fn bound_scalar(
+        name: &str,
+        registration: &'static crate::register::Registration,
+        arg: Value,
+        provable_pure: bool,
+    ) -> Self {
+        Self {
+            id: NEXT_FUNCTION_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+            name: (!name.is_empty()).then(|| SharedStr::from(name)),
+            kind: FunctionKind::BoundScalar {
+                registration,
+                arg,
+                provable_pure,
+            },
+            runtime_settings: None,
+        }
+    }
+
+    /// An inline bound 1-arg pattern registered transformer with no closure
+    /// allocation.
+    pub fn bound_one(
+        name: &str,
+        registration: &'static crate::register::Registration,
+        arg: crate::Pattern,
+        provable_pure: bool,
+    ) -> Self {
+        Self {
+            id: NEXT_FUNCTION_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+            name: (!name.is_empty()).then(|| SharedStr::from(name)),
+            kind: FunctionKind::BoundOne {
+                registration,
+                arg,
+                provable_pure,
+            },
+            runtime_settings: None,
+        }
+    }
+
+    /// An inline 1-number control transformer with no closure allocation.
+    pub fn control_number(
+        name: &str,
+        spec: &'static crate::controls::ControlSpec,
+        value: f64,
+    ) -> Self {
+        Self {
+            id: NEXT_FUNCTION_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+            name: (!name.is_empty()).then(|| SharedStr::from(name)),
+            kind: FunctionKind::ControlNumber { spec, value },
+            runtime_settings: None,
+        }
+    }
+
+    /// An inline 2-number control transformer with no closure allocation.
+    pub(crate) fn control_two_numbers(
+        name: &str,
+        s0: &'static crate::controls::ControlSpec,
+        v0: f64,
+        s1: &'static crate::controls::ControlSpec,
+        v1: f64,
+    ) -> Self {
+        Self {
+            id: NEXT_FUNCTION_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+            name: (!name.is_empty()).then(|| SharedStr::from(name)),
+            kind: FunctionKind::ControlTwoNumbers { s0, v0, s1, v1 },
             runtime_settings: None,
         }
     }
@@ -561,7 +6241,7 @@ impl FunctionRef {
     }
 
     pub fn name(&self) -> Option<&str> {
-        self.name.as_deref()
+        self.name.as_ref().map(SharedStr::as_str)
     }
 
     fn attach_runtime_settings(&mut self, settings: crate::settings::RuntimeSettings) {
@@ -580,11 +6260,29 @@ impl FunctionRef {
     /// [`Value::has_js_function`].
     pub fn is_native(&self) -> bool {
         match &self.kind {
-            FunctionKind::Native { .. } => true,
+            FunctionKind::Native { .. }
+            | FunctionKind::NativeProgram(_)
+            | FunctionKind::ComposeNumber { .. }
+            | FunctionKind::ControlNumber { .. }
+            | FunctionKind::ControlTwoNumbers { .. } => true,
             FunctionKind::LoweredJs { program, .. } => program.is_current(),
-            FunctionKind::Registered { provable_pure, .. } => *provable_pure,
+            FunctionKind::Registered { provable_pure, .. }
+            | FunctionKind::Compose { provable_pure, .. }
+            | FunctionKind::BoundScalar { provable_pure, .. }
+            | FunctionKind::BoundOne { provable_pure, .. } => *provable_pure,
             FunctionKind::Js(_) | FunctionKind::JsPatternIr { .. } => false,
         }
+    }
+
+    /// Whether this is a JavaScript callback with its compiled program: the
+    /// one function value a callback program may hold, in its registration's
+    /// function slot. The host owns the choice between the program and the
+    /// callback, in either kind.
+    pub(crate) fn carries_pattern_program(&self) -> bool {
+        matches!(
+            self.kind,
+            FunctionKind::LoweredJs { .. } | FunctionKind::JsPatternIr { .. }
+        )
     }
 
     /// The script callback a pure view of this function may still need: a
@@ -599,12 +6297,107 @@ impl FunctionRef {
         }
     }
 
+    /// Every script callback a wrapper owning this function must keep alive:
+    /// the fallback a lowered callback needs once its program can go stale,
+    /// the fallback a pattern-IR callback needs at every application, and -
+    /// for either kind - the same set for every function-valued argument the
+    /// program holds, which can go stale on its own while the program stands.
+    ///
+    /// A closure that captures a function value cannot show it to purity, so
+    /// [`crate::Pattern::retaining_callbacks`] is the only channel these ids
+    /// reach a wrapper's harvest through.
+    /// Fast check for whether [`Self::retained_callbacks`] could be non-empty,
+    /// avoiding temporary `Vec` allocations for native and registered callables.
+    #[inline]
+    pub(crate) fn has_retained_callbacks(&self) -> bool {
+        matches!(
+            self.kind,
+            FunctionKind::Js(_) | FunctionKind::JsPatternIr { .. } | FunctionKind::LoweredJs { .. }
+        )
+    }
+
+    pub(crate) fn retained_callbacks(&self) -> Vec<crate::CallbackId> {
+        let mut ids = Vec::new();
+        match &self.kind {
+            FunctionKind::Js(id) => ids.push(*id),
+            FunctionKind::JsPatternIr { fallback, program } => {
+                ids.push(*fallback);
+                ids.extend(program.retained_callback_ids());
+            }
+            FunctionKind::LoweredJs { fallback, program } => {
+                if program.can_go_stale() {
+                    ids.push(*fallback);
+                }
+                ids.extend(program.retained_callback_ids());
+            }
+            FunctionKind::Native { .. }
+            | FunctionKind::NativeProgram(_)
+            | FunctionKind::Registered { .. }
+            | FunctionKind::Compose { .. }
+            | FunctionKind::ComposeNumber { .. }
+            | FunctionKind::BoundScalar { .. }
+            | FunctionKind::BoundOne { .. }
+            | FunctionKind::ControlNumber { .. }
+            | FunctionKind::ControlTwoNumbers { .. } => {}
+        }
+        ids
+    }
+
+    /// Whether a later application may have to differ from this one: a
+    /// lowered callback whose program can go stale must reach its script
+    /// callback again once it does, so applying it once does not stand for
+    /// applying it at every query.
+    pub(crate) fn can_go_stale(&self) -> bool {
+        self.callback_kept_by_pure_view().is_some()
+    }
+
+    /// Whether applying this once stands for applying it at every query: a
+    /// function with a native view that cannot go stale always applies the
+    /// same way, so a combinator may apply it once while it builds its
+    /// graph. A JavaScript callback, a host-bound transformer, or a lowered
+    /// callback that can go stale does not: those applications run at query
+    /// time, once per carrier hap, and a program that stops standing for its
+    /// callback must reach the callback again.
+    pub(crate) fn stands_for_every_application(&self) -> bool {
+        self.is_native() && !self.can_go_stale()
+    }
+
     /// The callback id, for a JS function.
     pub fn callback_id(&self) -> Option<crate::CallbackId> {
         match self.kind {
             FunctionKind::Js(id) => Some(id),
             FunctionKind::JsPatternIr { fallback, .. }
             | FunctionKind::LoweredJs { fallback, .. } => Some(fallback),
+            _ => None,
+        }
+    }
+
+    /// Extract a direct single-layer transform view for `sequence::off_shifted`
+    /// when this transformer is pure and carries no bound runtime settings.
+    pub(crate) fn as_off_layer_op(&self) -> Option<OffLayerOp<'_>> {
+        if self.runtime_settings.is_some() {
+            return None;
+        }
+        match &self.kind {
+            FunctionKind::Compose {
+                other,
+                op,
+                align,
+                provable_pure: true,
+            } => Some(OffLayerOp::Compose {
+                other,
+                op: *op,
+                align: *align,
+            }),
+            FunctionKind::ComposeNumber { op, value, align } => Some(OffLayerOp::ComposeNumber {
+                op: *op,
+                value: *value,
+                align: *align,
+            }),
+            FunctionKind::ControlNumber { spec, value } => Some(OffLayerOp::ControlNumber {
+                spec,
+                value: *value,
+            }),
             _ => None,
         }
     }
@@ -647,7 +6440,15 @@ impl FunctionRef {
             FunctionKind::Js(id) => crate::host_call_value(*id, value),
             FunctionKind::JsPatternIr { fallback, .. }
             | FunctionKind::LoweredJs { fallback, .. } => crate::host_call_value(*fallback, value),
-            FunctionKind::Native { .. } | FunctionKind::Registered { .. } => {
+            FunctionKind::Native { .. }
+            | FunctionKind::NativeProgram(_)
+            | FunctionKind::Registered { .. }
+            | FunctionKind::Compose { .. }
+            | FunctionKind::ComposeNumber { .. }
+            | FunctionKind::BoundScalar { .. }
+            | FunctionKind::BoundOne { .. }
+            | FunctionKind::ControlNumber { .. }
+            | FunctionKind::ControlTwoNumbers { .. } => {
                 crate::signal_query_error(|| {
                     "pattern transformer cannot be called as a value predicate".into()
                 });
@@ -660,7 +6461,41 @@ impl FunctionRef {
     pub(crate) fn apply_unbound(&self, pattern: crate::Pattern) -> crate::Pattern {
         match &self.kind {
             FunctionKind::Native { any, .. } => any(pattern),
+            FunctionKind::NativeProgram(program) => program.apply(pattern),
             FunctionKind::Registered { apply, .. } => apply(pattern),
+            FunctionKind::Compose {
+                other, op, align, ..
+            } => crate::compose::compose_owned(
+                pattern,
+                other,
+                *op,
+                align.unwrap_or_else(crate::compose::default_alignment),
+            ),
+            FunctionKind::ComposeNumber { op, value, align } => {
+                crate::compose::compose_number_owned(
+                    pattern,
+                    *value,
+                    *op,
+                    align.unwrap_or_else(crate::compose::default_alignment),
+                )
+            }
+            FunctionKind::BoundScalar {
+                registration, arg, ..
+            } => registration.call_unpatternified(std::slice::from_ref(arg), pattern),
+            FunctionKind::BoundOne {
+                registration, arg, ..
+            } => registration.call(std::slice::from_ref(arg), pattern),
+            FunctionKind::ControlNumber { spec, value } => {
+                let call = [(*spec, crate::controls::ChainArgument::Number(*value))];
+                crate::controls::apply_chain(pattern, &call)
+            }
+            FunctionKind::ControlTwoNumbers { s0, v0, s1, v1 } => {
+                let calls = [
+                    (*s0, crate::controls::ChainArgument::Number(*v0)),
+                    (*s1, crate::controls::ChainArgument::Number(*v1)),
+                ];
+                crate::controls::apply_chain(pattern, &calls)
+            }
             FunctionKind::Js(id) => crate::host_call_pattern(*id, pattern),
             FunctionKind::JsPatternIr { fallback, program } => {
                 crate::host_call_pattern_ir(*fallback, program, pattern)
@@ -738,7 +6573,41 @@ impl FunctionRef {
         for (pattern, _) in patterns {
             let transformed = match &self.kind {
                 FunctionKind::Native { any, .. } => any(pattern),
+                FunctionKind::NativeProgram(program) => program.apply(pattern),
                 FunctionKind::Registered { apply, .. } => apply(pattern),
+                FunctionKind::Compose {
+                    other, op, align, ..
+                } => crate::compose::compose(
+                    &pattern,
+                    other,
+                    *op,
+                    align.unwrap_or_else(crate::compose::default_alignment),
+                ),
+                FunctionKind::ComposeNumber { op, value, align } => {
+                    crate::compose::compose_number_owned(
+                        pattern,
+                        *value,
+                        *op,
+                        align.unwrap_or_else(crate::compose::default_alignment),
+                    )
+                }
+                FunctionKind::BoundScalar {
+                    registration, arg, ..
+                } => registration.call_unpatternified(std::slice::from_ref(arg), pattern),
+                FunctionKind::BoundOne {
+                    registration, arg, ..
+                } => registration.call(std::slice::from_ref(arg), pattern),
+                FunctionKind::ControlNumber { spec, value } => {
+                    let call = [(*spec, crate::controls::ChainArgument::Number(*value))];
+                    crate::controls::apply_chain(pattern, &call)
+                }
+                FunctionKind::ControlTwoNumbers { s0, v0, s1, v1 } => {
+                    let calls = [
+                        (*s0, crate::controls::ChainArgument::Number(*v0)),
+                        (*s1, crate::controls::ChainArgument::Number(*v1)),
+                    ];
+                    crate::controls::apply_chain(pattern, &calls)
+                }
                 FunctionKind::Js(_)
                 | FunctionKind::JsPatternIr { .. }
                 | FunctionKind::LoweredJs { .. } => {
@@ -769,7 +6638,7 @@ impl FunctionRef {
         if let Some(settings) = owner {
             return settings.with(|| {
                 self.apply_pure_unbound(pattern).map(|pattern| {
-                    let mut pattern = pattern.pattern().clone();
+                    let mut pattern = pattern.0;
                     pattern.force_runtime_settings(settings.clone());
                     crate::purity::PurePattern::assert_pure(pattern)
                 })
@@ -785,6 +6654,7 @@ impl FunctionRef {
     ) -> Option<crate::purity::PurePattern> {
         match &self.kind {
             FunctionKind::Native { pure, .. } => Some(pure(pattern)),
+            FunctionKind::NativeProgram(program) => Some(program.apply_pure(pattern)),
             FunctionKind::LoweredJs { fallback, program } => Some(if program.is_current() {
                 // A construction kept with what the program built answers
                 // only while the program stands for its callback.
@@ -792,9 +6662,7 @@ impl FunctionRef {
                 program.apply_pure(pattern)
             } else if crate::host_installed() {
                 crate::purity::PurePattern::host_built(crate::host_call_pattern_ir(
-                    *fallback,
-                    program,
-                    pattern.pattern().clone(),
+                    *fallback, program, pattern.0,
                 ))
             } else {
                 crate::purity::PurePattern::assert_pure(stale_without_host(*fallback))
@@ -802,8 +6670,61 @@ impl FunctionRef {
             FunctionKind::Registered {
                 apply,
                 provable_pure,
-            } => provable_pure
-                .then(|| crate::purity::PurePattern::assert_pure(apply(pattern.pattern().clone()))),
+            } => provable_pure.then(|| crate::purity::PurePattern::assert_pure(apply(pattern.0))),
+            FunctionKind::Compose {
+                other,
+                op,
+                align,
+                provable_pure,
+            } => provable_pure.then(|| {
+                crate::purity::PurePattern::assert_pure(crate::compose::compose_owned(
+                    pattern.0,
+                    other,
+                    *op,
+                    align.unwrap_or_else(crate::compose::default_alignment),
+                ))
+            }),
+            FunctionKind::ComposeNumber { op, value, align } => Some(
+                crate::purity::PurePattern::assert_pure(crate::compose::compose_number_owned(
+                    pattern.0,
+                    *value,
+                    *op,
+                    align.unwrap_or_else(crate::compose::default_alignment),
+                )),
+            ),
+            FunctionKind::BoundScalar {
+                registration,
+                arg,
+                provable_pure,
+            } => provable_pure.then(|| {
+                crate::purity::PurePattern::assert_pure(
+                    registration.call_unpatternified(std::slice::from_ref(arg), pattern.0),
+                )
+            }),
+            FunctionKind::BoundOne {
+                registration,
+                arg,
+                provable_pure,
+            } => provable_pure.then(|| {
+                crate::purity::PurePattern::assert_pure(
+                    registration.call(std::slice::from_ref(arg), pattern.0),
+                )
+            }),
+            FunctionKind::ControlNumber { spec, value } => {
+                let call = [(*spec, crate::controls::ChainArgument::Number(*value))];
+                Some(crate::purity::PurePattern::assert_pure(
+                    crate::controls::apply_chain(pattern.0, &call),
+                ))
+            }
+            FunctionKind::ControlTwoNumbers { s0, v0, s1, v1 } => {
+                let calls = [
+                    (*s0, crate::controls::ChainArgument::Number(*v0)),
+                    (*s1, crate::controls::ChainArgument::Number(*v1)),
+                ];
+                Some(crate::purity::PurePattern::assert_pure(
+                    crate::controls::apply_chain(pattern.0, &calls),
+                ))
+            }
             FunctionKind::Js(_) | FunctionKind::JsPatternIr { .. } => None,
         }
     }
@@ -856,14 +6777,68 @@ impl FunctionRef {
                 }
                 Some(out)
             }
+            FunctionKind::NativeProgram(program) => {
+                for (pattern, _) in patterns {
+                    out.push(program.apply_pure(pattern));
+                    if crate::query_error_pending() {
+                        break;
+                    }
+                }
+                Some(out)
+            }
             FunctionKind::Registered {
                 apply,
                 provable_pure,
             } if *provable_pure => {
                 for (pattern, _) in patterns {
-                    out.push(crate::purity::PurePattern::assert_pure(apply(
-                        pattern.pattern().clone(),
-                    )));
+                    out.push(crate::purity::PurePattern::assert_pure(apply(pattern.0)));
+                    if crate::query_error_pending() {
+                        break;
+                    }
+                }
+                Some(out)
+            }
+            FunctionKind::Compose {
+                other,
+                op,
+                align,
+                provable_pure,
+            } if *provable_pure => {
+                let how = align.unwrap_or_else(crate::compose::default_alignment);
+                for (pattern, _) in patterns {
+                    out.push(crate::purity::PurePattern::assert_pure(
+                        crate::compose::compose(&pattern.0, other, *op, how),
+                    ));
+                    if crate::query_error_pending() {
+                        break;
+                    }
+                }
+                Some(out)
+            }
+            FunctionKind::BoundScalar {
+                registration,
+                arg,
+                provable_pure,
+            } if *provable_pure => {
+                for (pattern, _) in patterns {
+                    out.push(crate::purity::PurePattern::assert_pure(
+                        registration.call_unpatternified(std::slice::from_ref(arg), pattern.0),
+                    ));
+                    if crate::query_error_pending() {
+                        break;
+                    }
+                }
+                Some(out)
+            }
+            FunctionKind::BoundOne {
+                registration,
+                arg,
+                provable_pure,
+            } if *provable_pure => {
+                for (pattern, _) in patterns {
+                    out.push(crate::purity::PurePattern::assert_pure(
+                        registration.call(std::slice::from_ref(arg), pattern.0),
+                    ));
                     if crate::query_error_pending() {
                         break;
                     }
@@ -898,7 +6873,49 @@ impl FunctionRef {
                     *fallback,
                 ))]
             }),
+            FunctionKind::ControlNumber { spec, value } => {
+                let call = [(*spec, crate::controls::ChainArgument::Number(*value))];
+                for (pattern, _) in patterns {
+                    out.push(crate::purity::PurePattern::assert_pure(
+                        crate::controls::apply_chain(pattern.0, &call),
+                    ));
+                    if crate::query_error_pending() {
+                        break;
+                    }
+                }
+                Some(out)
+            }
+            FunctionKind::ControlTwoNumbers { s0, v0, s1, v1 } => {
+                let calls = [
+                    (*s0, crate::controls::ChainArgument::Number(*v0)),
+                    (*s1, crate::controls::ChainArgument::Number(*v1)),
+                ];
+                for (pattern, _) in patterns {
+                    out.push(crate::purity::PurePattern::assert_pure(
+                        crate::controls::apply_chain(pattern.0, &calls),
+                    ));
+                    if crate::query_error_pending() {
+                        break;
+                    }
+                }
+                Some(out)
+            }
+            FunctionKind::ComposeNumber { op, value, align } => {
+                let how = align.unwrap_or_else(crate::compose::default_alignment);
+                for (pattern, _) in patterns {
+                    out.push(crate::purity::PurePattern::assert_pure(
+                        crate::compose::compose_number_owned(pattern.0, *value, *op, how),
+                    ));
+                    if crate::query_error_pending() {
+                        break;
+                    }
+                }
+                Some(out)
+            }
             FunctionKind::Registered { .. }
+            | FunctionKind::Compose { .. }
+            | FunctionKind::BoundScalar { .. }
+            | FunctionKind::BoundOne { .. }
             | FunctionKind::Js(_)
             | FunctionKind::JsPatternIr { .. } => None,
         }
@@ -921,10 +6938,32 @@ fn stale_without_host(fallback: crate::CallbackId) -> crate::Pattern {
 impl fmt::Debug for FunctionRef {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match (&self.kind, &self.name) {
-            (FunctionKind::Native { .. }, Some(name)) => write!(f, "fn {name}#{}", self.id),
-            (FunctionKind::Native { .. }, None) => write!(f, "fn #{}", self.id),
-            (FunctionKind::Registered { .. }, Some(name)) => write!(f, "fn {name}#{}", self.id),
-            (FunctionKind::Registered { .. }, None) => write!(f, "fn #{}", self.id),
+            (FunctionKind::Native { .. } | FunctionKind::NativeProgram(_), Some(name)) => {
+                write!(f, "fn {name}#{}", self.id)
+            }
+            (FunctionKind::Native { .. } | FunctionKind::NativeProgram(_), None) => {
+                write!(f, "fn #{}", self.id)
+            }
+            (
+                FunctionKind::Registered { .. }
+                | FunctionKind::Compose { .. }
+                | FunctionKind::ComposeNumber { .. }
+                | FunctionKind::BoundScalar { .. }
+                | FunctionKind::BoundOne { .. }
+                | FunctionKind::ControlNumber { .. }
+                | FunctionKind::ControlTwoNumbers { .. },
+                Some(name),
+            ) => write!(f, "fn {name}#{}", self.id),
+            (
+                FunctionKind::Registered { .. }
+                | FunctionKind::Compose { .. }
+                | FunctionKind::ComposeNumber { .. }
+                | FunctionKind::BoundScalar { .. }
+                | FunctionKind::BoundOne { .. }
+                | FunctionKind::ControlNumber { .. }
+                | FunctionKind::ControlTwoNumbers { .. },
+                None,
+            ) => write!(f, "fn #{}", self.id),
             (FunctionKind::Js(callback), _) => write!(f, "js fn #{} (cb {callback})", self.id),
             (FunctionKind::JsPatternIr { fallback, program }, _) => write!(
                 f,
@@ -1057,6 +7096,321 @@ impl PartialEq for HapList {
     }
 }
 
+/// Maximum byte length stored inline in [`SharedStr`] with zero heap allocation.
+const INLINE_STR_MAX: usize = 14;
+
+/// A compact immutable string value: up to 14 UTF-8 bytes inline in 16 bytes,
+/// spilling to a shared heap allocation for longer strings.
+#[derive(Clone)]
+pub struct SharedStr(SharedStrRepr);
+
+#[derive(Clone)]
+enum SharedStrRepr {
+    Inline {
+        len: u8,
+        bytes: [u8; INLINE_STR_MAX],
+    },
+    Heap(Arc<Box<str>>),
+}
+
+#[cfg(target_pointer_width = "64")]
+const _: () = assert!(std::mem::size_of::<SharedStr>() == 16);
+
+impl SharedStr {
+    #[inline(always)]
+    pub fn as_bytes(&self) -> &[u8] {
+        match &self.0 {
+            SharedStrRepr::Inline { len, bytes } => &bytes[..usize::from(*len)],
+            SharedStrRepr::Heap(text) => text.as_bytes(),
+        }
+    }
+
+    #[inline(always)]
+    pub fn len(&self) -> usize {
+        match &self.0 {
+            SharedStrRepr::Inline { len, .. } => usize::from(*len),
+            SharedStrRepr::Heap(text) => text.len(),
+        }
+    }
+
+    #[inline(always)]
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    #[inline]
+    pub fn as_str(&self) -> &str {
+        match &self.0 {
+            SharedStrRepr::Inline { len, bytes } => {
+                // Inline bytes are always copied from valid UTF-8 `&str`.
+                std::str::from_utf8(&bytes[..usize::from(*len)]).unwrap_or("")
+            }
+            SharedStrRepr::Heap(text) => text,
+        }
+    }
+
+    #[inline]
+    pub fn to_arc(&self) -> Arc<str> {
+        Arc::from(self.as_str())
+    }
+}
+
+impl Default for SharedStr {
+    #[inline]
+    fn default() -> Self {
+        Self(SharedStrRepr::Inline {
+            len: 0,
+            bytes: [0; INLINE_STR_MAX],
+        })
+    }
+}
+
+impl std::ops::Deref for SharedStr {
+    type Target = str;
+
+    #[inline]
+    fn deref(&self) -> &str {
+        self.as_str()
+    }
+}
+
+impl AsRef<str> for SharedStr {
+    #[inline]
+    fn as_ref(&self) -> &str {
+        self.as_str()
+    }
+}
+
+impl std::borrow::Borrow<str> for SharedStr {
+    #[inline]
+    fn borrow(&self) -> &str {
+        self.as_str()
+    }
+}
+
+impl PartialEq for SharedStr {
+    #[inline(always)]
+    fn eq(&self, other: &Self) -> bool {
+        match (&self.0, &other.0) {
+            (SharedStrRepr::Heap(a), SharedStrRepr::Heap(b)) if Arc::ptr_eq(a, b) => true,
+            _ => self.as_bytes() == other.as_bytes(),
+        }
+    }
+}
+
+impl Eq for SharedStr {}
+
+impl PartialOrd for SharedStr {
+    #[inline(always)]
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for SharedStr {
+    #[inline(always)]
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.as_bytes().cmp(other.as_bytes())
+    }
+}
+
+impl Hash for SharedStr {
+    #[inline(always)]
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        // Matches `str::hash` (bytes followed by `0xff`) so `Borrow<str>` agrees.
+        state.write(self.as_bytes());
+        state.write_u8(0xff);
+    }
+}
+
+impl PartialEq<str> for SharedStr {
+    #[inline(always)]
+    fn eq(&self, other: &str) -> bool {
+        self.as_bytes() == other.as_bytes()
+    }
+}
+
+impl PartialEq<&str> for SharedStr {
+    #[inline(always)]
+    fn eq(&self, other: &&str) -> bool {
+        self.as_bytes() == other.as_bytes()
+    }
+}
+
+impl PartialEq<String> for SharedStr {
+    #[inline(always)]
+    fn eq(&self, other: &String) -> bool {
+        self.as_bytes() == other.as_bytes()
+    }
+}
+
+impl PartialEq<Arc<str>> for SharedStr {
+    #[inline(always)]
+    fn eq(&self, other: &Arc<str>) -> bool {
+        self.as_bytes() == other.as_bytes()
+    }
+}
+
+impl fmt::Debug for SharedStr {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Debug::fmt(self.as_str(), f)
+    }
+}
+
+impl fmt::Display for SharedStr {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Display::fmt(self.as_str(), f)
+    }
+}
+
+/// Pack 0..=8 bytes into a little-endian `u64` using inline scalar loads,
+/// avoiding libc `memmove` calls for short strings and keys.
+#[inline(always)]
+pub fn pack_le_u64(bytes: &[u8]) -> u64 {
+    match bytes.len() {
+        0 => 0,
+        1 => u64::from(bytes[0]),
+        2 => u64::from(u16::from_le_bytes([bytes[0], bytes[1]])),
+        3 => u64::from(u16::from_le_bytes([bytes[0], bytes[1]])) | (u64::from(bytes[2]) << 16),
+        4 => u64::from(u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]])),
+        5..=7 => {
+            let len = bytes.len();
+            let lo = u64::from(u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]));
+            let hi = u64::from(u32::from_le_bytes([
+                bytes[len - 4],
+                bytes[len - 3],
+                bytes[len - 2],
+                bytes[len - 1],
+            ]));
+            lo | (hi << ((len - 4) * 8))
+        }
+        _ => u64::from_le_bytes([
+            bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
+        ]),
+    }
+}
+
+/// Injective 64-bit tag for short identifier names (`1..=7` bytes, high byte =
+/// length) and 56-bit hashed tag (`high byte = 0xff`) for longer names. Zero is
+/// reserved for empty slots in open-addressed tables.
+#[inline(always)]
+pub fn name_tag(name: &str) -> u64 {
+    let bytes = name.as_bytes();
+    let len = bytes.len();
+    if len == 0 {
+        return 0xffu64 << 56;
+    }
+    if len <= 7 {
+        return ((len as u64) << 56) | pack_le_u64(bytes);
+    }
+    let mut h = (len as u64).wrapping_mul(0x517c_c1b7_2722_0a95);
+    let (chunks, rem) = bytes.as_chunks::<8>();
+    for chunk in chunks {
+        h = (h.rotate_left(5) ^ u64::from_le_bytes(*chunk)).wrapping_mul(0x517c_c1b7_2722_0a95);
+    }
+    if !rem.is_empty() {
+        h = (h.rotate_left(5) ^ pack_le_u64(rem)).wrapping_mul(0x517c_c1b7_2722_0a95);
+    }
+    h ^= h >> 32;
+    (0xffu64 << 56) | (h & 0x00ff_ffff_ffff_ffff)
+}
+
+#[inline(always)]
+fn copy_inline_str(src: &[u8]) -> [u8; INLINE_STR_MAX] {
+    let mut out = [0u8; INLINE_STR_MAX];
+    let len = src.len();
+    if len <= 8 {
+        let w = pack_le_u64(src).to_le_bytes();
+        out[..8].copy_from_slice(&w);
+        return out;
+    }
+    out[..8].copy_from_slice(&src[..8]);
+    let tail = pack_le_u64(&src[8..]).to_le_bytes();
+    out[8..14].copy_from_slice(&tail[..6]);
+    out
+}
+
+impl From<&str> for SharedStr {
+    #[inline]
+    fn from(s: &str) -> Self {
+        if s.len() <= INLINE_STR_MAX {
+            Self(SharedStrRepr::Inline {
+                len: s.len() as u8,
+                bytes: copy_inline_str(s.as_bytes()),
+            })
+        } else {
+            Self(SharedStrRepr::Heap(Arc::new(Box::<str>::from(s))))
+        }
+    }
+}
+
+impl From<String> for SharedStr {
+    #[inline]
+    fn from(s: String) -> Self {
+        if s.len() <= INLINE_STR_MAX {
+            Self::from(s.as_str())
+        } else {
+            Self(SharedStrRepr::Heap(Arc::new(s.into_boxed_str())))
+        }
+    }
+}
+
+impl From<Box<str>> for SharedStr {
+    #[inline]
+    fn from(s: Box<str>) -> Self {
+        if s.len() <= INLINE_STR_MAX {
+            Self::from(&*s)
+        } else {
+            Self(SharedStrRepr::Heap(Arc::new(s)))
+        }
+    }
+}
+
+impl From<Arc<str>> for SharedStr {
+    #[inline]
+    fn from(s: Arc<str>) -> Self {
+        Self::from(&*s)
+    }
+}
+
+impl From<&String> for SharedStr {
+    #[inline]
+    fn from(s: &String) -> Self {
+        Self::from(s.as_str())
+    }
+}
+
+impl From<std::borrow::Cow<'_, str>> for SharedStr {
+    #[inline]
+    fn from(s: std::borrow::Cow<'_, str>) -> Self {
+        match s {
+            std::borrow::Cow::Borrowed(b) => Self::from(b),
+            std::borrow::Cow::Owned(o) => Self::from(o),
+        }
+    }
+}
+
+impl From<SharedStr> for Arc<str> {
+    #[inline]
+    fn from(s: SharedStr) -> Self {
+        s.to_arc()
+    }
+}
+
+impl From<&SharedStr> for Arc<str> {
+    #[inline]
+    fn from(s: &SharedStr) -> Self {
+        s.to_arc()
+    }
+}
+
+impl From<SharedStr> for String {
+    #[inline]
+    fn from(s: SharedStr) -> Self {
+        s.as_str().to_owned()
+    }
+}
+
 /// A native representation of values that can cross the score's semantic
 /// boundary. Arrays and objects are recursive; object order is observable.
 #[derive(Debug, PartialEq)]
@@ -1065,8 +7419,9 @@ pub enum Value {
     Null,
     Bool(bool),
     F64(f64),
-    Str(String),
-    List(Vec<Value>),
+    /// Text: stored inline up to 14 bytes or shared on the heap.
+    Str(SharedStr),
+    List(Arc<[Value]>),
     Object(OrderedMap),
     /// A native Pattern nested in a JavaScript array/object value.
     Pattern(Box<PatternValue>),
@@ -1075,15 +7430,40 @@ pub enum Value {
     JsValue(JsValueRef),
     /// A pattern transformer. Upstream's `reify(func)` puts one of these in a
     /// hap; see [`FunctionRef`].
-    Function(Box<FunctionRef>),
+    Function(Arc<FunctionRef>),
     /// Congruent haps carried by `collect()` until a score callback consumes
     /// them.
     Haps(HapList),
 }
 
+#[cfg(target_pointer_width = "64")]
+const _: () = assert!(std::mem::size_of::<Value>() == 24);
+#[cfg(target_pointer_width = "64")]
+const _: () = assert!(std::mem::size_of::<Option<Value>>() == 24);
+
+impl Value {
+    /// Construct a `Value::List` from a `Vec<Value>`.
+    #[inline]
+    pub fn list(values: Vec<Value>) -> Self {
+        Self::List(Arc::from(values))
+    }
+
+    /// Construct a `Value::List` directly from a slice/array into one `Arc<[Value]>`.
+    #[inline]
+    pub fn list_from_arc(values: Arc<[Value]>) -> Self {
+        Self::List(values)
+    }
+
+    /// Construct a `Value::Function` from a [`FunctionRef`].
+    #[inline]
+    pub fn function(function: FunctionRef) -> Self {
+        Self::Function(Arc::new(function))
+    }
+}
+
 impl Clone for Value {
-    /// A number, flag or nullish value copies in place. The others own heap
-    /// memory and clone out of line.
+    /// A number, flag, inline text or nullish value copies in place. The
+    /// others own heap memory and clone out of line.
     #[inline]
     fn clone(&self) -> Self {
         match self {
@@ -1091,9 +7471,204 @@ impl Clone for Value {
             Self::Null => Self::Null,
             Self::Bool(value) => Self::Bool(*value),
             Self::F64(value) => Self::F64(*value),
+            Self::Str(SharedStr(SharedStrRepr::Inline { len, bytes })) => {
+                Self::Str(SharedStr(SharedStrRepr::Inline {
+                    len: *len,
+                    bytes: *bytes,
+                }))
+            }
+            Self::Object(OrderedMap {
+                entries: Entries::StaticInt(id, value, made),
+            }) => Self::Object(OrderedMap::from_static_int(*id, *value, *made)),
+            Self::Object(OrderedMap {
+                entries: Entries::SeqLayer(layers, row, layer_idx),
+            }) => Self::Object(OrderedMap::from_seq_layer(layers, *layer_idx, *row)),
             shared => shared.clone_shared(),
         }
     }
+}
+
+/// A fast hash for keys compared only within one process: one rotate,
+/// xor and multiply per word. Not resistant to chosen collisions, which
+/// cost a longer equality scan and never a wrong answer.
+#[derive(Default)]
+pub struct WordHasher(u64);
+
+impl WordHasher {
+    #[inline(always)]
+    fn add(&mut self, word: u64) {
+        self.0 = (self.0.rotate_left(5) ^ word).wrapping_mul(0x51_7c_c1_b7_27_22_0a_95);
+    }
+}
+
+impl std::hash::Hasher for WordHasher {
+    #[inline(always)]
+    fn finish(&self) -> u64 {
+        self.0
+    }
+
+    #[inline]
+    fn write(&mut self, bytes: &[u8]) {
+        if bytes.len() <= 8 {
+            self.add(pack_le_u64(bytes) ^ bytes.len() as u64);
+            return;
+        }
+        let (words, rest) = bytes.as_chunks::<8>();
+        for word in words {
+            self.add(u64::from_le_bytes(*word));
+        }
+        self.add(pack_le_u64(rest) ^ rest.len() as u64);
+    }
+
+    #[inline(always)]
+    fn write_u8(&mut self, value: u8) {
+        self.add(u64::from(value));
+    }
+
+    #[inline(always)]
+    fn write_u16(&mut self, value: u16) {
+        self.add(u64::from(value));
+    }
+
+    #[inline(always)]
+    fn write_u32(&mut self, value: u32) {
+        self.add(u64::from(value));
+    }
+
+    #[inline(always)]
+    fn write_u64(&mut self, value: u64) {
+        self.add(value);
+    }
+
+    #[inline(always)]
+    fn write_u128(&mut self, value: u128) {
+        self.add(value as u64);
+        self.add((value >> 64) as u64);
+    }
+
+    #[inline(always)]
+    fn write_usize(&mut self, value: usize) {
+        self.add(value as u64);
+    }
+
+    #[inline(always)]
+    fn write_i8(&mut self, value: i8) {
+        self.add(value as u64);
+    }
+
+    #[inline(always)]
+    fn write_i16(&mut self, value: i16) {
+        self.add(value as u64);
+    }
+
+    #[inline(always)]
+    fn write_i32(&mut self, value: i32) {
+        self.add(value as u64);
+    }
+
+    #[inline(always)]
+    fn write_i64(&mut self, value: i64) {
+        self.add(value as u64);
+    }
+
+    #[inline(always)]
+    fn write_i128(&mut self, value: i128) {
+        self.add(value as u64);
+        self.add((value >> 64) as u64);
+    }
+}
+
+/// Feed a map's entries to `state`, numbers by their bits.
+fn hash_data_entries(layout: Layout<'_>, state: &mut impl std::hash::Hasher) {
+    fn slice(entries: Slice<'_>, state: &mut impl std::hash::Hasher) {
+        for (key, value) in entries.iter() {
+            key.hash(state);
+            hash_data(value, state);
+        }
+    }
+    layout.len().hash(state);
+    match layout {
+        Layout::Plain(entries) => slice(entries, state),
+        Layout::Keyed(key, value, tail) => {
+            key.hash(state);
+            hash_data(value, state);
+            slice(tail, state);
+        }
+        Layout::Split(head, tail) => {
+            slice(head, state);
+            slice(tail, state);
+        }
+        Layout::Patched(base, replace, key, value) => {
+            slice(Slice::Plain(&base[..replace]), state);
+            key.hash(state);
+            hash_data(value, state);
+            slice(Slice::Plain(base.get(replace + 1..).unwrap_or(&[])), state);
+        }
+        Layout::KeyedExtra(hk, hv, tail, ek, ev) => {
+            hk.hash(state);
+            hash_data(hv, state);
+            slice(tail, state);
+            ek.hash(state);
+            hash_data(ev, state);
+        }
+        Layout::Overlay(patched, row, layer_idx) => {
+            for index in 0..patched.len() {
+                let (key, value) = patched.at(row, layer_idx, index);
+                key.hash(state);
+                hash_data(value, state);
+            }
+        }
+        Layout::StepOverlay(step, values, packed, layer_idx) => {
+            for index in 0..step.len() {
+                let (key, value) = step.at(values, packed, layer_idx, index);
+                key.hash(state);
+                hash_data(value, state);
+            }
+        }
+    }
+}
+
+/// Feed a data value to `state`, numbers by their bits.
+pub(crate) fn hash_data(value: &Value, state: &mut impl std::hash::Hasher) {
+    match value {
+        Value::Undefined => 0u8.hash(state),
+        Value::Null => 1u8.hash(state),
+        Value::Bool(value) => (2u8, value).hash(state),
+        Value::F64(value) => (3u8, value.to_bits()).hash(state),
+        Value::Str(value) => (4u8, value).hash(state),
+        Value::List(items) => {
+            (5u8, items.len()).hash(state);
+            for item in items.iter() {
+                hash_data(item, state);
+            }
+        }
+        Value::Object(object) => {
+            6u8.hash(state);
+            hash_data_entries(object.layout(), state);
+        }
+        Value::Pattern(_) | Value::JsValue(_) | Value::Function(_) | Value::Haps(_) => {
+            7u8.hash(state)
+        }
+    }
+}
+
+/// Whether two data values are the same down to the bits of every number.
+fn same_data(a: &Value, b: &Value) -> bool {
+    match (a, b) {
+        (Value::F64(a), Value::F64(b)) => a.to_bits() == b.to_bits(),
+        (Value::List(a), Value::List(b)) => {
+            a.len() == b.len() && a.iter().zip(b.iter()).all(|(a, b)| same_data(a, b))
+        }
+        (Value::Object(a), Value::Object(b)) => a.same_data(b),
+        _ => a == b,
+    }
+}
+
+/// [`same_data`] for the entries of two maps, in order.
+fn same_entries(a: Pairs<'_>, b: Pairs<'_>) -> bool {
+    a.len() == b.len()
+        && a.zip(b)
+            .all(|((a_key, a), (b_key, b))| a_key == b_key && same_data(a, b))
 }
 
 impl Value {
@@ -1105,11 +7680,11 @@ impl Value {
             Self::Bool(value) => Self::Bool(*value),
             Self::F64(value) => Self::F64(*value),
             Self::Str(value) => Self::Str(value.clone()),
-            Self::List(values) => Self::List(values.clone()),
+            Self::List(values) => Self::List(Arc::clone(values)),
             Self::Object(values) => Self::Object(values.clone()),
             Self::Pattern(value) => Self::Pattern(value.clone()),
             Self::JsValue(value) => Self::JsValue(*value),
-            Self::Function(value) => Self::Function(value.clone()),
+            Self::Function(value) => Self::Function(Arc::clone(value)),
             Self::Haps(value) => Self::Haps(value.clone()),
         }
     }
@@ -1127,6 +7702,9 @@ fn needs_runtime_settings(value: &Value, depth: u32) -> bool {
         Value::List(values) => values
             .iter()
             .any(|value| needs_runtime_settings(value, depth.saturating_add(1))),
+        // An empty map holds nothing, and a made map was made of data
+        // values only: data binds no runtime.
+        Value::Object(values) if values.is_known_data() => false,
         Value::Object(values) => values
             .iter()
             .any(|(_, value)| needs_runtime_settings(value, depth.saturating_add(1))),
@@ -1143,86 +7721,61 @@ fn needs_runtime_settings(value: &Value, depth: u32) -> bool {
     }
 }
 
-/// A content hash of a data value that agrees with [`same_data`]: a number
-/// hashes by its bits.
-fn hash_data(value: &Value, state: &mut impl Hasher) {
-    match value {
-        Value::Undefined => 0u8.hash(state),
-        Value::Null => 1u8.hash(state),
-        Value::Bool(value) => (2u8, value).hash(state),
-        Value::F64(value) => (3u8, value.to_bits()).hash(state),
-        Value::Str(value) => (4u8, value).hash(state),
-        Value::List(items) => {
-            (5u8, items.len()).hash(state);
-            for item in items {
-                hash_data(item, state);
-            }
-        }
-        Value::Object(object) => {
-            (6u8, object.len()).hash(state);
-            for (key, value) in object.iter() {
-                key.hash(state);
-                hash_data(value, state);
-            }
-        }
-        Value::Pattern(_) | Value::JsValue(_) | Value::Function(_) | Value::Haps(_) => {
-            7u8.hash(state)
-        }
-    }
-}
-
-/// Whether two data values are the same down to the bits of every number.
-/// `==` makes `0.0` equal to `-0.0`, which divide apart, and a NaN unequal
-/// to itself, which an interned map could then never find.
-fn same_data(a: &Value, b: &Value) -> bool {
-    match (a, b) {
-        (Value::F64(a), Value::F64(b)) => a.to_bits() == b.to_bits(),
-        (Value::List(a), Value::List(b)) => {
-            a.len() == b.len() && a.iter().zip(b).all(|(a, b)| same_data(a, b))
-        }
-        (Value::Object(a), Value::Object(b)) => same_entries(a.entries(), b.entries()),
-        _ => a == b,
-    }
-}
-
-/// [`same_data`] for the entries of two maps, in order.
-fn same_entries(a: &[(Key, Value)], b: &[(Key, Value)]) -> bool {
-    a.len() == b.len()
-        && a.iter()
-            .zip(b)
-            .all(|((a_key, a), (b_key, b))| a_key == b_key && same_data(a, b))
-}
-
-/// About how many heap bytes a data value holds.
-fn data_bytes(value: &Value) -> usize {
-    match value {
-        Value::Str(value) => value.len(),
-        Value::List(items) => {
-            items.iter().map(data_bytes).sum::<usize>() + std::mem::size_of_val(items.as_slice())
-        }
-        Value::Object(object) => object
-            .iter()
-            .map(|(key, value)| key.len() + data_bytes(value) + std::mem::size_of::<(Key, Value)>())
-            .sum(),
-        _ => 0,
-    }
-}
-
 impl Value {
     /// Whether this is data only: no script object, pattern, function or hap
     /// list, each of which a query resolves anew.
+    #[inline(always)]
     pub(crate) fn is_data(&self, depth: u32) -> bool {
+        match self {
+            Value::Undefined | Value::Null | Value::Bool(_) | Value::F64(_) | Value::Str(_) => {
+                depth <= crate::MAX_PATTERN_DEPTH
+            }
+            Value::Pattern(_) | Value::JsValue(_) | Value::Function(_) | Value::Haps(_) => false,
+            _ => self.is_data_compound(depth),
+        }
+    }
+
+    /// Cheap identity for scalars and graph-backed maps (`strong_count >= 2`)
+    /// used by query-local pair caches.
+    #[inline]
+    pub(crate) fn stable_identity(&self) -> Option<(usize, u64)> {
+        match self {
+            Value::Object(map) => map.stable_identity(),
+            Value::F64(n) => Some((0, n.to_bits())),
+            Value::Bool(b) => Some((1, u64::from(*b))),
+            Value::Null => Some((2, 0)),
+            Value::Undefined => Some((3, 0)),
+            _ => None,
+        }
+    }
+
+    #[inline(never)]
+    fn is_data_compound(&self, depth: u32) -> bool {
         if depth > crate::MAX_PATTERN_DEPTH {
             return false;
         }
         match self {
-            Value::Undefined | Value::Null | Value::Bool(_) | Value::F64(_) | Value::Str(_) => true,
             Value::List(items) => items.iter().all(|item| item.is_data(depth + 1)),
-            // A kept map was checked as data when it was kept.
-            Value::Object(object) if depth == 0 && object.is_interned() => true,
+            // An empty map holds nothing, and a made map was made of data
+            // values only.
+            Value::Object(object) if object.is_known_data() => true,
             Value::Object(object) => object.iter().all(|(_, item)| item.is_data(depth + 1)),
-            Value::Pattern(_) | Value::JsValue(_) | Value::Function(_) | Value::Haps(_) => false,
+            _ => false,
         }
+    }
+
+    /// A hash of this data value, numbers by their bits. Values that are
+    /// [the same data](Self::same_data) hash the same.
+    pub(crate) fn data_hash(&self) -> u64 {
+        let mut hasher = WordHasher::default();
+        hash_data(self, &mut hasher);
+        std::hash::Hasher::finish(&hasher)
+    }
+
+    /// Whether this data value and `other` are the same down to the bits of
+    /// every number.
+    pub(crate) fn same_data(&self, other: &Value) -> bool {
+        same_data(self, other)
     }
 
     pub fn object(entries: impl IntoIterator<Item = (String, Value)>) -> Self {
@@ -1266,7 +7819,7 @@ impl Value {
             Self::Null => "null".into(),
             Self::Bool(value) => value.to_string(),
             Self::F64(value) => js_number(*value),
-            Self::Str(value) => value.clone(),
+            Self::Str(value) => value.to_string(),
             Self::List(_) | Self::Object(_) => self.compact_json(),
             // `String(fn)` is the source text on strudel.cc; a stable identity is
             // more useful and never appears in a snapshot.
@@ -1320,6 +7873,9 @@ impl Value {
             Self::Haps(haps) => haps.0.iter().any(|hap| hap.value.has_js_function()),
             Self::JsValue(_) => true,
             Self::List(items) => items.iter().any(Value::has_js_function),
+            // An empty map holds nothing, and a made map was made of data
+            // values only. Data holds no function.
+            Self::Object(map) if map.is_known_data() => false,
             Self::Object(map) => map.iter().any(|(_, v)| v.has_js_function()),
             _ => false,
         }
@@ -1335,6 +7891,10 @@ impl Value {
             Self::JsValue(_) => true,
             Self::Haps(haps) => haps.0.iter().any(|hap| hap.value.contains_js_value()),
             Self::List(items) => items.iter().any(Value::contains_js_value),
+            // An empty map holds nothing, and a made map was made of data
+            // values only. Data holds nothing a host
+            // owns.
+            Self::Object(map) if map.is_known_data() => false,
             Self::Object(map) => map.iter().any(|(_, value)| value.contains_js_value()),
             _ => false,
         }
@@ -1351,7 +7911,27 @@ impl Value {
     /// Attach settings to nested executable metadata without allocating graph
     /// wrappers. Traversal is explicitly bounded because List/Object depth is
     /// user-controlled and Rust stack overflow aborts the process.
+    #[inline]
     pub(crate) fn attach_runtime_settings(
+        &mut self,
+        settings: &crate::settings::RuntimeSettings,
+        depth: u32,
+    ) -> bool {
+        // Most values of a query are scalars or maps of controls that say they
+        // hold data only: such values have nothing to attach.
+        if matches!(
+            self,
+            Self::F64(_) | Self::Str(_) | Self::Bool(_) | Self::Null | Self::Undefined
+        ) || matches!(self, Self::Object(values) if values.is_known_data())
+        {
+            return true;
+        }
+        self.attach_runtime_settings_slow(settings, depth)
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn attach_runtime_settings_slow(
         &mut self,
         settings: &crate::settings::RuntimeSettings,
         depth: u32,
@@ -1374,10 +7954,20 @@ impl Value {
                 {
                     return true;
                 }
-                for value in values {
-                    if !value.attach_runtime_settings(settings, depth + 1) {
-                        return false;
+                if let Some(slice) = Arc::get_mut(values) {
+                    for value in slice.iter_mut() {
+                        if !value.attach_runtime_settings(settings, depth + 1) {
+                            return false;
+                        }
                     }
+                } else {
+                    let mut owned = values.to_vec();
+                    for value in owned.iter_mut() {
+                        if !value.attach_runtime_settings(settings, depth + 1) {
+                            return false;
+                        }
+                    }
+                    *values = Arc::from(owned);
                 }
             }
             Self::Object(values) => {
@@ -1387,7 +7977,7 @@ impl Value {
                 {
                     return true;
                 }
-                for (_, value) in values.entries_mut(0) {
+                for (_, value) in values.entries_mut() {
                     if !value.attach_runtime_settings(settings, depth + 1) {
                         return false;
                     }
@@ -1397,7 +7987,9 @@ impl Value {
                 value.pattern.attach_runtime_settings(settings.clone());
             }
             Self::Function(function) => {
-                function.attach_runtime_settings(settings.clone());
+                if function.runtime_settings.is_none() {
+                    Arc::make_mut(function).attach_runtime_settings(settings.clone());
+                }
             }
             Self::Haps(haps) => {
                 if !haps
@@ -1592,7 +8184,59 @@ fn write_json_quote(out: &mut String, value: &str) {
 
 #[cfg(test)]
 mod tests {
-    use super::{OrderedMap, Value};
+    use super::{Key, OrderedMap, Table, Value};
+    use std::sync::Arc;
+
+    /// A table makes no map where a plain compose would not read the same.
+    #[test]
+    fn a_table_refuses_what_a_compose_would_read_otherwise() {
+        let values: Arc<[Value]> = Arc::from([Value::Str("c3".into())]);
+        let key = || Some(Key::from("note"));
+        let data = OrderedMap::from_entries([("gain".to_string(), Value::F64(1.0))]);
+        let no_data = OrderedMap::from_entries([(
+            "gain".to_string(),
+            Value::Haps(super::HapList::new(Vec::new())),
+        )]);
+        assert!(Table::new(&values, key(), Some(&data)).is_some());
+        assert!(
+            Table::new(&values, key(), Some(&no_data)).is_none(),
+            "a set that is no data"
+        );
+        assert!(
+            Table::new(&values, None, None).is_none(),
+            "no key and no set"
+        );
+        assert!(
+            Table::new(&values, None, Some(&data)).is_none(),
+            "a value that is no map"
+        );
+        assert!(
+            Table::new(&Arc::from([]), key(), Some(&data)).is_none(),
+            "no values"
+        );
+    }
+
+    /// A map that reads a shared table holds no more than a plain one.
+    #[test]
+    fn a_dressed_map_is_no_larger_than_a_plain_one() {
+        assert_eq!(
+            std::mem::size_of::<OrderedMap>(),
+            std::mem::size_of::<super::Entries>()
+        );
+        assert_eq!(std::mem::size_of::<super::Entries>(), 24);
+        assert_eq!(std::mem::size_of::<Value>(), 24);
+    }
+
+    #[test]
+    fn a_later_entry_of_a_key_takes_the_place_of_its_value() {
+        let map = OrderedMap::from_entries([
+            ("s".to_string(), Value::F64(1.0)),
+            ("n".to_string(), Value::F64(2.0)),
+            ("s".to_string(), Value::F64(3.0)),
+        ]);
+        let entries: Vec<_> = map.iter().collect();
+        assert_eq!(entries, [("s", &Value::F64(3.0)), ("n", &Value::F64(2.0))]);
+    }
 
     #[test]
     fn object_keys_follow_ecmascript_order() {
@@ -1622,10 +8266,10 @@ mod tests {
 
     #[test]
     fn nested_compact_format_matches_hap_show_algorithm() {
-        let value = Value::List(vec![
+        let value = Value::list(vec![
             Value::Str("c".into()),
             Value::Str("d".into()),
-            Value::List(vec![Value::Str("e".into()), Value::Str("f".into())]),
+            Value::list(vec![Value::Str("e".into()), Value::Str("f".into())]),
         ]);
         assert_eq!(value.compact_json(), "c d [e f]");
     }
@@ -1638,7 +8282,7 @@ mod tests {
         );
         assert_eq!(Value::F64(-0.0).json_stringify().as_deref(), Some("0"));
         assert_eq!(
-            Value::List(vec![Value::Undefined])
+            Value::list(vec![Value::Undefined])
                 .json_stringify()
                 .as_deref(),
             Some("[null]")
@@ -1698,12 +8342,12 @@ mod tests {
             ("after".into(), opaque(4)),
             ("last".into(), opaque(5)),
         ]);
-        let array = Value::List((1..=5).map(opaque).collect());
+        let array = Value::list((1..=5).map(opaque).collect());
         let all_omitted = Value::object([("tail".into(), opaque(3)), ("2".into(), opaque(1))]);
 
         for omitted in [
             Value::Undefined,
-            Value::Function(Box::new(super::FunctionRef::js(99))),
+            Value::Function(std::sync::Arc::new(super::FunctionRef::js(99))),
         ] {
             let host = MaterializeHost {
                 omitted,
@@ -1762,54 +8406,17 @@ mod tests {
         }
     }
 
-    fn map(entries: &[(&str, Value)]) -> OrderedMap {
-        OrderedMap::from_entries(
-            entries
-                .iter()
-                .map(|(key, value)| ((*key).to_owned(), value.clone())),
-        )
-    }
-
-    #[test]
-    fn an_interned_map_is_shared_and_a_change_copies_it_first() {
-        let shared = map(&[("s", Value::Str("bd".into())), ("n", Value::F64(3.0))]);
-        let interned = shared.interned().expect("a data map is interned");
-        assert!(interned.is_interned());
-        assert_eq!(interned, shared);
-        assert_eq!(format!("{interned:?}"), format!("{shared:?}"));
-        let again = shared.clone().interned().expect("a data map is interned");
-        assert!(std::ptr::eq(interned.entries(), again.entries()));
-        let mut changed = interned.clone();
-        changed.insert("n".into(), Value::F64(4.0));
-        assert!(!changed.is_interned());
-        assert_eq!(interned.get("n"), Some(&Value::F64(3.0)));
-        assert_eq!(changed.get("n"), Some(&Value::F64(4.0)));
-    }
-
-    #[test]
-    fn numbers_are_interned_by_their_bits() {
-        let nan = map(&[("n", Value::F64(f64::NAN))]);
-        let first = nan.interned().expect("a NaN map is data");
-        let second = nan.interned().expect("a NaN map is data");
-        assert!(std::ptr::eq(first.entries(), second.entries()));
-        let zero = map(&[("n", Value::F64(0.0))]).interned().expect("data");
-        let minus = map(&[("n", Value::F64(-0.0))]).interned().expect("data");
-        assert!(!std::ptr::eq(zero.entries(), minus.entries()));
-        let kept = minus.get("n").and_then(Value::as_f64).expect("a number");
-        assert_eq!(kept.to_bits(), (-0.0f64).to_bits());
-    }
-
     #[test]
     fn a_lowered_callback_is_a_native_transformer_and_a_javascript_value() {
         let program = crate::callback_ir::PatternTransformProgram::new([]).unwrap();
         let lowered = super::FunctionRef::lowered_js(9, program);
         assert!(lowered.is_native());
         assert_eq!(lowered.callback_id(), Some(9));
-        let value = Value::Function(Box::new(lowered.clone()));
+        let value = Value::Function(std::sync::Arc::new(lowered.clone()));
         assert!(value.has_js_function());
         assert!(!crate::pure(value).is_pure());
         assert!(super::is_rendered_function(&format!("{lowered:?}")));
-        assert!(format!("{lowered:?}").ends_with("(cb 9, native ir v12:0 ops)"));
+        assert!(format!("{lowered:?}").ends_with("(cb 9, native ir v13:0 ops)"));
 
         let pattern = crate::pure(Value::F64(4.0));
         let pure = crate::purity::PurePattern::assert_pure(pattern.clone());
@@ -1836,7 +8443,7 @@ mod tests {
         assert!(lowered.is_native());
         standing.mark_stale();
         assert!(!lowered.is_native(), "a stale program takes no pure view");
-        assert!(Value::Function(Box::new(lowered.clone())).has_js_function());
+        assert!(Value::Function(std::sync::Arc::new(lowered.clone())).has_js_function());
 
         // A pure graph built before the change still applies it. With no
         // host, nothing can run the callback, so it answers with an error.
@@ -1866,9 +8473,74 @@ mod tests {
         assert!(crate::take_query_error().is_some());
     }
 
+    /// A set that holds no entry, in the form of a map that was emptied, is
+    /// no set: the table reads as the plain map and refuses a bare step.
     #[test]
-    fn a_map_with_a_script_value_is_not_interned() {
-        let opaque = map(&[("x", Value::JsValue(super::JsValueRef::new(3, false)))]);
-        assert!(opaque.interned().is_none());
+    fn an_emptied_set_counts_as_no_set() {
+        for entries in [
+            super::Entries::Shared(Arc::from([])),
+            super::Entries::Made(Arc::from([])),
+        ] {
+            let emptied = OrderedMap { entries };
+            assert!(emptied.is_empty());
+            check_emptied(&emptied);
+        }
+    }
+
+    fn check_emptied(emptied: &OrderedMap) {
+        // A step with no entry has nothing to share.
+        let bare: Arc<[Value]> = Arc::from([Value::Object(OrderedMap::new())]);
+        assert!(Table::new(&bare, None, Some(emptied)).is_none());
+        // A named value reads as the map of its one entry.
+        let key = Key::from("note");
+        let values: Arc<[Value]> = Arc::from([Value::F64(1.0)]);
+        let table = Table::new(&values, Some(key.clone()), Some(emptied)).expect("a table");
+        let read = Arc::new(table).map(0).expect("step 0");
+        let plain = OrderedMap::of_one(key, Value::F64(1.0));
+        assert_eq!(read, plain);
+        assert_eq!(read.len(), 1);
+        assert!(!read.owns_no_heap() && plain.owns_no_heap());
+    }
+
+    /// A lookup of a name that no step holds finds nothing, and every name
+    /// that a step holds is found, whatever its mark is.
+    #[test]
+    fn a_lookup_through_the_marks_finds_what_the_map_holds() {
+        let names = [
+            "s", "n", "note", "gain", "lpf", "lpq", "room", "delay", "distort", "pan", "orbit",
+            "release", "sound", "speed", "shape", "cutoff", "decay", "vst", "vsti", "duration",
+        ];
+        let tail: Vec<(String, Value)> = names[4..]
+            .iter()
+            .map(|name| (name.to_string(), Value::F64(2.0)))
+            .collect();
+        let set = OrderedMap::from_entries(tail);
+        let values: Arc<[Value]> = Arc::from([Value::F64(1.0)]);
+        let table = Arc::new(Table::new(&values, Some(Key::from("note")), Some(&set)).unwrap());
+        let map = table.map(0).unwrap();
+        let plain = {
+            let mut plain = OrderedMap::from_entries([("note".to_string(), Value::F64(1.0))]);
+            for (key, value) in set.iter() {
+                plain.insert(key.to_string(), value.clone());
+            }
+            plain
+        };
+        for name in names.iter().copied().chain(["x", "", "gains", "notes"]) {
+            assert_eq!(map.get(name), plain.get(name), "{name}");
+            assert_eq!(map.contains_key(name), plain.contains_key(name), "{name}");
+        }
+    }
+
+    /// A merge of no entry changes nothing, and leaves a dressed map as it is.
+    #[test]
+    fn a_merge_of_an_empty_map_leaves_the_map() {
+        let values: Arc<[Value]> = Arc::from([Value::F64(1.0)]);
+        let set = OrderedMap::from_entries([("s".to_string(), Value::Str("x".into()))]);
+        let table = Arc::new(Table::new(&values, Some(Key::from("note")), Some(&set)).unwrap());
+        let mut map = table.map(0).unwrap();
+        let before = map.clone();
+        map.merge(&OrderedMap::new(), |_, other| other.clone());
+        assert_eq!(map, before);
+        assert!(matches!(map.entries, super::Entries::Dressed(..)));
     }
 }

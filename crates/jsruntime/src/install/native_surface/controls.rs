@@ -2,11 +2,12 @@ use super::{patterns::choose_lookup, *};
 fn distort_pattern(pattern: Pattern, args: Pattern, algorithm: &'static str) -> Pattern {
     let args = args.fmap(
         move |value| match rustel_core::materialize_js_value(value) {
-            Value::List(mut values) => {
-                values.push(Value::Str(algorithm.into()));
-                Value::List(values)
+            Value::List(values) => {
+                let mut out = values.to_vec();
+                out.push(Value::Str(algorithm.into()));
+                Value::list(out)
             }
-            value => Value::List(vec![value, Value::F64(1.0), Value::Str(algorithm.into())]),
+            value => Value::list(vec![value, Value::F64(1.0), Value::Str(algorithm.into())]),
         },
     );
     control_registry()
@@ -84,11 +85,11 @@ pub(super) fn span_signal(kind: &str) -> Pattern {
 
 pub(super) fn append_pattern_value(left: &Value, right: &Value) -> Value {
     let mut values = match rustel_core::materialize_js_value(left) {
-        Value::List(values) => values,
+        Value::List(values) => values.to_vec(),
         value => vec![value],
     };
     values.push(rustel_core::materialize_js_value(right));
-    Value::List(values)
+    Value::list(values)
 }
 
 fn reify_pattern_list<'js>(
@@ -99,7 +100,7 @@ fn reify_pattern_list<'js>(
         let (pattern, sidecar) = reify_bridged(ctx, value)?;
         return Ok((pattern, vec![sidecar]));
     };
-    let mut result = rustel_core::pure(Value::List(Vec::new()));
+    let mut result = rustel_core::pure(Value::list(Vec::new()));
     let mut sidecars = reserve_js_array(ctx, js_array_len(array)?)?;
     for value in array.iter::<rquickjs::Value>() {
         let (pattern, sidecar) = reify_bridged(ctx, &value?)?;
@@ -193,16 +194,16 @@ pub(super) fn fx<'js>(
             let mut combined = match controls
                 .get("FX")
                 .cloned()
-                .unwrap_or(Value::List(Vec::new()))
+                .unwrap_or_else(|| Value::list(Vec::new()))
             {
-                Value::List(values) => values,
+                Value::List(values) => values.to_vec(),
                 value => vec![value],
             };
             match rustel_core::materialize_js_value(effects) {
-                Value::List(values) => combined.extend(values),
+                Value::List(values) => combined.extend_from_slice(&values),
                 value => combined.push(value),
             }
-            controls.insert("FX".into(), Value::List(combined));
+            controls.insert("FX".into(), Value::list(combined));
             Value::Object(controls)
         },
         rustel_core::LookupFlow::LeftControls,

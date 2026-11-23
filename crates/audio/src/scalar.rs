@@ -1267,7 +1267,8 @@ pub const MAX_CONFIGURABLE_POLYPHONY: usize = 256;
 
 struct PolyphonyLimit(usize);
 
-/// The fade a culled sound gets.
+/// The longest fade a culled sound gets. A busy retirement shortens it: see
+/// [`voice::polyphony_fade_secs`].
 const POLYPHONY_FADE_SECS: f32 = 0.25;
 /// Duration of the linear choke fade from full gain to silence, in seconds.
 const CUT_FADE_SECS: f32 = 0.01;
@@ -2047,6 +2048,9 @@ pub struct ScalarBackend {
     /// (that generation, the block start its flip landed on, the last frame
     /// such an event can aim at). See [`Self::keep_started_onsets`].
     kept_onsets: Option<(u64, u64, u64)>,
+    /// How fast voices ask to start, which sizes the retirement fade:
+    /// see [`voice::polyphony_fade_secs`].
+    turnover: voice::TurnoverRate,
     pressure: ScalarPressureState,
 }
 
@@ -2074,18 +2078,32 @@ impl ScalarBackend {
             return;
         }
         self.max_polyphony.0 = limit;
-        let active = self
-            .voices
-            .iter()
-            .filter(|voice| !voice.end.is_culled())
-            .count();
+        let mut active = 0usize;
+        let mut fading = 0usize;
+        for voice in self.voices.iter() {
+            if voice.end.is_culled() {
+                fading += 1;
+            } else {
+                active += 1;
+            }
+        }
+        let kills = active.saturating_sub(limit);
+        // The voices that retire stay in the pool while they fade, and no
+        // voice joins it.
+        let fade_secs = voice::polyphony_fade_secs(
+            self.turnover.per_sec(),
+            fading + kills,
+            self.voices.len(),
+            limit,
+        );
         let led = Self::led(&self.voices, 0);
         let frame = self.frame;
         let faded = Self::fade_oldest_voices(
             &mut self.voices,
-            active.saturating_sub(limit),
+            kills,
             led,
             |_| frame,
+            fade_secs,
             self.sample_rate,
         );
         self.pressure.semantic_polyphony_fades = self
@@ -2363,6 +2381,7 @@ impl ScalarBackend {
         self.pending.clear();
         self.pending_chokes.fill(None);
         self.preview_epoch = 0;
+        self.turnover = voice::TurnoverRate::default();
         if let Some(stems) = self.stems.as_mut() {
             stems.reset();
         }

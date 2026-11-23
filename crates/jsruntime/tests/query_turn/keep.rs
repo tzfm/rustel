@@ -593,7 +593,10 @@ fn raw_keep_retains_mapper_inputs_prunes_transients_and_keeps_nested_accounting(
         "raw keep mapper lost its JavaScript query owner"
     );
     assert_eq!(
-        owned.active_pattern().expect("raw keep owned graph").steps,
+        owned
+            .active_pattern()
+            .expect("raw keep owned graph")
+            .steps(),
         Some(Fraction::int(5))
     );
     for _ in 0..3 {
@@ -672,7 +675,7 @@ fn raw_keep_retains_mapper_inputs_prunes_transients_and_keeps_nested_accounting(
         js_terminal
             .active_pattern()
             .expect("raw keep JavaScript terminal")
-            .steps,
+            .steps(),
         Some(Fraction::int(3))
     );
     for _ in 0..3 {
