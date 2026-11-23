@@ -3341,6 +3341,7 @@ mod tests {
             cps: None,
             value: crate::ValueJson::Raw(value.clone()),
             value_show: String::new(),
+            non_finite_pitch: None,
             log_line: None,
         }
     }

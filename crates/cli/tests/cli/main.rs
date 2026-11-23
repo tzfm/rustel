@@ -5474,6 +5474,45 @@ fn talkit_speaks_a_number() {
     assert!(loud, "the bounce is silent");
 }
 
+/// A pitch no voice can sound is refused and silent, by the rules of
+/// strudel.cc: an infinity for every voice, NaN for a sample. A synth reads
+/// a NaN note as absent and plays its default.
+#[test]
+fn a_pitch_that_is_not_a_finite_number_follows_strudel() {
+    let path = scratch("non-finite-pitch.wav");
+    for (score, refused) in [
+        (r#"note(run(1).log2()).s("triangle")"#, Some("note")),
+        (r#"freq(run(1).log2().mul(-1)).s("triangle")"#, Some("freq")),
+        (r#"freq(run(1).log2()).s("bd")"#, Some("freq")),
+        (r#"note(run(1).add(-1).log2()).s("bd")"#, Some("note")),
+        (r#"note(run(1).add(-1).log2()).s("triangle")"#, None),
+    ] {
+        let out = run(&[
+            "render",
+            "-e",
+            score,
+            "--duration",
+            "1",
+            "--format",
+            "scalar-wav",
+            "-o",
+            path.to_str().expect("UTF-8 path"),
+        ]);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(out.status.success(), "{score}: {stderr}");
+        let wav = std::fs::read(&path).expect("wav");
+        let silent = wav[44..].iter().all(|byte| *byte == 0);
+        assert_eq!(silent, refused.is_some(), "{score}: {stderr}");
+        if let Some(name) = refused {
+            let said = format!("{name} must be a finite number");
+            assert!(stderr.contains(&said), "{score}: {stderr}");
+        } else {
+            assert!(!stderr.contains("voice_refused"), "{score}: {stderr}");
+        }
+    }
+    let _ = std::fs::remove_file(&path);
+}
+
 /// The command line prints recoverable notices on stderr, which a library
 /// Session does only when its host opts in. A notice that every note raises
 /// prints once, with the number of onsets.
@@ -8888,6 +8927,50 @@ fn a_graph_below_the_depth_limit_still_queries() {
 }
 
 // -- check --------------------------------------------------------------
+
+/// A talkit setting the render refuses is a finding of the check, in the
+/// words the render uses, and one the render takes is not.
+#[test]
+fn check_names_a_talkit_setting_the_render_refuses() {
+    for (settings, said) in [
+        ("{pitch: 49}", "pitch takes 50 to 500"),
+        ("{speed: 150.5}", "speed takes a whole number"),
+        ("{q: 'garbled'}", "quality takes natural, monotone or sung"),
+        ("{out: 'x.wav'}", "`out` is not a setting"),
+    ] {
+        let score = format!("talkit('hello there', {settings})");
+        let out = run(&["check", "-e", &score, "--no-samples"]);
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert_eq!(out.status.code(), Some(1), "{score}: {stdout}");
+        assert!(stdout.contains(said), "{score}: {stdout}");
+    }
+    let out = run(&[
+        "check",
+        "-e",
+        "talkit('hello there', {pitch: 200})",
+        "--no-samples",
+    ]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+    // A note another output plays speaks nothing here, and a finding marks
+    // the line of the call.
+    for score in [
+        "talkit('hello', {pitch: 49}).note('c3').midi(0)",
+        "talkit('hello', {pitch: 49}).osc()",
+        "talkit('hello', {pitch: 49}).vsti('Some Synth')",
+    ] {
+        let out = run(&["check", "-e", score, "--no-samples"]);
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(!stdout.contains("pitch takes"), "{score}: {stdout}");
+    }
+    let score = "// intro\n$: s('bd')\n$: talkit('hello', {pitch: 49})";
+    let out = run(&["check", "-e", score, "--no-samples"]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("line 3"), "{stdout}");
+}
 
 /// The static lint never runs the score, so a name that only fails to
 /// resolve at evaluation time is invisible to it. `check` must still refuse

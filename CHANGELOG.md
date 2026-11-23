@@ -14,9 +14,12 @@
 - Fixed: an export, a replay export or a stems export that cannot write a file names that file, instead of a bare "No such file or directory".
 - Vim mode: `J` and `gJ` join lines, as in Vim. The shipped `$` label jumps move from `J` and `K` to `]$` and `[$`.
 - `rustel check` names a note that a `gm_*` soundfont has no note for, such as `note("c2").s("gm_clarinet")`, instead of finding no issues while the note plays as silence.
+- `rustel check` names a `talkit` setting the render refuses, such as `pitch: 49` or `quality: "garbled"`, instead of finding no issues while the voice is silent.
 - `rustel check` and `rustel query` take `--prebake setup.js`, so a score calling a prebake's helpers checks clean.
 - A sample source can be a repository page such as `https://github.com/user/repo`. It reads as `github:user/repo`, and a web page or a missing map says what to write instead.
 - Fixed: a sample source turned off and on again on the Permissions page brings its sounds back, and the update it refused while off runs again.
+- Fixed: in an export, an infinite `note` or `freq`, such as the log2 of 0, is a refused voice, and so is NaN on a sample, as on strudel.cc, instead of a note at the default pitch. A synth still reads a NaN note as absent.
+- Fixed: the update a permission re-runs waits for the engine to start fetching the source, instead of sometimes being refused again with an unknown sound.
 - Fixed: an Alt key over the mixer or another panel holding the keyboard no longer types into or edits the score.
 - A pattern can set the tempo: `cps("<0.5 1>")` changes it at each onset, unless Link or MIDI clock leads.
 - Fixed: a live output that fell behind and resumed is printed as a warning, not as an error, since the run plays on.

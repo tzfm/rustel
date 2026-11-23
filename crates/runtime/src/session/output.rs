@@ -556,6 +556,7 @@ mod tests {
                 "s": "bd"
             })),
             value_show: String::new(),
+            non_finite_pitch: None,
             log_line: None,
         };
 
@@ -589,6 +590,7 @@ mod tests {
             cps: None,
             value: ValueJson::Raw(value),
             value_show: String::new(),
+            non_finite_pitch: None,
             log_line: None,
         };
         let oversized = onset(
@@ -632,6 +634,7 @@ mod tests {
                 "s": "bd"
             })),
             value_show: String::new(),
+            non_finite_pitch: None,
             log_line: None,
         };
         let onsets = vec![onset; MAX_OSC_ROUTE_ATTEMPTS_PER_PASS + 1];
@@ -663,6 +666,7 @@ mod tests {
             cps: None,
             value: ValueJson::Raw(serde_json::json!({ "oscport": 57120, "s": "bd" })),
             value_show: String::new(),
+            non_finite_pitch: None,
             log_line: None,
         };
         let mut onsets = (0..=MAX_OSC_INTENTS_PER_PASS as u64)
@@ -682,6 +686,7 @@ mod tests {
             cps: None,
             value: ValueJson::Raw(serde_json::json!({ "s": "bd" })),
             value_show: String::new(),
+            non_finite_pitch: None,
             log_line: None,
         });
         let mut session = Session::new().expect("session");
@@ -722,6 +727,7 @@ mod tests {
                     "s": payload.clone()
                 })),
                 value_show: String::new(),
+                non_finite_pitch: None,
                 log_line: None,
             })
             .collect::<Vec<_>>();

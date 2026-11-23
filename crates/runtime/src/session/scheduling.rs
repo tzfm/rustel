@@ -208,6 +208,7 @@ impl Session {
                     cps: None,
                     value: ValueJson::from_value(&hap.value),
                     value_show: String::new(),
+                    non_finite_pitch: None,
                     ui_visuals: hap.ui_visuals_context(),
                     log_line: None,
                 };
@@ -855,6 +856,7 @@ impl Session {
                 cps: event.cps,
                 value: ValueJson::from_value(&event.value),
                 value_show: event.value.show(),
+                non_finite_pitch: None,
                 live_controls: event.live_controls,
                 ui_visuals: event.ui_visuals,
                 log_line: event.log_line.as_deref().map(str::to_owned),
