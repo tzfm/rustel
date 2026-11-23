@@ -14,6 +14,7 @@
 - Fixed: an export, a replay export or a stems export that cannot write a file names that file, instead of a bare "No such file or directory".
 - Vim mode: `J` and `gJ` join lines, as in Vim. The shipped `$` label jumps move from `J` and `K` to `]$` and `[$`.
 - `rustel check` names a note that a `gm_*` soundfont has no note for, such as `note("c2").s("gm_clarinet")`, instead of finding no issues while the note plays as silence.
+- `rustel check` names a `talkit` setting the render refuses, such as `pitch: 49` or `quality: "garbled"`, instead of finding no issues while the voice is silent.
 - `rustel check` and `rustel query` take `--prebake setup.js`, so a score calling a prebake's helpers checks clean.
 - A sample source can be a repository page such as `https://github.com/user/repo`. It reads as `github:user/repo`, and a web page or a missing map says what to write instead.
 - Fixed: a sample source turned off and on again on the Permissions page brings its sounds back, and the update it refused while off runs again.
