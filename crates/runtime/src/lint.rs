@@ -1996,9 +1996,12 @@ pub fn unknown_chord_warnings<'a>(
     mini: bool,
     setups: impl IntoIterator<Item = &'a str>,
 ) -> Vec<String> {
-    if setups
-        .into_iter()
-        .any(|setup| setup.contains("addVoicings(") || setup.contains("setDefaultVoicings("))
+    // The lint reads the whole score, up to the 4 MiB a score may be: a
+    // bounce with no voicing does not pay for it.
+    if !source.contains("voicing")
+        || setups
+            .into_iter()
+            .any(|setup| setup.contains("addVoicings(") || setup.contains("setDefaultVoicings("))
     {
         return Vec::new();
     }
