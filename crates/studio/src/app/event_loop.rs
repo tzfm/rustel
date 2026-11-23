@@ -266,6 +266,13 @@ impl App {
             // was checked: fetch it now, so the re-run's check finds its
             // names on their way rather than unknown.
             self.ask_for_imports_again(self.scenes.current().id);
+            self.refused_update_awaits_look_ups = true;
+        }
+        if self.refused_update_awaits_look_ups
+            && self.lookups_owed.is_empty()
+            && self.worker.look_ups_taken()
+        {
+            self.refused_update_awaits_look_ups = false;
             self.retry_refused_update();
         }
         #[cfg(feature = "hydra")]

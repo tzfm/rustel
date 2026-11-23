@@ -219,7 +219,9 @@ enum EngineCommand {
     SetLaunchPads(Vec<(u8, u8)>),
     /// Fetch the map of a `samples("…")` the score names, ahead of the
     /// score being evaluated.
-    LookUpSamples(String),
+    /// The counter moves once the engine has taken the look-up, so a check
+    /// after it finds the map on its way: see [`StudioWorker::look_ups_taken`].
+    LookUpSamples(String, Arc<AtomicU64>),
     /// Show a snippet from the shelf in its own picture, or `None` to stop.
     #[cfg(feature = "hydra")]
     HydraPreview(Option<String>),
@@ -331,6 +333,9 @@ pub struct StudioWorker {
     command_epoch: Arc<AtomicU64>,
     shutdown_requested: Arc<AtomicBool>,
     next_recording_request: AtomicU64,
+    /// Sample look-ups sent, and how many the engine has taken.
+    look_ups_sent: AtomicU64,
+    look_ups_done: Arc<AtomicU64>,
     join: Option<JoinHandle<()>>,
 }
 
@@ -442,6 +447,8 @@ impl StudioWorker {
             command_epoch,
             shutdown_requested,
             next_recording_request: AtomicU64::new(1),
+            look_ups_sent: AtomicU64::new(0),
+            look_ups_done: Arc::new(AtomicU64::new(0)),
             join: Some(join),
         })
     }
@@ -920,11 +927,24 @@ impl StudioWorker {
     /// banks are there before the score is evaluated. False when the queue
     /// is full; the checker asks again when it next runs.
     pub fn try_look_up_samples(&self, spec: &str) -> bool {
-        !self.shutdown_requested.load(Ordering::Acquire)
+        let sent = !self.shutdown_requested.load(Ordering::Acquire)
             && self
                 .commands
-                .try_send(EngineCommand::LookUpSamples(spec.to_owned()))
-                .is_ok()
+                .try_send(EngineCommand::LookUpSamples(
+                    spec.to_owned(),
+                    Arc::clone(&self.look_ups_done),
+                ))
+                .is_ok();
+        if sent {
+            self.look_ups_sent.fetch_add(1, Ordering::AcqRel);
+        }
+        sent
+    }
+
+    /// Whether the engine has taken every sample look-up sent. From then on
+    /// the library counts each map as pending until it lands.
+    pub fn look_ups_taken(&self) -> bool {
+        self.look_ups_done.load(Ordering::Acquire) >= self.look_ups_sent.load(Ordering::Acquire)
     }
 
     pub fn try_set_input(&self, name: Option<String>) -> bool {
@@ -1834,10 +1854,11 @@ fn process_command(
             engine.set_live_material(&material);
             false
         }
-        EngineCommand::LookUpSamples(spec) => {
+        EngineCommand::LookUpSamples(spec, done) => {
             // A refusal is recorded against the spec for the checker to
             // show where it is written; nothing to say here.
             let _ = engine.look_up_samples(&spec);
+            done.fetch_add(1, Ordering::AcqRel);
             false
         }
         EngineCommand::Record { request_id, path } => {
