@@ -1367,6 +1367,8 @@ pub struct StudioEngine {
     /// The names the text last evaluated can reach, and the variants of
     /// each it can play, read once per text.
     current_score_names: Vec<(String, Variants)>,
+    /// The gain warnings the log has of the score in play.
+    gain_fallbacks_said: std::collections::HashSet<String>,
     /// The sounds the score's own pattern resolved in the window its last
     /// warm queried, with the variants picked there. Kept while it plays,
     /// like [`Self::current_score_names`], and they reach what no text
@@ -1896,6 +1898,7 @@ impl StudioEngine {
             preview_budget_bytes,
             unused_sample_idle,
             current_score_names: Vec::new(),
+            gain_fallbacks_said: std::collections::HashSet::new(),
             score_window_names: Vec::new(),
             live_pinned: Vec::new(),
             live_recent: Vec::new(),
