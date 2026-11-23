@@ -63,30 +63,34 @@ pub(crate) fn end_query_merge_cache() {
 static UI_VISUAL_MASK_CACHE: [OnceLock<Arc<Keys>>; 64] = [const { OnceLock::new() }; 64];
 static UI_VISUAL_SINGLE_CACHE: [OnceLock<Arc<Keys>>; 64] = [const { OnceLock::new() }; 64];
 
-fn cached_ui_visual_mask(mask: u64) -> Option<Arc<Keys>> {
+fn cached_ui_visual_mask_ref(mask: u64) -> Option<&'static Arc<Keys>> {
     if mask == 0 {
         return None;
     }
     if mask < 64 {
         let cell = &UI_VISUAL_MASK_CACHE[mask as usize];
-        return Some(Arc::clone(cell.get_or_init(|| {
+        return Some(cell.get_or_init(|| {
             Arc::new(Keys {
                 ui_visuals: mask,
                 ..Keys::default()
             })
-        })));
+        }));
     }
     if mask.is_power_of_two() {
         let slot = mask.trailing_zeros() as usize;
         let cell = &UI_VISUAL_SINGLE_CACHE[slot];
-        return Some(Arc::clone(cell.get_or_init(|| {
+        return Some(cell.get_or_init(|| {
             Arc::new(Keys {
                 ui_visuals: mask,
                 ..Keys::default()
             })
-        })));
+        }));
     }
     None
+}
+
+fn cached_ui_visual_mask(mask: u64) -> Option<Arc<Keys>> {
+    cached_ui_visual_mask_ref(mask).map(Arc::clone)
 }
 
 #[derive(Clone, Debug, Default)]
@@ -255,25 +259,26 @@ impl ContextKeys {
     }
 
     /// Apply `slot` to every hap in `haps`, hoisting mask/slot checks and
-    /// caching `None` and recently seen input `Keys` pointers across the slice.
-    #[inline(never)]
-    pub(crate) fn add_ui_visual_slot_to_haps(
+    /// caching `None` and recently seen pinned input `Keys` pointers across
+    /// the slice with zero extra refcount traffic on cache hits.
+    #[inline]
+    pub(crate) fn add_ui_visual_slot_to_haps<'a>(
         haps: &mut [crate::Hap],
         slot: u8,
-        once: &UiVisualCache,
+        once: &'a UiVisualCache,
     ) {
         if haps.is_empty() || slot >= 64 {
             return;
         }
         let bit = 1_u64 << slot;
-        let mut none_cached: Option<Arc<Keys>> = None;
-        let mut local: [Option<(Arc<Keys>, Arc<Keys>)>; 2] = [None, None];
+        let mut none_cached: Option<&'static Arc<Keys>> = None;
+        let mut local: [Option<(*const Keys, &'a Arc<Keys>)>; 4] = [None; 4];
         let mut local_next = 0u8;
         for hap in haps {
             match &mut hap.keys.0 {
                 None => {
-                    let cached = none_cached.get_or_insert_with(|| {
-                        cached_ui_visual_mask(bit).expect("single visual slot is always cached")
+                    let cached = *none_cached.get_or_insert_with(|| {
+                        cached_ui_visual_mask_ref(bit).expect("single visual slot is always cached")
                     });
                     hap.keys.0 = Some(Arc::clone(cached));
                 }
@@ -281,46 +286,50 @@ impl ContextKeys {
                     if arc.ui_visuals & bit != 0 {
                         continue;
                     }
-                    let mut hit = None;
+                    let key_ptr = Arc::as_ptr(arc);
+                    let mut hit: Option<&'a Arc<Keys>> = None;
                     for entry in local.iter().flatten() {
-                        if Arc::ptr_eq(arc, &entry.0) {
-                            hit = Some(Arc::clone(&entry.1));
+                        if std::ptr::eq(key_ptr, entry.0) {
+                            hit = Some(entry.1);
                             break;
                         }
                     }
                     if let Some(out) = hit {
-                        *arc = out;
+                        *arc = Arc::clone(out);
                         continue;
                     }
                     if arc.is_ui_visuals_only()
-                        && let Some(cached) = cached_ui_visual_mask(arc.ui_visuals | bit)
+                        && let Some(cached) = cached_ui_visual_mask_ref(arc.ui_visuals | bit)
                     {
-                        let idx = usize::from(local_next & 1);
-                        local[idx] = Some((Arc::clone(arc), Arc::clone(&cached)));
-                        local_next = local_next.wrapping_add(1);
-                        *arc = cached;
+                        if let Some(static_in) = cached_ui_visual_mask_ref(arc.ui_visuals)
+                            && std::ptr::eq(key_ptr, Arc::as_ptr(static_in))
+                        {
+                            let idx = usize::from(local_next & 3);
+                            local[idx] = Some((Arc::as_ptr(static_in), cached));
+                            local_next = local_next.wrapping_add(1);
+                        }
+                        *arc = Arc::clone(cached);
                         continue;
                     }
                     if let Some(own) = Arc::get_mut(arc) {
                         own.ui_visuals |= bit;
                         continue;
                     }
-                    let mut once_hit = None;
+                    let mut once_hit: Option<&'a Arc<Keys>> = None;
                     for cell in once.iter() {
                         let Some(pair) = cell.get() else {
                             break;
                         };
-                        if Arc::ptr_eq(arc, &pair.0) {
-                            let out = Arc::clone(&pair.1);
-                            let idx = usize::from(local_next & 1);
-                            local[idx] = Some((Arc::clone(&pair.0), Arc::clone(&out)));
+                        if std::ptr::eq(key_ptr, Arc::as_ptr(&pair.0)) {
+                            let idx = usize::from(local_next & 3);
+                            local[idx] = Some((Arc::as_ptr(&pair.0), &pair.1));
                             local_next = local_next.wrapping_add(1);
-                            once_hit = Some(out);
+                            once_hit = Some(&pair.1);
                             break;
                         }
                     }
                     if let Some(out) = once_hit {
-                        *arc = out;
+                        *arc = Arc::clone(out);
                         continue;
                     }
                     Self::add_ui_visual_slot_slow(arc, bit, once, &mut local, &mut local_next);
@@ -329,24 +338,19 @@ impl ContextKeys {
         }
     }
 
-    #[cold]
     #[inline(never)]
-    fn add_ui_visual_slot_slow(
+    fn add_ui_visual_slot_slow<'a>(
         arc: &mut Arc<Keys>,
         bit: u64,
-        once: &UiVisualCache,
-        local: &mut [Option<(Arc<Keys>, Arc<Keys>)>; 2],
+        once: &'a UiVisualCache,
+        local: &mut [Option<(*const Keys, &'a Arc<Keys>)>; 4],
         local_next: &mut u8,
     ) {
         let mut free_slot = None;
         for (i, cell) in once.iter().enumerate() {
             if let Some(pair) = cell.get() {
                 if Keys::same_values(arc, &pair.0) {
-                    let out = Arc::clone(&pair.1);
-                    let idx = usize::from(*local_next & 1);
-                    local[idx] = Some((Arc::clone(arc), Arc::clone(&out)));
-                    *local_next = local_next.wrapping_add(1);
-                    *arc = out;
+                    *arc = Arc::clone(&pair.1);
                     return;
                 }
             } else if free_slot.is_none() {
@@ -358,11 +362,13 @@ impl ContextKeys {
         next.ui_visuals |= bit;
         let output = Arc::new(next);
         if let Some(idx) = free_slot {
-            let _ = once[idx].set((Arc::clone(&input), Arc::clone(&output)));
+            let _ = once[idx].set((input, Arc::clone(&output)));
+            if let Some(pair) = once[idx].get() {
+                let slot_idx = usize::from(*local_next & 3);
+                local[slot_idx] = Some((Arc::as_ptr(&pair.0), &pair.1));
+                *local_next = local_next.wrapping_add(1);
+            }
         }
-        let idx = usize::from(*local_next & 1);
-        local[idx] = Some((input, Arc::clone(&output)));
-        *local_next = local_next.wrapping_add(1);
         *arc = output;
     }
 
