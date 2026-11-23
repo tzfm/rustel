@@ -99,6 +99,52 @@ pub struct QueryReport {
     pub query_threw: Option<String>,
 }
 
+/// A `note` or `freq` no voice can sound: see [`non_finite_pitch`].
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct NonFinitePitch {
+    /// The control, `note` or `freq`.
+    pub(crate) name: &'static str,
+    /// NaN: a synth reads it as absent, and only a sample cannot play it.
+    pub(crate) sample_only: bool,
+}
+
+/// The pitch control of `value` that stops its voice, as on strudel.cc. An
+/// infinite `freq` stops every voice, and a finite one other than 0 leaves
+/// `note` unread. An infinite `note` stops every voice. NaN is falsy to a
+/// synth, which takes its default, and reaches a sample's playback rate,
+/// which refuses it. A talkit voice reads its own pitch.
+pub(crate) fn non_finite_pitch(value: &Value) -> Option<NonFinitePitch> {
+    let materialized;
+    let value = if matches!(value, Value::JsValue(_)) {
+        materialized = rustel_core::materialize_js_value(value);
+        &materialized
+    } else {
+        value
+    };
+    let object = value.as_object()?;
+    if object.get("talkit").is_some() {
+        return None;
+    }
+    let stops = |name, sample_only| Some(NonFinitePitch { name, sample_only });
+    let freq = object.get("freq").and_then(Value::as_f64);
+    let note = object.get("note").and_then(Value::as_f64);
+    match freq {
+        Some(freq) if freq.is_infinite() => return stops("freq", false),
+        Some(freq) if freq != 0.0 && !freq.is_nan() => return None,
+        _ => {}
+    }
+    if note.is_some_and(f64::is_infinite) {
+        return stops("note", false);
+    }
+    if freq.is_some_and(f64::is_nan) {
+        return stops("freq", true);
+    }
+    if note.is_some_and(f64::is_nan) {
+        return stops("note", true);
+    }
+    None
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct OnsetEventJson {
     /// Private direct-control provenance; never part of query/report JSON.
@@ -118,6 +164,12 @@ pub struct OnsetEventJson {
     pub cps: Option<f64>,
     pub value: ValueJson,
     pub value_show: String,
+    /// The `note` or `freq` that stops this onset's voice in a render. JSON
+    /// writes NaN and infinities as null, which a voice reads as no pitch.
+    /// A live update refuses such a score before it plays, and outputs that
+    /// are no voice read the value as JSON writes it.
+    #[serde(skip)]
+    pub(crate) non_finite_pitch: Option<NonFinitePitch>,
     #[serde(default, skip_serializing_if = "is_zero")]
     pub ui_visuals: u64,
     /// `.log()`'s text, printed when this onset fires. Absent for the events
@@ -257,4 +309,50 @@ pub struct BenchMetrics {
 
 pub fn fraction_label(f: Fraction) -> String {
     f.show()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn controls(entries: &[(&str, Value)]) -> Value {
+        let mut map = rustel_core::OrderedMap::default();
+        for (name, value) in entries {
+            map.insert((*name).into(), value.clone());
+        }
+        Value::Object(map)
+    }
+
+    /// The rules of strudel.cc, for a synth and for a sample.
+    #[test]
+    fn the_pitch_that_stops_a_voice_follows_strudel() {
+        let nan = Value::F64(f64::NAN);
+        let inf = Value::F64(f64::INFINITY);
+        let low = Value::F64(f64::NEG_INFINITY);
+        let stops = |name, sample_only| Some(NonFinitePitch { name, sample_only });
+        for (entries, judged) in [
+            (vec![("note", nan.clone())], stops("note", true)),
+            (vec![("note", low)], stops("note", false)),
+            (vec![("freq", inf.clone())], stops("freq", false)),
+            (
+                vec![("note", inf.clone()), ("freq", Value::F64(440.0))],
+                None,
+            ),
+            (
+                vec![("note", Value::F64(60.0)), ("freq", nan.clone())],
+                stops("freq", true),
+            ),
+            (
+                vec![("note", inf.clone()), ("freq", nan.clone())],
+                stops("note", false),
+            ),
+            (
+                vec![("note", nan.clone()), ("talkit", Value::Str("la".into()))],
+                None,
+            ),
+            (vec![("note", Value::F64(60.0)), ("gain", inf)], None),
+        ] {
+            assert_eq!(non_finite_pitch(&controls(&entries)), judged, "{entries:?}");
+        }
+    }
 }

@@ -175,8 +175,18 @@ fn tallied_scalar_event(
     let convert = || {
         let cycle = onset_cycle(onset, cps);
         let time = onset.target_time;
-        scalar_event_at(onset, time, cycle, sample_rate, cps, samples, origin, 0.0)
-            .map_err(|error| error.to_string())
+        let refused = |pitch: crate::hap_json::NonFinitePitch| {
+            format!("{} must be a finite number", pitch.name)
+        };
+        if let Some(pitch) = onset.non_finite_pitch.filter(|pitch| !pitch.sample_only) {
+            return Err(refused(pitch));
+        }
+        let event = scalar_event_at(onset, time, cycle, sample_rate, cps, samples, origin, 0.0)
+            .map_err(|error| error.to_string())?;
+        match onset.non_finite_pitch {
+            Some(pitch) if event.sample.is_some() => Err(refused(pitch)),
+            _ => Ok(event),
+        }
     };
     let Some(tally) = tally else {
         return convert();
@@ -1849,6 +1859,7 @@ mod stretch_chain_tests {
                 cps: None,
                 value: crate::ValueJson::Raw(value),
                 value_show: String::new(),
+                non_finite_pitch: None,
                 log_line: None,
             }];
             let ordered = super::musical_order(&onsets, rate);
@@ -2354,6 +2365,7 @@ mod tests {
             cps: None,
             value: crate::ValueJson::Raw(value),
             value_show: String::new(),
+            non_finite_pitch: None,
             log_line: None,
         }
     }
