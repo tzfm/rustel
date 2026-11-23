@@ -335,10 +335,24 @@ pub(crate) fn plays_locally(onset: &OnsetEventJson) -> bool {
     crate::midi_onset::midi_route(onset).is_none()
 }
 
+/// Whether an onset falls before the first frame of a render, as the first
+/// voice of a `strum` at cycle zero does. strudel.cc does not schedule a
+/// sound in the past, so it plays nothing and is no refused voice. A time
+/// that is not finite is not one: the voice refuses it.
+fn before_the_render(onset: &OnsetEventJson, sample_rate: u32) -> bool {
+    onset.target_time.is_finite()
+        && onset.target_time < 0.0
+        && onset_frame_at(onset.target_time, sample_rate) == u64::MAX
+}
+
 /// The onsets a render plays, in the order of the music: the order of their
-/// frames. An onset that goes to MIDI is not one of them.
+/// frames. An onset that goes to MIDI or falls before the render is not one
+/// of them.
 fn musical_order(onsets: &[OnsetEventJson], sample_rate: u32) -> Vec<&OnsetEventJson> {
-    let mut ordered: Vec<_> = onsets.iter().filter(|onset| plays_locally(onset)).collect();
+    let mut ordered: Vec<_> = onsets
+        .iter()
+        .filter(|onset| plays_locally(onset) && !before_the_render(onset, sample_rate))
+        .collect();
     ordered.sort_by_key(|onset| onset_frame_at(onset.target_time, sample_rate));
     ordered
 }

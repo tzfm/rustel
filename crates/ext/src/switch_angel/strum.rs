@@ -10,7 +10,7 @@ pub(super) const REFERENCE: ReferenceEntry = ReferenceEntry {
     name: "strum",
     synonyms: &[],
     summary: "spread a chord's onsets in time",
-    description: "Moves the voices of each chord apart so they arrive one after another, the way a guitarist does not strike six strings at once. The first voice lands early by the amount you give and the last lands late by it, with the rest spaced evenly between, so the chord keeps its centre.\n\nA negative amount strums downward: the top voice arrives first. A single note is left where it is.",
+    description: "Moves the voices of each chord apart so they arrive one after another, the way a guitarist does not strike six strings at once. The first voice lands early by the amount you give and the last lands late by it, with the rest spaced evenly between, so the chord keeps its centre. A voice moved before the start of the score does not sound, as on strudel.cc.\n\nA negative amount strums downward: the top voice arrives first. A single note is left where it is.",
     params: &[ReferenceParam {
         name: "amount",
         r#type: "number | Pattern",

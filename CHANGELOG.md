@@ -16,6 +16,7 @@
 - `rustel check` names a note that a `gm_*` soundfont has no note for, such as `note("c2").s("gm_clarinet")`, instead of finding no issues while the note plays as silence.
 - `rustel check` names a `talkit` setting the render refuses, such as `pitch: 49` or `quality: "garbled"`, instead of finding no issues while the voice is silent.
 - `rustel check` and `rustel query` take `--prebake setup.js`, so a score calling a prebake's helpers checks clean.
+- Fixed: a voice a shift moves before the start of an export, such as the first voice of a `strum` at cycle zero, is silent as on strudel.cc, with no refusal, so a Studio export of such a score no longer fails. Live play says so in plain words.
 - A sample source can be a repository page such as `https://github.com/user/repo`. It reads as `github:user/repo`, and a web page or a missing map says what to write instead.
 - Fixed: a sample source turned off and on again on the Permissions page brings its sounds back, and the update it refused while off runs again.
 - Fixed: in an export, an infinite `note` or `freq`, such as the log2 of 0, is a refused voice, and so is NaN on a sample, as on strudel.cc, instead of a note at the default pitch. A synth still reads a NaN note as absent.

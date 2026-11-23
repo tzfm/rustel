@@ -5474,6 +5474,38 @@ fn talkit_speaks_a_number() {
     assert!(loud, "the bounce is silent");
 }
 
+/// A strum at cycle zero moves its first voice before the export begins.
+/// strudel.cc does not schedule a sound in the past, so that voice is silent
+/// and is no refusal. The voice after it plays.
+#[test]
+fn a_voice_before_the_export_is_silent_and_not_refused() {
+    let path = scratch("strum-at-zero.wav");
+    let out = run(&[
+        "export",
+        "-e",
+        r#"note("c2,g4").strum(0.1).s("sine")"#,
+        "--cycles",
+        "1",
+        "-o",
+        path.to_str().expect("UTF-8 path"),
+    ]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "{stderr}");
+    assert!(!stderr.contains("voice_refused"), "{stderr}");
+    let wav = std::fs::read(&path).expect("wav");
+    let _ = std::fs::remove_file(&path);
+    // 16-bit stereo after the 44-byte header. The g4 starts at 0.2 s.
+    let at = |tenths: usize| 44 + tenths * 192_000 / 10;
+    assert!(
+        wav[44..at(1)].iter().all(|byte| *byte == 0),
+        "the early voice sounds"
+    );
+    assert!(
+        wav[at(3)..at(4)].iter().any(|byte| *byte != 0),
+        "the later voice is silent"
+    );
+}
+
 /// A pitch no voice can sound is refused and silent, by the rules of
 /// strudel.cc: an infinity for every voice, NaN for a sample. A synth reads
 /// a NaN note as absent and plays its default.

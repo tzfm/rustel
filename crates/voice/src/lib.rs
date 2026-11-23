@@ -3189,7 +3189,16 @@ fn resolve_voice_at(
     let onset_frame = exact_frame.ceil();
     // The origin adds whole frames after the lead, so the lead keeps its bits.
     let framed = onset_frame + origin as f64;
-    if !framed.is_finite() || framed < 0.0 || framed > u64::MAX as f64 {
+    // A shift such as `strum` can move a voice before the output starts.
+    // strudel.cc does not schedule a sound in the past either.
+    if framed.is_finite() && framed < 0.0 {
+        return Err(format!(
+            "a voice {:.3} s before the start does not sound",
+            -target_time
+        )
+        .into());
+    }
+    if !framed.is_finite() || framed > u64::MAX as f64 {
         return Err(
             format!("onset {onset_id} has an unrepresentable target time {target_time}").into(),
         );
