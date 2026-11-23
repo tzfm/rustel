@@ -393,22 +393,30 @@ fn the_limiter_strip_takes_its_keys_and_enter_is_its_switch() {
 }
 
 /// The mixer keeps an Alt key no chord takes: an Alt digit picks a score
-/// only while the score has the keyboard, so over the desk neither it nor a
-/// letter may type into the score.
+/// only while the score has the keyboard, so over the desk neither it, a
+/// letter, a word delete nor a legacy AltGr character may edit the score.
 #[test]
 fn an_alt_key_over_the_mixer_leaves_the_score_alone() {
-    for key in ['5', 'q'] {
+    for (code, modifiers) in [
+        (KeyCode::Char('5'), KeyModifiers::ALT),
+        (KeyCode::Char('q'), KeyModifiers::ALT),
+        (KeyCode::Backspace, KeyModifiers::ALT),
+        (
+            KeyCode::Char('@'),
+            KeyModifiers::CONTROL | KeyModifiers::ALT,
+        ),
+    ] {
         let mut studio = hermetic();
         let before = studio.score();
         studio.press(KeyCode::F(4), KeyModifiers::NONE);
         studio.settle();
-        studio.press(KeyCode::Char(key), KeyModifiers::ALT);
+        studio.press(code, modifiers);
         studio.settle();
-        assert_eq!(studio.score(), before, "Alt+{key}");
+        assert_eq!(studio.score(), before, "{code:?} {modifiers:?}");
         assert_eq!(
-            studio.status(),
-            "the mixer has the keyboard - Esc gives it back to the score",
-            "Alt+{key}"
+            studio.focus(),
+            Some(PanelKind::Mixer),
+            "{code:?} {modifiers:?}"
         );
     }
 }
