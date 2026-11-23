@@ -1246,8 +1246,6 @@ mod reference_honesty_tests {
             "adsr",
             // One argument documented as its parts.
             "euclidLegato",
-            // `amt` plus the `edoSize` it falls back to.
-            "ftranspose",
             // The message plus the device it is sent to.
             "midi",
             // The message plus the device it is sent to.
