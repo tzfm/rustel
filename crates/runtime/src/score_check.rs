@@ -149,6 +149,12 @@ pub fn check_score_with(
             cancellation,
         ));
     }
+    if eval_error.is_none()
+        && !cancellation.load(Ordering::Relaxed)
+        && let Some(report) = &first_cycle
+    {
+        diagnostics.extend(talkit_settings(report, source));
+    }
     if eval_error.is_none() && cancellation.load(Ordering::Relaxed) {
         eval_error = Some(EvalError {
             message: RuntimeError::Cancelled.to_string(),
@@ -231,6 +237,54 @@ fn notes_outside_their_fonts(
             from: char_floor(source, from),
             to: char_floor(source, to),
         });
+    }
+    diagnostics
+}
+
+/// The most `talkit` findings a check reports: a patterned value that is
+/// out of range is one mistake, with a different number on each note.
+const MAX_TALKIT_FINDINGS: usize = 8;
+
+/// The `talkit` notes of the first cycle whose text or settings a render
+/// refuses, in the words the render uses, one time each. A note sent to
+/// MIDI, OSC or serial speaks nothing here, so it is not judged. A phrase in
+/// single quotes has no place of its own: the finding marks the first
+/// `talkit(` of the score.
+fn talkit_settings(report: &crate::hap_json::QueryReport, source: &str) -> Vec<Diagnostic> {
+    let mut said = std::collections::HashSet::new();
+    let mut diagnostics = Vec::new();
+    let first_call = source.find("talkit(").map(|at| (at, at + "talkit".len()));
+    for hap in report.haps.iter().filter(|hap| hap.has_onset) {
+        let crate::hap_json::ValueJson::Raw(value) = &hap.value else {
+            continue;
+        };
+        if ["midiport", "oscport", "serialport"]
+            .iter()
+            .any(|key| value.get(*key).is_some_and(|port| !port.is_null()))
+        {
+            continue;
+        }
+        let Some(message) = rustel_voice::talkit_refusal(value) else {
+            continue;
+        };
+        if !said.insert(message.clone()) {
+            continue;
+        }
+        let (from, to) = hap
+            .context
+            .first()
+            .copied()
+            .or(first_call)
+            .unwrap_or((0, 0));
+        diagnostics.push(Diagnostic {
+            level: Level::Value,
+            message,
+            from: char_floor(source, from),
+            to: char_floor(source, to),
+        });
+        if diagnostics.len() == MAX_TALKIT_FINDINGS {
+            break;
+        }
     }
     diagnostics
 }
