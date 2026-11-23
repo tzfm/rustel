@@ -963,7 +963,35 @@ impl App {
         if self.performance_chord(key, primary, shift, alt, letter) {
             return Ok(true);
         }
-        Ok(self.control_chord(key, primary, shift, alt, letter))
+        if self.control_chord(key, primary, shift, alt, letter) {
+            return Ok(true);
+        }
+        Ok(self.alt_key_stays_with_panel(key, alt))
+    }
+
+    /// An Alt key no chord took, over a panel that holds the keyboard. The
+    /// score's editor would read it as typing or a word edit, and Ctrl+Alt
+    /// is how a legacy terminal sends AltGr. It is dropped and said out
+    /// loud, as a plain key is. Text an Option key composes arrives with no
+    /// Alt, so it is not this key. A panel read beside the score still lets
+    /// the caret move.
+    fn alt_key_stays_with_panel(&mut self, key: &KeyEvent, alt: bool) -> bool {
+        let Focus::Panel(kind) = self.focus else {
+            return false;
+        };
+        if !alt
+            || self.menu.is_some()
+            || matches!(key.code, KeyCode::F(_))
+            || (self.panel_reads_beside_score(kind) && moves_the_caret(key.code))
+        {
+            return false;
+        }
+        self.status = format!(
+            "the {} has the keyboard - Esc gives it back to the score",
+            kind.label()
+        );
+        self.dirty_frame = true;
+        true
     }
 
     /// Update and stop, and ^⇧S's rewinding update, in every spelling:

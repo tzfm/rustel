@@ -21,6 +21,7 @@
 - Fixed: a sample source turned off and on again on the Permissions page brings its sounds back, and the update it refused while off runs again.
 - Fixed: in an export, an infinite `note` or `freq`, such as the log2 of 0, is a refused voice, and so is NaN on a sample, as on strudel.cc, instead of a note at the default pitch. A synth still reads a NaN note as absent.
 - Fixed: the update a permission re-runs waits for the engine to start fetching the source, instead of sometimes being refused again with an unknown sound.
+- Fixed: an Alt key over the mixer or another panel holding the keyboard no longer types into or edits the score.
 - A pattern can set the tempo: `cps("<0.5 1>")` changes it at each onset, unless Link or MIDI clock leads.
 - Fixed: a live output that fell behind and resumed is printed as a warning, not as an error, since the run plays on.
 - Fixed: leaving a Link session or letting go of an incoming MIDI clock plays the score's own tempo again, instead of the bent tempo the follow left until the next update.
