@@ -1584,6 +1584,60 @@ fn a_wait_start_and_a_wait_edit_play_no_note_before_their_plugin() {
     rustel_audio::set_plugin_pool_for_test(None);
 }
 
+/// While the score plays, the plugin of a lane an edit removed unloads once
+/// the chain of the lane has ended, with no Stop.
+#[cfg(feature = "vst")]
+#[test]
+fn a_removed_lane_unloads_its_plugin_while_the_score_plays() {
+    use rustel_runtime::vst;
+    use rustel_studio::engine::LiveMaterial;
+    let _engine = one_engine();
+    let _plugins = fixture_plugins();
+    let mut engine = silent_engine_with(StudioConfig {
+        unused_sample_idle: Duration::from_millis(1),
+        ..StudioConfig::default()
+    });
+    let loaded = || {
+        let plugins = vst::host().plugins();
+        plugins
+            .iter()
+            .any(|plugin| plugin.status == vst::Status::Ready)
+    };
+    let with_plugin = "$: note('c3').s('sine').vst('rustel fixture')\n$: note('e3').s('sine')";
+    let without = "$: note('e3').s('sine')";
+    engine.set_live_material(&LiveMaterial {
+        pinned: vec![with_plugin.into()],
+        ..LiveMaterial::default()
+    });
+    engine
+        .evaluate_and_start(with_plugin, false)
+        .expect("a start");
+    let started = Instant::now();
+    while !vst::engine_holds_unkept(&[]) {
+        assert!(
+            started.elapsed() < Duration::from_secs(20),
+            "the plugin did not take the lane"
+        );
+        tick_for(&mut engine, Duration::from_millis(50), &mut || {});
+    }
+    engine.evaluate(without, false).expect("the edit");
+    engine.set_live_material(&LiveMaterial {
+        pinned: vec![without.into()],
+        ..LiveMaterial::default()
+    });
+    let edited = Instant::now();
+    while loaded() {
+        assert!(
+            edited.elapsed() < Duration::from_secs(20),
+            "the plugin stayed loaded while the score played"
+        );
+        tick_for(&mut engine, Duration::from_millis(100), &mut || {});
+        vst::host().wait_idle();
+    }
+    assert!(engine.device_report().is_some(), "the score still plays");
+    let _ = engine.stop(engine.stop_timeout());
+}
+
 /// The idle sweep unloads a plugin no tab names and no chain of the score
 /// has. A stop parks the output with the copy of the plugin, so the sweep
 /// closes that output first. A tab with the plugin name keeps the plugin

@@ -15,13 +15,14 @@
 - Vim mode: `J` and `gJ` join lines, as in Vim. The shipped `$` label jumps move from `J` and `K` to `]$` and `[$`.
 - `rustel check` names a note that a `gm_*` soundfont has no note for, such as `note("c2").s("gm_clarinet")`, instead of finding no issues while the note plays as silence.
 - `rustel check` and `rustel query` take `--prebake setup.js`, so a score calling a prebake's helpers checks clean.
+- Fixed: a voice a shift moves before the start of an export, such as the first voice of a `strum` at cycle zero, is silent as on strudel.cc, with no refusal, so a Studio export of such a score no longer fails. Live play says so in plain words.
 - A sample source can be a repository page such as `https://github.com/user/repo`. It reads as `github:user/repo`, and a web page or a missing map says what to write instead.
 - Fixed: a sample source turned off and on again on the Permissions page brings its sounds back, and the update it refused while off runs again.
 - A pattern can set the tempo: `cps("<0.5 1>")` changes it at each onset, unless Link or MIDI clock leads.
 - Fixed: a live output that fell behind and resumed is printed as a warning, not as an error, since the run plays on.
 - Fixed: leaving a Link session or letting go of an incoming MIDI clock plays the score's own tempo again, instead of the bent tempo the follow left until the next update.
 - Fixed: `mouseX` and `mouseY` inside `K()` say they need live control input, instead of a message about scope IDs.
-- Fixed: a voice a shift moves before the start of an export, such as the first voice of a `strum` at cycle zero, is silent as on strudel.cc, with no refusal, so a Studio export of such a score no longer fails. Live play says so in plain words.
+- Fixed: while the score plays, Studio unloads the plugin of a lane you remove once its chains end, instead of keeping it loaded until Stop.
 - Fixed: a `.dict()` name no dictionary has is an error, as on strudel.cc, instead of a lane that plays silence.
 - Fixed: the slider form and the knobs column's value form refuse a step of zero with the reason, as `rustel check` does, instead of writing a step of their own.
 - The reference search also finds entries by extension name, description, tags, parameters and examples, and by words spread across them. These matches come after the usual matches, under more matches.
