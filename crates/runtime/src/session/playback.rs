@@ -965,7 +965,7 @@ impl Session {
         let play = self.play(duration_secs);
         let unknown_chords: Vec<String> = rustel_core::voicings::take_unknown_chords()
             .into_iter()
-            .map(|chord| format!("unknown chord \"{chord}\" - it plays silence"))
+            .map(|chord| format!("cannot voice chord \"{chord}\" - it is silent"))
             .collect();
         // The cycles are for this one bounce.
         self.render_cycles = None;

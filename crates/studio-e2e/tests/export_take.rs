@@ -149,12 +149,13 @@ fn an_export_names_an_unknown_chord() {
     wait_for_export(&mut studio);
     let status = studio.status().to_owned();
     assert!(status.starts_with("exported"), "{status}");
-    assert!(status.contains("unknown chord \"C9add9\""), "{status}");
+    assert!(status.contains("cannot voice chord \"C9add9\""), "{status}");
+    assert!(status.contains("click the path"), "{status}");
     assert!(
         studio
             .log_texts()
             .iter()
-            .any(|line| line.contains("unknown chord \"C9add9\"")),
+            .any(|line| line.contains("cannot voice chord \"C9add9\"")),
         "{:?}",
         studio.log_texts()
     );

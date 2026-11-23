@@ -371,8 +371,9 @@ thread_local! {
         const { std::cell::RefCell::new(Vec::new()) };
 }
 
-/// Remember a chord `voicing` found in no dictionary: strudel.cc logs it and
-/// plays silence.
+/// Remember a chord `voicing` could not voice, because no dictionary has it
+/// or a control such as `mode` is wrong: strudel.cc logs it and plays
+/// silence.
 fn note_unknown_chord(chord: &str) {
     UNKNOWN_CHORDS.with(|chords| {
         let mut chords = chords.borrow_mut();
@@ -382,8 +383,9 @@ fn note_unknown_chord(chord: &str) {
     });
 }
 
-/// The chords this thread's queries found in no dictionary since the last
-/// call, each one time.
+/// The chords this thread's queries could not voice since the last call,
+/// each one time. A query can look past what is played, so a chord here is
+/// in the score and may lie outside the bounce.
 pub fn take_unknown_chords() -> Vec<String> {
     UNKNOWN_CHORDS.with(|chords| std::mem::take(&mut *chords.borrow_mut()))
 }

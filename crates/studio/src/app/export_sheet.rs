@@ -274,7 +274,7 @@ impl App {
         let lines = job.take_plugin_lines();
         let unknown_chord = lines
             .iter()
-            .find(|line| line.starts_with("unknown chord"))
+            .find(|line| line.starts_with("cannot voice chord"))
             .cloned();
         for line in lines {
             self.log.push(LogLevel::Warn, "export", line);
@@ -303,12 +303,12 @@ impl App {
                     ),
                 );
                 self.status.push_str(" - click the path to show it");
-                self.remember_status_file(job.output());
-                // The take is written, and a chord no dictionary has is
-                // silent in it, as on strudel.cc: say which.
+                // The take is written, and a chord that could not be voiced
+                // is silent, as on strudel.cc: say which.
                 if let Some(chord) = unknown_chord {
                     self.status = format!("{} · {chord}", self.status);
                 }
+                self.remember_status_file(job.output());
             }
             // The chord ended the render before its first frame, as asked.
             Err(error)
