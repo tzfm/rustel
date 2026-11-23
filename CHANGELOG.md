@@ -21,6 +21,7 @@
 - Fixed: a live output that fell behind and resumed is printed as a warning, not as an error, since the run plays on.
 - Fixed: leaving a Link session or letting go of an incoming MIDI clock plays the score's own tempo again, instead of the bent tempo the follow left until the next update.
 - Fixed: `mouseX` and `mouseY` inside `K()` say they need live control input, instead of a message about scope IDs.
+- Fixed: while the score plays, Studio unloads the plugin of a lane you remove once its chains end, instead of keeping it loaded until Stop.
 - Fixed: a `.dict()` name no dictionary has is an error, as on strudel.cc, instead of a lane that plays silence.
 - Fixed: the slider form and the knobs column's value form refuse a step of zero with the reason, as `rustel check` does, instead of writing a step of their own.
 - The reference search also finds entries by extension name, description, tags, parameters and examples, and by words spread across them. These matches come after the usual matches, under more matches.

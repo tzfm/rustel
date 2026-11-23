@@ -392,6 +392,11 @@ impl StudioEngine {
             .get_or_insert_with(|| live.device.clock_seconds());
         // As for a stop: the score is no longer kept for being the score.
         self.ask_idle_sweep();
+        // As for a stop: no sweep is owed after an edit any more.
+        #[cfg(feature = "vst")]
+        {
+            self.plugins_sweep_again_at = None;
+        }
         self.session.transport().stop();
         // As for a stop: the score of a tab that closed while it played
         // ends its chains.
