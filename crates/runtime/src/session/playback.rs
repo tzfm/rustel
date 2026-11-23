@@ -789,6 +789,7 @@ impl Session {
             onset_count: onsets.len(),
             voices_refused,
             plugin_lines,
+            unknown_chords: Vec::new(),
         })
     }
 
@@ -959,7 +960,13 @@ impl Session {
                 "stems are written for a scalar WAV export, not another format".into(),
             ));
         }
+        // Only the chords of this bounce are its to report.
+        let _ = rustel_core::voicings::take_unknown_chords();
         let play = self.play(duration_secs);
+        let unknown_chords: Vec<String> = rustel_core::voicings::take_unknown_chords()
+            .into_iter()
+            .map(|chord| format!("unknown chord \"{chord}\" - it plays silence"))
+            .collect();
         // The cycles are for this one bounce.
         self.render_cycles = None;
         let play = play?;
@@ -1183,6 +1190,7 @@ impl Session {
             onset_count: play.onsets.len(),
             voices_refused,
             plugin_lines,
+            unknown_chords,
         })
     }
 }

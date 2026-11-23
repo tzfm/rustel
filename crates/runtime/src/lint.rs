@@ -1987,38 +1987,6 @@ pub fn rejection_with(
     rejection_of(source, &lint_with(source, mini, library, context))
 }
 
-/// What a bounce says about each chord of `source` no dictionary has.
-/// strudel.cc logs such a chord and plays silence, so the bounce goes on and
-/// this is its log line. A setup that registers or picks voicings may know
-/// the chord, so with one nothing is said.
-pub fn unknown_chord_warnings<'a>(
-    source: &str,
-    mini: bool,
-    setups: impl IntoIterator<Item = &'a str>,
-) -> Vec<String> {
-    // The lint reads the whole score, up to the 4 MiB a score may be: a
-    // bounce with no voicing does not pay for it.
-    if !source.contains("voicing")
-        || setups
-            .into_iter()
-            .any(|setup| setup.contains("addVoicings(") || setup.contains("setDefaultVoicings("))
-    {
-        return Vec::new();
-    }
-    lint_with(source, mini, None, &LintContext::default())
-        .into_iter()
-        .filter(|finding| finding.message.starts_with("unknown chord"))
-        .map(|finding| {
-            let line = source[..finding.from.min(source.len())]
-                .bytes()
-                .filter(|byte| *byte == b'\n')
-                .count()
-                + 1;
-            format!("line {line}: {} - it plays silence", finding.message)
-        })
-        .collect()
-}
-
 /// The same answer from findings already in hand, so a caller that wants
 /// both the underlines and the reason checks once rather than twice.
 pub fn rejection_of(source: &str, diagnostics: &[Diagnostic]) -> Option<String> {

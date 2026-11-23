@@ -1042,6 +1042,7 @@ fn render(
     };
     if let Ok(mut lines) = progress.plugin_lines.lock() {
         lines.clone_from(&report.plugin_lines);
+        lines.extend(report.unknown_chords.iter().cloned());
     }
     // Written, but not the score: see `RenderReport::failure`.
     if let Some(message) = report.failure() {

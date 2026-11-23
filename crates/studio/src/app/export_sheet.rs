@@ -177,20 +177,14 @@ impl App {
         self.remember_export_directory(&target);
         let scene = self.scenes.current();
         let source = scene.editor.source().to_string();
-        let prebakes = super::super::prebake::PrebakeScope::ALL
-            .map(|scope| self.stored_prebake(scope).to_owned());
-        self.export_warnings = rustel_runtime::lint::unknown_chord_warnings(
-            &source,
-            self.options.mini,
-            prebakes.iter().map(String::as_str),
-        );
         // What play runs, the bounce runs: both setups, global first, as
         // stored - an unsaved edit in a setup tab is the engine's business,
         // not the bounce's.
         let score = ExportScore {
             source,
             mini: self.options.mini,
-            prebakes,
+            prebakes: super::super::prebake::PrebakeScope::ALL
+                .map(|scope| self.stored_prebake(scope).to_owned()),
             csound: self
                 .snapshot
                 .as_ref()
@@ -277,7 +271,12 @@ impl App {
         if self.export_sheet.take().is_some() {
             self.settle_focus();
         }
-        for line in job.take_plugin_lines() {
+        let lines = job.take_plugin_lines();
+        let unknown_chord = lines
+            .iter()
+            .find(|line| line.starts_with("unknown chord"))
+            .cloned();
+        for line in lines {
             self.log.push(LogLevel::Warn, "export", line);
         }
         match outcome {
@@ -307,11 +306,8 @@ impl App {
                 self.remember_status_file(job.output());
                 // The take is written, and a chord no dictionary has is
                 // silent in it, as on strudel.cc: say which.
-                if let Some(first) = self.export_warnings.first() {
-                    self.status = format!("{} · {first}", self.status);
-                }
-                for warning in std::mem::take(&mut self.export_warnings) {
-                    self.log.push(LogLevel::Warn, "export", warning);
+                if let Some(chord) = unknown_chord {
+                    self.status = format!("{} · {chord}", self.status);
                 }
             }
             // The chord ended the render before its first frame, as asked.

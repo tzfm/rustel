@@ -1137,8 +1137,6 @@ struct App {
     export_settings: ExportSettings,
     /// A render in progress.
     export_job: Option<ExportJob>,
-    /// What the running export has to say once its take is written.
-    export_warnings: Vec<String>,
     /// The last file the studio made - an export, a take - for ⌘⇧O and a
     /// click on the status line.
     last_file: Option<PathBuf>,
@@ -1851,7 +1849,6 @@ impl App {
             export_sheet: None,
             export_settings: ExportSettings::default(),
             export_job: None,
-            export_warnings: Vec::new(),
             last_file: None,
             last_file_status: None,
             last_recorded_sample: None,

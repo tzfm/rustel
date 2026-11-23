@@ -362,6 +362,32 @@ fn anchor_midi(value: Option<&Value>) -> Option<f64> {
     }
 }
 
+/// The most chords a bounce names: a score that computes its chord names
+/// could otherwise grow this list without end.
+const MAX_UNKNOWN_CHORDS: usize = 8;
+
+thread_local! {
+    static UNKNOWN_CHORDS: std::cell::RefCell<Vec<String>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Remember a chord `voicing` found in no dictionary: strudel.cc logs it and
+/// plays silence.
+fn note_unknown_chord(chord: &str) {
+    UNKNOWN_CHORDS.with(|chords| {
+        let mut chords = chords.borrow_mut();
+        if chords.len() < MAX_UNKNOWN_CHORDS && !chords.iter().any(|known| known == chord) {
+            chords.push(chord.to_owned());
+        }
+    });
+}
+
+/// The chords this thread's queries found in no dictionary since the last
+/// call, each one time.
+pub fn take_unknown_chords() -> Vec<String> {
+    UNKNOWN_CHORDS.with(|chords| std::mem::take(&mut *chords.borrow_mut()))
+}
+
 /// The notes of one voicing for a hap value, or None for strudel.cc's caught
 /// throw (unknown chord → logger + silence).
 pub fn render_voicing(map: &OrderedMap) -> Option<Vec<Value>> {
@@ -1023,6 +1049,11 @@ pub fn voicing<P: crate::ops::PatOps>(pat: &P) -> P {
         };
         let Some(notes) = render_voicing(map) else {
             // Upstream: caught throw → `[voicing]: unknown chord` + silence.
+            if !crate::query_error_pending()
+                && let Some(chord) = value_str(map.get("chord"))
+            {
+                note_unknown_chord(chord);
+            }
             return Vec::new();
         };
         const VOICING_CONTROLS: [&str; 7] = [

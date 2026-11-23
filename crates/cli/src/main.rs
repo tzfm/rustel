@@ -2808,21 +2808,11 @@ fn run_command(
                 &input.sample_access,
             )?)?;
             let _watcher = watch_for_interrupt(session.transport());
-            let mut setup = None;
             if let Some(path) = &prebake {
                 let source = read_bounded_file(path, "prebake")?;
                 session.evaluate_prebake_cancellable(&source, &EVALUATION_CANCELLED)?;
-                setup = Some(source);
             }
-            let source = load_source(&mut session, &input, &EVALUATION_CANCELLED)?;
-            for message in
-                rustel_runtime::lint::unknown_chord_warnings(&source, false, setup.as_deref())
-            {
-                notice(
-                    serde_json::json!({ "unknown_chord": { "message": &message } }),
-                    || format!("warning: {message}"),
-                );
-            }
+            load_source(&mut session, &input, &EVALUATION_CANCELLED)?;
             if let Some(options) = midi_options {
                 session.set_midi_export_options(options)?;
             } else if let Err(error) = session.enable_default_samples() {
@@ -2856,6 +2846,12 @@ fn run_command(
             }
             session.set_stems_export(stems);
             let report = session.render(duration, &output, format.into())?;
+            for message in &report.unknown_chords {
+                notice(
+                    serde_json::json!({ "unknown_chord": { "message": message } }),
+                    || format!("warning: {message}"),
+                );
+            }
             if json_asked() {
                 outln!(
                     "{}",

@@ -5565,10 +5565,21 @@ fn an_export_names_an_unknown_chord() {
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(out.status.success(), "{stderr}");
     assert!(stderr.contains(r#"unknown chord "C9add9""#), "{stderr}");
-    let out = export(r#"chord("C7").voicing().s("sine")"#);
+    // A chord the score computes is named too.
+    let out = export(r#"const c = 'C' + '9add9'; chord(c).voicing().s("sine")"#);
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(out.status.success(), "{stderr}");
-    assert!(!stderr.contains("unknown chord"), "{stderr}");
+    assert!(stderr.contains(r#"unknown chord "C9add9""#), "{stderr}");
+    // A chord that plays is not, nor a word in a comment.
+    for score in [
+        r#"chord("C7").voicing().s("sine")"#,
+        "note(\n  // chord(\n  \"c4 e4\"\n).s(\"sine\")",
+    ] {
+        let out = export(score);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(out.status.success(), "{score}: {stderr}");
+        assert!(!stderr.contains("unknown chord"), "{score}: {stderr}");
+    }
     let _ = std::fs::remove_file(&path);
 }
 
