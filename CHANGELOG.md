@@ -22,7 +22,7 @@
 - Fixed: in an export, an infinite `note` or `freq`, such as the log2 of 0, is a refused voice, and so is NaN on a sample, as on strudel.cc, instead of a note at the default pitch. A synth still reads a NaN note as absent.
 - Fixed: the update a permission re-runs waits for the engine to start fetching the source, instead of sometimes being refused again with an unknown sound.
 - Fixed: an Alt key over the mixer or another panel holding the keyboard no longer types into or edits the score.
-- Fixed: an export of a score with an unknown chord says which chord, instead of writing a silent file with no message. The chord stays silent, as on strudel.cc.
+- Fixed: an export of a score with an unknown chord, from the command line or the Studio sheet, says which chord, instead of writing a silent file with no message. The chord stays silent, as on strudel.cc.
 - A pattern can set the tempo: `cps("<0.5 1>")` changes it at each onset, unless Link or MIDI clock leads.
 - Fixed: a live output that fell behind and resumed is printed as a warning, not as an error, since the run plays on.
 - Fixed: leaving a Link session or letting go of an incoming MIDI clock plays the score's own tempo again, instead of the bent tempo the follow left until the next update.

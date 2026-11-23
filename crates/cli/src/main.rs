@@ -2815,7 +2815,14 @@ fn run_command(
                 setup = Some(source);
             }
             let source = load_source(&mut session, &input, &EVALUATION_CANCELLED)?;
-            note_unknown_chords(&source, setup.as_deref());
+            for message in
+                rustel_runtime::lint::unknown_chord_warnings(&source, false, setup.as_deref())
+            {
+                notice(
+                    serde_json::json!({ "unknown_chord": { "message": &message } }),
+                    || format!("warning: {message}"),
+                );
+            }
             if let Some(options) = midi_options {
                 session.set_midi_export_options(options)?;
             } else if let Err(error) = session.enable_default_samples() {
@@ -4234,32 +4241,6 @@ fn notice(json: serde_json::Value, text: impl FnOnce() -> String) {
         eprintln!("{json}");
     } else {
         eprintln!("{}", style::yellow(style::stderr_on(), &text()));
-    }
-}
-
-/// Say which chords of a bounced score no dictionary has. strudel.cc logs
-/// such a chord and plays silence, so the bounce goes on: this is the log
-/// line. A setup that registers or picks voicings may know the chord.
-fn note_unknown_chords(source: &str, setup: Option<&str>) {
-    if setup.is_some_and(|setup| {
-        setup.contains("addVoicings(") || setup.contains("setDefaultVoicings(")
-    }) {
-        return;
-    }
-    let context = rustel_runtime::lint::LintContext::default();
-    for finding in rustel_runtime::lint::lint_with(source, false, None, &context) {
-        if !finding.message.starts_with("unknown chord") {
-            continue;
-        }
-        let line = source[..finding.from.min(source.len())]
-            .matches('\n')
-            .count()
-            + 1;
-        let message = format!("line {line}: {} - it plays silence", finding.message);
-        notice(
-            serde_json::json!({ "unknown_chord": { "message": &message } }),
-            || format!("warning: {message}"),
-        );
     }
 }
 

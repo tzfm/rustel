@@ -177,14 +177,20 @@ impl App {
         self.remember_export_directory(&target);
         let scene = self.scenes.current();
         let source = scene.editor.source().to_string();
+        let prebakes = super::super::prebake::PrebakeScope::ALL
+            .map(|scope| self.stored_prebake(scope).to_owned());
+        self.export_warnings = rustel_runtime::lint::unknown_chord_warnings(
+            &source,
+            self.options.mini,
+            prebakes.iter().map(String::as_str),
+        );
         // What play runs, the bounce runs: both setups, global first, as
         // stored - an unsaved edit in a setup tab is the engine's business,
         // not the bounce's.
         let score = ExportScore {
             source,
             mini: self.options.mini,
-            prebakes: super::super::prebake::PrebakeScope::ALL
-                .map(|scope| self.stored_prebake(scope).to_owned()),
+            prebakes,
             csound: self
                 .snapshot
                 .as_ref()
@@ -299,6 +305,14 @@ impl App {
                 );
                 self.status.push_str(" - click the path to show it");
                 self.remember_status_file(job.output());
+                // The take is written, and a chord no dictionary has is
+                // silent in it, as on strudel.cc: say which.
+                if let Some(first) = self.export_warnings.first() {
+                    self.status = format!("{} · {first}", self.status);
+                }
+                for warning in std::mem::take(&mut self.export_warnings) {
+                    self.log.push(LogLevel::Warn, "export", warning);
+                }
             }
             // The chord ended the render before its first frame, as asked.
             Err(error)
