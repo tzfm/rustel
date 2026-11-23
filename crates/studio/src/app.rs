@@ -1310,10 +1310,10 @@ struct App {
     /// It waits for the engine to hold the permission, so the re-run cannot
     /// be refused by the state it is running to use.
     refused_update_owed: bool,
-    /// The owed re-run has asked for the score's maps again and waits for
-    /// the engine to take those look-ups. A check before that finds a map
-    /// neither loaded nor on its way, and refuses the update again.
-    refused_update_awaits_look_ups: bool,
+    /// The text whose owed re-run has asked for its maps again and waits
+    /// for the engine to take those look-ups. A check before that finds a
+    /// map neither loaded nor on its way, and refuses the update again.
+    refused_update_awaits_look_ups: Option<(SceneId, Revision)>,
     /// Latest refused revision for each scene with an unresolved log alert.
     evaluation_alerts: HashMap<SceneId, Revision>,
     /// A diagnostic copied into the ordinary status line by the navigation
@@ -1906,7 +1906,7 @@ impl App {
             sample_grants_owed: false,
             sample_grants_sent_at: None,
             refused_update_owed: false,
-            refused_update_awaits_look_ups: false,
+            refused_update_awaits_look_ups: None,
             evaluation_alerts: HashMap::new(),
             lint_status: None,
             pending_evaluation: None,
