@@ -2808,11 +2808,14 @@ fn run_command(
                 &input.sample_access,
             )?)?;
             let _watcher = watch_for_interrupt(session.transport());
+            let mut setup = None;
             if let Some(path) = &prebake {
                 let source = read_bounded_file(path, "prebake")?;
                 session.evaluate_prebake_cancellable(&source, &EVALUATION_CANCELLED)?;
+                setup = Some(source);
             }
-            load_source(&mut session, &input, &EVALUATION_CANCELLED)?;
+            let source = load_source(&mut session, &input, &EVALUATION_CANCELLED)?;
+            note_unknown_chords(&source, setup.as_deref());
             if let Some(options) = midi_options {
                 session.set_midi_export_options(options)?;
             } else if let Err(error) = session.enable_default_samples() {
@@ -4231,6 +4234,32 @@ fn notice(json: serde_json::Value, text: impl FnOnce() -> String) {
         eprintln!("{json}");
     } else {
         eprintln!("{}", style::yellow(style::stderr_on(), &text()));
+    }
+}
+
+/// Say which chords of a bounced score no dictionary has. strudel.cc logs
+/// such a chord and plays silence, so the bounce goes on: this is the log
+/// line. A setup that registers or picks voicings may know the chord.
+fn note_unknown_chords(source: &str, setup: Option<&str>) {
+    if setup.is_some_and(|setup| {
+        setup.contains("addVoicings(") || setup.contains("setDefaultVoicings(")
+    }) {
+        return;
+    }
+    let context = rustel_runtime::lint::LintContext::default();
+    for finding in rustel_runtime::lint::lint_with(source, false, None, &context) {
+        if !finding.message.starts_with("unknown chord") {
+            continue;
+        }
+        let line = source[..finding.from.min(source.len())]
+            .matches('\n')
+            .count()
+            + 1;
+        let message = format!("line {line}: {} - it plays silence", finding.message);
+        notice(
+            serde_json::json!({ "unknown_chord": { "message": &message } }),
+            || format!("warning: {message}"),
+        );
     }
 }
 

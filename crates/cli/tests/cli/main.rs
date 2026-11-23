@@ -5545,6 +5545,33 @@ fn a_pitch_that_is_not_a_finite_number_follows_strudel() {
     let _ = std::fs::remove_file(&path);
 }
 
+/// An export of an unknown chord says which chord. It stays silent and
+/// exits 0, as strudel.cc logs the chord and plays nothing.
+#[test]
+fn an_export_names_an_unknown_chord() {
+    let path = scratch("unknown-chord.wav");
+    let export = |score: &str| {
+        run(&[
+            "export",
+            "-e",
+            score,
+            "--cycles",
+            "1",
+            "-o",
+            path.to_str().expect("UTF-8 path"),
+        ])
+    };
+    let out = export(r#"chord("C9add9").voicing().s("sine")"#);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "{stderr}");
+    assert!(stderr.contains(r#"unknown chord "C9add9""#), "{stderr}");
+    let out = export(r#"chord("C7").voicing().s("sine")"#);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "{stderr}");
+    assert!(!stderr.contains("unknown chord"), "{stderr}");
+    let _ = std::fs::remove_file(&path);
+}
+
 /// The command line prints recoverable notices on stderr, which a library
 /// Session does only when its host opts in. A notice that every note raises
 /// prints once, with the number of onsets.
