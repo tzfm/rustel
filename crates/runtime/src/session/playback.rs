@@ -194,6 +194,7 @@ impl Session {
                         cps: event.cps,
                         value: ValueJson::from_value(&event.value),
                         value_show: event.value.show(),
+                        non_finite_pitch: crate::hap_json::non_finite_pitch(&event.value),
                         log_line: event.log_line.as_deref().map(str::to_owned),
                     });
                     // Print logs for accepted onsets so re-querying a span

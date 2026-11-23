@@ -4047,18 +4047,29 @@ fn slice_refusal(begin: f64, end: f64) -> String {
 /// The longest text one `talkit` hap speaks, in characters.
 const MAX_SPEECH_CHARS: usize = 300;
 
-/// The `talkit` hap: the host renders the text to a sample and the sampler
-/// plays it. The spoken word is the source, so `speed` is its playback rate
-/// and `cut`, `release` and `clip` keep their sample meanings. `freq`, `note`
-/// and `octave` set the pitch the voice speaks at, so they never transpose
-/// the playback.
-fn speech_controls(
+/// The words a render refuses a `talkit` hap with for its text or settings,
+/// judged as the voice judges them, without speaking. `None` for a hap with
+/// no `talkit`, one a plugin or Csound plays instead, or one the voice takes.
+/// `rustel check` reports these.
+pub fn talkit_refusal(value: &serde_json::Value) -> Option<String> {
+    let object = value.as_object()?;
+    let fields = object.get("talkit")?;
+    if ["csound", "csoundm", "vsti"]
+        .iter()
+        .any(|key| object.contains_key(*key))
+    {
+        return None;
+    }
+    speech_request(object, fields)
+        .err()
+        .map(VoiceError::into_message)
+}
+
+/// The text and settings of a `talkit` hap, or the refusal of them.
+fn speech_request<'a>(
     object: &serde_json::Map<String, serde_json::Value>,
-    samples: &dyn SampleLookup,
-) -> Result<Option<rustel_audio::SampleControls>, VoiceError> {
-    let Some(fields) = object.get("talkit") else {
-        return Ok(None);
-    };
+    fields: &'a serde_json::Value,
+) -> Result<SpeechRequest<'a>, VoiceError> {
     // The talkit call writes one object: `talkit("hi", { quality: "sung" })`
     // carries `{ talkit: { text: "hi", quality: "sung" } }`.
     let Some(fields) = fields.as_object() else {
@@ -4076,10 +4087,25 @@ fn speech_controls(
             "talkit text is {length} characters; maximum is {MAX_SPEECH_CHARS}"
         )));
     }
-    let request = SpeechRequest {
+    Ok(SpeechRequest {
         text,
         params: speech_params(object, fields)?,
+    })
+}
+
+/// The `talkit` hap: the host renders the text to a sample and the sampler
+/// plays it. The spoken word is the source, so `speed` is its playback rate
+/// and `cut`, `release` and `clip` keep their sample meanings. `freq`, `note`
+/// and `octave` set the pitch the voice speaks at, so they never transpose
+/// the playback.
+fn speech_controls(
+    object: &serde_json::Map<String, serde_json::Value>,
+    samples: &dyn SampleLookup,
+) -> Result<Option<rustel_audio::SampleControls>, VoiceError> {
+    let Some(fields) = object.get("talkit") else {
+        return Ok(None);
     };
+    let request = speech_request(object, fields)?;
     let (id, natural_duration_secs, envelope_peak) = match samples.insert_speech(&request)? {
         SampleResolution::Found {
             id,

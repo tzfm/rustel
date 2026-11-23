@@ -1825,6 +1825,7 @@ impl Session {
                     cps: None,
                     value: ValueJson::from_value(&hap.value),
                     value_show: String::new(),
+                    non_finite_pitch: None,
                     ui_visuals: hap.ui_visuals_context(),
                     log_line: None,
                 };

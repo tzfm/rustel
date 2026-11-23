@@ -255,18 +255,34 @@ impl App {
         // A permit that unblocked a refused update re-runs it here, once
         // the sends above have put the permission in the engine's hands -
         // a re-run ahead of them would be refused by the old state.
-        if self.refused_update_owed
-            && !self.csound_owed
+        let permits_in_force = !self.csound_owed
             && !self.import_origins_owed
             && !self.sample_grants_owed
-            && self.sample_grants_in_force()
-        {
+            && self.sample_grants_in_force();
+        if self.refused_update_owed && permits_in_force {
             self.refused_update_owed = false;
             // A source the permission allowed was refused when the score
             // was checked: fetch it now, so the re-run's check finds its
             // names on their way rather than unknown.
-            self.ask_for_imports_again(self.scenes.current().id);
-            self.retry_refused_update();
+            let current = self.scenes.current();
+            let text = (current.id, current.editor.revision());
+            self.ask_for_imports_again(text.0);
+            self.refused_update_awaits_look_ups = Some(text);
+        }
+        // Another permission given meanwhile asks again, above, and owes
+        // one re-run. The text the look-ups were for is the one that runs:
+        // an edit or another tab since then has an owner of its own.
+        if let Some(text) = self.refused_update_awaits_look_ups
+            && !self.refused_update_owed
+            && permits_in_force
+            && self.lookups_owed.is_empty()
+            && self.worker.look_ups_taken()
+        {
+            self.refused_update_awaits_look_ups = None;
+            let current = self.scenes.current();
+            if self.engine_connected && (current.id, current.editor.revision()) == text {
+                self.retry_refused_update();
+            }
         }
         #[cfg(feature = "hydra")]
         self.warm_selected_snippet();
