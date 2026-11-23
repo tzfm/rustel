@@ -347,15 +347,31 @@ impl ContextKeys {
         local_next: &mut u8,
     ) {
         let mut free_slot = None;
+        let mut matched: Option<&'a Arc<Keys>> = None;
         for (i, cell) in once.iter().enumerate() {
             if let Some(pair) = cell.get() {
-                if Keys::same_values(arc, &pair.0) {
-                    *arc = Arc::clone(&pair.1);
-                    return;
+                if matched.is_none() && Keys::same_values(arc, &pair.0) {
+                    matched = Some(&pair.1);
                 }
             } else if free_slot.is_none() {
                 free_slot = Some(i);
+                if matched.is_some() {
+                    break;
+                }
             }
+        }
+        if let Some(found) = matched {
+            let output = Arc::clone(found);
+            if let Some(idx) = free_slot {
+                let _ = once[idx].set((Arc::clone(arc), Arc::clone(&output)));
+                if let Some(pair) = once[idx].get() {
+                    let slot_idx = usize::from(*local_next & 3);
+                    local[slot_idx] = Some((Arc::as_ptr(&pair.0), &pair.1));
+                    *local_next = local_next.wrapping_add(1);
+                }
+            }
+            *arc = output;
+            return;
         }
         let input = Arc::clone(arc);
         let mut next = (**arc).clone();

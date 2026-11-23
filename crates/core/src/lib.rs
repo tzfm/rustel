@@ -3970,9 +3970,251 @@ impl Pattern {
         pattern
     }
 
+    fn can_fold_ui_visual_cell(cell: &NodeCell) -> bool {
+        match &cell.kind {
+            Node::Silence | Node::Sequence(_) => true,
+            Node::Stack(pats) | Node::SlowCat(pats) => pats.iter().all(Self::can_fold_ui_visual),
+            Node::StackPure(cells)
+            | Node::SlowCatPure(cells)
+            | Node::SlowCatPrimePure(cells) => {
+                cells.iter().all(|c| Self::can_fold_ui_visual_cell(c))
+            }
+            Node::SplitQueries(inner, _)
+            | Node::FastSmall(inner, ..)
+            | Node::ShiftSmall(inner, ..) => Self::can_fold_ui_visual_cell(inner),
+            Node::SplitQueriesBoxed(inner) => inner.can_fold_ui_visual(),
+            Node::Fast(boxed) => boxed.0.can_fold_ui_visual(),
+            Node::Shift(boxed) => boxed.0.can_fold_ui_visual(),
+            Node::Degrade(boxed) => boxed.0.can_fold_ui_visual(),
+            Node::Constants(boxed) => boxed.0.can_fold_ui_visual(),
+            Node::AppWave(app) => app.inner.can_fold_ui_visual(),
+            Node::AddContext(boxed) => boxed.0.can_fold_ui_visual(),
+            Node::FilterValues(boxed) => boxed.0.can_fold_ui_visual(),
+            Node::AppLeft(app) => app.0.can_fold_ui_visual(),
+            Node::Pick(pick) => pick.lookup.patterns().all(Self::can_fold_ui_visual),
+            _ => false,
+        }
+    }
+
+    fn can_fold_ui_visual(&self) -> bool {
+        if sequence::builds_each_node() || self.is_volatile() {
+            return false;
+        }
+        if matches!(self.node_kind(), Node::Sequence(_)) {
+            return sequence::folds(self);
+        }
+        if self.has_runtime_settings() {
+            return false;
+        }
+        Self::can_fold_ui_visual_cell(&self.node)
+    }
+
+    fn fold_ui_visual_cell(mut cell: Arc<NodeCell>, slot: u8) -> Arc<NodeCell> {
+        if let Some(own) = Arc::get_mut(&mut cell) {
+            match &mut own.kind {
+                Node::Silence => return cell,
+                Node::Sequence(layers) => {
+                    if !sequence::with_ui_visual_slot_in_place(layers, slot) {
+                        *layers = sequence::with_ui_visual_slot_layers(layers, slot);
+                    }
+                    return cell;
+                }
+                Node::Stack(pats) | Node::SlowCat(pats) => {
+                    for p in pats.iter_mut() {
+                        let taken = std::mem::replace(p, silence());
+                        *p = taken.fold_ui_visual_owned(slot);
+                    }
+                    return cell;
+                }
+                Node::StackPure(cells)
+                | Node::SlowCatPure(cells)
+                | Node::SlowCatPrimePure(cells) => {
+                    for c in cells.iter_mut() {
+                        let taken = std::mem::replace(c, silence().node);
+                        *c = Self::fold_ui_visual_cell(taken, slot);
+                    }
+                    return cell;
+                }
+                Node::SplitQueries(inner, _)
+                | Node::FastSmall(inner, ..)
+                | Node::ShiftSmall(inner, ..) => {
+                    let taken = std::mem::replace(inner, silence().node);
+                    *inner = Self::fold_ui_visual_cell(taken, slot);
+                    return cell;
+                }
+                Node::SplitQueriesBoxed(inner) => {
+                    let taken = std::mem::replace(&mut **inner, silence());
+                    **inner = taken.fold_ui_visual_owned(slot);
+                    return cell;
+                }
+                Node::Fast(boxed) => {
+                    let taken = std::mem::replace(&mut boxed.0, silence());
+                    boxed.0 = taken.fold_ui_visual_owned(slot);
+                    return cell;
+                }
+                Node::Shift(boxed) => {
+                    let taken = std::mem::replace(&mut boxed.0, silence());
+                    boxed.0 = taken.fold_ui_visual_owned(slot);
+                    return cell;
+                }
+                Node::Degrade(boxed) => {
+                    let taken = std::mem::replace(&mut boxed.0, silence());
+                    boxed.0 = taken.fold_ui_visual_owned(slot);
+                    return cell;
+                }
+                Node::Constants(boxed) => {
+                    let taken = std::mem::replace(&mut boxed.0, silence());
+                    boxed.0 = taken.fold_ui_visual_owned(slot);
+                    return cell;
+                }
+                Node::AppWave(app) => {
+                    let taken = std::mem::replace(&mut app.inner, silence());
+                    app.inner = taken.fold_ui_visual_owned(slot);
+                    return cell;
+                }
+                Node::AddContext(boxed) => {
+                    let taken = std::mem::replace(&mut boxed.0, silence());
+                    boxed.0 = taken.fold_ui_visual_owned(slot);
+                    return cell;
+                }
+                Node::FilterValues(boxed) => {
+                    let taken = std::mem::replace(&mut boxed.0, silence());
+                    boxed.0 = taken.fold_ui_visual_owned(slot);
+                    return cell;
+                }
+                Node::AppLeft(app) => {
+                    let taken = std::mem::replace(&mut app.0, silence());
+                    app.0 = taken.fold_ui_visual_owned(slot);
+                    return cell;
+                }
+                Node::Pick(pick) => {
+                    for p in pick.lookup.patterns_mut() {
+                        let taken = std::mem::replace(p, silence());
+                        *p = taken.fold_ui_visual_owned(slot);
+                    }
+                    return cell;
+                }
+                _ => return cell,
+            }
+        }
+        let next = match &cell.kind {
+            Node::Silence => return cell,
+            Node::Sequence(layers) => {
+                Node::Sequence(sequence::with_ui_visual_slot_layers(layers, slot))
+            }
+            Node::Stack(pats) => Node::Stack(
+                pats.iter()
+                    .map(|p| p.clone().fold_ui_visual_owned(slot))
+                    .collect(),
+            ),
+            Node::SlowCat(pats) => Node::SlowCat(
+                pats.iter()
+                    .map(|p| p.clone().fold_ui_visual_owned(slot))
+                    .collect(),
+            ),
+            Node::StackPure(cells) => Node::StackPure(
+                cells
+                    .iter()
+                    .map(|c| Self::fold_ui_visual_cell(Arc::clone(c), slot))
+                    .collect(),
+            ),
+            Node::SlowCatPure(cells) => Node::SlowCatPure(
+                cells
+                    .iter()
+                    .map(|c| Self::fold_ui_visual_cell(Arc::clone(c), slot))
+                    .collect(),
+            ),
+            Node::SlowCatPrimePure(cells) => Node::SlowCatPrimePure(
+                cells
+                    .iter()
+                    .map(|c| Self::fold_ui_visual_cell(Arc::clone(c), slot))
+                    .collect(),
+            ),
+            Node::SplitQueries(inner, flags) => {
+                Node::SplitQueries(Self::fold_ui_visual_cell(Arc::clone(inner), slot), *flags)
+            }
+            Node::FastSmall(inner, flags, n, d, is_slow) => Node::FastSmall(
+                Self::fold_ui_visual_cell(Arc::clone(inner), slot),
+                *flags,
+                *n,
+                *d,
+                *is_slow,
+            ),
+            Node::ShiftSmall(inner, flags, n, d, is_early) => Node::ShiftSmall(
+                Self::fold_ui_visual_cell(Arc::clone(inner), slot),
+                *flags,
+                *n,
+                *d,
+                *is_early,
+            ),
+            Node::SplitQueriesBoxed(inner) => {
+                Node::SplitQueriesBoxed(Box::new((**inner).clone().fold_ui_visual_owned(slot)))
+            }
+            Node::Fast(boxed) => Node::Fast(Box::new(FastNode(
+                boxed.0.clone().fold_ui_visual_owned(slot),
+                boxed.1,
+                boxed.2,
+            ))),
+            Node::Shift(boxed) => Node::Shift(Box::new(ShiftNode(
+                boxed.0.clone().fold_ui_visual_owned(slot),
+                boxed.1,
+                boxed.2,
+            ))),
+            Node::Degrade(boxed) => Node::Degrade(Box::new((
+                boxed.0.clone().fold_ui_visual_owned(slot),
+                boxed.1,
+                boxed.2,
+            ))),
+            Node::Constants(boxed) => Node::Constants(Box::new(ConstantsNode(
+                boxed.0.clone().fold_ui_visual_owned(slot),
+                boxed.1.clone(),
+            ))),
+            Node::AppWave(app) => Node::AppWave(Box::new(AppWaveNode {
+                inner: app.inner.clone().fold_ui_visual_owned(slot),
+                waves: app.waves.clone(),
+            })),
+            Node::AddContext(boxed) => Node::AddContext(Box::new((
+                boxed.0.clone().fold_ui_visual_owned(slot),
+                boxed.1.clone(),
+            ))),
+            Node::FilterValues(boxed) => Node::FilterValues(Box::new((
+                boxed.0.clone().fold_ui_visual_owned(slot),
+                Arc::clone(&boxed.1),
+            ))),
+            Node::AppLeft(app) => Node::AppLeft(Box::new(AppLeftNode(
+                app.0.clone().fold_ui_visual_owned(slot),
+                app.1.clone(),
+                ValueReading::default(),
+                app.3.clone(),
+                app.4,
+            ))),
+            Node::Pick(pick) => {
+                let mut lookup = pick.lookup.clone();
+                for p in lookup.patterns_mut() {
+                    let taken = std::mem::replace(p, silence());
+                    *p = taken.fold_ui_visual_owned(slot);
+                }
+                Node::Pick(Box::new(PickNode {
+                    selector: pick.selector.clone(),
+                    lookup,
+                    index_mode: pick.index_mode,
+                    mode: pick.mode,
+                }))
+            }
+            _ => return cell,
+        };
+        Pattern::of(next).node
+    }
+
+    fn fold_ui_visual_owned(mut self, slot: u8) -> Self {
+        let taken = std::mem::replace(&mut self.node, silence().node);
+        self.node = Self::fold_ui_visual_cell(taken, slot);
+        self
+    }
+
     pub fn with_ui_visual_slot(&self, slot: u8) -> Self {
-        if let Some(folded) = sequence::with_ui_visual_slot(self, slot) {
-            return folded.with_steps_of(self);
+        if self.can_fold_ui_visual() {
+            return self.clone().fold_ui_visual_owned(slot);
         }
         let mut pattern = Pattern::of(Node::UiVisual(Box::new(UiVisualNode {
             inner: self.clone(),
@@ -3986,15 +4228,11 @@ impl Pattern {
         pattern
     }
 
-    /// Owned variant of [`Self::with_ui_visual_slot`] that updates an unshared
-    /// `Node::Sequence` in place without cloning layers or `NodeCell`.
-    pub fn with_ui_visual_slot_owned(mut self, slot: u8) -> Self {
-        if self.extras.is_none()
-            && let Some(cell) = Arc::get_mut(&mut self.node)
-            && let Node::Sequence(layers) = &mut cell.kind
-            && sequence::with_ui_visual_slot_in_place(layers, slot)
-        {
-            return self;
+    /// Owned variant of [`Self::with_ui_visual_slot`] that updates unshared
+    /// foldable nodes in place without cloning layers or `NodeCell`s.
+    pub fn with_ui_visual_slot_owned(self, slot: u8) -> Self {
+        if self.can_fold_ui_visual() {
+            return self.fold_ui_visual_owned(slot);
         }
         self.with_ui_visual_slot(slot)
     }

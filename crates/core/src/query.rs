@@ -3144,19 +3144,23 @@ impl Pattern {
         haps: &mut dyn Iterator<Item = Hap>,
         out: &mut Vec<Hap>,
     ) -> Option<bool> {
-        let mut keys: [Option<&Key>; 4] = [None; 4];
-        for (i, item) in items.iter().enumerate() {
-            keys[i] = Some(controls::builtin_key_ref_by_id(item.key_id)?);
-        }
-        let first_key = keys[0].expect("at least two items");
+        let first_key = controls::builtin_key_ref_by_id(items.first()?.key_id)?;
         let n_waves = items.len();
+        let mut keys: [&Key; 4] = [first_key; 4];
         let mut unique_keys: [&Key; value::StepPatch::MAX_KEYS] =
             [first_key; value::StepPatch::MAX_KEYS];
         let mut unique_key_ids = [0u16; value::StepPatch::MAX_KEYS];
         let mut key_slot = [0u8; 4];
         let mut n_unique = 0usize;
-        for (w, item) in items.iter().enumerate().take(n_waves) {
-            let key = keys[w].expect("key");
+        let mut hoisted_mask = 0u8;
+        let mut wave_live_mask = 0u8;
+        for (w, item) in items.iter().enumerate() {
+            let key = if w == 0 {
+                first_key
+            } else {
+                controls::builtin_key_ref_by_id(item.key_id)?
+            };
+            keys[w] = key;
             if let Some(pos) = unique_key_ids[..n_unique]
                 .iter()
                 .position(|&id| id == item.key_id)
@@ -3167,6 +3171,12 @@ impl Pattern {
                 unique_key_ids[n_unique] = item.key_id;
                 key_slot[w] = n_unique as u8;
                 n_unique += 1;
+            }
+            if item.steps == 0 && item.wave.has_no_cuts() {
+                hoisted_mask |= 1u8 << w;
+            }
+            if let Some(s) = controls::live_slot(key.as_str()) {
+                wave_live_mask |= 1u8 << s;
             }
         }
         struct MultiStepSlot {
@@ -3180,26 +3190,33 @@ impl Pattern {
             step_next: u8,
             fallback_caches: Option<Box<[value::SharedWaveCache; 8]>>,
         }
+        impl MultiStepSlot {
+            fn empty(zero: TimeSpan) -> Self {
+                Self {
+                    active: false,
+                    met: zero,
+                    part: zero,
+                    count: 0,
+                    pieces: [zero; 8],
+                    nums: [[0.0f64; 4]; 8],
+                    step_patches: [None, None, None, None],
+                    step_next: 0,
+                    fallback_caches: None,
+                }
+            }
+        }
         let zero_span = TimeSpan::new(Fraction::ZERO, Fraction::ZERO);
-        let mut slot0 = MultiStepSlot {
-            active: false,
-            met: zero_span,
-            part: zero_span,
-            count: 0,
-            pieces: [zero_span; 8],
-            nums: [[0.0f64; 4]; 8],
-            step_patches: [None, None, None, None],
-            step_next: 0,
-            fallback_caches: None,
-        };
-        let mut slot1: Option<MultiStepSlot> = None;
+        let mut slots = [
+            MultiStepSlot::empty(zero_span),
+            MultiStepSlot::empty(zero_span),
+        ];
         let mut slot_next = 0u8;
         #[cold]
         #[inline(never)]
         fn emit_fallback(
             slot: &mut MultiStepSlot,
-            template: Hap,
-            keys: &[Option<&Key>; 4],
+            mut template: Hap,
+            keys: &[&Key; 4],
             n_waves: usize,
             thread: &QueryThread,
             out: &mut Vec<Hap>,
@@ -3207,20 +3224,21 @@ impl Pattern {
         ) -> bool {
             let (from, bulk_ok) = state_flags;
             let count = usize::from(slot.count);
-            let first_key = keys[0].expect("first key");
-            let mut patches: [(&Key, f64); 4] = [(first_key, 0.0); 4];
+            let mut patches: [(&Key, f64); 4] = [(keys[0], 0.0); 4];
             let caches = slot.fallback_caches.get_or_insert_with(|| {
                 Box::new(std::array::from_fn(|_| value::SharedWaveCache::default()))
             });
-            let mut template = Some(template);
             for s_idx in 0..count {
                 let mut hap = if s_idx + 1 == count {
-                    template.take().expect("last step moves template")
+                    std::mem::replace(
+                        &mut template,
+                        Hap::new(None, TimeSpan::new(Fraction::ZERO, Fraction::ZERO), Value::Undefined),
+                    )
                 } else {
-                    template.as_ref().expect("template present").clone()
+                    template.clone()
                 };
                 for w in 0..n_waves {
-                    patches[w] = (keys[w].expect("key"), slot.nums[s_idx][w]);
+                    patches[w] = (keys[w], slot.nums[s_idx][w]);
                 }
                 if let Value::Object(controls) = &mut hap.value {
                     controls.set_data_many_cached(&patches[..n_waves], &mut caches[s_idx]);
@@ -3239,117 +3257,83 @@ impl Pattern {
             fused::note(fused::Hit::StepMany);
             true
         }
-        let mut hoisted_mask = 0u8;
-        for (w, item) in items.iter().enumerate() {
-            if item.steps == 0 && item.wave.has_no_cuts() {
-                hoisted_mask |= 1u8 << w;
-            }
-        }
-        let mut wave_live_mask = 0u8;
-        for key in keys[..n_waves].iter().flatten() {
-            if let Some(s) = controls::live_slot(key.as_str()) {
-                wave_live_mask |= 1u8 << s;
-            }
-        }
         for hf in haps {
             let met = if has_continuous {
                 hf.whole_or_part()
             } else {
                 hf.part
             };
-            let use_slot1 =
-                if slot0.active && slot0.part == hf.part && (!has_continuous || slot0.met == met) {
-                    false
-                } else if slot1.as_ref().is_some_and(|s| {
-                    s.active && s.part == hf.part && (!has_continuous || s.met == met)
-                }) {
-                    true
-                } else {
-                    let grid = fused::StepWave::step_grid_over(shared_steps, hf.part)?;
-                    let count = grid.len();
-                    let mut hoisted_vals = [0.0f64; 4];
-                    if hoisted_mask != 0 {
-                        for (w, item) in items.iter().enumerate() {
-                            if hoisted_mask & (1u8 << w) != 0 {
-                                hoisted_vals[w] =
-                                    item.wave.number(met, hf.part, &state.controls)?;
-                            }
-                        }
-                    }
-                    let target_slot1 = if !slot0.active {
-                        false
-                    } else if slot1.as_ref().is_none_or(|s| !s.active) {
-                        true
-                    } else {
-                        let victim = (slot_next & 1) != 0;
-                        slot_next = slot_next.wrapping_add(1);
-                        victim
-                    };
-                    let slot = if target_slot1 {
-                        slot1.get_or_insert_with(|| MultiStepSlot {
-                            active: false,
-                            met: zero_span,
-                            part: zero_span,
-                            count: 0,
-                            pieces: [zero_span; 8],
-                            nums: [[0.0f64; 4]; 8],
-                            step_patches: [None, None, None, None],
-                            step_next: 0,
-                            fallback_caches: None,
-                        })
-                    } else {
-                        &mut slot0
-                    };
-                    slot.active = false;
-                    let grid_steps = grid.steps();
-                    let grid_start = grid_steps.start;
-                    let grid_end = grid_steps.end;
-                    let mut begin = grid.time(grid_start)?;
-                    if thread.stop_requested() {
-                        out.truncate(from);
-                        return Some(true);
-                    }
-                    for (s_idx, k) in grid_steps.enumerate() {
-                        let end = grid.time(k + 1)?;
-                        let step_span = TimeSpan::new(begin, end);
-                        let piece = if k > grid_start && k + 1 < grid_end {
-                            step_span
-                        } else {
-                            grid.cut(k, step_span, hf.part)
-                        };
-                        slot.pieces[s_idx] = piece;
-                        for (w, item) in items.iter().enumerate() {
-                            slot.nums[s_idx][w] = if hoisted_mask & (1u8 << w) != 0 {
-                                hoisted_vals[w]
-                            } else if item.steps == 0 {
-                                item.wave.number(met, piece, &state.controls)?
-                            } else if single_step_mask & (1u8 << w) != 0 {
-                                fused::StepWave::step_number(
-                                    &item.wave,
-                                    item.steps,
-                                    piece,
-                                    &state.controls,
-                                )?
-                            } else {
-                                item.wave.step_value_at(begin, &state.controls)?
-                            };
-                        }
-                        begin = end;
-                    }
-                    slot.met = met;
-                    slot.part = hf.part;
-                    slot.count = count as u8;
-                    slot.step_patches = [None, None, None, None];
-                    slot.step_next = 0;
-                    slot.fallback_caches = None;
-                    slot.active = true;
-                    target_slot1
-                };
-            let slot = if use_slot1 {
-                slot1.as_mut().expect("slot1 initialized")
+            let slot_idx = if let Some(idx) = slots.iter().position(|s| {
+                s.active && s.part == hf.part && (!has_continuous || s.met == met)
+            }) {
+                idx
             } else {
-                &mut slot0
+                let grid = fused::StepWave::step_grid_over(shared_steps, hf.part)?;
+                let count = grid.len();
+                let mut hoisted_vals = [0.0f64; 4];
+                if hoisted_mask != 0 {
+                    for (w, item) in items.iter().enumerate() {
+                        if hoisted_mask & (1u8 << w) != 0 {
+                            hoisted_vals[w] = item.wave.number(met, hf.part, &state.controls)?;
+                        }
+                    }
+                }
+                let target_idx = if !slots[0].active {
+                    0
+                } else if !slots[1].active {
+                    1
+                } else {
+                    let victim = usize::from(slot_next & 1);
+                    slot_next = slot_next.wrapping_add(1);
+                    victim
+                };
+                let slot = &mut slots[target_idx];
+                slot.active = false;
+                let grid_steps = grid.steps();
+                let grid_start = grid_steps.start;
+                let grid_end = grid_steps.end;
+                let mut begin = grid.time(grid_start)?;
+                if thread.stop_requested() {
+                    out.truncate(from);
+                    return Some(true);
+                }
+                for (s_idx, k) in grid_steps.enumerate() {
+                    let end = grid.time(k + 1)?;
+                    let step_span = TimeSpan::new(begin, end);
+                    let piece = if k > grid_start && k + 1 < grid_end {
+                        step_span
+                    } else {
+                        grid.cut(k, step_span, hf.part)
+                    };
+                    slot.pieces[s_idx] = piece;
+                    for (w, item) in items.iter().enumerate() {
+                        slot.nums[s_idx][w] = if hoisted_mask & (1u8 << w) != 0 {
+                            hoisted_vals[w]
+                        } else if item.steps == 0 {
+                            item.wave.number(met, piece, &state.controls)?
+                        } else if single_step_mask & (1u8 << w) != 0 {
+                            fused::StepWave::step_number(
+                                &item.wave,
+                                item.steps,
+                                piece,
+                                &state.controls,
+                            )?
+                        } else {
+                            item.wave.step_value_at(begin, &state.controls)?
+                        };
+                    }
+                    begin = end;
+                }
+                slot.met = met;
+                slot.part = hf.part;
+                slot.count = count as u8;
+                slot.step_patches = [None, None, None, None];
+                slot.step_next = 0;
+                slot.fallback_caches = None;
+                slot.active = true;
+                target_idx
             };
+            let slot = &mut slots[slot_idx];
             let count = usize::from(slot.count);
             out.reserve(count);
             let bulk_ok = thread.charge(out.len() - from + count);
@@ -3407,19 +3391,10 @@ impl Pattern {
                         count * n_unique,
                     ) {
                         let dst = built.values_mut();
-                        if n_waves == 1 {
-                            for (dst_slot, row_nums) in
-                                dst.iter_mut().zip(slot.nums.iter()).take(count)
-                            {
-                                *dst_slot = Value::F64(row_nums[0]);
-                            }
-                        } else {
-                            for (s_idx, row_nums) in slot.nums.iter().enumerate().take(count) {
-                                let offset = s_idx * n_unique;
-                                for w in 0..n_waves {
-                                    dst[offset + usize::from(key_slot[w])] =
-                                        Value::F64(row_nums[w]);
-                                }
+                        for (s_idx, row_nums) in slot.nums.iter().enumerate().take(count) {
+                            let offset = s_idx * n_unique;
+                            for w in 0..n_waves {
+                                dst[offset + usize::from(key_slot[w])] = Value::F64(row_nums[w]);
                             }
                         }
                         let sp = built.finish();
@@ -3442,19 +3417,15 @@ impl Pattern {
                 };
                 if let Some((sp, row, layer_idx)) = resolved {
                     let whole = template.whole;
-                    let mut tpl_context = Some(template.context);
-                    let mut tpl_keys = Some(template.keys);
-                    for (s_idx, &piece) in slot.pieces.iter().enumerate().take(count) {
-                        let (context, keys) = if s_idx + 1 == count {
+                    let last = count - 1;
+                    for (s_idx, &piece) in slot.pieces[..count].iter().enumerate() {
+                        let (context, keys) = if s_idx == last {
                             (
-                                tpl_context.take().expect("last step moves context"),
-                                tpl_keys.take().expect("last step moves keys"),
+                                std::mem::take(&mut template.context),
+                                std::mem::take(&mut template.keys),
                             )
                         } else {
-                            (
-                                tpl_context.as_ref().expect("context present").clone(),
-                                tpl_keys.as_ref().expect("keys present").clone(),
-                            )
+                            (template.context.clone(), template.keys.clone())
                         };
                         let hap = Hap {
                             whole,

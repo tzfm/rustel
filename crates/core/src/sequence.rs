@@ -7256,10 +7256,9 @@ pub(crate) fn with_ui_visual_slot_in_place(layers: &mut Arc<[Layer]>, slot: u8) 
     true
 }
 
-/// `pattern` with UI visual `slot` folded into its sequence layers.
-pub(crate) fn with_ui_visual_slot(pattern: &Pattern, slot: u8) -> Option<Pattern> {
-    let layers = redressed_arc(folded(pattern)?, |dress| dress.add_ui_visual_slot(slot));
-    Some(Pattern::of(Node::Sequence(layers)))
+/// `layers` with UI visual `slot` folded into every layer's dress.
+pub(crate) fn with_ui_visual_slot_layers(layers: &[Layer], slot: u8) -> Arc<[Layer]> {
+    redressed_arc(layers, |dress| dress.add_ui_visual_slot(slot))
 }
 
 /// `selector`, the sequence that selects for a pick, with `locations`
