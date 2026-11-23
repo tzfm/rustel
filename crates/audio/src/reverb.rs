@@ -180,6 +180,10 @@ const TAIL_START: usize = 2048;
 const TAIL_BLOCK: usize = TAIL_START;
 const TAIL_FFT: usize = 2 * TAIL_BLOCK;
 
+/// Head hops per tail hop. A tail hop transforms a whole tail block at once,
+/// so one live callback in this many carries it.
+const TAIL_HOPS: usize = TAIL_BLOCK / REVERB_BLOCK;
+
 /// Fill a spectrum's upper half with the conjugates of its lower half.
 ///
 /// Both convolvers multiply-accumulate only the bins up to the middle and
@@ -223,6 +227,9 @@ struct TailConvolver {
     /// Output for the block now being played, produced one hop ahead.
     wet: Vec<f32>,
     wet_read: usize,
+    /// Silent frames a reset stages, a multiple of [`REVERB_BLOCK`]. It moves
+    /// the tail hops on the head clock, see [`OrbitReverb::spread_tail_hops`].
+    phase: usize,
 }
 
 impl TailConvolver {
@@ -276,6 +283,7 @@ impl TailConvolver {
             scratch,
             wet: vec![0.0; TAIL_BLOCK],
             wet_read: 0,
+            phase: 0,
         })
     }
 
@@ -284,10 +292,19 @@ impl TailConvolver {
             spectrum.fill(Complex::default());
         }
         self.previous_block.fill(0.0);
-        self.stage_fill = 0;
+        self.stage.fill(0.0);
         self.wet.fill(0.0);
-        self.wet_read = 0;
+        self.stage_fill = self.phase;
+        self.wet_read = self.phase;
         self.head = 0;
+    }
+
+    /// Stages `hops` head hops of silence, so the tail hops come that much
+    /// sooner. Only for a tail that has run no hop since its reset.
+    fn set_phase(&mut self, hops: usize) {
+        self.phase = hops % TAIL_HOPS * REVERB_BLOCK;
+        self.stage_fill = self.phase;
+        self.wet_read = self.phase;
     }
 
     /// Take one input sample and give back this sample's tail contribution.
@@ -582,6 +599,17 @@ impl MonoConvolver {
         self.silent_frames = usize::MAX / 2;
         if let Some(tail) = self.tail.as_mut() {
             tail.reset();
+        }
+    }
+
+    /// See [`TailConvolver::set_phase`]. A convolver that ran since its
+    /// reset keeps its phase.
+    fn set_tail_phase(&mut self, hops: usize) {
+        if self.dirty {
+            return;
+        }
+        if let Some(tail) = self.tail.as_mut() {
+            tail.set_phase(hops);
         }
     }
 
@@ -922,6 +950,20 @@ impl OrbitReverb {
     pub fn reset(&mut self) {
         self.left.reset();
         self.right.reset();
+    }
+
+    /// Gives each channel of `slot` its own block of the tail-hop grid, for
+    /// a reverb that has run no block since its reset and that gets its next
+    /// block at `frame`. A tail hop transforms a whole tail block in one
+    /// callback, so reverbs that hop together can miss the deadline of that
+    /// callback. Live orbits that each take their own slot hop apart. The
+    /// silence in front of the input moves the output by float rounding only.
+    pub(crate) fn spread_tail_hops(&mut self, frame: u64, slot: usize) {
+        let block = (frame / REVERB_BLOCK as u64 % TAIL_HOPS as u64) as usize;
+        for (channel, convolver) in [&mut self.left, &mut self.right].into_iter().enumerate() {
+            let target = (2 * slot + channel) % TAIL_HOPS;
+            convolver.set_tail_phase(block + TAIL_HOPS - target);
+        }
     }
 
     /// Whether the reverb can still give a sample other than zero while its
@@ -1501,5 +1543,93 @@ mod tests {
                 "{quiet_from} after {last_sound}"
             );
         }
+    }
+
+    /// A tail that hops on another block of the head clock gives the same
+    /// output, up to float rounding.
+    #[test]
+    fn a_tail_phase_keeps_the_output() {
+        let ir: Vec<f32> = (0..6_000)
+            .map(|i| (((i * 37) % 211) as f32 - 105.0) / 105.0 * (1.0 - i as f32 / 6_000.0))
+            .collect();
+        let frames = 64 * REVERB_BLOCK;
+        let input: Vec<f32> = (0..frames)
+            .map(|n| (((n * 53) % 97) as f32 - 48.0) / 48.0)
+            .collect();
+        let run = |hops: Option<usize>| {
+            let mut planner = FftPlanner::new();
+            let mut convolver = MonoConvolver::new(&ir, &mut planner, ConvolutionKernel::PORTABLE);
+            if let Some(hops) = hops {
+                convolver.set_tail_phase(hops);
+            }
+            let mut got = vec![0.0f32; frames];
+            for (block, out) in input.chunks(REVERB_BLOCK).zip(got.chunks_mut(REVERB_BLOCK)) {
+                convolver.process_block(block, out);
+            }
+            got
+        };
+        let reference = run(None);
+        let peak = reference.iter().fold(0.0f32, |peak, s| peak.max(s.abs()));
+        for hops in 1..TAIL_HOPS {
+            let got = run(Some(hops));
+            let worst = got
+                .iter()
+                .zip(&reference)
+                .fold(0.0f32, |worst, (a, b)| worst.max((a - b).abs()));
+            assert!(
+                worst <= peak * 1e-5,
+                "phase {hops}: worst {worst} of {peak}"
+            );
+        }
+    }
+
+    /// The tails of 16 orbits made at the same frame hop on distinct blocks,
+    /// 2 channels on each block of the tail grid, and keep that after a reset.
+    #[test]
+    fn spread_orbits_hop_on_their_own_blocks() {
+        let params = ReverbParams {
+            ir: None,
+            size_secs: 0.1,
+            fade_secs: 0.05,
+            lp_start_hz: 15_000.0,
+            lp_end_hz: 1_000.0,
+        };
+        let template = OrbitReverb::generate(48_000, params);
+        assert!(template.left.tail.is_some(), "the room needs a tail");
+        let hop_blocks = |frame: u64| {
+            let mut counts = [0usize; TAIL_HOPS];
+            for slot in 0..16 {
+                let mut reverb = OrbitReverb::generate(48_000, params);
+                reverb.spread_tail_hops(frame, slot);
+                let silence = [0.0f32; REVERB_BLOCK];
+                for block in 0..TAIL_HOPS as u64 {
+                    let [mut left, mut right] = [[0.0f32; REVERB_BLOCK]; 2];
+                    reverb.process_block(&silence, &silence, &mut left, &mut right);
+                    for convolver in [&reverb.left, &reverb.right] {
+                        if convolver
+                            .tail
+                            .as_ref()
+                            .is_some_and(|tail| tail.stage_fill == 0)
+                        {
+                            let absolute = frame / REVERB_BLOCK as u64 + block;
+                            counts[(absolute % TAIL_HOPS as u64) as usize] += 1;
+                        }
+                    }
+                }
+            }
+            counts
+        };
+        assert_eq!(hop_blocks(0), [2; TAIL_HOPS]);
+        assert_eq!(hop_blocks(37 * REVERB_BLOCK as u64), [2; TAIL_HOPS]);
+        let mut reverb = OrbitReverb::generate(48_000, params);
+        reverb.spread_tail_hops(0, 3);
+        let burst = [0.5f32; REVERB_BLOCK];
+        let [mut left, mut right] = [[0.0f32; REVERB_BLOCK]; 2];
+        reverb.process_block(&burst, &burst, &mut left, &mut right);
+        reverb.reset();
+        let phase = |reverb: &OrbitReverb| reverb.left.tail.as_ref().map(|tail| tail.stage_fill);
+        let mut fresh = OrbitReverb::generate(48_000, params);
+        fresh.spread_tail_hops(0, 3);
+        assert_eq!(phase(&reverb), phase(&fresh));
     }
 }
