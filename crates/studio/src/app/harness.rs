@@ -577,13 +577,6 @@ impl Studio {
         self.app.scenes.directory().to_path_buf()
     }
 
-    /// Whether the last update of the focused text stands refused, so a
-    /// permission given now owes its re-run.
-    pub fn update_stands_refused(&self) -> bool {
-        let current = self.app.scenes.current();
-        self.app.update_failure == Some((current.id, current.editor.revision()))
-    }
-
     /// The error line's current text, if one is showing.
     pub fn errors(&self) -> Option<String> {
         self.app.errors.visible().map(str::to_owned)
