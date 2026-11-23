@@ -5589,6 +5589,37 @@ fn an_export_names_an_unknown_chord() {
     let _ = std::fs::remove_file(&path);
 }
 
+/// A patterned argument that refuses only in a later cycle fails the check,
+/// and names that cycle.
+#[test]
+fn check_finds_a_refusal_in_a_later_cycle() {
+    let out = run(&[
+        "check",
+        "-e",
+        r#"s("bd*2").euclid(3, "<8 1000000>")"#,
+        "--no-samples",
+    ]);
+    let said = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(!out.status.success(), "{said}");
+    assert!(said.contains("cycle 1"), "{said}");
+    assert!(said.contains("1000000 steps"), "{said}");
+    let out = run(&[
+        "check",
+        "-e",
+        r#"s("bd*2").euclid(3, "<8 16>")"#,
+        "--no-samples",
+    ]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+}
+
 /// The command line prints recoverable notices on stderr, which a library
 /// Session does only when its host opts in. A notice that every note raises
 /// prints once, with the number of onsets.
