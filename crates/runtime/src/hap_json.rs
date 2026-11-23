@@ -271,6 +271,10 @@ pub struct RenderReport {
     /// with such a sample, and a value lost to too many values at one time.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub plugin_lines: Vec<String>,
+    /// What the bounce says of each chord it could not voice. It is silent,
+    /// as on strudel.cc, which logs it and plays on.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub unknown_chords: Vec<String>,
 }
 
 impl RenderReport {
