@@ -2391,8 +2391,14 @@ impl ScalarBackend {
             *duck = OrbitDuck::default();
         }
         self.pending_ducks.clear();
-        for reverb in self.orbit_reverbs.iter_mut().flatten() {
-            reverb.reset();
+        let live = self.mode == RenderMode::Live;
+        for (orbit, slot) in self.orbit_reverbs.iter_mut().enumerate() {
+            if let Some(reverb) = slot {
+                reverb.reset();
+                if live {
+                    reverb.spread_tail_hops(frame, orbit);
+                }
+            }
         }
         // Each fade ends now: the copy in a leaving place goes back, and a
         // stage that fades out leaves the order. A copy with no place in the

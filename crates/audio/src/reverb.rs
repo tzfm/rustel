@@ -180,6 +180,10 @@ const TAIL_START: usize = 2048;
 const TAIL_BLOCK: usize = TAIL_START;
 const TAIL_FFT: usize = 2 * TAIL_BLOCK;
 
+/// Head hops per tail hop. A tail hop transforms a whole tail block at once,
+/// so one live callback in this many carries it.
+const TAIL_HOPS: usize = TAIL_BLOCK / REVERB_BLOCK;
+
 /// Fill a spectrum's upper half with the conjugates of its lower half.
 ///
 /// Both convolvers multiply-accumulate only the bins up to the middle and
@@ -211,7 +215,8 @@ struct TailConvolver {
     kernel: ConvolutionKernel,
     fft: Arc<dyn Fft<f32>>,
     ifft: Arc<dyn Fft<f32>>,
-    partitions: Vec<Vec<Complex<f32>>>,
+    /// Shared by the reverbs made from one [`ReverbResponse`].
+    partitions: Arc<[Vec<Complex<f32>>]>,
     history: Vec<Vec<Complex<f32>>>,
     head: usize,
     previous_block: Vec<f32>,
@@ -223,6 +228,9 @@ struct TailConvolver {
     /// Output for the block now being played, produced one hop ahead.
     wet: Vec<f32>,
     wet_read: usize,
+    /// Silent frames a reset stages, a multiple of [`REVERB_BLOCK`]. It moves
+    /// the tail hops on the head clock, see [`OrbitReverb::spread_tail_hops`].
+    phase: usize,
 }
 
 impl TailConvolver {
@@ -265,7 +273,7 @@ impl TailConvolver {
             kernel,
             fft,
             ifft,
-            partitions,
+            partitions: partitions.into(),
             history,
             head: 0,
             previous_block: vec![0.0; TAIL_BLOCK],
@@ -276,7 +284,31 @@ impl TailConvolver {
             scratch,
             wet: vec![0.0; TAIL_BLOCK],
             wet_read: 0,
+            phase: 0,
         })
+    }
+
+    /// A tail with the same response and no input. With `history` false it
+    /// holds no input history and must not run.
+    fn share(&self, history: bool) -> Self {
+        let count = if history { self.partitions.len() } else { 0 };
+        Self {
+            kernel: self.kernel,
+            fft: Arc::clone(&self.fft),
+            ifft: Arc::clone(&self.ifft),
+            partitions: Arc::clone(&self.partitions),
+            history: vec![vec![Complex::default(); TAIL_FFT]; count],
+            head: 0,
+            previous_block: vec![0.0; TAIL_BLOCK],
+            stage: vec![0.0; TAIL_BLOCK],
+            stage_fill: 0,
+            work: vec![Complex::default(); TAIL_FFT],
+            accumulator: vec![Complex::default(); TAIL_FFT],
+            scratch: vec![Complex::default(); self.scratch.len()],
+            wet: vec![0.0; TAIL_BLOCK],
+            wet_read: 0,
+            phase: 0,
+        }
     }
 
     fn reset(&mut self) {
@@ -284,10 +316,19 @@ impl TailConvolver {
             spectrum.fill(Complex::default());
         }
         self.previous_block.fill(0.0);
-        self.stage_fill = 0;
+        self.stage.fill(0.0);
         self.wet.fill(0.0);
-        self.wet_read = 0;
+        self.stage_fill = self.phase;
+        self.wet_read = self.phase;
         self.head = 0;
+    }
+
+    /// Stages `hops` head hops of silence, so the tail hops come that much
+    /// sooner. Only for a tail that has run no hop since its reset.
+    fn set_phase(&mut self, hops: usize) {
+        self.phase = hops % TAIL_HOPS * REVERB_BLOCK;
+        self.stage_fill = self.phase;
+        self.wet_read = self.phase;
     }
 
     /// Take one input sample and give back this sample's tail contribution.
@@ -378,8 +419,9 @@ struct MonoConvolver {
     kernel: ConvolutionKernel,
     fft: Arc<dyn Fft<f32>>,
     ifft: Arc<dyn Fft<f32>>,
-    /// IR block spectra, oldest lag first.
-    partitions: Vec<Vec<Complex<f32>>>,
+    /// IR block spectra, oldest lag first. Shared by the reverbs made from
+    /// one [`ReverbResponse`].
+    partitions: Arc<[Vec<Complex<f32>>]>,
     /// Ring of recent input-block spectra; `head` is the newest.
     history: Vec<Vec<Complex<f32>>>,
     head: usize,
@@ -542,7 +584,7 @@ impl MonoConvolver {
             kernel,
             fft,
             ifft,
-            partitions,
+            partitions: partitions.into(),
             history,
             head: 0,
             previous_block: [0.0; REVERB_BLOCK],
@@ -561,6 +603,51 @@ impl MonoConvolver {
             silent_frames: usize::MAX / 2,
             direct,
         }
+    }
+
+    /// A convolver with the same response and no input. With `history`
+    /// false it holds no input history and must not run.
+    fn share(&self, history: bool) -> Self {
+        let count = if history { self.partitions.len() } else { 0 };
+        Self {
+            kernel: self.kernel,
+            fft: Arc::clone(&self.fft),
+            ifft: Arc::clone(&self.ifft),
+            partitions: Arc::clone(&self.partitions),
+            history: vec![vec![Complex::default(); FFT_SIZE]; count],
+            head: 0,
+            previous_block: [0.0; REVERB_BLOCK],
+            dirty: false,
+            work: vec![Complex::default(); FFT_SIZE],
+            accumulator: vec![Complex::default(); FFT_SIZE],
+            scratch: vec![Complex::default(); self.scratch.len()],
+            stage: [0.0; REVERB_BLOCK],
+            stage_fill: 0,
+            wet: [0.0; WET_CAP],
+            wet_head: 0,
+            wet_len: 0,
+            tail: self.tail.as_ref().map(|tail| tail.share(history)),
+            ir_frames: self.ir_frames,
+            silent_frames: usize::MAX / 2,
+            direct: self.direct.as_ref().map(|head| {
+                Box::new(DirectHead {
+                    ir: head.ir,
+                    history: [0.0; REVERB_BLOCK],
+                    pos: 0,
+                })
+            }),
+        }
+    }
+
+    /// Bytes of the response spectra, which the reverbs made from one
+    /// response share.
+    fn response_bytes(&self) -> usize {
+        let complex = std::mem::size_of::<Complex<f32>>();
+        let tail = self
+            .tail
+            .as_ref()
+            .map_or(0, |tail| tail.partitions.len() * TAIL_FFT);
+        (self.partitions.len() * FFT_SIZE + tail) * complex
     }
 
     fn reset(&mut self) {
@@ -582,6 +669,17 @@ impl MonoConvolver {
         self.silent_frames = usize::MAX / 2;
         if let Some(tail) = self.tail.as_mut() {
             tail.reset();
+        }
+    }
+
+    /// See [`TailConvolver::set_phase`]. A convolver that ran since its
+    /// reset keeps its phase.
+    fn set_tail_phase(&mut self, hops: usize) {
+        if self.dirty {
+            return;
+        }
+        if let Some(tail) = self.tail.as_mut() {
+            tail.set_phase(hops);
         }
     }
 
@@ -726,6 +824,39 @@ impl MonoConvolver {
             self.wet[(self.wet_head + offset) % WET_CAP] = 0.0;
         }
         self.wet_len += REVERB_BLOCK;
+    }
+}
+
+/// The impulse response of a reverb without the state that runs it. A
+/// reverb made from it shares its spectra and allocates only its own input
+/// history, a fraction of a new reverb, and needs no new response. The
+/// spectra stay while the response or any reverb made from it stays.
+pub struct ReverbResponse(OrbitReverb);
+
+impl ReverbResponse {
+    pub fn params(&self) -> ReverbParams {
+        self.0.params
+    }
+
+    /// A new reverb with this response and no sound in it. Not real-time
+    /// safe: it allocates the input history.
+    pub fn reverb(&self) -> OrbitReverb {
+        OrbitReverb {
+            params: self.0.params,
+            dispatch: self.0.dispatch,
+            left: self.0.left.share(true),
+            right: self.0.right.share(true),
+        }
+    }
+
+    /// Whether a reverb made from this response still exists.
+    pub fn in_use(&self) -> bool {
+        Arc::strong_count(&self.0.left.partitions) > 1
+    }
+
+    /// Bytes of the spectra: what this response keeps alone.
+    pub fn approx_bytes(&self) -> usize {
+        self.0.left.response_bytes() + self.0.right.response_bytes()
     }
 }
 
@@ -917,11 +1048,43 @@ impl OrbitReverb {
         self.left.approx_bytes() + self.right.approx_bytes()
     }
 
+    /// The bytes of this reverb that it does not share with the other
+    /// reverbs of its [`ReverbResponse`].
+    pub fn state_bytes(&self) -> usize {
+        let response = self.left.response_bytes() + self.right.response_bytes();
+        self.approx_bytes().saturating_sub(response)
+    }
+
     /// Drop the tail (input history and overlap), keeping the planned IR.
     /// Cheap when the convolver never ran since the last reset.
     pub fn reset(&mut self) {
         self.left.reset();
         self.right.reset();
+    }
+
+    /// Gives each channel of `slot` its own block of the tail-hop grid, for
+    /// a reverb that has run no block since its reset and that gets its next
+    /// block at `frame`. A tail hop transforms a whole tail block in one
+    /// callback, so reverbs that hop together can miss the deadline of that
+    /// callback. Live orbits that each take their own slot hop apart. The
+    /// silence in front of the input moves the output by float rounding only.
+    pub(crate) fn spread_tail_hops(&mut self, frame: u64, slot: usize) {
+        let block = (frame / REVERB_BLOCK as u64 % TAIL_HOPS as u64) as usize;
+        for (channel, convolver) in [&mut self.left, &mut self.right].into_iter().enumerate() {
+            let target = (2 * slot + channel) % TAIL_HOPS;
+            convolver.set_tail_phase(block + TAIL_HOPS - target);
+        }
+    }
+
+    /// The impulse response of this reverb, for more reverbs that share its
+    /// spectra. See [`ReverbResponse`].
+    pub fn response(&self) -> ReverbResponse {
+        ReverbResponse(Self {
+            params: self.params,
+            dispatch: self.dispatch,
+            left: self.left.share(false),
+            right: self.right.share(false),
+        })
     }
 
     /// Whether the reverb can still give a sample other than zero while its
@@ -1501,5 +1664,126 @@ mod tests {
                 "{quiet_from} after {last_sound}"
             );
         }
+    }
+
+    /// A tail that hops on another block of the head clock gives the same
+    /// output, up to float rounding.
+    #[test]
+    fn a_tail_phase_keeps_the_output() {
+        let ir: Vec<f32> = (0..6_000)
+            .map(|i| (((i * 37) % 211) as f32 - 105.0) / 105.0 * (1.0 - i as f32 / 6_000.0))
+            .collect();
+        let frames = 64 * REVERB_BLOCK;
+        let input: Vec<f32> = (0..frames)
+            .map(|n| (((n * 53) % 97) as f32 - 48.0) / 48.0)
+            .collect();
+        let run = |hops: Option<usize>| {
+            let mut planner = FftPlanner::new();
+            let mut convolver = MonoConvolver::new(&ir, &mut planner, ConvolutionKernel::PORTABLE);
+            if let Some(hops) = hops {
+                convolver.set_tail_phase(hops);
+            }
+            let mut got = vec![0.0f32; frames];
+            for (block, out) in input.chunks(REVERB_BLOCK).zip(got.chunks_mut(REVERB_BLOCK)) {
+                convolver.process_block(block, out);
+            }
+            got
+        };
+        let reference = run(None);
+        let peak = reference.iter().fold(0.0f32, |peak, s| peak.max(s.abs()));
+        for hops in 1..TAIL_HOPS {
+            let got = run(Some(hops));
+            let worst = got
+                .iter()
+                .zip(&reference)
+                .fold(0.0f32, |worst, (a, b)| worst.max((a - b).abs()));
+            assert!(
+                worst <= peak * 1e-5,
+                "phase {hops}: worst {worst} of {peak}"
+            );
+        }
+    }
+
+    /// The tails of 16 orbits made at the same frame hop on distinct blocks,
+    /// 2 channels on each block of the tail grid, and keep that after a reset.
+    #[test]
+    fn spread_orbits_hop_on_their_own_blocks() {
+        let params = ReverbParams {
+            ir: None,
+            size_secs: 0.1,
+            fade_secs: 0.05,
+            lp_start_hz: 15_000.0,
+            lp_end_hz: 1_000.0,
+        };
+        let template = OrbitReverb::generate(48_000, params);
+        assert!(template.left.tail.is_some(), "the room needs a tail");
+        let hop_blocks = |frame: u64| {
+            let mut counts = [0usize; TAIL_HOPS];
+            for slot in 0..16 {
+                let mut reverb = OrbitReverb::generate(48_000, params);
+                reverb.spread_tail_hops(frame, slot);
+                let silence = [0.0f32; REVERB_BLOCK];
+                for block in 0..TAIL_HOPS as u64 {
+                    let [mut left, mut right] = [[0.0f32; REVERB_BLOCK]; 2];
+                    reverb.process_block(&silence, &silence, &mut left, &mut right);
+                    for convolver in [&reverb.left, &reverb.right] {
+                        if convolver
+                            .tail
+                            .as_ref()
+                            .is_some_and(|tail| tail.stage_fill == 0)
+                        {
+                            let absolute = frame / REVERB_BLOCK as u64 + block;
+                            counts[(absolute % TAIL_HOPS as u64) as usize] += 1;
+                        }
+                    }
+                }
+            }
+            counts
+        };
+        assert_eq!(hop_blocks(0), [2; TAIL_HOPS]);
+        assert_eq!(hop_blocks(37 * REVERB_BLOCK as u64), [2; TAIL_HOPS]);
+        let mut reverb = OrbitReverb::generate(48_000, params);
+        reverb.spread_tail_hops(0, 3);
+        let burst = [0.5f32; REVERB_BLOCK];
+        let [mut left, mut right] = [[0.0f32; REVERB_BLOCK]; 2];
+        reverb.process_block(&burst, &burst, &mut left, &mut right);
+        reverb.reset();
+        let phase = |reverb: &OrbitReverb| reverb.left.tail.as_ref().map(|tail| tail.stage_fill);
+        let mut fresh = OrbitReverb::generate(48_000, params);
+        fresh.spread_tail_hops(0, 3);
+        assert_eq!(phase(&reverb), phase(&fresh));
+    }
+
+    /// A reverb made from a response sounds as the reverb that made the
+    /// response, and the response knows while such a reverb exists.
+    #[test]
+    fn a_reverb_from_a_response_matches_a_new_one() {
+        let params = ReverbParams {
+            ir: None,
+            size_secs: 0.2,
+            fade_secs: 0.05,
+            lp_start_hz: 15_000.0,
+            lp_end_hz: 1_000.0,
+        };
+        let mut made = OrbitReverb::generate(48_000, params);
+        let response = made.response();
+        assert!(response.in_use());
+        let mut shared = response.reverb();
+        assert!(response.approx_bytes() > 0);
+        assert!(shared.state_bytes() < shared.approx_bytes());
+        let input: Vec<f32> = (0..32 * REVERB_BLOCK)
+            .map(|n| (((n * 53) % 97) as f32 - 48.0) / 48.0)
+            .collect();
+        for block in input.chunks(REVERB_BLOCK) {
+            let mut a = [[0.0f32; REVERB_BLOCK]; 2];
+            let mut b = [[0.0f32; REVERB_BLOCK]; 2];
+            let [a_left, a_right] = &mut a;
+            let [b_left, b_right] = &mut b;
+            made.process_block(block, block, a_left, a_right);
+            shared.process_block(block, block, b_left, b_right);
+            assert_eq!(a, b);
+        }
+        drop((made, shared));
+        assert!(!response.in_use());
     }
 }
