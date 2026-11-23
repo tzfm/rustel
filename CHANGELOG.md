@@ -14,6 +14,7 @@
 - Fixed: an export, a replay export or a stems export that cannot write a file names that file, instead of a bare "No such file or directory".
 - Vim mode: `J` and `gJ` join lines, as in Vim. The shipped `$` label jumps move from `J` and `K` to `]$` and `[$`.
 - `rustel check` names a note that a `gm_*` soundfont has no note for, such as `note("c2").s("gm_clarinet")`, instead of finding no issues while the note plays as silence.
+- `rustel check` names a `talkit` setting the render refuses, such as `pitch: 49` or `quality: "garbled"`, instead of finding no issues while the voice is silent.
 - `rustel check` and `rustel query` take `--prebake setup.js`, so a score calling a prebake's helpers checks clean.
 - A sample source can be a repository page such as `https://github.com/user/repo`. It reads as `github:user/repo`, and a web page or a missing map says what to write instead.
 - Fixed: a sample source turned off and on again on the Permissions page brings its sounds back, and the update it refused while off runs again.
@@ -21,7 +22,7 @@
 - Fixed: a live output that fell behind and resumed is printed as a warning, not as an error, since the run plays on.
 - Fixed: leaving a Link session or letting go of an incoming MIDI clock plays the score's own tempo again, instead of the bent tempo the follow left until the next update.
 - Fixed: `mouseX` and `mouseY` inside `K()` say they need live control input, instead of a message about scope IDs.
-- `rustel check` names a `talkit` setting the render refuses, such as `pitch: 49` or `quality: "garbled"`, instead of finding no issues while the voice is silent.
+- Fixed: while the score plays, Studio unloads the plugin of a lane you remove once its chains end, instead of keeping it loaded until Stop.
 - Fixed: a `.dict()` name no dictionary has is an error, as on strudel.cc, instead of a lane that plays silence.
 - Fixed: the slider form and the knobs column's value form refuse a step of zero with the reason, as `rustel check` does, instead of writing a step of their own.
 - The reference search also finds entries by extension name, description, tags, parameters and examples, and by words spread across them. These matches come after the usual matches, under more matches.

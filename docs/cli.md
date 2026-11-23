@@ -250,8 +250,9 @@ destructive commands then require `--force`.
 | 5 | Audio failure |
 | 128 + signal | Interrupted: 130 for Ctrl+C, 143 for SIGTERM |
 
-Recoverable MIDI or serial failures can leave playback running and return 0
-on normal completion. An export with a refused voice returns 0 too: the
+Recoverable MIDI, serial or audio input failures can leave playback running
+and return 0 on normal completion: an audio input that does not open is
+retried for the whole run. An export with a refused voice returns 0 too: the
 refusal is reported as `voice_refused` and the rest of the bounce plays.
 Use `check` to find such a score before it is exported. Argument errors use text diagnostics, even with `--json`.
 

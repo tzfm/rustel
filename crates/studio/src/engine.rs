@@ -1456,6 +1456,11 @@ pub struct StudioEngine {
     /// nothing keeps: see [`Self::unload_idle_plugins`].
     #[cfg(feature = "vst")]
     plugins_swept: bool,
+    /// While the score plays, when the sweep looks again at a plugin it
+    /// kept because a copy of a removed lane still played it: see
+    /// [`Self::unload_idle_plugins`].
+    #[cfg(feature = "vst")]
+    plugins_sweep_again_at: Option<Instant>,
     /// How much decoded sound the recently visited tabs may keep, when a
     /// test says: see [`Self::recent_tabs_allowance`] otherwise.
     recent_tabs_bytes: Option<usize>,
@@ -1918,6 +1923,8 @@ impl StudioEngine {
             live_plugins_shown: Vec::new(),
             #[cfg(feature = "vst")]
             plugins_swept: false,
+            #[cfg(feature = "vst")]
+            plugins_sweep_again_at: None,
             recent_tabs_bytes: None,
             protection_generation: 0,
             protection: None,
@@ -2637,6 +2644,12 @@ impl StudioEngine {
             // last sweep decided was still wanted is decided again: a tab
             // closed while it played goes with the next idle sweep.
             self.ask_idle_sweep();
+            // That sweep runs stopped, with nothing left to play out: no
+            // sweep is owed after an edit any more.
+            #[cfg(feature = "vst")]
+            {
+                self.plugins_sweep_again_at = None;
+            }
         }
         self.piano = [None; PIANO_KEYS];
         self.piano_close_when_idle = true;
