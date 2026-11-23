@@ -1068,15 +1068,34 @@ fn a_source_turned_off_and_on_again_reruns_the_refused_update() {
     studio.set_score(&format!(
         "samples('{origin}/map.json')\n$: s(\"sn sn\").gain(0.03)"
     ));
-    studio.chord("ctrl+s");
-    // Read off the screen: a notice about the layer still playing can take
-    // the status line over.
-    studio.pump_until(Duration::from_secs(10), "the update is refused", |studio| {
+    // Only the check's refusal is remembered for a permission to re-run. An
+    // update sent before the engine has taken the grant back installs, then
+    // rolls back with nothing to re-run, so press again until the check
+    // refuses it: one press a second at most, as above.
+    let refusals = |studio: &rustel_studio_e2e::Hermetic| {
         studio
-            .rows()
+            .log_texts()
             .iter()
-            .any(|row| row.contains("unknown sound \"sn\""))
-    });
+            .filter(|line| line.contains("refused - ") && line.contains("unknown sound \"sn\""))
+            .count()
+    };
+    let before = refusals(&studio);
+    studio.chord("ctrl+s");
+    let mut pressed = std::time::Instant::now();
+    studio.pump_until(
+        Duration::from_secs(15),
+        "the check refuses the update",
+        |studio| {
+            if refusals(studio) > before {
+                return true;
+            }
+            if pressed.elapsed() > Duration::from_secs(1) {
+                studio.chord("ctrl+s");
+                pressed = std::time::Instant::now();
+            }
+            false
+        },
+    );
 
     open_permissions(&mut studio);
     select_row(&mut studio, &format!("▸ {origin}"));

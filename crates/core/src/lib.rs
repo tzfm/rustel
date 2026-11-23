@@ -3672,7 +3672,8 @@ impl PickLookup {
     }
 
     /// The pattern `value` picks, or the key it looked up and did not find,
-    /// as the lookup read it.
+    /// as the lookup read it. A list reads a name that is no number as NaN;
+    /// that miss gives the name as written.
     fn select(&self, value: &Value, index_mode: PickIndexMode) -> Result<&Pattern, String> {
         // Property access coerces the actual JavaScript selector.
         // `pure(['1']).pick(['a', 'b'])` therefore selects `b`; treating an
@@ -3704,6 +3705,11 @@ impl PickLookup {
                 };
                 // JavaScript property access turns -0 into "0". Every other
                 // negative, NaN, infinite or out-of-range number misses.
+                // A name that is no number misses as NaN; the name as
+                // written says more than NaN does.
+                if numeric.is_nan() {
+                    return Err(pick_property_key(value));
+                }
                 if !numeric.is_finite() || numeric < 0.0 || numeric > usize::MAX as f64 {
                     return Err(numeric.to_string());
                 }
@@ -4211,20 +4217,10 @@ fn query_pick(
         let inner_pattern = match lookup.select(&outer.value, index_mode) {
             Ok(pattern) => pattern,
             Err(key) => {
-                // `lookup[key]` is `undefined`; the selected value becomes a
-                // hap normally and fails only when the join reaches it. The
-                // text strudel.cc throws comes after the key it did not find:
-                // the JavaScript words alone name no part of the score.
-                let thrown = match mode {
-                    JoinMode::Squeeze => {
-                        "Cannot read properties of undefined (reading '_focusSpan')"
-                    }
-                    JoinMode::Reset | JoinMode::Restart => {
-                        "Cannot read properties of undefined (reading 'late')"
-                    }
-                    _ => "x.value.query is not a function",
-                };
-                signal_query_error(|| format!("no {key:?} in the pick lookup ({thrown})"));
+                // `lookup[key]` is `undefined`; strudel.cc fails when the
+                // join reaches it, with JavaScript words that name no part of
+                // the score. The key it did not find does.
+                signal_query_error(|| format!("no {key:?} in the pick lookup"));
                 return Vec::new();
             }
         };
