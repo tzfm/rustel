@@ -25,6 +25,7 @@
 - Fixed: an Alt key over the mixer or another panel holding the keyboard no longer types into or edits the score.
 - Fixed: an export of a score with an unknown chord, from the command line or the Studio sheet, says which chord, instead of writing a silent file with no message. The chord stays silent, as on strudel.cc.
 - `rustel check` queries the first 8 cycles, so a patterned value that is refused in a later one, such as `euclid(3, "<8 1000000>")`, is found and its cycle named.
+- Fixed: a `gain` that is no number, such as `"0.1..0.4"` or `"0.2:0.4"`, plays at 1 with a warning, as on strudel.cc, instead of a refused, silent voice.
 - A pattern can set the tempo: `cps("<0.5 1>")` changes it at each onset, unless Link or MIDI clock leads.
 - Fixed: a live output that fell behind and resumed is printed as a warning, not as an error, since the run plays on.
 - Fixed: leaving a Link session or letting go of an incoming MIDI clock plays the score's own tempo again, instead of the bent tempo the follow left until the next update.

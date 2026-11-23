@@ -1,5 +1,9 @@
 use super::*;
 
+/// The most gain warnings the log takes for one score: a pattern of bad
+/// values has a different text on each note.
+const MAX_GAIN_FALLBACKS_SAID: usize = 8;
+
 /// How long after an edit of the score in play the plugin sweep looks
 /// again: the 5 s of play the chains of a removed lane keep, and a second
 /// for the output to give their copies back. See
@@ -94,6 +98,7 @@ impl StudioEngine {
         // A different score names different sounds, so what the last sweep
         // decided was still wanted has to be decided again.
         if self.current_score != source {
+            self.gain_fallbacks_said.clear();
             self.ask_idle_sweep();
             // The sweep this asks for runs while the lanes the edit removed
             // still play their last 5 s, and before the texts of the tabs
@@ -193,8 +198,16 @@ impl StudioEngine {
             queue_diagnostic(&mut self.pending_diagnostics, diagnostic);
         }
         for diagnostic in self.session.take_diagnostics() {
-            // The studio log does not list the voice resolver's notices.
-            if diagnostic.kind == rustel_runtime::VOICE_NOTICE_DIAGNOSTIC {
+            // The studio log does not list the voice resolver's notices, but
+            // for a gain played at 1: the score sounds other than written.
+            // It is said once for each score, not once for each window.
+            if diagnostic.kind == rustel_runtime::VOICE_NOTICE_DIAGNOSTIC
+                && (!diagnostic
+                    .message
+                    .ends_with("is not a number, falling back to 1")
+                    || self.gain_fallbacks_said.len() >= MAX_GAIN_FALLBACKS_SAID
+                    || !self.gain_fallbacks_said.insert(diagnostic.message.clone()))
+            {
                 continue;
             }
             // Said once, in one line, when the load is over.
