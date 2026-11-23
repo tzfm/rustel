@@ -170,17 +170,20 @@ impl StepGrid {
     }
 
     /// The count of steps.
+    #[inline]
     pub(crate) fn len(&self) -> usize {
         (self.after - self.first) as usize
     }
 
     /// The indexes of the steps, in order.
+    #[inline]
     pub(crate) fn steps(&self) -> std::ops::Range<i128> {
         self.first..self.after
     }
 
     /// The time of the boundary `k`. A count that is a power of two
     /// reduces by a shift, with no gcd.
+    #[inline]
     pub(crate) fn time(&self, k: i128) -> Option<Fraction> {
         let count = self.count;
         match count & (count - 1) == 0 {
@@ -191,6 +194,7 @@ impl StepGrid {
 
     /// `whole`, the step `k`, as far as `span` reaches. Only the first and
     /// the last step can be cut by the span.
+    #[inline]
     pub(crate) fn cut(&self, k: i128, whole: TimeSpan, span: TimeSpan) -> TimeSpan {
         match k == self.first || k + 1 == self.after {
             true => TimeSpan::new(whole.begin.max(span.begin), whole.end.min(span.end)),

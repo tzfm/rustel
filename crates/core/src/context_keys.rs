@@ -254,67 +254,79 @@ impl ContextKeys {
         self.edit().ui_visuals |= bit;
     }
 
-    /// Like [`Self::add_ui_visual_slot`], mutating uniquely owned keys in place
-    /// and otherwise checking a 4-slot persistent node-level `OnceLock` cache
-    /// first and a per-query local cache second so haps sharing non-visual keys
-    /// across stacked layers allocate once over the lifetime of the graph.
-    #[inline]
-    pub(crate) fn add_ui_visual_slot_cached(
-        &mut self,
+    /// Apply `slot` to every hap in `haps`, hoisting mask/slot checks and
+    /// caching `None` and recently seen input `Keys` pointers across the slice.
+    #[inline(never)]
+    pub(crate) fn add_ui_visual_slot_to_haps(
+        haps: &mut [crate::Hap],
         slot: u8,
         once: &UiVisualCache,
-        local: &mut [Option<(Arc<Keys>, Arc<Keys>)>; 2],
-        local_next: &mut u8,
     ) {
-        if slot >= 64 {
+        if haps.is_empty() || slot >= 64 {
             return;
         }
         let bit = 1_u64 << slot;
-        match &mut self.0 {
-            None => {
-                if let Some(cached) = cached_ui_visual_mask(bit) {
-                    self.0 = Some(cached);
-                    return;
+        let mut none_cached: Option<Arc<Keys>> = None;
+        let mut local: [Option<(Arc<Keys>, Arc<Keys>)>; 2] = [None, None];
+        let mut local_next = 0u8;
+        for hap in haps {
+            match &mut hap.keys.0 {
+                None => {
+                    let cached = none_cached.get_or_insert_with(|| {
+                        cached_ui_visual_mask(bit).expect("single visual slot is always cached")
+                    });
+                    hap.keys.0 = Some(Arc::clone(cached));
                 }
-            }
-            Some(arc) => {
-                if arc.ui_visuals & bit != 0 {
-                    return;
-                }
-                if arc.is_ui_visuals_only()
-                    && let Some(cached) = cached_ui_visual_mask(arc.ui_visuals | bit)
-                {
-                    self.0 = Some(cached);
-                    return;
-                }
-                if let Some(own) = Arc::get_mut(arc) {
-                    own.ui_visuals |= bit;
-                    return;
-                }
-                for entry in local.iter().flatten() {
-                    if Arc::ptr_eq(arc, &entry.0) {
-                        self.0 = Some(Arc::clone(&entry.1));
-                        return;
+                Some(arc) => {
+                    if arc.ui_visuals & bit != 0 {
+                        continue;
                     }
-                }
-                for cell in once.iter() {
-                    let Some(pair) = cell.get() else {
-                        break;
-                    };
-                    if Arc::ptr_eq(arc, &pair.0) {
-                        let out = Arc::clone(&pair.1);
-                        let idx = usize::from(*local_next & 1);
-                        local[idx] = Some((Arc::clone(&pair.0), Arc::clone(&out)));
-                        *local_next = local_next.wrapping_add(1);
-                        self.0 = Some(out);
-                        return;
+                    let mut hit = None;
+                    for entry in local.iter().flatten() {
+                        if Arc::ptr_eq(arc, &entry.0) {
+                            hit = Some(Arc::clone(&entry.1));
+                            break;
+                        }
                     }
+                    if let Some(out) = hit {
+                        *arc = out;
+                        continue;
+                    }
+                    if arc.is_ui_visuals_only()
+                        && let Some(cached) = cached_ui_visual_mask(arc.ui_visuals | bit)
+                    {
+                        let idx = usize::from(local_next & 1);
+                        local[idx] = Some((Arc::clone(arc), Arc::clone(&cached)));
+                        local_next = local_next.wrapping_add(1);
+                        *arc = cached;
+                        continue;
+                    }
+                    if let Some(own) = Arc::get_mut(arc) {
+                        own.ui_visuals |= bit;
+                        continue;
+                    }
+                    let mut once_hit = None;
+                    for cell in once.iter() {
+                        let Some(pair) = cell.get() else {
+                            break;
+                        };
+                        if Arc::ptr_eq(arc, &pair.0) {
+                            let out = Arc::clone(&pair.1);
+                            let idx = usize::from(local_next & 1);
+                            local[idx] = Some((Arc::clone(&pair.0), Arc::clone(&out)));
+                            local_next = local_next.wrapping_add(1);
+                            once_hit = Some(out);
+                            break;
+                        }
+                    }
+                    if let Some(out) = once_hit {
+                        *arc = out;
+                        continue;
+                    }
+                    Self::add_ui_visual_slot_slow(arc, bit, once, &mut local, &mut local_next);
                 }
-                Self::add_ui_visual_slot_slow(arc, bit, once, local, local_next);
-                return;
             }
         }
-        self.edit().ui_visuals |= bit;
     }
 
     #[cold]

@@ -1447,6 +1447,15 @@ impl StepPatch {
         Self::from_head(head)
     }
 
+    #[cold]
+    #[inline(never)]
+    fn alloc_fresh(head: StepPatchHead) -> Arc<StepPatchData> {
+        Arc::new(StepPatchData {
+            head,
+            values: [const { Value::Undefined }; 16],
+        })
+    }
+
     #[inline]
     fn from_head(head: StepPatchHead) -> Option<StepPatchBuilder> {
         if let Some(mut arc) = StepPatchData::take_from_pool()
@@ -1455,10 +1464,7 @@ impl StepPatch {
             data.head = head;
             return Some(StepPatchBuilder(StepPatch(PooledStepPatch::new(arc))));
         }
-        let arc = Arc::new(StepPatchData {
-            head,
-            values: [const { Value::Undefined }; 16],
-        });
+        let arc = Self::alloc_fresh(head);
         Some(StepPatchBuilder(StepPatch(PooledStepPatch::new(arc))))
     }
 

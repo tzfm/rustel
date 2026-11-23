@@ -5396,7 +5396,7 @@ impl Pattern {
             if matches!(self.node_kind(), Node::Sequence(_)) {
                 return Err((self, context));
             }
-            if self.meets_constants() {
+            if self.meets_each_control() {
                 let steps = self.steps();
                 let meeting = RunMeeting::of_single_control_at(packed_key, value.clone(), context);
                 return Ok(self.met_owned([meeting]).with_steps(steps));

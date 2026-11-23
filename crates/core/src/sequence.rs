@@ -953,8 +953,10 @@ impl Listing {
 
     #[inline]
     fn with_grid_view<R>(&self, f: impl FnOnce(GridView<'_>) -> R) -> Option<R> {
-        match self {
-            Self::Places(_) => None,
+        let one_step: [SmallGridStep; 1];
+        let packed_buf: [u16; 3];
+        let view = match self {
+            Self::Places(_) => return None,
             Self::CompactGrid(CompactGrid::OneStep(buf)) => {
                 let base_ticks = u32::from_ne_bytes([buf[0], buf[1], buf[2], buf[3]]);
                 let span_loc = u32::from_ne_bytes([buf[4], buf[5], buf[6], buf[7]]);
@@ -967,15 +969,17 @@ impl Listing {
                 };
                 let ticks = NonZeroU32::new(base_ticks >> 25).expect("non-zero packed ticks");
                 let loc0 = (span_loc >> 16) as u16;
-                let (step_loc, packed_buf, packed_len) = if extra != 0 {
+                let (step_loc, packed_len) = if extra != 0 {
                     let loc1 = (extra & 0xffff) as u16;
                     let loc2 = (extra >> 16) as u16;
                     let len = if loc2 != 0 { 3 } else { 2 };
-                    (SmallGridStep::SPARE, [loc0, loc1, loc2], len)
+                    packed_buf = [loc0, loc1, loc2];
+                    (SmallGridStep::SPARE, len)
                 } else {
-                    (loc0, [0, 0, 0], 0)
+                    packed_buf = [0, 0, 0];
+                    (loc0, 0)
                 };
-                let step = [SmallGridStep {
+                one_step = [SmallGridStep {
                     part_begin: (span_loc & 0xff) as u16,
                     part_end: ((span_loc >> 8) & 0xff) as u16,
                     value: 0,
@@ -986,13 +990,13 @@ impl Listing {
                 } else {
                     PackedRunsRef::None
                 };
-                Some(f(GridView {
+                GridView {
                     ticks,
                     base: raw_base | small_bit,
-                    steps: GridStepsRef::Small(&step),
+                    steps: GridStepsRef::Small(&one_step),
                     packed,
                     rare: None,
-                }))
+                }
             }
             Self::CompactGrid(CompactGrid::OneStepVal(buf)) => {
                 let base_ticks = u32::from_ne_bytes([buf[0], buf[1], buf[2], buf[3]]);
@@ -1007,12 +1011,14 @@ impl Listing {
                 };
                 let ticks = NonZeroU32::new(base_ticks >> 25).expect("non-zero packed ticks");
                 let loc0 = (span_loc >> 16) as u16;
-                let (step_loc, packed_buf, packed_len) = if loc1 != 0 {
-                    (SmallGridStep::SPARE, [loc0, loc1], 2)
+                let (step_loc, packed_len) = if loc1 != 0 {
+                    packed_buf = [loc0, loc1, 0];
+                    (SmallGridStep::SPARE, 2)
                 } else {
-                    (loc0, [0, 0], 0)
+                    packed_buf = [0, 0, 0];
+                    (loc0, 0)
                 };
-                let step = [SmallGridStep {
+                one_step = [SmallGridStep {
                     part_begin: (span_loc & 0xff) as u16,
                     part_end: ((span_loc >> 8) & 0xff) as u16,
                     value,
@@ -1023,17 +1029,17 @@ impl Listing {
                 } else {
                     PackedRunsRef::None
                 };
-                Some(f(GridView {
+                GridView {
                     ticks,
                     base: raw_base | small_bit,
-                    steps: GridStepsRef::Small(&step),
+                    steps: GridStepsRef::Small(&one_step),
                     packed,
                     rare: None,
-                }))
+                }
             }
             Self::CompactGrid(grid) => {
                 let (ticks, base, steps, packed) = grid.parts();
-                Some(f(GridView {
+                GridView {
                     ticks,
                     base,
                     steps: GridStepsRef::Small(steps),
@@ -1042,10 +1048,11 @@ impl Listing {
                         None => PackedRunsRef::None,
                     },
                     rare: None,
-                }))
+                }
             }
-            Self::Grid(grid) => Some(f(grid.view())),
-        }
+            Self::Grid(grid) => grid.view(),
+        };
+        Some(f(view))
     }
 
     fn len(&self) -> usize {
@@ -2667,14 +2674,25 @@ impl Maker<'_> {
         Hap::of_sequence(whole, part, value, context, self.keys.clone())
     }
 
-    /// Like [`Self::make`], reading step locations directly from an already
-    /// unpacked [`GridView`] to skip per-hap `CompactGrid` dispatch.
+    #[cold]
+    #[inline(never)]
+    fn make_grid_context_slow(&self, grid: GridView<'_>, index: usize) -> Locations {
+        let step_loc = grid.locations(index);
+        match self.loc_dress {
+            Some(dress) => dress.around_owned(step_loc),
+            None => step_loc,
+        }
+    }
+
+    /// Like [`Self::make_grid`], reading a pre-fetched `SmallGridStep::loc`
+    /// directly without re-matching `GridStepsRef::Small`.
     #[inline(always)]
-    fn make_grid(
+    fn make_grid_small(
         &self,
         grid: GridView<'_>,
         index: usize,
         value: u32,
+        loc: u16,
         whole: TimeSpan,
         part: TimeSpan,
     ) -> Hap {
@@ -2684,10 +2702,7 @@ impl Maker<'_> {
             .expect("a step holds a value of its layer");
         let context = if let Some(contexts) = self.contexts {
             contexts[index].clone()
-        } else if let GridStepsRef::Small(steps) = grid.steps
-            && let loc = steps[index].loc
-            && (loc & SmallGridStep::SPARE) == 0
-            && self.loc_dress.is_none_or(|d| d.tail.is_none())
+        } else if (loc & SmallGridStep::SPARE) == 0 && self.loc_dress.is_none_or(|d| d.tail.is_none())
         {
             if loc == 0 {
                 match self.loc_dress {
@@ -2731,19 +2746,37 @@ impl Maker<'_> {
                         _ => Locations::from_packed_parts(1, step_packed, 0, 0, 0),
                     }
                 } else {
-                    let step_loc = grid.locations(index);
-                    match self.loc_dress {
-                        Some(dress) => dress.around_owned(step_loc),
-                        None => step_loc,
-                    }
+                    self.make_grid_context_slow(grid, index)
                 }
             }
         } else {
-            let step_loc = grid.locations(index);
-            match self.loc_dress {
-                Some(dress) => dress.around_owned(step_loc),
-                None => step_loc,
-            }
+            self.make_grid_context_slow(grid, index)
+        };
+        Hap::of_sequence(whole, part, value, context, self.keys.clone())
+    }
+
+    /// Like [`Self::make`], reading step locations directly from an already
+    /// unpacked [`GridView`] to skip per-hap `CompactGrid` dispatch.
+    #[inline(always)]
+    fn make_grid(
+        &self,
+        grid: GridView<'_>,
+        index: usize,
+        value: u32,
+        whole: TimeSpan,
+        part: TimeSpan,
+    ) -> Hap {
+        if let GridStepsRef::Small(steps) = grid.steps {
+            return self.make_grid_small(grid, index, value, steps[index].loc, whole, part);
+        }
+        let value = self
+            .values
+            .get(value as usize)
+            .expect("a step holds a value of its layer");
+        let context = if let Some(contexts) = self.contexts {
+            contexts[index].clone()
+        } else {
+            self.make_grid_context_slow(grid, index)
         };
         Hap::of_sequence(whole, part, value, context, self.keys.clone())
     }
@@ -6409,9 +6442,62 @@ fn single_turn_fractional(period: Fraction, span: TimeSpan) -> Option<Turn> {
     None
 }
 
-/// Push the haps of `layers`, which share a period, in `span`: each layer
-/// in turn, as a stack of them answers.
-fn query_layers(
+#[cold]
+#[inline(never)]
+fn tick_time_moved(grid: GridView<'_>, turn: &Turn, tick: u32) -> Result<Fraction, SequenceStop> {
+    turn.moved(grid.made_small_with(i64::from(tick), None))
+}
+
+#[inline]
+fn resolve_tick_time(
+    grid: GridView<'_>,
+    turn: &Turn,
+    offset: Option<i64>,
+    ticks_pow2: Option<u32>,
+    tick: u32,
+) -> Result<Fraction, SequenceStop> {
+    if let Some(ticks) = offset.and_then(|o| o.checked_add(i64::from(tick))) {
+        if let Some(shift) = ticks_pow2
+            && let Some(dyadic) = Fraction::dyadic_i64(ticks, shift)
+        {
+            return Ok(dyadic);
+        }
+        return Ok(Fraction::from_ticks(i128::from(ticks), grid.ticks));
+    }
+    tick_time_moved(grid, turn, tick)
+}
+
+#[cold]
+#[inline(never)]
+fn resolve_cut_whole(
+    grid: GridView<'_>,
+    turn: &Turn,
+    offset: Option<i64>,
+    ticks_pow2: Option<u32>,
+    cut: Cut,
+) -> Result<TimeSpan, SequenceStop> {
+    let wb = resolve_tick_time(grid, turn, offset, ticks_pow2, cut.begin)?;
+    let we = resolve_tick_time(grid, turn, offset, ticks_pow2, cut.end)?;
+    Ok(TimeSpan::new(wb, we))
+}
+
+#[cold]
+#[inline(never)]
+fn sub_start_cycles_fallback(
+    span: TimeSpan,
+    start_cycles: i128,
+) -> Result<(Fraction, Fraction), SequenceStop> {
+    let start_frac = Fraction::int(start_cycles);
+    Ok((
+        span.begin
+            .checked_sub(start_frac)
+            .ok_or(SequenceStop::Range)?,
+        span.end.checked_sub(start_frac).ok_or(SequenceStop::Range)?,
+    ))
+}
+
+#[inline(never)]
+fn query_layers_multi(
     thread: &QueryThread,
     owner: &Arc<[Layer]>,
     offset: usize,
@@ -6420,242 +6506,7 @@ fn query_layers(
     from: usize,
     out: &mut Vec<Hap>,
 ) -> Result<(), SequenceStop> {
-    let Some(first) = layers.first() else {
-        return Ok(());
-    };
-    let period = first.period();
-    // Direct single-turn fast paths for whole-cycle and positive rational
-    // periods without building `Turns` on the stack.
-    let single_turn = if span.begin < span.end {
-        if period.denom() == 1 && period.numer() > 0 {
-            let p = period.numer();
-            let first_cycle = span.begin.floor_int();
-            let turn_idx = if p == 1 {
-                first_cycle
-            } else if p & (p - 1) == 0 {
-                first_cycle >> p.trailing_zeros()
-            } else {
-                first_cycle.div_euclid(p)
-            };
-            if let Some(next_turn) = turn_idx.checked_add(1)
-                && let Some(next_start) = next_turn.checked_mul(p)
-                && (if span.end.denom() == 1 {
-                    span.end.numer() <= next_start
-                } else {
-                    span.end.floor_int() < next_start
-                })
-            {
-                let start_cycles = if p == 1 {
-                    turn_idx
-                } else {
-                    turn_idx.checked_mul(p).ok_or(SequenceStop::Range)?
-                };
-                let (begin, end) = if p == 1 {
-                    let b = span.begin.cycle_pos();
-                    let e = if span.end.denom() == 1 {
-                        Fraction::ONE
-                    } else {
-                        span.end.cycle_pos()
-                    };
-                    (b, e)
-                } else if let Some(back) = start_cycles.checked_neg() {
-                    (
-                        span.begin
-                            .checked_add_int(back)
-                            .ok_or(SequenceStop::Range)?,
-                        span.end.checked_add_int(back).ok_or(SequenceStop::Range)?,
-                    )
-                } else {
-                    let start_frac = Fraction::int(start_cycles);
-                    (
-                        span.begin
-                            .checked_sub(start_frac)
-                            .ok_or(SequenceStop::Range)?,
-                        span.end
-                            .checked_sub(start_frac)
-                            .ok_or(SequenceStop::Range)?,
-                    )
-                };
-                Some(Turn {
-                    index: turn_idx,
-                    start: Fraction::int(start_cycles),
-                    whole_cycles: Some(start_cycles),
-                    begin,
-                    end,
-                    keys: std::cell::Cell::new(None),
-                })
-            } else {
-                None
-            }
-        } else {
-            single_turn_fractional(period, span)
-        }
-    } else {
-        None
-    };
-    if let Some(turn) = single_turn {
-        for (i, layer) in layers.iter().enumerate() {
-            let layer_ref = u16::try_from(offset + i).ok().map(|idx| (owner, idx));
-            if layer.source().is_none()
-                && let Some(done) = layer
-                    .listing()
-                    .with_grid_view(|grid| {
-                        let GridStepsRef::Small(steps) = grid.steps else {
-                            return None;
-                        };
-                        let (begin_low, begin_high) = grid.ticks_at(turn.begin)?;
-                        let (end_low, end_high) = grid.ticks_at(turn.end)?;
-                        let begin_exact = begin_low == begin_high;
-                        let end_exact = end_low == end_high;
-                        let instant = span.begin == span.end;
-                        let (first, last_step) = if steps.len() == 1 {
-                            let s = steps[0];
-                            if i64::from(s.part_end) <= begin_low
-                                || (instant && i64::from(s.part_begin) > begin_low)
-                                || (!instant && i64::from(s.part_begin) >= end_high)
-                            {
-                                return Some(Ok(()));
-                            }
-                            (0, 1)
-                        } else {
-                            let (Some(first_step), Some(last_step_ref)) =
-                                (steps.first(), steps.last())
-                            else {
-                                return Some(Ok(()));
-                            };
-                            if i64::from(last_step_ref.part_end) <= begin_low
-                                || (instant && i64::from(first_step.part_begin) > begin_low)
-                                || (!instant && i64::from(first_step.part_begin) >= end_high)
-                            {
-                                return Some(Ok(()));
-                            }
-                            let begun = steps
-                                .partition_point(|step| i64::from(step.part_begin) < begin_high);
-                            let first = begun
-                                - steps[..begun]
-                                    .iter()
-                                    .rev()
-                                    .take_while(|step| i64::from(step.part_end) > begin_low)
-                                    .count();
-                            let last_step = begun
-                                + steps[begun..]
-                                    .iter()
-                                    .take_while(|step| {
-                                        let begins = i64::from(step.part_begin);
-                                        begins <= begin_low || (!instant && begins < end_high)
-                                    })
-                                    .count();
-                            (first, last_step)
-                        };
-                        let met = last_step - first;
-                        if met == 0 {
-                            return Some(Ok(()));
-                        }
-                        if !thread.charge(out.len() - from + met) {
-                            return Some(Err(SequenceStop::Query));
-                        }
-                        if met > 1 {
-                            out.reserve(met);
-                        }
-                        let mut cuts = if let Some(rare) = grid.rare {
-                            rare.cuts().starting_at(first)
-                        } else {
-                            CutsSlice::EMPTY
-                        };
-                        let has_cuts = cuts.len() != 0;
-                        let offset = turn
-                            .whole_cycles
-                            .and_then(|cycles| i64::try_from(cycles).ok())
-                            .and_then(|cycles| cycles.checked_mul(i64::from(grid.ticks.get())));
-                        let ticks_pow2 = grid
-                            .ticks
-                            .is_power_of_two()
-                            .then(|| grid.ticks.trailing_zeros());
-                        let tick_time = |tick: u32| -> Result<Fraction, SequenceStop> {
-                            match offset.and_then(|o| o.checked_add(i64::from(tick))) {
-                                Some(ticks) => {
-                                    if let Some(shift) = ticks_pow2
-                                        && let Some(dyadic) = Fraction::dyadic_i64(ticks, shift)
-                                    {
-                                        Ok(dyadic)
-                                    } else {
-                                        Ok(grid.made_small_with(ticks, None))
-                                    }
-                                }
-                                None => turn.moved(grid.made_small_with(i64::from(tick), None)),
-                            }
-                        };
-                        let maker = layer.maker(layer_ref);
-                        let mut last_tick = u16::MAX;
-                        let mut last_time = Fraction::ZERO;
-                        for (index, &s) in steps[first..last_step].iter().enumerate() {
-                            let step_idx = first + index;
-                            let vis_begin = if begin_exact && i64::from(s.part_begin) == begin_low {
-                                span.begin
-                            } else if s.part_begin == last_tick {
-                                last_time
-                            } else {
-                                match tick_time(u32::from(s.part_begin)) {
-                                    Ok(t) => t,
-                                    Err(e) => return Some(Err(e)),
-                                }
-                            };
-                            let vis_end = if end_exact && i64::from(s.part_end) == end_high {
-                                span.end
-                            } else {
-                                match tick_time(u32::from(s.part_end)) {
-                                    Ok(t) => t,
-                                    Err(e) => return Some(Err(e)),
-                                }
-                            };
-                            last_tick = s.part_end;
-                            last_time = vis_end;
-                            let whole = if has_cuts && let Some(cut) = cuts.split_first_at(step_idx)
-                            {
-                                let wb = match tick_time(cut.begin) {
-                                    Ok(t) => t,
-                                    Err(e) => return Some(Err(e)),
-                                };
-                                let we = match tick_time(cut.end) {
-                                    Ok(t) => t,
-                                    Err(e) => return Some(Err(e)),
-                                };
-                                TimeSpan::new(wb, we)
-                            } else {
-                                TimeSpan::new(vis_begin, vis_end)
-                            };
-                            let part = TimeSpan::new(
-                                if i64::from(s.part_begin) <= begin_low {
-                                    span.begin
-                                } else {
-                                    vis_begin
-                                },
-                                if i64::from(s.part_end) >= end_high {
-                                    span.end
-                                } else {
-                                    vis_end
-                                },
-                            );
-                            out.push(maker.make_grid(
-                                grid,
-                                step_idx,
-                                u32::from(s.value),
-                                whole,
-                                part,
-                            ));
-                        }
-                        thread.note_accumulated(out.len() - from);
-                        Some(Ok(()))
-                    })
-                    .flatten()
-            {
-                done?;
-                continue;
-            }
-            layer.push(thread, layer_ref, &turn, span, from, out)?;
-        }
-        return Ok(());
-    }
+    let period = layers[0].period();
     let mut turns = Turns::of(period, span)?;
     if turns.indices.end.checked_sub(turns.indices.start) == Some(1) {
         let turn = turns.turn(turns.indices.start)?;
@@ -6735,6 +6586,236 @@ fn query_layers(
                 layer.push(thread, layer_ref, turns.turn(index)?, span, from, out)?;
             }
         }
+    }
+    Ok(())
+}
+
+/// Push the haps of `layers`, which share a period, in `span`: each layer
+/// in turn, as a stack of them answers.
+fn query_layers(
+    thread: &QueryThread,
+    owner: &Arc<[Layer]>,
+    offset: usize,
+    layers: &[Layer],
+    span: TimeSpan,
+    from: usize,
+    out: &mut Vec<Hap>,
+) -> Result<(), SequenceStop> {
+    let Some(first) = layers.first() else {
+        return Ok(());
+    };
+    let period = first.period();
+    // Direct single-turn fast paths for whole-cycle and positive rational
+    // periods without building `Turns` on the stack.
+    let single_turn = if span.begin < span.end {
+        if period.denom() == 1 && period.numer() > 0 {
+            let p = period.numer();
+            let first_cycle = span.begin.floor_int();
+            let turn_idx = if p == 1 {
+                first_cycle
+            } else if p & (p - 1) == 0 {
+                first_cycle >> p.trailing_zeros()
+            } else {
+                first_cycle.div_euclid(p)
+            };
+            if let Some(next_turn) = turn_idx.checked_add(1)
+                && let Some(next_start) = next_turn.checked_mul(p)
+                && (if span.end.denom() == 1 {
+                    span.end.numer() <= next_start
+                } else {
+                    span.end.floor_int() < next_start
+                })
+            {
+                let start_cycles = if p == 1 {
+                    turn_idx
+                } else {
+                    turn_idx.checked_mul(p).ok_or(SequenceStop::Range)?
+                };
+                let (begin, end) = if p == 1 {
+                    let b = span.begin.cycle_pos();
+                    let e = if span.end.denom() == 1 {
+                        Fraction::ONE
+                    } else {
+                        span.end.cycle_pos()
+                    };
+                    (b, e)
+                } else if let Some(back) = start_cycles.checked_neg() {
+                    (
+                        span.begin
+                            .checked_add_int(back)
+                            .ok_or(SequenceStop::Range)?,
+                        span.end.checked_add_int(back).ok_or(SequenceStop::Range)?,
+                    )
+                } else {
+                    sub_start_cycles_fallback(span, start_cycles)?
+                };
+                Some(Turn {
+                    index: turn_idx,
+                    start: Fraction::int(start_cycles),
+                    whole_cycles: Some(start_cycles),
+                    begin,
+                    end,
+                    keys: std::cell::Cell::new(None),
+                })
+            } else {
+                None
+            }
+        } else {
+            single_turn_fractional(period, span)
+        }
+    } else {
+        None
+    };
+    let Some(turn) = single_turn else {
+        return query_layers_multi(thread, owner, offset, layers, span, from, out);
+    };
+    for (i, layer) in layers.iter().enumerate() {
+        let layer_ref = u16::try_from(offset + i).ok().map(|idx| (owner, idx));
+        if layer.source().is_none()
+            && let Some(done) = layer
+                .listing()
+                .with_grid_view(|grid| {
+                    let GridStepsRef::Small(steps) = grid.steps else {
+                        return None;
+                    };
+                    let (begin_low, begin_high) = grid.ticks_at(turn.begin)?;
+                    let (end_low, end_high) = grid.ticks_at(turn.end)?;
+                    let begin_exact = begin_low == begin_high;
+                    let end_exact = end_low == end_high;
+                    // `single_turn` guarantees `span.begin < span.end` (never instant).
+                    let (first, last_step) = if steps.len() == 1 {
+                        let s = steps[0];
+                        if i64::from(s.part_end) <= begin_low
+                            || i64::from(s.part_begin) >= end_high
+                        {
+                            return Some(Ok(()));
+                        }
+                        (0, 1)
+                    } else {
+                        let (Some(first_step), Some(last_step_ref)) =
+                            (steps.first(), steps.last())
+                        else {
+                            return Some(Ok(()));
+                        };
+                        if i64::from(last_step_ref.part_end) <= begin_low
+                            || i64::from(first_step.part_begin) >= end_high
+                        {
+                            return Some(Ok(()));
+                        }
+                        let begun = steps
+                            .partition_point(|step| i64::from(step.part_begin) < begin_high);
+                        let first = begun
+                            - steps[..begun]
+                                .iter()
+                                .rev()
+                                .take_while(|step| i64::from(step.part_end) > begin_low)
+                                .count();
+                        let last_step = begun
+                            + steps[begun..]
+                                .iter()
+                                .take_while(|step| i64::from(step.part_begin) < end_high)
+                                .count();
+                        (first, last_step)
+                    };
+                    let met = last_step - first;
+                    if met == 0 {
+                        return Some(Ok(()));
+                    }
+                    if !thread.charge(out.len() - from + met) {
+                        return Some(Err(SequenceStop::Query));
+                    }
+                    if met > 1 {
+                        out.reserve(met);
+                    }
+                    let mut cuts = if let Some(rare) = grid.rare {
+                        rare.cuts().starting_at(first)
+                    } else {
+                        CutsSlice::EMPTY
+                    };
+                    let has_cuts = cuts.len() != 0;
+                    let offset = turn
+                        .whole_cycles
+                        .and_then(|cycles| i64::try_from(cycles).ok())
+                        .and_then(|cycles| cycles.checked_mul(i64::from(grid.ticks.get())));
+                    let ticks_pow2 = grid
+                        .ticks
+                        .is_power_of_two()
+                        .then(|| grid.ticks.trailing_zeros());
+                    let maker = layer.maker(layer_ref);
+                    let mut last_tick = u16::MAX;
+                    let mut last_time = Fraction::ZERO;
+                    for (index, &s) in steps[first..last_step].iter().enumerate() {
+                        let step_idx = first + index;
+                        let vis_begin = if begin_exact && i64::from(s.part_begin) == begin_low {
+                            span.begin
+                        } else if s.part_begin == last_tick {
+                            last_time
+                        } else {
+                            match resolve_tick_time(
+                                grid,
+                                &turn,
+                                offset,
+                                ticks_pow2,
+                                u32::from(s.part_begin),
+                            ) {
+                                Ok(t) => t,
+                                Err(e) => return Some(Err(e)),
+                            }
+                        };
+                        let vis_end = if end_exact && i64::from(s.part_end) == end_high {
+                            span.end
+                        } else {
+                            match resolve_tick_time(
+                                grid,
+                                &turn,
+                                offset,
+                                ticks_pow2,
+                                u32::from(s.part_end),
+                            ) {
+                                Ok(t) => t,
+                                Err(e) => return Some(Err(e)),
+                            }
+                        };
+                        last_tick = s.part_end;
+                        last_time = vis_end;
+                        let whole = if has_cuts && let Some(cut) = cuts.split_first_at(step_idx) {
+                            match resolve_cut_whole(grid, &turn, offset, ticks_pow2, cut) {
+                                Ok(w) => w,
+                                Err(e) => return Some(Err(e)),
+                            }
+                        } else {
+                            TimeSpan::new(vis_begin, vis_end)
+                        };
+                        let part = TimeSpan::new(
+                            if i64::from(s.part_begin) <= begin_low {
+                                span.begin
+                            } else {
+                                vis_begin
+                            },
+                            if i64::from(s.part_end) >= end_high {
+                                span.end
+                            } else {
+                                vis_end
+                            },
+                        );
+                        out.push(maker.make_grid_small(
+                            grid,
+                            step_idx,
+                            u32::from(s.value),
+                            s.loc,
+                            whole,
+                            part,
+                        ));
+                    }
+                    thread.note_accumulated(out.len() - from);
+                    Some(Ok(()))
+                })
+                .flatten()
+        {
+            done?;
+            continue;
+        }
+        layer.push(thread, layer_ref, &turn, span, from, out)?;
     }
     Ok(())
 }
@@ -8285,6 +8366,39 @@ fn apply_layer_with(
                 return Some(met);
             }
         }
+    }
+    // Fast path: composing a direct-keyed control-object layer with a
+    // non-object, non-undefined scalar layer keeps every control map unchanged
+    // (`compose_op`: `(Value::Object(kept), value) => Value::Object(kept)`)
+    // without materializing `BuiltinMap`s (matching `apply_constant_to_layer`).
+    if let Some(op) = apply.in_place_op()
+        && op != crate::compose::ComposeOp::KeepIf
+        && layer.is_direct_keyed()
+        && values.named_id == 0
+        && values
+            .dress
+            .as_deref()
+            .is_none_or(|d| !d.has_set_map() && d.tail.is_none())
+        && values.values.iter().all(|v| {
+            !matches!(v, Value::Object(_) | Value::Undefined)
+                && (flow != LookupFlow::Set
+                    || (op == crate::compose::ComposeOp::Set && !matches!(v, Value::Str(_))))
+        })
+    {
+        let pairs_slice = pairs.as_slice();
+        let identity = pairs_slice.len() == layer.values.len()
+            && pairs_slice
+                .iter()
+                .enumerate()
+                .all(|(i, &(f, _))| f as usize == i);
+        if !identity {
+            met.values = pairs_slice
+                .iter()
+                .map(|&(f, _)| layer.values[f as usize].clone())
+                .collect();
+            met.refresh_direct();
+        }
+        return Some(met);
     }
     // What each pair of values makes, with no location: the
     // locations of both sides are those of the steps.

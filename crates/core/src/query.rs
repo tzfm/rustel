@@ -3369,15 +3369,20 @@ impl Pattern {
                     }
                 }
                 if clear_slot {
-                    let edit = template.keys.edit();
-                    let mut m = wave_live_mask;
-                    while m != 0 {
-                        let s = m.trailing_zeros() as usize;
-                        m &= m - 1;
-                        edit.live_controls[s] = 0;
+                    #[cold]
+                    #[inline(never)]
+                    fn clear_wave_live_controls(keys: &mut ContextKeys, wave_live_mask: u8) {
+                        let edit = keys.edit();
+                        let mut m = wave_live_mask;
+                        while m != 0 {
+                            let s = m.trailing_zeros() as usize;
+                            m &= m - 1;
+                            edit.live_controls[s] = 0;
+                        }
+                        edit.slider_binding = 0;
+                        keys.trim();
                     }
-                    edit.slider_binding = 0;
-                    template.keys.trim();
+                    clear_wave_live_controls(&mut template.keys, wave_live_mask);
                 }
             }
             // Single-allocation StepPatch fast path across all `count` steps.
@@ -3442,38 +3447,94 @@ impl Pattern {
                 };
                 if let Some((sp, row, layer_idx)) = resolved {
                     let whole = template.whole;
-                    let mut tpl_context = Some(template.context);
-                    let mut tpl_keys = Some(template.keys);
-                    for (s_idx, &piece) in slot.pieces.iter().enumerate().take(count) {
-                        let (context, keys) = if s_idx + 1 == count {
-                            (
-                                tpl_context.take().expect("last step moves context"),
-                                tpl_keys.take().expect("last step moves keys"),
-                            )
-                        } else {
-                            (
-                                tpl_context.as_ref().expect("context present").clone(),
-                                tpl_keys.as_ref().expect("keys present").clone(),
-                            )
-                        };
-                        let hap = Hap {
+                    if bulk_ok {
+                        let last = count - 1;
+                        let mut tpl_context = Some(template.context);
+                        let mut tpl_keys = Some(template.keys);
+                        for (s_idx, &piece) in slot.pieces[..count].iter().enumerate() {
+                            let (context, keys) = if s_idx == last {
+                                (
+                                    tpl_context.take().expect("last step moves context"),
+                                    tpl_keys.take().expect("last step moves keys"),
+                                )
+                            } else {
+                                (
+                                    tpl_context.as_ref().expect("context present").clone(),
+                                    tpl_keys.as_ref().expect("keys present").clone(),
+                                )
+                            };
+                            out.push(Hap {
+                                whole,
+                                part: piece,
+                                value: Value::Object(OrderedMap::from_step_patch(
+                                    &sp, row, layer_idx, s_idx,
+                                )),
+                                context,
+                                keys,
+                            });
+                        }
+                        thread.note_accumulated(out.len() - from);
+                    } else {
+                        #[cold]
+                        #[inline(never)]
+                        #[allow(clippy::too_many_arguments)]
+                        fn emit_step_patch_budgeted(
+                            pieces: &[TimeSpan],
+                            sp: &value::StepPatch,
+                            row: u32,
+                            layer_idx: u16,
+                            whole: Option<TimeSpan>,
+                            context: Locations,
+                            keys: ContextKeys,
+                            thread: &QueryThread,
+                            from: usize,
+                            out: &mut Vec<Hap>,
+                        ) -> bool {
+                            let last = pieces.len() - 1;
+                            let mut tpl_context = Some(context);
+                            let mut tpl_keys = Some(keys);
+                            for (s_idx, &piece) in pieces.iter().enumerate() {
+                                let (context, keys) = if s_idx == last {
+                                    (
+                                        tpl_context.take().expect("last step moves context"),
+                                        tpl_keys.take().expect("last step moves keys"),
+                                    )
+                                } else {
+                                    (
+                                        tpl_context.as_ref().expect("context present").clone(),
+                                        tpl_keys.as_ref().expect("keys present").clone(),
+                                    )
+                                };
+                                let hap = Hap {
+                                    whole,
+                                    part: piece,
+                                    value: Value::Object(OrderedMap::from_step_patch(
+                                        sp, row, layer_idx, s_idx,
+                                    )),
+                                    context,
+                                    keys,
+                                };
+                                if thread.stop_requested() || !thread.push_budgeted(out, from, hap) {
+                                    out.truncate(from);
+                                    return false;
+                                }
+                            }
+                            true
+                        }
+                        if !emit_step_patch_budgeted(
+                            &slot.pieces[..count],
+                            &sp,
+                            row,
+                            layer_idx,
                             whole,
-                            part: piece,
-                            value: Value::Object(OrderedMap::from_step_patch(
-                                &sp, row, layer_idx, s_idx,
-                            )),
-                            context,
-                            keys,
-                        };
-                        if bulk_ok {
-                            out.push(hap);
-                        } else if thread.stop_requested() || !thread.push_budgeted(out, from, hap) {
-                            out.truncate(from);
+                            template.context,
+                            template.keys,
+                            thread,
+                            from,
+                            out,
+                        ) {
                             return Some(true);
                         }
-                    }
-                    if bulk_ok {
-                        thread.note_accumulated(out.len() - from);
                     }
                     fused::note(fused::Hit::StepMany);
                     continue;
@@ -3481,6 +3542,438 @@ impl Pattern {
             }
             if !emit_fallback(slot, template, &keys, n_waves, thread, out, (from, bulk_ok)) {
                 return Some(true);
+            }
+        }
+        Some(true)
+    }
+
+    #[inline]
+    fn all_uniform_steps(
+        haps: &[Hap],
+        shared_steps: u32,
+        has_continuous: bool,
+        min_uniform_steps: usize,
+    ) -> bool {
+        let mut last_part: Option<TimeSpan> = None;
+        for hf in haps {
+            if !fused::StepWave::takes(hf) {
+                return false;
+            }
+            if has_continuous && hf.whole.is_none() {
+                return false;
+            }
+            if last_part == Some(hf.part) {
+                continue;
+            }
+            if has_continuous && !hf.part.within_one_cycle() {
+                return false;
+            }
+            let Some(g) = fused::StepWave::step_grid_over(shared_steps, hf.part) else {
+                return false;
+            };
+            if !(min_uniform_steps..=8).contains(&g.len()) {
+                return false;
+            }
+            last_part = Some(hf.part);
+        }
+        true
+    }
+
+    #[inline(never)]
+    fn try_query_app_wave_single_item_small(
+        item: &AppWaveItem,
+        key: &Key,
+        inner_len: usize,
+        thread: &QueryThread,
+        state: &State,
+        from: usize,
+        out: &mut Vec<Hap>,
+    ) -> bool {
+        let apply = Combine::Composed(compose::ComposeOp::Set);
+        let mut stack_haps: [Option<Hap>; 4] = [None, None, None, None];
+        for (slot, hf) in stack_haps.iter_mut().zip(out.drain(from..)) {
+            *slot = Some(hf);
+        }
+        let mut one_cache = value::SharedWaveCache::default();
+        let mut one_last: Option<(TimeSpan, f64)> = None;
+        let mut small_cache: [Option<SmallStepSlot>; 4] = [None, None, None, None];
+        let mut small_next = 0u8;
+        let mut ok = true;
+        for mut hf in stack_haps[..inner_len].iter_mut().filter_map(Option::take) {
+            let cached_one = match one_last {
+                Some((lp, ln)) if lp == hf.part => Some(ln),
+                _ => fused::StepWave::step_number(
+                    &item.wave,
+                    item.steps,
+                    hf.part,
+                    &state.controls,
+                )
+                .inspect(|&n| {
+                    one_last = Some((hf.part, n));
+                    one_cache = value::SharedWaveCache::default();
+                }),
+            };
+            if let Some(num) = cached_one {
+                let part = hf.part;
+                if !Meeting::set_number_in_place_cached(
+                    &mut hf,
+                    key,
+                    num,
+                    part,
+                    &apply,
+                    LookupFlow::Set,
+                    Some(&mut one_cache),
+                ) {
+                    ok = false;
+                    break;
+                }
+                if thread.stop_requested() || !thread.push_budgeted(out, from, hf) {
+                    out.truncate(from);
+                    return true;
+                }
+                fused::note(fused::Hit::StepOne);
+                continue;
+            }
+            let Some(grid) = fused::StepWave::step_grid_over(item.steps, hf.part) else {
+                ok = false;
+                break;
+            };
+            let count = grid.len();
+            if count == 0 {
+                continue;
+            }
+            if count == 1 {
+                let k = grid.steps().start;
+                let (Some(begin), Some(end)) = (grid.time(k), grid.time(k + 1)) else {
+                    ok = false;
+                    break;
+                };
+                let piece = grid.cut(k, TimeSpan::new(begin, end), hf.part);
+                let Some(num) = item.wave.step_value_at(begin, &state.controls) else {
+                    ok = false;
+                    break;
+                };
+                if one_last.is_none_or(|(lp, _)| lp != hf.part) {
+                    one_last = Some((hf.part, num));
+                    one_cache = value::SharedWaveCache::default();
+                }
+                if !Meeting::set_number_in_place_cached(
+                    &mut hf,
+                    key,
+                    num,
+                    piece,
+                    &apply,
+                    LookupFlow::Set,
+                    Some(&mut one_cache),
+                ) {
+                    ok = false;
+                    break;
+                }
+                if thread.stop_requested() || !thread.push_budgeted(out, from, hf) {
+                    out.truncate(from);
+                    return true;
+                }
+                fused::note(fused::Hit::StepMany);
+                continue;
+            }
+            match meet_steps_small(
+                thread,
+                hf,
+                key,
+                &item.wave,
+                &grid,
+                &mut small_cache,
+                &mut small_next,
+                state,
+                from,
+                out,
+            ) {
+                Some(true) => {}
+                Some(false) => {
+                    out.truncate(from);
+                    return true;
+                }
+                None => {
+                    ok = false;
+                    break;
+                }
+            }
+        }
+        if !ok {
+            out.truncate(from);
+            return false;
+        }
+        true
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn try_query_app_wave_multipass(
+        items: &[AppWaveItem],
+        apply: &Combine,
+        thread: &QueryThread,
+        state: &State,
+        from: usize,
+        buf: &mut Vec<Hap>,
+        out: &mut Vec<Hap>,
+    ) -> Option<bool> {
+        for (item_idx, item) in items.iter().enumerate() {
+            let key = controls::builtin_key_ref_by_id(item.key_id)?;
+            let is_last = item_idx + 1 == items.len();
+            if item.steps == 0 {
+                let mut wave_cache = value::SharedWaveCache::default();
+                let mut last_span: Option<(TimeSpan, TimeSpan, f64)> = None;
+                for hap in buf.iter_mut() {
+                    if hap.pick_lookup().is_some()
+                        || !hap.part.within_one_cycle()
+                        || !hap.value.is_data(0)
+                        || !matches!(hap.value, Value::Object(_))
+                    {
+                        return None;
+                    }
+                    let met = hap.whole_or_part();
+                    let part = hap.part.intersection(&met)?;
+                    let num = match last_span {
+                        Some((lm, lp, ln)) if lm == met && lp == part => ln,
+                        _ => {
+                            let n = item.wave.number(met, part, &state.controls)?;
+                            last_span = Some((met, part, n));
+                            wave_cache = value::SharedWaveCache::default();
+                            n
+                        }
+                    };
+                    if !Meeting::set_number_in_place_cached(
+                        hap,
+                        key,
+                        num,
+                        part,
+                        apply,
+                        LookupFlow::Set,
+                        Some(&mut wave_cache),
+                    ) {
+                        return None;
+                    }
+                }
+                if is_last {
+                    out.append(buf);
+                }
+                continue;
+            }
+            // Segmented step wave (`item.steps > 0`).
+            let valid = buf.iter().all(fused::StepWave::takes);
+            if !valid {
+                return None;
+            }
+            let apply_into = |src: &mut Vec<Hap>,
+                              dst: &mut Vec<Hap>,
+                              dst_from: usize|
+             -> Option<bool> {
+                let mut one_cache = value::SharedWaveCache::default();
+                let mut one_last: Option<(TimeSpan, f64)> = None;
+                let mut small_cache: [Option<SmallStepSlot>; 4] = [None, None, None, None];
+                let mut small_next = 0u8;
+                let mut large_cache = StepWaveCacheSet::default();
+                for mut hf in src.drain(..) {
+                    let cached_one = match one_last {
+                        Some((lp, ln)) if lp == hf.part => Some(ln),
+                        _ => fused::StepWave::step_number(
+                            &item.wave,
+                            item.steps,
+                            hf.part,
+                            &state.controls,
+                        )
+                        .inspect(|&n| {
+                            one_last = Some((hf.part, n));
+                            one_cache = value::SharedWaveCache::default();
+                        }),
+                    };
+                    if let Some(num) = cached_one {
+                        let part = hf.part;
+                        if !Meeting::set_number_in_place_cached(
+                            &mut hf,
+                            key,
+                            num,
+                            part,
+                            apply,
+                            LookupFlow::Set,
+                            Some(&mut one_cache),
+                        ) {
+                            return None;
+                        }
+                        if thread.stop_requested() || !thread.push_budgeted(dst, dst_from, hf) {
+                            return Some(false);
+                        }
+                        fused::note(fused::Hit::StepOne);
+                        continue;
+                    }
+                    let grid = fused::StepWave::step_grid_over(item.steps, hf.part)?;
+                    let count = grid.len();
+                    if count == 0 {
+                        continue;
+                    }
+                    if count == 1 {
+                        let k = grid.steps().start;
+                        let begin = grid.time(k)?;
+                        let end = grid.time(k + 1)?;
+                        let piece = grid.cut(k, TimeSpan::new(begin, end), hf.part);
+                        let num = item.wave.step_value_at(begin, &state.controls)?;
+                        if one_last.is_none_or(|(lp, _)| lp != hf.part) {
+                            one_last = Some((hf.part, num));
+                            one_cache = value::SharedWaveCache::default();
+                        }
+                        if !Meeting::set_number_in_place_cached(
+                            &mut hf,
+                            key,
+                            num,
+                            piece,
+                            apply,
+                            LookupFlow::Set,
+                            Some(&mut one_cache),
+                        ) {
+                            return None;
+                        }
+                        if thread.stop_requested() || !thread.push_budgeted(dst, dst_from, hf) {
+                            return Some(false);
+                        }
+                        fused::note(fused::Hit::StepMany);
+                        continue;
+                    }
+                    if count <= 8 {
+                        if !meet_steps_small(
+                            thread,
+                            hf,
+                            key,
+                            &item.wave,
+                            &grid,
+                            &mut small_cache,
+                            &mut small_next,
+                            state,
+                            dst_from,
+                            dst,
+                        )? {
+                            return Some(false);
+                        }
+                        continue;
+                    }
+                    // Large multi-cycle step count (> 8): share one `Table` across steps.
+                    let Value::Object(base_map) = &hf.value else {
+                        return None;
+                    };
+                    let cached = if large_cache.find(hf.part).is_some() {
+                        large_cache.find(hf.part).expect("checked present")
+                    } else {
+                        let mut pieces = large_cache.take_victim_pieces(count);
+                        let mut begin = grid.time(grid.steps().start)?;
+                        let mut vals = Vec::with_capacity(count);
+                        for k in grid.steps() {
+                            if thread.stop_requested() {
+                                return Some(false);
+                            }
+                            let end = grid.time(k + 1)?;
+                            pieces.push(grid.cut(k, TimeSpan::new(begin, end), hf.part));
+                            vals.push(Value::F64(
+                                item.wave.step_value_at(begin, &state.controls)?,
+                            ));
+                            begin = end;
+                        }
+                        large_cache.insert(StepWaveCache {
+                            part: hf.part,
+                            values: Arc::from(vals),
+                            pieces,
+                            table: None,
+                        })
+                    };
+                    let shared_patched =
+                        if let Some((base_source, base_row)) = base_map.dressed_base() {
+                            if let Some((cached_base, cached_patched)) = &cached.table
+                                && cached_base.same_source(&base_source)
+                            {
+                                Some((Arc::clone(cached_patched), base_row))
+                            } else if let Some(patched) = value::Table::patched_keyed_table(
+                                &base_source,
+                                key.clone(),
+                                Arc::clone(&cached.values),
+                            ) {
+                                let patched = Arc::new(patched);
+                                cached.table = Some((base_source, Arc::clone(&patched)));
+                                Some((patched, base_row))
+                            } else {
+                                None
+                            }
+                        } else {
+                            None
+                        };
+                    let fallback_table = if shared_patched.is_none() {
+                        Some(Arc::new(value::Table::patched(
+                            base_map,
+                            key.clone(),
+                            Arc::clone(&cached.values),
+                        )?))
+                    } else {
+                        None
+                    };
+                    let mut template = hf.clone();
+                    template.value = Value::Undefined;
+                    if !template.keys.is_empty() {
+                        let slot = controls::live_slot(key.as_str());
+                        let k = template.keys.get();
+                        if k.slider_binding != 0
+                            || slot.is_some_and(|s| k.live_controls[s] != 0)
+                        {
+                            let edit = template.keys.edit();
+                            if let Some(slot) = slot {
+                                edit.live_controls[slot] = 0;
+                            }
+                            edit.slider_binding = 0;
+                            template.keys.trim();
+                        }
+                    }
+                    let step_count = cached.pieces.len();
+                    dst.reserve(step_count);
+                    let bulk_ok = thread.charge(dst.len() - dst_from + step_count);
+                    for (index, &piece) in cached.pieces.iter().enumerate() {
+                        let map = match &shared_patched {
+                            Some((table, base_row)) => table.map_packed(*base_row, index),
+                            None => fallback_table
+                                .as_ref()
+                                .expect("fallback table")
+                                .map(index)?,
+                        };
+                        let mut hap = template.clone();
+                        hap.value = Value::Object(map);
+                        hap.part = piece;
+                        if bulk_ok {
+                            dst.push(hap);
+                        } else if thread.stop_requested()
+                            || !thread.push_budgeted(dst, dst_from, hap)
+                        {
+                            return Some(false);
+                        }
+                    }
+                    if bulk_ok {
+                        thread.note_accumulated(dst.len() - dst_from);
+                    }
+                    fused::note(fused::Hit::StepMany);
+                }
+                Some(true)
+            };
+            if is_last {
+                if !apply_into(buf, out, from)? {
+                    out.truncate(from);
+                    return Some(true);
+                }
+            } else {
+                let cont = with_list(|next| {
+                    let res = apply_into(buf, next, 0)?;
+                    if res {
+                        std::mem::swap(buf, next);
+                    }
+                    Some(res)
+                })?;
+                if !cont {
+                    out.truncate(from);
+                    return Some(true);
+                }
             }
         }
         Some(true)
@@ -3528,18 +4021,18 @@ impl Pattern {
                 break;
             }
         }
+        let min_uniform_steps = if items.len() == 1 { 2 } else { 1 };
+        let can_uniform = uniform_steps
+            && shared_steps > 0
+            && !items.is_empty()
+            && Self::all_uniform_steps(
+                &out[from..],
+                shared_steps,
+                has_continuous,
+                min_uniform_steps,
+            );
         if inner_len <= 4 {
-            let min_uniform_steps = if items.len() == 1 { 2 } else { 1 };
-            if uniform_steps
-                && shared_steps > 0
-                && !items.is_empty()
-                && out[from..].iter().all(|hf| {
-                    fused::StepWave::takes(hf)
-                        && (!has_continuous || (hf.whole.is_some() && hf.part.within_one_cycle()))
-                        && fused::StepWave::step_grid_over(shared_steps, hf.part)
-                            .is_some_and(|g| (min_uniform_steps..=8).contains(&g.len()))
-                })
-            {
+            if can_uniform {
                 let mut stack_haps: [Option<Hap>; 4] = [None, None, None, None];
                 for (slot, hf) in stack_haps.iter_mut().zip(out.drain(from..)) {
                     *slot = Some(hf);
@@ -3565,141 +4058,16 @@ impl Pattern {
             if let [item] = items
                 && item.steps > 0
                 && let Some(key) = controls::builtin_key_ref_by_id(item.key_id)
-                && out[from..].iter().all(|hf| {
-                    fused::StepWave::takes(hf)
-                        && fused::StepWave::step_grid_over(item.steps, hf.part)
-                            .is_some_and(|g| g.len() <= 8)
-                })
+                && Self::all_uniform_steps(&out[from..], item.steps, false, 0)
             {
-                let mut stack_haps: [Option<Hap>; 4] = [None, None, None, None];
-                for (slot, hf) in stack_haps.iter_mut().zip(out.drain(from..)) {
-                    *slot = Some(hf);
-                }
-                let mut one_cache = value::SharedWaveCache::default();
-                let mut one_last: Option<(TimeSpan, f64)> = None;
-                let mut small_cache: [Option<SmallStepSlot>; 4] = [None, None, None, None];
-                let mut small_next = 0u8;
-                let mut ok = true;
-                for mut hf in stack_haps[..inner_len].iter_mut().filter_map(Option::take) {
-                    let cached_one = match one_last {
-                        Some((lp, ln)) if lp == hf.part => Some(ln),
-                        _ => fused::StepWave::step_number(
-                            &item.wave,
-                            item.steps,
-                            hf.part,
-                            &state.controls,
-                        )
-                        .inspect(|&n| {
-                            one_last = Some((hf.part, n));
-                            one_cache = value::SharedWaveCache::default();
-                        }),
-                    };
-                    if let Some(num) = cached_one {
-                        let part = hf.part;
-                        if !Meeting::set_number_in_place_cached(
-                            &mut hf,
-                            key,
-                            num,
-                            part,
-                            &apply,
-                            LookupFlow::Set,
-                            Some(&mut one_cache),
-                        ) {
-                            ok = false;
-                            break;
-                        }
-                        if thread.stop_requested() || !thread.push_budgeted(out, from, hf) {
-                            out.truncate(from);
-                            return true;
-                        }
-                        fused::note(fused::Hit::StepOne);
-                        continue;
-                    }
-                    let Some(grid) = fused::StepWave::step_grid_over(item.steps, hf.part) else {
-                        ok = false;
-                        break;
-                    };
-                    let count = grid.len();
-                    if count == 0 {
-                        continue;
-                    }
-                    if count == 1 {
-                        let k = grid.steps().start;
-                        let (Some(begin), Some(end)) = (grid.time(k), grid.time(k + 1)) else {
-                            ok = false;
-                            break;
-                        };
-                        let piece = grid.cut(k, TimeSpan::new(begin, end), hf.part);
-                        let Some(num) = item.wave.step_value_at(begin, &state.controls) else {
-                            ok = false;
-                            break;
-                        };
-                        if one_last.is_none_or(|(lp, _)| lp != hf.part) {
-                            one_last = Some((hf.part, num));
-                            one_cache = value::SharedWaveCache::default();
-                        }
-                        if !Meeting::set_number_in_place_cached(
-                            &mut hf,
-                            key,
-                            num,
-                            piece,
-                            &apply,
-                            LookupFlow::Set,
-                            Some(&mut one_cache),
-                        ) {
-                            ok = false;
-                            break;
-                        }
-                        if thread.stop_requested() || !thread.push_budgeted(out, from, hf) {
-                            out.truncate(from);
-                            return true;
-                        }
-                        fused::note(fused::Hit::StepMany);
-                        continue;
-                    }
-                    match meet_steps_small(
-                        thread,
-                        hf,
-                        key,
-                        &item.wave,
-                        &grid,
-                        &mut small_cache,
-                        &mut small_next,
-                        state,
-                        from,
-                        out,
-                    ) {
-                        Some(true) => {}
-                        Some(false) => {
-                            out.truncate(from);
-                            return true;
-                        }
-                        None => {
-                            ok = false;
-                            break;
-                        }
-                    }
-                }
-                if !ok {
-                    out.truncate(from);
-                    return false;
-                }
-                return true;
+                return Self::try_query_app_wave_single_item_small(
+                    item, key, inner_len, thread, state, from, out,
+                );
             }
         }
         let ok = with_list(|buf| {
             buf.extend(out.drain(from..));
-            let min_uniform_steps = if items.len() == 1 { 2 } else { 1 };
-            if uniform_steps
-                && shared_steps > 0
-                && !items.is_empty()
-                && buf.iter().all(|hf| {
-                    fused::StepWave::takes(hf)
-                        && (!has_continuous || (hf.whole.is_some() && hf.part.within_one_cycle()))
-                        && fused::StepWave::step_grid_over(shared_steps, hf.part)
-                            .is_some_and(|g| (min_uniform_steps..=8).contains(&g.len()))
-                })
-            {
+            if can_uniform {
                 let mut iter = buf.drain(..);
                 return Self::try_query_app_wave_uniform_steps_onto(
                     items,
@@ -3713,266 +4081,7 @@ impl Pattern {
                     out,
                 );
             }
-            for (item_idx, item) in items.iter().enumerate() {
-                let key = controls::builtin_key_ref_by_id(item.key_id)?;
-                let is_last = item_idx + 1 == items.len();
-                if item.steps == 0 {
-                    let mut wave_cache = value::SharedWaveCache::default();
-                    let mut last_span: Option<(TimeSpan, TimeSpan, f64)> = None;
-                    for hap in buf.iter_mut() {
-                        if hap.pick_lookup().is_some()
-                            || !hap.part.within_one_cycle()
-                            || !hap.value.is_data(0)
-                            || !matches!(hap.value, Value::Object(_))
-                        {
-                            return None;
-                        }
-                        let met = hap.whole_or_part();
-                        let part = hap.part.intersection(&met)?;
-                        let num = match last_span {
-                            Some((lm, lp, ln)) if lm == met && lp == part => ln,
-                            _ => {
-                                let n = item.wave.number(met, part, &state.controls)?;
-                                last_span = Some((met, part, n));
-                                wave_cache = value::SharedWaveCache::default();
-                                n
-                            }
-                        };
-                        if !Meeting::set_number_in_place_cached(
-                            hap,
-                            key,
-                            num,
-                            part,
-                            &apply,
-                            LookupFlow::Set,
-                            Some(&mut wave_cache),
-                        ) {
-                            return None;
-                        }
-                    }
-                    if is_last {
-                        out.append(buf);
-                    }
-                    continue;
-                }
-                // Segmented step wave (`item.steps > 0`).
-                let valid = buf.iter().all(fused::StepWave::takes);
-                if !valid {
-                    return None;
-                }
-                let apply_into = |src: &mut Vec<Hap>,
-                                  dst: &mut Vec<Hap>,
-                                  dst_from: usize|
-                 -> Option<bool> {
-                    let mut one_cache = value::SharedWaveCache::default();
-                    let mut one_last: Option<(TimeSpan, f64)> = None;
-                    let mut small_cache: [Option<SmallStepSlot>; 4] = [None, None, None, None];
-                    let mut small_next = 0u8;
-                    let mut large_cache = StepWaveCacheSet::default();
-                    for mut hf in src.drain(..) {
-                        let cached_one = match one_last {
-                            Some((lp, ln)) if lp == hf.part => Some(ln),
-                            _ => fused::StepWave::step_number(
-                                &item.wave,
-                                item.steps,
-                                hf.part,
-                                &state.controls,
-                            )
-                            .inspect(|&n| {
-                                one_last = Some((hf.part, n));
-                                one_cache = value::SharedWaveCache::default();
-                            }),
-                        };
-                        if let Some(num) = cached_one {
-                            let part = hf.part;
-                            if !Meeting::set_number_in_place_cached(
-                                &mut hf,
-                                key,
-                                num,
-                                part,
-                                &apply,
-                                LookupFlow::Set,
-                                Some(&mut one_cache),
-                            ) {
-                                return None;
-                            }
-                            if thread.stop_requested() || !thread.push_budgeted(dst, dst_from, hf) {
-                                return Some(false);
-                            }
-                            fused::note(fused::Hit::StepOne);
-                            continue;
-                        }
-                        let grid = fused::StepWave::step_grid_over(item.steps, hf.part)?;
-                        let count = grid.len();
-                        if count == 0 {
-                            continue;
-                        }
-                        if count == 1 {
-                            let k = grid.steps().start;
-                            let begin = grid.time(k)?;
-                            let end = grid.time(k + 1)?;
-                            let piece = grid.cut(k, TimeSpan::new(begin, end), hf.part);
-                            let num = item.wave.step_value_at(begin, &state.controls)?;
-                            if one_last.is_none_or(|(lp, _)| lp != hf.part) {
-                                one_last = Some((hf.part, num));
-                                one_cache = value::SharedWaveCache::default();
-                            }
-                            if !Meeting::set_number_in_place_cached(
-                                &mut hf,
-                                key,
-                                num,
-                                piece,
-                                &apply,
-                                LookupFlow::Set,
-                                Some(&mut one_cache),
-                            ) {
-                                return None;
-                            }
-                            if thread.stop_requested() || !thread.push_budgeted(dst, dst_from, hf) {
-                                return Some(false);
-                            }
-                            fused::note(fused::Hit::StepMany);
-                            continue;
-                        }
-                        if count <= 8 {
-                            if !meet_steps_small(
-                                thread,
-                                hf,
-                                key,
-                                &item.wave,
-                                &grid,
-                                &mut small_cache,
-                                &mut small_next,
-                                state,
-                                dst_from,
-                                dst,
-                            )? {
-                                return Some(false);
-                            }
-                            continue;
-                        }
-                        // Large multi-cycle step count (> 8): share one `Table` across steps.
-                        let Value::Object(base_map) = &hf.value else {
-                            return None;
-                        };
-                        let cached = if large_cache.find(hf.part).is_some() {
-                            large_cache.find(hf.part).expect("checked present")
-                        } else {
-                            let mut pieces = large_cache.take_victim_pieces(count);
-                            let mut begin = grid.time(grid.steps().start)?;
-                            let mut vals = Vec::with_capacity(count);
-                            for k in grid.steps() {
-                                if thread.stop_requested() {
-                                    return Some(false);
-                                }
-                                let end = grid.time(k + 1)?;
-                                pieces.push(grid.cut(k, TimeSpan::new(begin, end), hf.part));
-                                vals.push(Value::F64(
-                                    item.wave.step_value_at(begin, &state.controls)?,
-                                ));
-                                begin = end;
-                            }
-                            large_cache.insert(StepWaveCache {
-                                part: hf.part,
-                                values: Arc::from(vals),
-                                pieces,
-                                table: None,
-                            })
-                        };
-                        let shared_patched =
-                            if let Some((base_source, base_row)) = base_map.dressed_base() {
-                                if let Some((cached_base, cached_patched)) = &cached.table
-                                    && cached_base.same_source(&base_source)
-                                {
-                                    Some((Arc::clone(cached_patched), base_row))
-                                } else if let Some(patched) = value::Table::patched_keyed_table(
-                                    &base_source,
-                                    key.clone(),
-                                    Arc::clone(&cached.values),
-                                ) {
-                                    let patched = Arc::new(patched);
-                                    cached.table = Some((base_source, Arc::clone(&patched)));
-                                    Some((patched, base_row))
-                                } else {
-                                    None
-                                }
-                            } else {
-                                None
-                            };
-                        let fallback_table = if shared_patched.is_none() {
-                            Some(Arc::new(value::Table::patched(
-                                base_map,
-                                key.clone(),
-                                Arc::clone(&cached.values),
-                            )?))
-                        } else {
-                            None
-                        };
-                        let mut template = hf.clone();
-                        template.value = Value::Undefined;
-                        if !template.keys.is_empty() {
-                            let slot = controls::live_slot(key.as_str());
-                            let k = template.keys.get();
-                            if k.slider_binding != 0
-                                || slot.is_some_and(|s| k.live_controls[s] != 0)
-                            {
-                                let edit = template.keys.edit();
-                                if let Some(slot) = slot {
-                                    edit.live_controls[slot] = 0;
-                                }
-                                edit.slider_binding = 0;
-                                template.keys.trim();
-                            }
-                        }
-                        let step_count = cached.pieces.len();
-                        dst.reserve(step_count);
-                        let bulk_ok = thread.charge(dst.len() - dst_from + step_count);
-                        for (index, &piece) in cached.pieces.iter().enumerate() {
-                            let map = match &shared_patched {
-                                Some((table, base_row)) => table.map_packed(*base_row, index),
-                                None => fallback_table
-                                    .as_ref()
-                                    .expect("fallback table")
-                                    .map(index)?,
-                            };
-                            let mut hap = template.clone();
-                            hap.value = Value::Object(map);
-                            hap.part = piece;
-                            if bulk_ok {
-                                dst.push(hap);
-                            } else if thread.stop_requested()
-                                || !thread.push_budgeted(dst, dst_from, hap)
-                            {
-                                return Some(false);
-                            }
-                        }
-                        if bulk_ok {
-                            thread.note_accumulated(dst.len() - dst_from);
-                        }
-                        fused::note(fused::Hit::StepMany);
-                    }
-                    Some(true)
-                };
-                if is_last {
-                    if !apply_into(buf, out, from)? {
-                        out.truncate(from);
-                        return Some(true);
-                    }
-                } else {
-                    let cont = with_list(|next| {
-                        let res = apply_into(buf, next, 0)?;
-                        if res {
-                            std::mem::swap(buf, next);
-                        }
-                        Some(res)
-                    })?;
-                    if !cont {
-                        out.truncate(from);
-                        return Some(true);
-                    }
-                }
-            }
-            Some(true)
+            Self::try_query_app_wave_multipass(items, &apply, thread, state, from, buf, out)
         });
         match ok {
             Some(_) => true,
@@ -4959,28 +5068,43 @@ impl Pattern {
             }
 
             Node::AppWave(app) => {
-                if self.try_query_wave_chain_onto(thread, state, out) {
+                let all_single_step = app.waves.iter().all(|item| {
+                    item.steps == 0 || fused::StepWave::step_covers_span(item.steps, state.span)
+                });
+                if all_single_step && self.try_query_wave_chain_onto(thread, state, out) {
                     return;
                 }
                 if self.try_query_app_wave_steps_onto(app, thread, state, out) {
                     return;
                 }
-                // Rare fallback for non-object haps, multi-cycle parts, >48-bit
-                // rationals, or cut_mask boundaries: rebuild exact wave chain.
-                let mut current = app.inner.clone();
-                for item in app.waves.iter() {
-                    let values =
-                        item.wave
-                            .to_control_pattern(item.key_id, item.math_inside, item.steps);
-                    current = Pattern::of(Node::AppLeft(Box::new(AppLeftNode(
-                        current,
-                        values,
-                        ValueReading::default(),
-                        Combine::Composed(compose::ComposeOp::Set),
-                        LookupFlow::Set,
-                    ))));
+                #[cold]
+                #[inline(never)]
+                fn query_app_wave_fallback(
+                    app: &AppWaveNode,
+                    thread: &QueryThread,
+                    state: &State,
+                    out: &mut Vec<Hap>,
+                ) {
+                    // Rare fallback for non-object haps, multi-cycle parts, >48-bit
+                    // rationals, or cut_mask boundaries: rebuild exact wave chain.
+                    let mut current = app.inner.clone();
+                    for item in app.waves.iter() {
+                        let values = item.wave.to_control_pattern(
+                            item.key_id,
+                            item.math_inside,
+                            item.steps,
+                        );
+                        current = Pattern::of(Node::AppLeft(Box::new(AppLeftNode(
+                            current,
+                            values,
+                            ValueReading::default(),
+                            Combine::Composed(compose::ComposeOp::Set),
+                            LookupFlow::Set,
+                        ))));
+                    }
+                    current.answer_child_onto(thread, state, out);
                 }
-                current.answer_child_onto(thread, state, out);
+                query_app_wave_fallback(app, thread, state, out);
             }
 
             // Function haps drive: values are queried over each function
@@ -5244,14 +5368,11 @@ impl Pattern {
             Node::UiVisual(node) => {
                 let from = out.len();
                 node.inner.answer_child_onto(thread, state, out);
-                let mut local = [None, None];
-                let mut local_next = 0u8;
-                for hap in &mut out[from..] {
-                    hap.keys.add_ui_visual_slot_cached(
+                if out.len() > from {
+                    ContextKeys::add_ui_visual_slot_to_haps(
+                        &mut out[from..],
                         node.slot,
                         &node.cache,
-                        &mut local,
-                        &mut local_next,
                     );
                 }
             }
