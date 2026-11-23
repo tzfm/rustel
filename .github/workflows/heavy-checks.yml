@@ -192,6 +192,21 @@ jobs:
     # Two cold release builds with fat LTO: this revision and main.
     timeout-minutes: 150
     steps:
+      - name: Install Linux audio build dependencies
+        run: |
+          if ! pkg-config --exists alsa || ! pkg-config --exists libudev; then
+            for attempt in 1 2 3 4 5 6; do
+              if sudo apt-get -o Acquire::Retries=3 update \
+                && sudo apt-get -o Acquire::Retries=3 install --yes pkg-config libasound2-dev libudev-dev libdbus-1-dev; then
+                exit 0
+              fi
+              if [ "$attempt" -lt 6 ]; then
+                sleep $((attempt * 30))
+              fi
+            done
+            exit 1
+          fi
+
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           ref: ${{ inputs.ref }}
@@ -219,12 +234,6 @@ jobs:
             ~/.cargo/git/db/
           key: ${{ runner.os }}-cargo-bench-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: ${{ runner.os }}-cargo-bench-
-
-      - name: Install Linux audio build dependencies
-        run: |
-          if ! pkg-config --exists alsa || ! pkg-config --exists libudev; then
-            bash .github/scripts/apt-install.sh pkg-config libasound2-dev libudev-dev libdbus-1-dev
-          fi
 
       - name: Measure this revision
         run: |
