@@ -109,7 +109,8 @@ fn a_strum_at_cycle_zero_exports_its_file() {
 }
 
 /// Live play from cycle zero of a strum wide enough to move its first voice
-/// before the start: the voice is silent and the footer shows no error.
+/// before the start: the footer shows no error, and the log says why the
+/// voice is silent in plain words.
 #[test]
 fn a_strum_at_cycle_zero_plays_with_no_error() {
     let mut studio = hermetic();
@@ -117,20 +118,23 @@ fn a_strum_at_cycle_zero_plays_with_no_error() {
     studio.chord("ctrl+s");
     studio.pump_until(
         std::time::Duration::from_secs(10),
-        "the score plays",
-        |studio| studio.status().starts_with("playing") || studio.errors().is_some(),
+        "the log says the voice is before the start",
+        |studio| {
+            studio
+                .log_texts()
+                .iter()
+                .any(|line| line.contains("before the start does not sound"))
+        },
     );
-    let started = std::time::Instant::now();
-    while started.elapsed() < std::time::Duration::from_secs(3) {
-        studio.pump();
-    }
-    let refusals: Vec<_> = studio
-        .log_texts()
-        .into_iter()
-        .filter(|line| line.contains("unrepresentable") || line.contains("refused"))
-        .collect();
-    assert_eq!(studio.errors(), None, "{refusals:?}");
-    assert!(refusals.is_empty(), "{refusals:?}");
+    assert_eq!(studio.errors(), None);
+    assert!(
+        !studio
+            .log_texts()
+            .iter()
+            .any(|line| line.contains("unrepresentable")),
+        "{:?}",
+        studio.log_texts()
+    );
 }
 
 /// Enter renders the scene as written: a real WAV appears in the set's

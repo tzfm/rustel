@@ -5495,7 +5495,7 @@ fn a_voice_before_the_export_is_silent_and_not_refused() {
     let wav = std::fs::read(&path).expect("wav");
     let _ = std::fs::remove_file(&path);
     // 16-bit stereo after the 44-byte header. The g4 starts at 0.2 s.
-    let at = |seconds: usize| 44 + seconds * 192_000 / 10;
+    let at = |tenths: usize| 44 + tenths * 192_000 / 10;
     assert!(
         wav[44..at(1)].iter().all(|byte| *byte == 0),
         "the early voice sounds"
