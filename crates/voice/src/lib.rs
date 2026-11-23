@@ -239,11 +239,28 @@ mod classification_tests {
         ));
     }
 
+    /// A gain that is no number plays at 1, as strudel.cc's `nanFallback`
+    /// does. One that JavaScript reads as a number is that number.
+    #[test]
+    fn a_gain_that_is_no_number_plays_at_one() {
+        for (gain, expected) in [
+            (json!("0.1..0.4"), 1.0),
+            (json!([0.2, 0.4]), 1.0),
+            (json!("not a number"), 1.0),
+            (json!("0.25"), 0.25),
+            (json!(0.5), 0.5),
+            (json!(true), 1.0),
+            (json!(null), 0.8),
+        ] {
+            assert_eq!(super::gain_control(Some(&gain)), expected, "{gain}");
+        }
+        assert_eq!(super::gain_control(None), 0.8);
+    }
+
     #[test]
     fn malformed_values_slices_and_room_sizes_are_invalid_controls() {
         for value in [
             json!(60),
-            json!({ "s": "sine", "gain": "not a number" }),
             json!({ "s": "sine", "room": 1, "roomsize": -1 }),
             json!({
                 "s": "sine", "room": 1,
@@ -2816,7 +2833,7 @@ fn resolve_voice_at(
                 (1.0, 1.0)
             } else {
                 (
-                    optional_f64(object.get("gain"), "gain")?.unwrap_or(0.8),
+                    gain_control(object.get("gain")),
                     optional_f64(object.get("velocity"), "velocity")?.unwrap_or(1.0),
                 )
             };
@@ -5087,7 +5104,7 @@ fn modulator_controls(
                 };
                 Some((
                     rustel_audio::ModTarget::Gain,
-                    read("gain", 0.8) * read("velocity", 1.0),
+                    gain_control(object.get("gain")) * read("velocity", 1.0),
                     false,
                 ))
             }
@@ -6791,7 +6808,7 @@ fn fx_stage_controls(
     // `gain *= velocity`. The default gain is 0.8, not 1, so a stage that
     // names no gain still attenuates. Three such stages attenuate by 0.8^3,
     // which is audible.
-    let gain = optional_f64(object.get("gain"), "gain")?.unwrap_or(0.8)
+    let gain = gain_control(object.get("gain"))
         * optional_f64(object.get("velocity"), "velocity")?.unwrap_or(1.0);
     Ok(rustel_audio::FxStage {
         kabel: kabel_controls(object, target_time, target_time, target_time)?,
@@ -7102,6 +7119,34 @@ fn optional_f64(value: Option<&serde_json::Value>, name: &str) -> Result<Option<
             .ok_or_else(|| format!("{name} must be a finite number"))
             .map(Some),
     }
+}
+
+/// The `gain` of a voice, 0.8 when it has none. As on strudel.cc, a gain
+/// JavaScript cannot read as a number, such as `"0.1..0.4"` or the pair
+/// `"0.2:0.4"` makes, plays at 1 and says so (`nanFallback(gain, 1)`).
+fn gain_control(value: Option<&serde_json::Value>) -> f64 {
+    let number = match value {
+        None | Some(serde_json::Value::Null) => return 0.8,
+        Some(serde_json::Value::Bool(flag)) => Some(f64::from(u8::from(*flag))),
+        Some(serde_json::Value::Number(number)) => number.as_f64(),
+        Some(serde_json::Value::String(text)) => match text.trim() {
+            "" => Some(0.0),
+            text => text.parse::<f64>().ok().filter(|number| number.is_finite()),
+        },
+        Some(_) => None,
+    };
+    number.unwrap_or_else(|| {
+        let shown = value.map_or_else(String::new, |value| match value {
+            serde_json::Value::String(text) => text.clone(),
+            other => other.to_string(),
+        });
+        let message = format!("gain \"{shown}\" is not a number, falling back to 1");
+        report_notice(
+            message.clone(),
+            serde_json::json!({ "gain_fallback": { "message": message } }),
+        );
+        1.0
+    })
 }
 
 fn checked_frequency(frequency: f64) -> Result<f64, String> {

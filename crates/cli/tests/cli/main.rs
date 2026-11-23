@@ -5589,6 +5589,35 @@ fn an_export_names_an_unknown_chord() {
     let _ = std::fs::remove_file(&path);
 }
 
+/// A gain that is no number plays at 1 and says so, as on strudel.cc.
+#[test]
+fn a_gain_that_is_no_number_plays_and_says_so() {
+    let path = scratch("gain-no-number.wav");
+    for score in [
+        r#"note("c3").s("sine").gain("0.1..0.4")"#,
+        r#"note("c3").s("sine").gain("0.2:0.4")"#,
+    ] {
+        let out = run(&[
+            "render",
+            "-e",
+            score,
+            "--duration",
+            "1",
+            "--format",
+            "scalar-wav",
+            "-o",
+            path.to_str().expect("UTF-8 path"),
+        ]);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(out.status.success(), "{score}: {stderr}");
+        assert!(!stderr.contains("voice_refused"), "{score}: {stderr}");
+        assert!(stderr.contains("falling back to 1"), "{score}: {stderr}");
+        let wav = std::fs::read(&path).expect("wav");
+        assert!(wav[44..].iter().any(|byte| *byte != 0), "{score} is silent");
+    }
+    let _ = std::fs::remove_file(&path);
+}
+
 /// The command line prints recoverable notices on stderr, which a library
 /// Session does only when its host opts in. A notice that every note raises
 /// prints once, with the number of onsets.
