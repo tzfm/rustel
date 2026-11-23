@@ -19,6 +19,10 @@ use callback::write_output;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
+
+/// The bytes of the orbit reverb responses that the producer keeps while no
+/// reverb uses them: a few long rooms, or many short ones.
+const UNUSED_REVERB_RESPONSE_BYTES: usize = 64 << 20;
 pub use stream::audio_device_inventory;
 pub use stream::audio_devices;
 #[cfg(feature = "test-support")]
@@ -248,6 +252,12 @@ pub struct LiveScalarDevice {
     /// A mutex only because the producer closures hold `&self`; the audio
     /// thread never touches it.
     reverb_cache: std::sync::Mutex<Vec<Option<(crate::reverb::ReverbParams, usize)>>>,
+    /// The impulse responses of the orbit reverbs, oldest use first. An
+    /// orbit that changes its room back, or takes the room of another orbit,
+    /// shares the response instead of making it again: that takes tens of
+    /// ms. A response no reverb uses stays within
+    /// [`UNUSED_REVERB_RESPONSE_BYTES`].
+    reverb_responses: std::sync::Mutex<Vec<crate::reverb::ReverbResponse>>,
     /// Recently shipped `.FX()` stage reverbs. The pointer identity lets the
     /// producer forget a fingerprint when the callback returns that box.
     fx_reverb_cache: std::sync::Mutex<Vec<(crate::reverb::ReverbParams, usize, usize)>>,

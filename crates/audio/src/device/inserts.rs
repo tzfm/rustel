@@ -438,12 +438,8 @@ impl LiveScalarDevice {
         if cache[orbit].is_some_and(|(cached, _)| cached == params) {
             return;
         }
-        let reverb = Box::new(crate::reverb::OrbitReverb::generate_with_dispatch(
-            self.sample_rate,
-            params,
-            self.dispatch(),
-        ));
-        let bytes = reverb.approx_bytes();
+        let reverb = Box::new(self.orbit_reverb(params));
+        let bytes = reverb.state_bytes();
         let pointer = Box::into_raw(reverb);
         match self
             .shared
@@ -464,6 +460,39 @@ impl LiveScalarDevice {
                 drop(unsafe { Box::from_raw(install.reverb) });
             }
         }
+    }
+
+    /// A new orbit reverb with the response of `params`: a shared response
+    /// when one is known, else a new one that joins them. Producer-side.
+    fn orbit_reverb(&self, params: crate::reverb::ReverbParams) -> crate::reverb::OrbitReverb {
+        let mut responses = locked(&self.reverb_responses);
+        if let Some(at) = responses.iter().position(|known| known.params() == params) {
+            let known = responses.remove(at);
+            let reverb = known.reverb();
+            responses.push(known);
+            return reverb;
+        }
+        let reverb = crate::reverb::OrbitReverb::generate_with_dispatch(
+            self.sample_rate,
+            params,
+            self.dispatch(),
+        );
+        responses.push(reverb.response());
+        // Forget the oldest responses no reverb uses past the budget. A
+        // response in use costs nothing more than its reverbs.
+        let mut unused: usize = responses
+            .iter()
+            .filter(|known| !known.in_use())
+            .map(crate::reverb::ReverbResponse::approx_bytes)
+            .sum();
+        responses.retain(|known| {
+            if unused <= UNUSED_REVERB_RESPONSE_BYTES || known.in_use() {
+                return true;
+            }
+            unused -= known.approx_bytes();
+            false
+        });
+        reverb
     }
 
     /// Makes sure the room of `chain` holds a reverb with `reverb` and a
@@ -1260,6 +1289,7 @@ impl LiveScalarDevice {
             .lock()
             .expect("producer reverb cache")
             .fill(None);
+        locked(&self.reverb_responses).clear();
         self.fx_reverb_cache
             .lock()
             .expect("producer fx reverb cache")
@@ -1520,6 +1550,28 @@ mod tests {
     /// the old one's place rather than adding to it, and a recycled backend
     /// holds none until asked again. The backend is measured once, before
     /// the callback owns it.
+    /// An orbit that goes back to a room, or takes the room of another
+    /// orbit, makes no new response.
+    #[test]
+    fn orbits_share_the_response_of_a_room() {
+        let device = LiveScalarDevice::start_silent(48_000, 7).expect("silent output");
+        let room = |size_secs| crate::reverb::ReverbParams {
+            size_secs,
+            fade_secs: 0.01,
+            lp_start_hz: 15_000.0,
+            lp_end_hz: 1_000.0,
+            ir: None,
+        };
+        for (orbit, size) in [(0, 0.05), (0, 0.1), (0, 0.05), (1, 0.1), (2, 0.05)] {
+            device.ensure_reverb(orbit, room(size));
+        }
+        let known: Vec<f32> = locked(&device.reverb_responses)
+            .iter()
+            .map(|response| response.params().size_secs)
+            .collect();
+        assert_eq!(known, [0.1, 0.05]);
+    }
+
     #[test]
     fn an_outputs_memory_counts_each_orbit_reverb_once() {
         let mut device = LiveScalarDevice::start_silent(48_000, 7).expect("silent output");
@@ -1550,7 +1602,11 @@ mod tests {
             "replaced by the larger room: {larger} against {one}"
         );
         device.ensure_reverb(1, small);
-        assert_eq!(device.memory().reverbs, larger + one, "another orbit's own");
+        let added = device.memory().reverbs - larger;
+        assert!(
+            added > 0 && added < one,
+            "another orbit shares the response of the room: {added} against {one}"
+        );
 
         device.recycle_output().expect("recycle silent output");
         let recycled = device.memory();
