@@ -963,7 +963,32 @@ impl App {
         if self.performance_chord(key, primary, shift, alt, letter) {
             return Ok(true);
         }
-        Ok(self.control_chord(key, primary, shift, alt, letter))
+        if self.control_chord(key, primary, shift, alt, letter) {
+            return Ok(true);
+        }
+        Ok(self.alt_key_stays_with_panel(key, primary, alt))
+    }
+
+    /// An Alt character no chord took, over a panel that holds the keyboard.
+    /// It is dropped and said out loud, as a plain key is, instead of being
+    /// typed into a score the eye is not on.
+    fn alt_key_stays_with_panel(&mut self, key: &KeyEvent, primary: bool, alt: bool) -> bool {
+        let Focus::Panel(kind) = self.focus else {
+            return false;
+        };
+        if !alt
+            || primary
+            || !matches!(key.code, KeyCode::Char(_))
+            || self.panel_types_through(kind)
+        {
+            return false;
+        }
+        self.status = format!(
+            "the {} has the keyboard - Esc gives it back to the score",
+            kind.label()
+        );
+        self.dirty_frame = true;
+        true
     }
 
     /// Update and stop, and ^⇧S's rewinding update, in every spelling:
