@@ -113,12 +113,6 @@ fn scalar_event_at(
     floor: f64,
 ) -> Result<rustel_audio::OnsetEvent, rustel_voice::VoiceError> {
     let cps = onset.cps_or(cps);
-    let stopped = |pitch: crate::hap_json::NonFinitePitch| {
-        rustel_voice::VoiceError::InvalidControl(format!("{} must be a finite number", pitch.name))
-    };
-    if let Some(pitch) = onset.non_finite_pitch.filter(|pitch| !pitch.sample_only) {
-        return Err(stopped(pitch));
-    }
     let value = match &onset.value {
         crate::ValueJson::Null => serde_json::Value::Null,
         crate::ValueJson::Bool(flag) => serde_json::Value::Bool(*flag),
@@ -128,7 +122,7 @@ fn scalar_event_at(
         crate::ValueJson::String(note) => serde_json::Value::String(note.clone()),
         crate::ValueJson::Raw(raw) => raw.clone(),
     };
-    let event = rustel_voice::resolve_voice_with_origin(
+    rustel_voice::resolve_voice_with_origin(
         &value,
         onset.onset_id,
         onset.duration_secs,
@@ -139,11 +133,7 @@ fn scalar_event_at(
         samples,
         origin,
         floor,
-    )?;
-    match onset.non_finite_pitch {
-        Some(pitch) if event.sample.is_some() => Err(stopped(pitch)),
-        _ => Ok(event),
-    }
+    )
     .map(|mut event| {
         event.controls.preview_epoch = value
             .get("__rustelPreview")
@@ -185,8 +175,18 @@ fn tallied_scalar_event(
     let convert = || {
         let cycle = onset_cycle(onset, cps);
         let time = onset.target_time;
-        scalar_event_at(onset, time, cycle, sample_rate, cps, samples, origin, 0.0)
-            .map_err(|error| error.to_string())
+        let refused = |pitch: crate::hap_json::NonFinitePitch| {
+            format!("{} must be a finite number", pitch.name)
+        };
+        if let Some(pitch) = onset.non_finite_pitch.filter(|pitch| !pitch.sample_only) {
+            return Err(refused(pitch));
+        }
+        let event = scalar_event_at(onset, time, cycle, sample_rate, cps, samples, origin, 0.0)
+            .map_err(|error| error.to_string())?;
+        match onset.non_finite_pitch {
+            Some(pitch) if event.sample.is_some() => Err(refused(pitch)),
+            _ => Ok(event),
+        }
     };
     let Some(tally) = tally else {
         return convert();

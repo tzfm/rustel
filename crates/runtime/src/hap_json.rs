@@ -164,8 +164,9 @@ pub struct OnsetEventJson {
     pub cps: Option<f64>,
     pub value: ValueJson,
     pub value_show: String,
-    /// The `note` or `freq` that stops this onset's voice. JSON writes NaN
-    /// and infinities as null, which a voice reads as no pitch. Outputs that
+    /// The `note` or `freq` that stops this onset's voice in a render. JSON
+    /// writes NaN and infinities as null, which a voice reads as no pitch.
+    /// A live update refuses such a score before it plays, and outputs that
     /// are no voice read the value as JSON writes it.
     #[serde(skip)]
     pub(crate) non_finite_pitch: Option<NonFinitePitch>,
