@@ -211,7 +211,7 @@ jobs:
 
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
-          save-if: ${{ inputs.save_cache }}
+          save-if: false
 
       - name: Install Linux audio build dependencies
         run: |
