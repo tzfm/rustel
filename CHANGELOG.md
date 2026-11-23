@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- Fixed: a live orbit that changes its `roomsize` back, or takes the `roomsize` of another orbit, reuses that reverb instead of making it again, so frequent room changes no longer cause audio underruns.
 - Scene > Save, and `:w` in Vim mode, save the scene without playing it. `:wq` and `:x` save it and close the tab.
 - A Studio crash saves unsaved edits, as quit does.
 - Fixed: a plugin made with DPF, such as the Dragonfly reverbs, no longer prints an assertion on every audio block: the host gives it a list for the parameter values it changes itself.
