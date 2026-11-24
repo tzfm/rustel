@@ -63,6 +63,9 @@ pub struct FileRow {
     pub strip: Option<usize>,
     pub current: bool,
     pub dirty: bool,
+    /// Nothing but whitespace: the open scene's text when it is open,
+    /// the file's otherwise.
+    pub empty: bool,
     /// What its leading comments say about it, read off the file.
     pub meta: ScoreMeta,
     /// When it was last saved, as the details block shows it. Read with
@@ -191,6 +194,8 @@ impl SetPanel {
                         .map(|index| index + 1),
                     current: file.open == Some(current),
                     dirty: scene.is_some_and(|scene| scene.dirty),
+                    empty: scene
+                        .map_or_else(|| blank_on_disk(&file.path), |scene| scene.is_blank()),
                     name: file.name,
                     path: file.path.clone(),
                     meta: ScoreMeta::read(&file.path),
@@ -263,6 +268,9 @@ impl SetPanel {
             let scene = file.open.and_then(|id| set.get(id));
             file.current = file.open == Some(current);
             file.dirty = scene.is_some_and(|scene| scene.dirty);
+            if let Some(scene) = scene {
+                file.empty = scene.is_blank();
+            }
         }
     }
 
@@ -356,6 +364,9 @@ impl SetPanel {
                         };
                         if file.current {
                             state.push_str(" · on screen");
+                        }
+                        if file.empty {
+                            state.push_str(" · empty");
                         }
                         if file.dirty {
                             state.push_str(" · unsaved");
@@ -759,6 +770,19 @@ fn readable_stamp(stamp: &str) -> Option<String> {
     ))
 }
 
+/// Whether a score file holds nothing but whitespace. A file too big to
+/// be blank by any honest measure is not read.
+fn blank_on_disk(path: &Path) -> bool {
+    const LARGEST_BLANK: u64 = 4096;
+    match std::fs::metadata(path) {
+        Ok(metadata) if metadata.len() == 0 => true,
+        Ok(metadata) if metadata.len() <= LARGEST_BLANK => {
+            std::fs::read_to_string(path).is_ok_and(|text| text.chars().all(char::is_whitespace))
+        }
+        _ => false,
+    }
+}
+
 /// When the file was last saved, read off its mtime when the panel
 /// reads the folder: `Sep 24 03:15:30`. None when the file cannot be asked.
 fn saved_at(path: &Path) -> Option<String> {
@@ -929,6 +953,10 @@ impl ratatui::widgets::Widget for SetPanelView<'_> {
                         None => " ·".to_owned(),
                     };
                     let mut notes = String::new();
+                    if file.empty {
+                        notes.push(' ');
+                        notes.push_str(crate::terminal::symbol("○"));
+                    }
                     if file.dirty {
                         notes.push_str(" ●");
                     }

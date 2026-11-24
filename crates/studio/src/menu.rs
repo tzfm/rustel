@@ -1303,7 +1303,6 @@ pub struct MenuContext<'a> {
     pub scene_rewinds: bool,
     pub can_add_scene: bool,
     pub on_prebake: bool,
-    pub can_delete_scene: bool,
     pub can_step_scene: bool,
     pub can_learn_pad: bool,
     pub has_pad: bool,
@@ -1532,7 +1531,7 @@ pub fn menus(cx: &MenuContext) -> Vec<Menu> {
             // Closing keeps the file; this is the one that does not. It
             // asks twice, the way Quit does.
             MenuItem::action(MenuAction::DeleteScene, "Delete scene", 't', "")
-                .enabled(cx.can_delete_scene && !cx.on_prebake),
+                .enabled(!cx.on_prebake),
             MenuItem::separator(),
             MenuItem::action(MenuAction::PreviousScene, "Previous scene", 'p', previous)
                 .enabled(cx.can_step_scene),
@@ -1987,7 +1986,6 @@ mod tests {
             scene_rewinds: false,
             can_add_scene: true,
             on_prebake: false,
-            can_delete_scene: true,
             can_step_scene: true,
             can_learn_pad: true,
             has_pad: true,

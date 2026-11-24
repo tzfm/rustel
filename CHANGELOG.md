@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Studio deletes the last open score of a set: the next score in the set panel opens in its place, or a new empty score when it was the only one.
+- The set panel marks empty scores with `○`.
 - Fixed: when the set open last time is gone from the disk, `rustel studio` opens the newest recent set that is still there, instead of a new empty set.
 - Fixed: a stopped Studio closes its audio output after 30 seconds with nothing playing, so the output's buffers no longer keep the memory figure up after a score stops or its tab closes. Piano mode and a recording keep it open.
 - Fixed: a session tape that the first save opens records the master fader at its start, so a replay export plays its first seconds at the level of the take.

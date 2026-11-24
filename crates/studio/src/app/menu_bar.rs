@@ -299,7 +299,6 @@ impl App {
             scene_rewinds: self.scenes.current_rewinds(),
             can_add_scene: self.scenes.score_count() < super::super::scenes::MAX_SCENES,
             on_prebake: self.current_prebake().is_some(),
-            can_delete_scene: !(self.scenes.current().is_score() && self.scenes.score_count() <= 1),
             can_step_scene: self.scenes.len() > self.panes.len() && self.replay_view.is_none(),
             can_learn_pad: !self.devices.inventory().midi_inputs.is_empty()
                 || self.pads.open_count() > 0,
