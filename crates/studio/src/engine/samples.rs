@@ -980,8 +980,7 @@ impl StudioEngine {
 
     /// True when the parked output closes with no sound lost: no score
     /// plays, Piano mode is closed, and no key or score tail rings out.
-    #[cfg(feature = "vst")]
-    fn parked_output_idle(&self) -> bool {
+    pub(super) fn parked_output_idle(&self) -> bool {
         self.live.is_none()
             && self.piano_output.is_some()
             && !self.piano_mode

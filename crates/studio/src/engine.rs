@@ -92,6 +92,10 @@ pub const DEFAULT_STUDIO_STOP_TIMEOUT: Duration = Duration::from_secs(1);
 /// How long the mix has to stay below the silence floor before a graceful
 /// stop concludes that nothing is left to hear.
 const GRACEFUL_STOP_SILENCE_HOLD: Duration = Duration::from_millis(250);
+/// How long a parked output stays open with nothing to play before it
+/// closes and gives back its rings, pools and DSP. Long enough that a stop
+/// and the next start reuse the stream, which on some hosts saves a click.
+const PARKED_OUTPUT_IDLE: Duration = Duration::from_secs(30);
 /// How long a preview waits for its sample to load before giving up. A
 /// long recording or a video decodes for seconds, and the list says
 /// `loading` while it does: the wait is the studio's stop window, so a
@@ -1249,13 +1253,16 @@ pub struct StudioEngine {
     /// cycle ownership. A stop parks the stream here rather than closing
     /// it, and the next start adopts it where it stands. Outside Piano mode,
     /// a stop closes a stream that holds a plugin copy of a chain that a
-    /// closed tab ended: see [`Self::closed_plugin_copies`].
+    /// closed tab ended: see [`Self::closed_plugin_copies`]. Left idle for
+    /// [`PARKED_OUTPUT_IDLE`], it closes: see [`Self::parked_idle_since`].
     piano_output: Option<LiveScalarDevice>,
+    /// When the parked output last became idle: nothing plays, rings out
+    /// or records, and Piano mode is closed.
+    parked_idle_since: Option<Instant>,
     piano_close_when_idle: bool,
     /// Piano mode is open in the app: from [`Self::prepare_piano`] to
     /// [`Self::close_piano_mode`]. A Stop and a focus loss stop the keys,
     /// and Piano mode stays open.
-    #[cfg(feature = "vst")]
     piano_mode: bool,
     piano_sound: super::PianoSound,
     piano_volume: u16,
@@ -1849,8 +1856,8 @@ impl StudioEngine {
             launch_pads: Vec::new(),
             live: None,
             piano_output: None,
+            parked_idle_since: None,
             piano_close_when_idle: true,
-            #[cfg(feature = "vst")]
             piano_mode: false,
             piano_sound: super::PianoSound::default(),
             piano_volume: super::piano::DEFAULT_PIANO_VOLUME,
@@ -2626,7 +2633,8 @@ impl StudioEngine {
 
     /// Stop is idempotent at the Session level and ends the current playback.
     /// A healthy device stays open after an acknowledged Stop or a zero timeout.
-    /// A later [`Self::evaluate`] adopts that stream rather than opening a new one.
+    /// A later [`Self::evaluate`] adopts that stream rather than opening a new one,
+    /// unless it idled for [`PARKED_OUTPUT_IDLE`] and closed.
     /// Outside Piano mode, the device closes at the Stop while it holds a
     /// plugin copy of a chain that a closed tab ended: see
     /// [`Self::closed_plugin_copies`].
@@ -2716,8 +2724,9 @@ impl StudioEngine {
         #[cfg(feature = "vst")]
         self.close_output_of_closed_tabs();
         // The parked output keeps its rings and pools until the next start
-        // adopts them or a device change releases the stream. What the
-        // session let go is still owed back.
+        // adopts them, a device change releases the stream, or it idles
+        // for `PARKED_OUTPUT_IDLE`. What the session let go is still owed
+        // back.
         self.owe_free_memory();
         self.sync_input_channels();
         // A timed-out callback may still read retiring samples during its

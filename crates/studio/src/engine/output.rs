@@ -1106,6 +1106,27 @@ mod tests {
     }
 
     #[test]
+    fn an_idle_parked_output_closes_after_a_while() {
+        let mut engine = silent_engine_for_output_selection();
+        engine.stop(Duration::from_millis(500));
+        let start = Instant::now();
+        engine.close_idle_parked_output(start);
+        engine.close_idle_parked_output(start + PARKED_OUTPUT_IDLE / 2);
+        assert!(engine.piano_output.is_some(), "a stop and a start share it");
+
+        engine.piano_mode = true;
+        engine.close_idle_parked_output(start + PARKED_OUTPUT_IDLE * 2);
+        assert!(engine.piano_output.is_some(), "Piano mode keeps it");
+
+        engine.piano_mode = false;
+        let idle = start + PARKED_OUTPUT_IDLE * 2;
+        engine.close_idle_parked_output(idle);
+        assert!(engine.piano_output.is_some(), "the wait starts again");
+        engine.close_idle_parked_output(idle + PARKED_OUTPUT_IDLE);
+        assert!(engine.piano_output.is_none(), "an idle output closes");
+    }
+
+    #[test]
     fn refreshing_the_default_output_preserves_piano_and_tail_ownership() {
         let mut engine = silent_engine_for_output_selection();
         engine.stop(Duration::from_millis(500));
