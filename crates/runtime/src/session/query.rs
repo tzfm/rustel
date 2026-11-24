@@ -285,7 +285,7 @@ mod tests {
     ) {
         assert!(!session.active_needs_host());
         assert_eq!(
-            session.js.active_pattern().expect("active pattern").steps,
+            session.js.active_pattern().expect("active pattern").steps(),
             steps
         );
         assert_eq!(
@@ -667,7 +667,11 @@ mod tests {
             .evaluate("stepcat(sequence(0, 1, 2, 3).contract(2), 9)")
             .expect("evaluate contract step consumer");
         assert_eq!(
-            session.js.active_pattern().expect("active contract").steps,
+            session
+                .js
+                .active_pattern()
+                .expect("active contract")
+                .steps(),
             Some(Fraction::int(3)),
             "contract metadata did not reach a real step consumer"
         );
@@ -713,7 +717,7 @@ mod tests {
             .expect("evaluate patterned take");
         assert!(!session.active_needs_host());
         assert_eq!(
-            session.js.active_pattern().expect("active take").steps,
+            session.js.active_pattern().expect("active take").steps(),
             Some(Fraction::ONE),
             "take metadata must come from StepJoin's cycle-zero slice"
         );
@@ -762,7 +766,7 @@ mod tests {
             .expect("evaluate patterned drop");
         assert!(!session.active_needs_host());
         assert_eq!(
-            session.js.active_pattern().expect("active drop").steps,
+            session.js.active_pattern().expect("active drop").steps(),
             Some(Fraction::int(2)),
             "drop metadata must come from StepJoin's cycle-zero slice"
         );
@@ -875,7 +879,7 @@ mod tests {
                     .js
                     .active_pattern()
                     .expect("active pool-neutral raw graph")
-                    .steps,
+                    .steps(),
                 Some(Fraction::int(i128::from(expected_steps)))
             );
             assert_eq!(
@@ -969,7 +973,7 @@ mod tests {
                     .js
                     .active_pattern()
                     .expect("active pool-neutral raw chain")
-                    .steps,
+                    .steps(),
                 Some(Fraction::int(i128::from(over)))
             );
             assert_eq!(
@@ -1076,7 +1080,7 @@ mod tests {
                     .js
                     .active_pattern()
                     .expect("active pool-neutral metadata graph")
-                    .steps,
+                    .steps(),
                 Some(expected_steps)
             );
             assert_eq!(
@@ -1154,7 +1158,7 @@ mod tests {
                     .js
                     .active_pattern()
                     .expect("active pool-neutral raw range")
-                    .steps,
+                    .steps(),
                 Some(Fraction::int(i128::from(over)))
             );
             assert_eq!(
@@ -1214,7 +1218,7 @@ mod tests {
                 .js
                 .active_pattern()
                 .expect("active pool-neutral raw apply")
-                .steps,
+                .steps(),
             Some(Fraction::int(i128::from(over)))
         );
         assert_eq!(
@@ -1322,7 +1326,7 @@ mod tests {
                 .js
                 .active_pattern()
                 .expect("active pool-neutral raw when")
-                .steps,
+                .steps(),
             Some(Fraction::int(i128::from(over)))
         );
         assert_eq!(
@@ -1425,7 +1429,7 @@ mod tests {
                     .js
                     .active_pattern()
                     .expect("active pool-neutral raw never/always")
-                    .steps,
+                    .steps(),
                 Some(Fraction::int(i128::from(over)))
             );
             assert_eq!(
@@ -1515,7 +1519,7 @@ mod tests {
             zero.js
                 .active_pattern()
                 .expect("active zero raw swing")
-                .steps,
+                .steps(),
             Some(Fraction::ONE),
             "zero raw swing replaced constructed silence metadata"
         );
@@ -1540,7 +1544,7 @@ mod tests {
                 .js
                 .active_pattern()
                 .expect("active pool-neutral raw swing")
-                .steps,
+                .steps(),
             Some(Fraction::int(i128::from(over)))
         );
         assert_eq!(
@@ -1637,7 +1641,7 @@ mod tests {
                     .js
                     .active_pattern()
                     .expect("active raw signal")
-                    .steps,
+                    .steps(),
                 None,
                 "{raw_name}: outer result retained source steps"
             );
@@ -1750,7 +1754,7 @@ mod tests {
             "raw set's lexical fmap callback was granted host-free purity"
         );
         assert_eq!(
-            session.js.active_pattern().expect("active raw set").steps,
+            session.js.active_pattern().expect("active raw set").steps(),
             Some(Fraction::int(7)),
             "raw set lost source steps"
         );
@@ -1851,7 +1855,11 @@ mod tests {
             "raw keep's lexical fmap callback was granted host-free purity"
         );
         assert_eq!(
-            session.js.active_pattern().expect("active raw keep").steps,
+            session
+                .js
+                .active_pattern()
+                .expect("active raw keep")
+                .steps(),
             Some(Fraction::int(7)),
             "raw keep lost source steps"
         );
@@ -1974,7 +1982,7 @@ mod tests {
                 .js
                 .active_pattern()
                 .expect("active raw keepif")
-                .steps,
+                .steps(),
             Some(Fraction::int(7)),
             "raw keepif lost source steps"
         );
@@ -2115,7 +2123,7 @@ mod tests {
             "raw eqt's lexical fmap callback was granted host-free purity"
         );
         assert_eq!(
-            session.js.active_pattern().expect("active raw eqt").steps,
+            session.js.active_pattern().expect("active raw eqt").steps(),
             Some(Fraction::int(7)),
             "raw eqt lost source steps"
         );
@@ -2226,7 +2234,7 @@ mod tests {
             "raw net's lexical fmap callback was granted host-free purity"
         );
         assert_eq!(
-            session.js.active_pattern().expect("active raw net").steps,
+            session.js.active_pattern().expect("active raw net").steps(),
             Some(Fraction::int(7)),
             "raw net lost source steps"
         );
@@ -2364,7 +2372,7 @@ mod tests {
             "raw and's lexical fmap callback was granted host-free purity"
         );
         assert_eq!(
-            session.js.active_pattern().expect("active raw and").steps,
+            session.js.active_pattern().expect("active raw and").steps(),
             Some(Fraction::int(7)),
             "raw and lost source steps"
         );
@@ -2503,7 +2511,7 @@ mod tests {
             "raw or's lexical fmap callback was granted host-free purity"
         );
         assert_eq!(
-            session.js.active_pattern().expect("active raw or").steps,
+            session.js.active_pattern().expect("active raw or").steps(),
             Some(Fraction::int(7)),
             "raw or lost source steps"
         );
@@ -2721,7 +2729,7 @@ mod tests {
                     .js
                     .active_pattern()
                     .expect("active shrink/grow")
-                    .steps,
+                    .steps(),
                 Some(Fraction::int(10)),
                 "StepJoin metadata must come from cycle zero"
             );
@@ -2871,7 +2879,7 @@ mod tests {
                     .js
                     .active_pattern()
                     .expect("active canonical pair")
-                    .steps,
+                    .steps(),
                 Some(Fraction::int(steps)),
                 "{source}: wrong pair step metadata"
             );
@@ -2998,7 +3006,11 @@ mod tests {
                 "{source}: eager raw pair retained the JS host"
             );
             assert_eq!(
-                session.js.active_pattern().expect("active raw pair").steps,
+                session
+                    .js
+                    .active_pattern()
+                    .expect("active raw pair")
+                    .steps(),
                 Some(Fraction::int(steps))
             );
             assert_eq!(
@@ -3117,7 +3129,7 @@ mod tests {
                     .js
                     .active_pattern()
                     .expect("active patterned canonical")
-                    .steps,
+                    .steps(),
                 Some(Fraction::int(8)),
                 "patterned {name} changed its eager cycle-zero metadata"
             );
@@ -3151,7 +3163,7 @@ mod tests {
                     .js
                     .active_pattern()
                     .expect("active patterned canonical after mutation")
-                    .steps,
+                    .steps(),
                 Some(Fraction::int(8)),
                 "patterned {name} refreshed stale eager metadata"
             );
@@ -3455,7 +3467,7 @@ mod tests {
             "a native tour graph was pushed onto the JavaScript scheduler path"
         );
         assert_eq!(
-            session.js.active_pattern().expect("active tour").steps,
+            session.js.active_pattern().expect("active tour").steps(),
             Some(Fraction::int(9))
         );
         assert_eq!(
@@ -3534,7 +3546,7 @@ mod tests {
             "a pure stepalt graph was pushed onto the JavaScript scheduler path"
         );
         assert_eq!(
-            session.js.active_pattern().expect("active stepalt").steps,
+            session.js.active_pattern().expect("active stepalt").steps(),
             Some(Fraction::int(12))
         );
         assert_eq!(
@@ -3618,7 +3630,7 @@ mod tests {
                 .js
                 .active_pattern()
                 .expect("active modern polymeter")
-                .steps,
+                .steps(),
             Some(Fraction::int(6))
         );
         assert_eq!(
@@ -3678,7 +3690,7 @@ mod tests {
                 .js
                 .active_pattern()
                 .expect("active legacy polymeter")
-                .steps,
+                .steps(),
             Some(Fraction::int(6)),
             "legacy metadata must remain the source-lane LCM"
         );
@@ -3803,7 +3815,7 @@ mod tests {
             "a native zip graph was pushed onto the JavaScript scheduler path"
         );
         assert_eq!(
-            session.js.active_pattern().expect("active zip").steps,
+            session.js.active_pattern().expect("active zip").steps(),
             Some(Fraction::int(6))
         );
         assert_eq!(
@@ -3963,7 +3975,7 @@ mod tests {
                     .js
                     .active_pattern()
                     .expect("active list graph")
-                    .steps,
+                    .steps(),
                 Some(Fraction::int(9)),
                 "{source}: stepcat lost list step metadata"
             );
@@ -4093,7 +4105,7 @@ mod tests {
             .evaluate("silence.tour(...Array.from({ length: 127 }, () => silence))")
             .expect("construct exact-bound tour");
         assert_eq!(
-            exact.js.active_pattern().expect("exact-bound tour").steps,
+            exact.js.active_pattern().expect("exact-bound tour").steps(),
             Some(Fraction::int(16_384))
         );
         assert!(
@@ -4171,7 +4183,7 @@ mod tests {
                 .js
                 .active_pattern()
                 .expect("exact-bound stepalt")
-                .steps,
+                .steps(),
             Some(Fraction::ZERO)
         );
         assert!(

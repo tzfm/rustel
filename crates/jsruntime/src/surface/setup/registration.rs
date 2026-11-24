@@ -352,8 +352,10 @@ impl<'js> JsClass<'js> for NativeSetStringParser<'js> {
         // A compiled callback must not stand for a string argument that the
         // parser now reads. Teardown severs the parser after the host roots
         // are gone, and nothing is compiled then.
-        if let Ok(state) = host_callback_ir(params.ctx()) {
-            state.gate.borrow_mut().close_raw_strings();
+        let active = common::truthy(params.ctx(), parser.clone()).unwrap_or(true);
+        if let Ok(ir) = host_callback_ir(params.ctx()) {
+            ir.gate.borrow_mut().close_raw_strings();
+            ir.string_parser_active.set(active);
         }
         state.borrow_mut().string_parser = parser.clone();
         Ok(parser)

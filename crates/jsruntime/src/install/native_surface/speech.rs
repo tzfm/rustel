@@ -14,7 +14,7 @@ enum Field {
 fn spoken_text(text: Value) -> Value {
     match text {
         // `+ 0.0` turns -0 into 0, as JavaScript prints it.
-        Value::F64(number) if number.is_finite() => Value::Str((number + 0.0).to_string()),
+        Value::F64(number) if number.is_finite() => Value::Str((number + 0.0).to_string().into()),
         other => other,
     }
 }
@@ -103,7 +103,7 @@ fn speech_text<'js>(
             .as_string()
             .expect("caller checked is_string")
             .to_string()?;
-        Ok(rustel_core::pure(Value::Str(text)))
+        Ok(rustel_core::pure(Value::Str(text.into())))
     };
     let mut sidecars = Vec::new();
     match args.0.first() {

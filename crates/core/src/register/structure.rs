@@ -355,7 +355,8 @@ pub(super) fn register(r: &mut Registry) {
         false,
         crate::native_combinator!(|args, pat| {
             let name: std::sync::Arc<str> = match args.first() {
-                Some(crate::Value::Str(text)) => std::sync::Arc::from(text.as_str()),
+                // A handle of the text.
+                Some(crate::Value::Str(text)) => text.to_arc(),
                 Some(other) => std::sync::Arc::from(other.show().as_str()),
                 None => std::sync::Arc::from(""),
             };
@@ -374,10 +375,10 @@ pub(super) fn register(r: &mut Registry) {
         WHEN,
         3,
         false,
-        crate::native_combinator!(|args, pat| c::when(
+        super::native_transformer!(1, |args, func, pat| c::when(
             &pat,
             args.first().is_some_and(Value::js_truthy),
-            arg_function(args, 1)
+            func
         )),
     );
 
@@ -387,7 +388,7 @@ pub(super) fn register(r: &mut Registry) {
         APPLY,
         2,
         false,
-        crate::native_combinator!(|args, pat| c::apply(&pat, arg_function(args, 0))),
+        super::native_transformer!(0, |_args, func, pat| c::apply(&pat, func)),
     );
 
     add_fn(
@@ -396,10 +397,10 @@ pub(super) fn register(r: &mut Registry) {
         APPLY_N,
         3,
         false,
-        crate::native_combinator!(|args, pat| c::apply_n(
+        super::native_transformer!(1, |args, func, pat| c::apply_n(
             &pat,
             arg_number(args, 0) as i64,
-            arg_function(args, 1)
+            func
         )),
     );
 
@@ -409,10 +410,10 @@ pub(super) fn register(r: &mut Registry) {
         FIRST_OF,
         3,
         false,
-        crate::native_combinator!(|args, pat| c::first_of(
+        super::native_transformer!(1, |args, func, pat| c::first_of(
             &pat,
             arg_number(args, 0) as i64,
-            arg_function(args, 1)
+            func
         )),
     );
 
@@ -422,10 +423,10 @@ pub(super) fn register(r: &mut Registry) {
         LAST_OF,
         3,
         false,
-        crate::native_combinator!(|args, pat| c::last_of(
+        super::native_transformer!(1, |args, func, pat| c::last_of(
             &pat,
             arg_number(args, 0) as i64,
-            arg_function(args, 1)
+            func
         )),
     );
 
@@ -435,7 +436,7 @@ pub(super) fn register(r: &mut Registry) {
         JUX,
         2,
         false,
-        crate::native_combinator!(|args, pat| c::jux(&pat, arg_function(args, 0))),
+        super::native_transformer!(0, |_args, func, pat| c::jux(&pat, func)),
     );
 
     add_fn(
@@ -444,10 +445,10 @@ pub(super) fn register(r: &mut Registry) {
         JUX_BY,
         3,
         false,
-        crate::native_combinator!(|args, pat| c::jux_by(
+        super::native_transformer!(1, |args, func, pat| c::jux_by(
             &pat,
             arg_number(args, 0),
-            arg_function(args, 1)
+            func
         )),
     );
 
@@ -457,10 +458,10 @@ pub(super) fn register(r: &mut Registry) {
         JUX_FLIP_BY,
         3,
         false,
-        crate::native_combinator!(|args, pat| c::jux_flip_by(
+        super::native_transformer!(1, |args, func, pat| c::jux_flip_by(
             &pat,
             arg_number(args, 0),
-            arg_function(args, 1)
+            func
         )),
     );
 
@@ -470,7 +471,7 @@ pub(super) fn register(r: &mut Registry) {
         JUX_FLIP,
         2,
         false,
-        crate::native_combinator!(|args, pat| c::jux_flip(&pat, arg_function(args, 0))),
+        super::native_transformer!(0, |_args, func, pat| c::jux_flip(&pat, func)),
     );
 
     add(

@@ -207,7 +207,7 @@ fn from_js_within_depth(
     } else if let Some(n) = v.as_number() {
         Value::F64(n)
     } else if let Some(s) = v.as_string() {
-        Value::Str(js_string_text(s)?)
+        Value::Str(js_string_text(s)?.into())
     } else if v.is_big_int() {
         // `Number(bigint)`: the exact decimal digits parse to the correctly
         // rounded f64, and magnitudes past f64 read as ±infinity.
@@ -228,7 +228,7 @@ fn from_js_within_depth(
                 items.push(from_js_within_depth(&item, remaining, depth + 1)?);
             }
         }
-        Value::List(items)
+        Value::list(items)
     } else if let Some(object) = v.as_object() {
         // Each property charges one element, so a child shared by several
         // keys cannot multiply the walk past the budget. Arrays reached
@@ -242,7 +242,7 @@ fn from_js_within_depth(
         }
         Value::object(entries)
     } else {
-        Value::Str(format!("{v:?}"))
+        Value::Str(format!("{v:?}").into())
     })
 }
 

@@ -111,10 +111,24 @@ pub fn rands_at_time(time: f64, count: usize, seed: f64) -> Vec<f64> {
 }
 
 /// The first value of [`rands_at_time`], without a list.
+#[inline]
 pub fn rand_at_time(time: f64, seed: f64) -> f64 {
-    match rng_mode() {
+    let mode = rng_mode();
+    let seed_i32 = if matches!(mode, RngMode::Precise) {
+        crate::compose::to_int32(seed)
+    } else {
+        0
+    };
+    rand_at_time_with_mode(mode, time, seed, seed_i32)
+}
+
+/// [`rand_at_time`] with pre-resolved [`RngMode`] and `ToInt32(seed)` for tight
+/// segmented-wave loops.
+#[inline(always)]
+pub(crate) fn rand_at_time_with_mode(mode: RngMode, time: f64, seed: f64, seed_i32: i32) -> f64 {
+    match mode {
         RngMode::Legacy => legacy_seed_rand(legacy_time_seed(time + seed)).abs(),
-        RngMode::Precise => precise_at(time_key(time), 0, crate::compose::to_int32(seed)),
+        RngMode::Precise => precise_at(time_key(time), 0, seed_i32),
     }
 }
 

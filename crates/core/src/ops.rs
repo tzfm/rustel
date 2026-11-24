@@ -32,7 +32,7 @@ later version.
 //! rather than a false-pure pattern escaping to the tight-lookahead path.
 
 use crate::purity::PurePattern;
-use crate::{Hap, Pattern, Value};
+use crate::{Combine, Hap, Pattern, Value};
 use rustel_fraction::Fraction;
 
 /// The purity-parametric combinator surface.
@@ -43,10 +43,23 @@ use rustel_fraction::Fraction;
 pub trait PatOps: Clone + Sized + Send + Sync + 'static {
     // -- constructors ------------------------------------------------------
     fn pat_pure(value: Value) -> Self;
+    fn pat_pulse(rate: Fraction) -> Self {
+        Self::pat_pure(Value::Bool(true)).fast(rate)
+    }
     fn pat_silence() -> Self;
     fn pat_query_error(message: std::sync::Arc<str>) -> Self;
     fn pat_query_limit(limit: crate::QueryLimit) -> Self;
     fn pat_stack(pats: Vec<Self>) -> Self;
+    fn pat_stack_opt(pats: &mut [Option<Self>]) -> Self {
+        Self::pat_stack(pats.iter_mut().filter_map(Option::take).collect())
+    }
+    fn pat_off(&self, time: Fraction, f: Option<&crate::value::FunctionRef>) -> Self {
+        let mut pair = [
+            Some(self.clone()),
+            Some(crate::combinators::call_owned(self.late(time), f)),
+        ];
+        Self::pat_stack_opt(&mut pair)
+    }
     fn pat_slowcat(pats: Vec<Self>) -> Self;
     fn pat_slowcat_prime(pats: Vec<Self>) -> Self;
     fn pat_fastcat(pats: Vec<Self>) -> Self;
@@ -61,11 +74,23 @@ pub trait PatOps: Clone + Sized + Send + Sync + 'static {
 
     // -- time --------------------------------------------------------------
     fn fast(&self, factor: Fraction) -> Self;
+    fn fast_owned(self, factor: Fraction) -> Self
+    where
+        Self: Sized,
+    {
+        self.fast(factor)
+    }
     /// The speed change itself, with no zero check or step update. Only
     /// [`crate::combinators::checked_fast`] calls it.
     #[doc(hidden)]
     fn fast_node(&self, factor: Fraction, operation: &'static str) -> Self;
     fn slow(&self, factor: Fraction) -> Self;
+    fn slow_owned(self, factor: Fraction) -> Self
+    where
+        Self: Sized,
+    {
+        self.slow(factor)
+    }
     fn early(&self, t: Fraction) -> Self;
     fn late(&self, t: Fraction) -> Self;
     fn fast_gap(&self, factor: Fraction) -> Self;
@@ -95,13 +120,28 @@ pub trait PatOps: Clone + Sized + Send + Sync + 'static {
 
     // -- values ------------------------------------------------------------
     fn fmap(&self, f: impl Fn(&Value) -> Value + Send + Sync + 'static) -> Self;
-    fn map_control(&self, spec: crate::controls::ControlSpec, unnamed_only: bool) -> Self;
+    fn map_control(&self, spec: &crate::controls::ControlSpec, unnamed_only: bool) -> Self;
+    /// This pattern with the control of `spec` set to the constant `value`,
+    /// where the `set` of that control folds into this pattern with no
+    /// pattern between. `Err` gives the pattern back as it was. See
+    /// [`crate::Pattern::set_constant_control`].
+    fn set_constant_control(
+        self,
+        spec: &crate::controls::ControlSpec,
+        value: &Self,
+    ) -> Result<Self, Self>;
     fn filter_values(&self, predicate: impl Fn(&Value) -> bool + Send + Sync + 'static) -> Self;
+    /// [`Self::filter_values`] with an already-built predicate, for a
+    /// combinator that interned one by what it reads.
+    fn filter_values_with(&self, predicate: crate::ValuePredicate) -> Self;
     fn filter_haps(&self, predicate: impl Fn(&Hap) -> bool + Send + Sync + 'static) -> Self;
     fn filter_haps_function(&self, function: Option<&crate::value::FunctionRef>) -> Self;
     fn filter_when_function(&self, function: Option<&crate::value::FunctionRef>) -> Self;
     /// Native `withHaps` with per-hap drop (tonal `scale`'s shape).
     fn map_haps_native(&self, f: impl Fn(&Hap) -> Option<Hap> + Send + Sync + 'static) -> Self;
+    /// [`Self::map_haps_native`] for a body that captures nothing: one
+    /// closure object per body for the whole process.
+    fn map_haps_native_static(&self, body: fn(&Hap) -> Option<Hap>) -> Self;
     /// Internal pitch-only rewrite: named gain, cutoff and resonance controls must not be transformed.
     #[doc(hidden)]
     fn map_pitch_haps_native(
@@ -109,6 +149,37 @@ pub trait PatOps: Clone + Sized + Send + Sync + 'static {
         f: impl Fn(&Hap) -> Option<Hap> + Send + Sync + 'static,
     ) -> Self {
         self.map_haps_native(f)
+    }
+    /// Internal pitch-only rewrite interned by the name it reads: one
+    /// closure object per name for the whole process.
+    #[doc(hidden)]
+    ///
+    /// `make` gives the rewrite of a hap, and the note that the rewrite
+    /// makes of a note or a step that a hap holds alone.
+    fn map_pitch_haps_native_interned<F, G>(
+        &self,
+        key: &str,
+        make: impl FnOnce() -> (F, G, Option<std::sync::Arc<str>>),
+    ) -> Self
+    where
+        F: Fn(&Hap) -> Option<Hap> + Send + Sync + 'static,
+        G: Fn(&crate::Value) -> Option<crate::Value> + Send + Sync + 'static,
+    {
+        let _ = key;
+        self.map_pitch_haps_native(make().0)
+    }
+    /// Owned variant of [`Self::map_pitch_haps_native_interned`] that can
+    /// mutate uniquely-owned pattern nodes in place.
+    fn map_pitch_haps_native_interned_owned<F, G>(
+        self,
+        key: &str,
+        make: impl FnOnce() -> (F, G, Option<std::sync::Arc<str>>),
+    ) -> Self
+    where
+        F: Fn(&Hap) -> Option<Hap> + Send + Sync + 'static,
+        G: Fn(&crate::Value) -> Option<crate::Value> + Send + Sync + 'static,
+    {
+        self.map_pitch_haps_native_interned(key, make)
     }
     fn fit(&self) -> Self;
     /// One hap → N haps sharing its span (`voicing()`'s shape).
@@ -120,6 +191,16 @@ pub trait PatOps: Clone + Sized + Send + Sync + 'static {
         f: impl Fn(&Hap) -> Vec<Hap> + Send + Sync + 'static,
     ) -> Self {
         self.expand_haps_native(f)
+    }
+    /// Internal voicing expansion for a body that captures nothing: one
+    /// closure object per body for the whole process, writing directly onto `out`.
+    #[doc(hidden)]
+    fn expand_pitch_haps_native_static(&self, body: fn(&Hap, &mut Vec<Hap>)) -> Self {
+        self.expand_pitch_haps_native(move |hap| {
+            let mut out = Vec::new();
+            body(hap, &mut out);
+            out
+        })
     }
     /// `tag(name)` - mark haps for a later `hasTag` filter.
     fn tag(&self, name: std::sync::Arc<str>) -> Self;
@@ -136,6 +217,8 @@ pub trait PatOps: Clone + Sized + Send + Sync + 'static {
     fn onsets_only(&self) -> Self;
     fn remove_undefineds(&self) -> Self;
     fn degrade_by_seeded(&self, amount: f64, seed: u32) -> Self;
+    #[doc(hidden)]
+    fn degrade_by_rand(&self, amount: f64, inverted: bool) -> Self;
 
     // -- application -------------------------------------------------------
     fn app_left_with(
@@ -171,6 +254,37 @@ pub trait PatOps: Clone + Sized + Send + Sync + 'static {
         combine: impl Fn(&Value, &Value) -> Value + Send + Sync + 'static,
         lookup_flow: crate::LookupFlow,
     ) -> Self;
+    /// `app_*_with_lookup` with an already-built combine, for a combinator
+    /// that interned one by what it reads. See [`crate::interned_closure`].
+    fn app_left_interned(
+        &self,
+        other: Self,
+        combine: crate::CombineFn,
+        lookup_flow: crate::LookupFlow,
+    ) -> Self;
+    /// [`Self::app_left_interned`] at `appRight` alignment.
+    fn app_right_interned(
+        &self,
+        other: Self,
+        combine: crate::CombineFn,
+        lookup_flow: crate::LookupFlow,
+    ) -> Self;
+    /// [`Self::app_left_interned`] at `appBoth` alignment.
+    fn app_both_interned(
+        &self,
+        other: Self,
+        combine: crate::CombineFn,
+        lookup_flow: crate::LookupFlow,
+    ) -> Self;
+    /// This pattern with each of `numbers` composed `in` in turn, as
+    /// [`crate::compose::compose`] composes a `pure` of each, in one node
+    /// with no pattern of a number. `None` when the pattern takes no run of
+    /// numbers so: the caller then composes each.
+    fn met_numbers(&self, numbers: &[(crate::compose::ComposeOp, f64)]) -> Option<Self>;
+    /// This pattern with each step `count` times in its time, in one
+    /// sequence. `None` when the pattern is no sequence of whole steps of
+    /// data: the caller then joins a pattern for each hap.
+    fn plied(&self, count: usize) -> Option<Self>;
     /// `app_*_with_lookup` of [`crate::compose::compose_op`] for `op`.
     fn app_left_composed(
         &self,
@@ -208,6 +322,12 @@ pub trait PatOps: Clone + Sized + Send + Sync + 'static {
     /// `Registration::function_argument`, which keeps it unreachable.
     fn apply_fn(&self, f: &crate::value::FunctionRef) -> Self;
 
+    /// Owned variant of [`Self::apply_fn`], moving `self` into `f` without
+    /// bumping reference counts so `Arc::get_mut` fast paths remain available.
+    fn apply_fn_owned(self, f: &crate::value::FunctionRef) -> Self {
+        self.apply_fn(f)
+    }
+
     /// Apply one indexed transformer to a complete `echoWith` batch.
     ///
     /// The associated form makes the two-phase JavaScript boundary explicit:
@@ -239,6 +359,28 @@ impl PatOps for Pattern {
     fn pat_pure(value: Value) -> Self {
         crate::pure(value)
     }
+    fn pat_pulse(rate: Fraction) -> Self {
+        if rate.denom() == 1
+            && !crate::sequence::builds_each_node()
+            && let Some(slot) = match rate.numer() {
+                1 => Some(0),
+                2 => Some(1),
+                4 => Some(2),
+                8 => Some(3),
+                16 => Some(4),
+                32 => Some(5),
+                64 => Some(6),
+                _ => None,
+            }
+        {
+            static PULSES: [std::sync::OnceLock<Pattern>; 7] =
+                [const { std::sync::OnceLock::new() }; 7];
+            return PULSES[slot]
+                .get_or_init(|| crate::pure(Value::Bool(true)).fast(rate))
+                .clone();
+        }
+        crate::pure(Value::Bool(true)).fast(rate)
+    }
     fn pat_silence() -> Self {
         crate::silence()
     }
@@ -250,6 +392,19 @@ impl PatOps for Pattern {
     }
     fn pat_stack(pats: Vec<Self>) -> Self {
         crate::stack(pats)
+    }
+    fn pat_stack_opt(pats: &mut [Option<Self>]) -> Self {
+        crate::stack_slice(pats)
+    }
+    fn pat_off(&self, time: Fraction, f: Option<&crate::value::FunctionRef>) -> Self {
+        if let Some(folded) = crate::sequence::off_shifted(self, time, f) {
+            return folded;
+        }
+        let mut pair = [
+            Some(self.clone()),
+            Some(crate::combinators::call_owned(self.late(time), f)),
+        ];
+        Self::pat_stack_opt(&mut pair)
     }
     fn pat_slowcat(pats: Vec<Self>) -> Self {
         crate::slowcat(pats)
@@ -271,7 +426,7 @@ impl PatOps for Pattern {
     }
 
     fn pat_steps(&self) -> Option<Fraction> {
-        self.steps
+        self.steps()
     }
     fn set_steps(&self, steps: Option<Fraction>) -> Self {
         self.clone().with_steps(steps)
@@ -280,11 +435,17 @@ impl PatOps for Pattern {
     fn fast(&self, factor: Fraction) -> Self {
         Pattern::fast(self, factor)
     }
+    fn fast_owned(self, factor: Fraction) -> Self {
+        Pattern::fast_owned(self, factor)
+    }
     fn fast_node(&self, factor: Fraction, operation: &'static str) -> Self {
         Pattern::fast_node(self, factor, operation)
     }
     fn slow(&self, factor: Fraction) -> Self {
         Pattern::slow(self, factor)
+    }
+    fn slow_owned(self, factor: Fraction) -> Self {
+        Pattern::slow_owned(self, factor)
     }
     fn early(&self, t: Fraction) -> Self {
         Pattern::early(self, t)
@@ -353,6 +514,11 @@ impl PatOps for Pattern {
     fn filter_values(&self, predicate: impl Fn(&Value) -> bool + Send + Sync + 'static) -> Self {
         Pattern::filter_values(self, predicate)
     }
+    /// [`Self::filter_values`] with an already-built predicate, for a
+    /// combinator that interned one by what it reads.
+    fn filter_values_with(&self, predicate: crate::ValuePredicate) -> Self {
+        Pattern::filter_values_with(self, predicate)
+    }
     fn filter_haps(&self, predicate: impl Fn(&Hap) -> bool + Send + Sync + 'static) -> Self {
         Pattern::filter_haps(self, predicate)
     }
@@ -371,11 +537,36 @@ impl PatOps for Pattern {
     fn map_haps_native(&self, f: impl Fn(&Hap) -> Option<Hap> + Send + Sync + 'static) -> Self {
         Pattern::map_haps_native(self, f)
     }
+    fn map_haps_native_static(&self, body: fn(&Hap) -> Option<Hap>) -> Self {
+        Pattern::map_haps_native_static(self, body)
+    }
     fn map_pitch_haps_native(
         &self,
         f: impl Fn(&Hap) -> Option<Hap> + Send + Sync + 'static,
     ) -> Self {
         Pattern::map_pitch_haps_native(self, f)
+    }
+    fn map_pitch_haps_native_interned<F, G>(
+        &self,
+        key: &str,
+        make: impl FnOnce() -> (F, G, Option<std::sync::Arc<str>>),
+    ) -> Self
+    where
+        F: Fn(&Hap) -> Option<Hap> + Send + Sync + 'static,
+        G: Fn(&crate::Value) -> Option<crate::Value> + Send + Sync + 'static,
+    {
+        Pattern::map_pitch_haps_native_interned(self, key, make)
+    }
+    fn map_pitch_haps_native_interned_owned<F, G>(
+        self,
+        key: &str,
+        make: impl FnOnce() -> (F, G, Option<std::sync::Arc<str>>),
+    ) -> Self
+    where
+        F: Fn(&Hap) -> Option<Hap> + Send + Sync + 'static,
+        G: Fn(&crate::Value) -> Option<crate::Value> + Send + Sync + 'static,
+    {
+        Pattern::map_pitch_haps_native_interned_owned(self, key, make)
     }
     fn expand_pitch_haps_native(
         &self,
@@ -383,8 +574,18 @@ impl PatOps for Pattern {
     ) -> Self {
         Pattern::expand_pitch_haps_native(self, f)
     }
-    fn map_control(&self, spec: crate::controls::ControlSpec, unnamed_only: bool) -> Self {
+    fn expand_pitch_haps_native_static(&self, body: fn(&Hap, &mut Vec<Hap>)) -> Self {
+        Pattern::expand_pitch_haps_native_static(self, body)
+    }
+    fn map_control(&self, spec: &crate::controls::ControlSpec, unnamed_only: bool) -> Self {
         Pattern::map_control(self, spec, unnamed_only)
+    }
+    fn set_constant_control(
+        self,
+        spec: &crate::controls::ControlSpec,
+        value: &Self,
+    ) -> Result<Self, Self> {
+        Pattern::set_constant_control(self, spec, value)
     }
     fn fit(&self) -> Self {
         Pattern::fit(self)
@@ -415,6 +616,10 @@ impl PatOps for Pattern {
     }
     fn degrade_by_seeded(&self, amount: f64, seed: u32) -> Self {
         Pattern::degrade_by_seeded(self, amount, seed)
+    }
+
+    fn degrade_by_rand(&self, amount: f64, inverted: bool) -> Self {
+        Pattern::degrade_by_rand(self, amount, inverted)
     }
 
     fn app_left_with(
@@ -462,6 +667,36 @@ impl PatOps for Pattern {
     ) -> Self {
         Pattern::app_both_with_lookup(self, other, combine, lookup_flow)
     }
+    fn app_left_interned(
+        &self,
+        other: Self,
+        combine: crate::CombineFn,
+        lookup_flow: crate::LookupFlow,
+    ) -> Self {
+        Pattern::app_left_by(self, other, Combine::with(combine), lookup_flow)
+    }
+    fn app_right_interned(
+        &self,
+        other: Self,
+        combine: crate::CombineFn,
+        lookup_flow: crate::LookupFlow,
+    ) -> Self {
+        Pattern::app_right_by(self, other, Combine::with(combine), lookup_flow)
+    }
+    fn app_both_interned(
+        &self,
+        other: Self,
+        combine: crate::CombineFn,
+        lookup_flow: crate::LookupFlow,
+    ) -> Self {
+        Pattern::app_both_by(self, other, Combine::with(combine), lookup_flow)
+    }
+    fn met_numbers(&self, numbers: &[(crate::compose::ComposeOp, f64)]) -> Option<Self> {
+        Pattern::met_numbers(self, numbers)
+    }
+    fn plied(&self, count: usize) -> Option<Self> {
+        crate::sequence::plied(self, count)
+    }
     fn app_left_composed(
         &self,
         other: Self,
@@ -492,7 +727,7 @@ impl PatOps for Pattern {
     }
     fn outer_bind(&self, f: impl Fn(&Value) -> Self + Send + Sync + 'static) -> Self {
         // `outerBind` carries `_steps` through, `innerBind` does not.
-        self.fmap_to_pattern(f).outer_join().with_steps(self.steps)
+        self.fmap_to_pattern(f).outer_join().with_steps_of(self)
     }
     fn mix_bind(&self, f: impl Fn(&Value) -> Self + Send + Sync + 'static) -> Self {
         self.fmap_to_pattern(f).mix_join()
@@ -512,6 +747,10 @@ impl PatOps for Pattern {
 
     fn apply_fn(&self, f: &crate::value::FunctionRef) -> Self {
         f.apply(self.clone())
+    }
+
+    fn apply_fn_owned(self, f: &crate::value::FunctionRef) -> Self {
+        f.apply(self)
     }
 
     fn apply_fn_indexed_batch(
@@ -553,6 +792,31 @@ impl PatOps for PurePattern {
             pats.into_iter().map(|p| p.pattern().clone()).collect(),
         ))
     }
+    fn pat_stack_opt(pats: &mut [Option<Self>]) -> Self {
+        if pats.len() <= 8 {
+            let mut inner: [Option<Pattern>; 8] = [const { None }; 8];
+            for (slot, pat) in inner.iter_mut().zip(pats.iter_mut()) {
+                *slot = pat.take().map(|p| p.0);
+            }
+            return PurePattern::assert_pure(crate::stack_slice(&mut inner[..pats.len()]));
+        }
+        PurePattern::assert_pure(crate::stack(
+            pats.iter_mut()
+                .filter_map(Option::take)
+                .map(|p| p.0)
+                .collect(),
+        ))
+    }
+    fn pat_off(&self, time: Fraction, f: Option<&crate::value::FunctionRef>) -> Self {
+        if let Some(folded) = crate::sequence::off_shifted(&self.0, time, f) {
+            return PurePattern::assert_pure(folded);
+        }
+        let mut pair = [
+            Some(self.clone()),
+            Some(crate::combinators::call_owned(self.late(time), f)),
+        ];
+        Self::pat_stack_opt(&mut pair)
+    }
     fn pat_slowcat(pats: Vec<Self>) -> Self {
         PurePattern::assert_pure(crate::slowcat(
             pats.into_iter().map(|p| p.pattern().clone()).collect(),
@@ -579,7 +843,7 @@ impl PatOps for PurePattern {
     }
 
     fn pat_steps(&self) -> Option<Fraction> {
-        self.pattern().steps
+        self.pattern().steps()
     }
     fn set_steps(&self, steps: Option<Fraction>) -> Self {
         PurePattern::with_steps(self, steps)
@@ -588,11 +852,17 @@ impl PatOps for PurePattern {
     fn fast(&self, factor: Fraction) -> Self {
         PurePattern::fast(self, factor)
     }
+    fn fast_owned(self, factor: Fraction) -> Self {
+        PurePattern::assert_pure(self.0.fast_owned(factor))
+    }
     fn fast_node(&self, factor: Fraction, operation: &'static str) -> Self {
         PurePattern::assert_pure(self.pattern().fast_node(factor, operation))
     }
     fn slow(&self, factor: Fraction) -> Self {
         PurePattern::slow(self, factor)
+    }
+    fn slow_owned(self, factor: Fraction) -> Self {
+        PurePattern::assert_pure(self.0.slow_owned(factor))
     }
     fn early(&self, t: Fraction) -> Self {
         PurePattern::early(self, t)
@@ -661,6 +931,9 @@ impl PatOps for PurePattern {
     fn filter_values(&self, predicate: impl Fn(&Value) -> bool + Send + Sync + 'static) -> Self {
         PurePattern::assert_pure(self.pattern().filter_values(predicate))
     }
+    fn filter_values_with(&self, predicate: crate::ValuePredicate) -> Self {
+        PurePattern::assert_pure(self.pattern().filter_values_with(predicate))
+    }
     fn filter_haps(&self, predicate: impl Fn(&Hap) -> bool + Send + Sync + 'static) -> Self {
         PurePattern::assert_pure(self.pattern().filter_haps(predicate))
     }
@@ -677,11 +950,36 @@ impl PatOps for PurePattern {
     fn map_haps_native(&self, f: impl Fn(&Hap) -> Option<Hap> + Send + Sync + 'static) -> Self {
         PurePattern::assert_pure(self.pattern().map_haps_native(f))
     }
+    fn map_haps_native_static(&self, body: fn(&Hap) -> Option<Hap>) -> Self {
+        PurePattern::assert_pure(self.pattern().map_haps_native_static(body))
+    }
     fn map_pitch_haps_native(
         &self,
         f: impl Fn(&Hap) -> Option<Hap> + Send + Sync + 'static,
     ) -> Self {
         PurePattern::assert_pure(self.pattern().map_pitch_haps_native(f))
+    }
+    fn map_pitch_haps_native_interned<F, G>(
+        &self,
+        key: &str,
+        make: impl FnOnce() -> (F, G, Option<std::sync::Arc<str>>),
+    ) -> Self
+    where
+        F: Fn(&Hap) -> Option<Hap> + Send + Sync + 'static,
+        G: Fn(&crate::Value) -> Option<crate::Value> + Send + Sync + 'static,
+    {
+        PurePattern::assert_pure(self.pattern().map_pitch_haps_native_interned(key, make))
+    }
+    fn map_pitch_haps_native_interned_owned<F, G>(
+        self,
+        key: &str,
+        make: impl FnOnce() -> (F, G, Option<std::sync::Arc<str>>),
+    ) -> Self
+    where
+        F: Fn(&Hap) -> Option<Hap> + Send + Sync + 'static,
+        G: Fn(&crate::Value) -> Option<crate::Value> + Send + Sync + 'static,
+    {
+        PurePattern::assert_pure(self.0.map_pitch_haps_native_interned_owned(key, make))
     }
     fn expand_pitch_haps_native(
         &self,
@@ -689,8 +987,23 @@ impl PatOps for PurePattern {
     ) -> Self {
         PurePattern::assert_pure(self.pattern().expand_pitch_haps_native(f))
     }
-    fn map_control(&self, spec: crate::controls::ControlSpec, unnamed_only: bool) -> Self {
+    fn expand_pitch_haps_native_static(&self, body: fn(&Hap, &mut Vec<Hap>)) -> Self {
+        PurePattern::assert_pure(self.pattern().expand_pitch_haps_native_static(body))
+    }
+    fn map_control(&self, spec: &crate::controls::ControlSpec, unnamed_only: bool) -> Self {
         PurePattern::assert_pure(self.pattern().map_control(spec, unnamed_only))
+    }
+    fn set_constant_control(
+        self,
+        spec: &crate::controls::ControlSpec,
+        value: &Self,
+    ) -> Result<Self, Self> {
+        // A set of a data value keeps a pure pattern pure, and a pattern
+        // that comes back is the one that went in.
+        self.0
+            .set_constant_control(spec, value.pattern())
+            .map(PurePattern::assert_pure)
+            .map_err(PurePattern)
     }
     fn fit(&self) -> Self {
         PurePattern::assert_pure(self.pattern().fit())
@@ -721,6 +1034,10 @@ impl PatOps for PurePattern {
     }
     fn degrade_by_seeded(&self, amount: f64, seed: u32) -> Self {
         PurePattern::assert_pure(self.pattern().degrade_by_seeded(amount, seed))
+    }
+
+    fn degrade_by_rand(&self, amount: f64, inverted: bool) -> Self {
+        PurePattern::assert_pure(self.pattern().degrade_by_rand(amount, inverted))
     }
 
     fn app_left_with(
@@ -789,6 +1106,52 @@ impl PatOps for PurePattern {
             lookup_flow,
         ))
     }
+    fn app_left_interned(
+        &self,
+        other: Self,
+        combine: crate::CombineFn,
+        lookup_flow: crate::LookupFlow,
+    ) -> Self {
+        PurePattern::assert_pure(self.pattern().app_left_by(
+            other.pattern().clone(),
+            Combine::with(combine),
+            lookup_flow,
+        ))
+    }
+    fn app_right_interned(
+        &self,
+        other: Self,
+        combine: crate::CombineFn,
+        lookup_flow: crate::LookupFlow,
+    ) -> Self {
+        PurePattern::assert_pure(self.pattern().app_right_by(
+            other.pattern().clone(),
+            Combine::with(combine),
+            lookup_flow,
+        ))
+    }
+    fn app_both_interned(
+        &self,
+        other: Self,
+        combine: crate::CombineFn,
+        lookup_flow: crate::LookupFlow,
+    ) -> Self {
+        PurePattern::assert_pure(self.pattern().app_both_by(
+            other.pattern().clone(),
+            Combine::with(combine),
+            lookup_flow,
+        ))
+    }
+    fn met_numbers(&self, numbers: &[(crate::compose::ComposeOp, f64)]) -> Option<Self> {
+        // Numbers are data, so the run of them is as pure as its receiver.
+        self.pattern()
+            .met_numbers(numbers)
+            .map(PurePattern::assert_pure)
+    }
+    fn plied(&self, count: usize) -> Option<Self> {
+        // Steps of data are as pure as their receiver.
+        crate::sequence::plied(self.pattern(), count).map(PurePattern::assert_pure)
+    }
     fn app_left_composed(
         &self,
         other: Self,
@@ -830,7 +1193,7 @@ impl PatOps for PurePattern {
         PurePattern::assert_pure(self.pattern().fmap_to_pure_pattern(f).inner_join())
     }
     fn outer_bind(&self, f: impl Fn(&Value) -> Self + Send + Sync + 'static) -> Self {
-        let steps = self.pattern().steps;
+        let steps = self.pattern().steps();
         PurePattern::assert_pure(
             self.pattern()
                 .fmap_to_pure_pattern(f)
@@ -857,11 +1220,22 @@ impl PatOps for PurePattern {
     fn apply_fn(&self, f: &crate::value::FunctionRef) -> Self {
         f.apply_pure(self.clone()).unwrap_or_else(|| {
             // Unreachable: a registration that consumes a function argument
-            // declares `function_argument`, which keeps the general path on the
-            // dynamic constructor, and the fast path checks the argument
-            // values. Kept as the self-check that keeps that claim honest.
+            // declares `function_argument`. Its general path then takes the
+            // pure route only with constant functions that have a pure view,
+            // and the fast path checks the argument values. Kept as the
+            // self-check that keeps that claim honest.
             PurePattern::assert_pure(f.apply(self.pattern().clone()))
         })
+    }
+
+    fn apply_fn_owned(self, f: &crate::value::FunctionRef) -> Self {
+        if f.is_native() {
+            if let Some(pure) = f.apply_pure(self) {
+                return pure;
+            }
+            unreachable!("native function must have a pure view");
+        }
+        PurePattern::assert_pure(f.apply(self.pattern().clone()))
     }
 
     fn apply_fn_indexed_batch(

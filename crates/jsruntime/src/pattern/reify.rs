@@ -24,7 +24,7 @@ pub(crate) fn reify_native_reference_arg(
         // can be turned back into a native transformer instead of degrading to
         // `pure(<object>)`.
         if let Some(func) = combinator_reference_within(object.clone(), remaining) {
-            return Some(rustel_core::pure(Value::Function(Box::new(func))));
+            return Some(rustel_core::pure(Value::function(func)));
         }
         // A tagged function that could not be rebuilt fails closed with its
         // caller rather than degrading to the object form of the function.
@@ -70,7 +70,7 @@ pub(crate) fn reify_xen_array<'js>(
         values.push(array.get::<rquickjs::Value>(index)?);
     }
     if values.iter().all(rquickjs::Value::is_number) {
-        let ratios = Value::List(values.iter().map(from_js).collect());
+        let ratios = Value::list(values.iter().map(from_js).collect());
         return Ok((rustel_core::xen::xen(receiver, ratios), Vec::new()));
     }
     let mut patterns = reserve_js_array(ctx, len)?;
@@ -136,7 +136,7 @@ pub(crate) fn reify_bridged<'js>(
         {
             // A native combinator reference needs no cell at all.
             return Ok((
-                rustel_core::pure(Value::Function(Box::new(reference))),
+                rustel_core::pure(Value::function(reference)),
                 Sidecar::default(),
             ));
         }
@@ -147,10 +147,7 @@ pub(crate) fn reify_bridged<'js>(
             })?
             .clone();
         let (function, sidecar) = bridge_pattern_callable(ctx, function)?;
-        return Ok((
-            rustel_core::pure(Value::Function(Box::new(function))),
-            sidecar,
-        ));
+        return Ok((rustel_core::pure(Value::function(function)), sidecar));
     }
     let (bridged, nested) = materialize_js_value(ctx, value)?;
     let pattern = rustel_core::pure(bridged);
@@ -196,7 +193,7 @@ pub(crate) fn reify_indexed_transformer<'js>(
             .is_some();
         if native_unpatternified && let Some(reference) = combinator_reference(object.clone()) {
             return Ok((
-                rustel_core::pure(Value::Function(Box::new(reference))),
+                rustel_core::pure(Value::function(reference)),
                 Sidecar::default(),
             ));
         }
@@ -204,9 +201,7 @@ pub(crate) fn reify_indexed_transformer<'js>(
 
     let (id, sidecar) = bridge_callable(ctx, function.clone())?;
     Ok((
-        rustel_core::pure(Value::Function(Box::new(
-            rustel_core::value::FunctionRef::js(id),
-        ))),
+        rustel_core::pure(Value::function(rustel_core::value::FunctionRef::js(id))),
         sidecar,
     ))
 }
@@ -475,7 +470,7 @@ fn combinator_reference_within(
     let tag: rquickjs::Object = object.get("__rustel_combinator").ok()?;
     let name: String = tag.get("name").ok()?;
     let bound: rquickjs::Array = tag.get("args").ok()?;
-    let registration = registry().get(&name)?.clone();
+    let registration = registry().get(&name)?;
     // Defence in depth: never build a transformer around an argument that
     // cannot be bridged. `reify_args` rejects these first, but
     // `superimpose`/`layer` reach this function directly.
@@ -512,15 +507,102 @@ fn combinator_reference_within(
 /// The transformer is provably pure exactly when the registration keeps a
 /// pure operand pure with these arguments. Otherwise it is applied through
 /// the conservative path.
+pub(crate) enum MethodArgs {
+    Zero,
+    One(Pattern),
+    Two([Pattern; 2]),
+    Many(Vec<Pattern>),
+}
+
+impl MethodArgs {
+    #[inline]
+    pub(crate) fn len(&self) -> usize {
+        match self {
+            Self::Zero => 0,
+            Self::One(_) => 1,
+            Self::Two(_) => 2,
+            Self::Many(v) => v.len(),
+        }
+    }
+
+    #[inline]
+    pub(crate) fn as_slice(&self) -> &[Pattern] {
+        match self {
+            Self::Zero => &[],
+            Self::One(a) => std::slice::from_ref(a),
+            Self::Two(ab) => ab,
+            Self::Many(v) => v,
+        }
+    }
+
+    #[inline]
+    pub(crate) fn into_vec(self) -> Vec<Pattern> {
+        match self {
+            Self::Zero => Vec::new(),
+            Self::One(a) => vec![a],
+            Self::Two([a, b]) => vec![a, b],
+            Self::Many(v) => v,
+        }
+    }
+
+    #[inline]
+    pub(crate) fn from_vec(mut v: Vec<Pattern>) -> Self {
+        match v.len() {
+            0 => Self::Zero,
+            1 => Self::One(v.pop().expect("len 1")),
+            2 => {
+                let b = v.pop().expect("len 2");
+                let a = v.pop().expect("len 1");
+                Self::Two([a, b])
+            }
+            _ => Self::Many(v),
+        }
+    }
+}
+
 pub(crate) fn bound_registered_transformer(
     name: &str,
-    registration: rustel_core::register::Registration,
+    registration: &'static rustel_core::register::Registration,
     args: Vec<Pattern>,
 ) -> rustel_core::value::FunctionRef {
-    let provable_pure = registration.preserves_purity_with(&args);
-    rustel_core::value::FunctionRef::registered(
-        name,
-        std::sync::Arc::new(move |pattern| registration.call(&args, pattern)),
-        provable_pure,
-    )
+    bound_registered_transformer_args(name, registration, MethodArgs::from_vec(args))
+}
+
+/// Build a bound transformer for a non-patterned registered method taking one
+/// plain scalar value, skipping temporary `pure(value)` and closure allocations.
+pub(crate) fn bound_registered_transformer_scalar(
+    name: &str,
+    registration: &'static rustel_core::register::Registration,
+    arg: Value,
+) -> rustel_core::value::FunctionRef {
+    let provable_pure = registration.preserves_purity_with_values(std::slice::from_ref(&arg));
+    rustel_core::value::FunctionRef::bound_scalar(name, registration, arg, provable_pure)
+}
+
+pub(crate) fn bound_registered_transformer_args(
+    name: &str,
+    registration: &'static rustel_core::register::Registration,
+    args: MethodArgs,
+) -> rustel_core::value::FunctionRef {
+    let provable_pure = registration.preserves_purity_with(args.as_slice());
+    match args {
+        MethodArgs::One(a) => {
+            rustel_core::value::FunctionRef::bound_one(name, registration, a, provable_pure)
+        }
+        other => {
+            let body: std::sync::Arc<dyn Fn(Pattern) -> Pattern + Send + Sync> = match other {
+                MethodArgs::Zero => {
+                    std::sync::Arc::new(move |pattern| registration.call(&[], pattern))
+                }
+                MethodArgs::One(_) => unreachable!(),
+                MethodArgs::Two(ab) => {
+                    std::sync::Arc::new(move |pattern| registration.call(&ab, pattern))
+                }
+                MethodArgs::Many(vec) => {
+                    std::sync::Arc::new(move |pattern| registration.call(&vec, pattern))
+                }
+            };
+            rustel_core::value::FunctionRef::registered(name, body, provable_pure)
+        }
+    }
 }

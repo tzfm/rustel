@@ -183,8 +183,8 @@ pub(super) fn register(r: &mut Registry) {
         SCALE,
         2,
         true,
-        crate::native_combinator!(|args, pat| c::scale(
-            &pat,
+        crate::native_combinator!(|args, pat| c::scale_owned(
+            pat,
             args.first().cloned().unwrap_or(crate::Value::Undefined)
         )),
     );

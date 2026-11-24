@@ -70,8 +70,8 @@ jobs:
     cache-mode: write
     uses: ./.github/workflows/heavy-checks.yml
     with:
-      ref: ${{ needs.validate.outputs.ref }}
-      sha: ${{ needs.validate.outputs.sha }}
+      ref: ${{ github.sha }}
+      sha: ${{ github.sha }}
       save_cache: true
 
   pull-request:
