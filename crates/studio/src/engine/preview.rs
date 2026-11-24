@@ -175,10 +175,7 @@ impl StudioEngine {
 
     /// Open keyboard audio when F12 opens, without loading samples or touching transport.
     pub fn prepare_piano(&mut self) -> Result<(), RuntimeError> {
-        #[cfg(feature = "vst")]
-        {
-            self.piano_mode = true;
-        }
+        self.piano_mode = true;
         self.open_piano_output()?;
         self.piano_close_when_idle = false;
         Ok(())
@@ -190,12 +187,10 @@ impl StudioEngine {
     /// call with Piano mode closed asks for no sweep.
     pub fn close_piano_mode(&mut self) {
         #[cfg(feature = "vst")]
-        {
-            if self.piano_mode {
-                self.plugins_swept = false;
-            }
-            self.piano_mode = false;
+        if self.piano_mode {
+            self.plugins_swept = false;
         }
+        self.piano_mode = false;
     }
 
     fn open_piano_output(&mut self) -> Result<(), RuntimeError> {
@@ -434,6 +429,7 @@ impl StudioEngine {
     /// an idle sweep outside Piano mode that unloads a plugin the output
     /// holds a copy of, or a closed tab whose copies it holds.
     pub(super) fn close_piano_output(&mut self) {
+        self.parked_idle_since = None;
         let Some(device) = self.piano_output.take() else {
             return;
         };
@@ -480,7 +476,8 @@ impl StudioEngine {
             };
             // The parked output stays open for the next start: closing a
             // stream and opening one again make their own click on some
-            // hosts, even from silence. Only a failed stream is retired.
+            // hosts, even from silence. A failed stream is retired here,
+            // an idle one after a while below.
             if device.output_failed() {
                 self.close_piano_output();
             } else if tail_done {
@@ -488,6 +485,22 @@ impl StudioEngine {
                 self.piano_has_score_tail = false;
                 self.piano_tail_silent_since = None;
             }
+        }
+        self.close_idle_parked_output(Instant::now());
+    }
+
+    /// Close the parked output once it has idled for [`PARKED_OUTPUT_IDLE`],
+    /// so a stopped studio does not keep the output's rings, pools and DSP.
+    /// The next start opens a new stream.
+    pub(super) fn close_idle_parked_output(&mut self, now: Instant) {
+        if !self.parked_output_idle() || self.recording.is_some() {
+            self.parked_idle_since = None;
+            return;
+        }
+        let since = *self.parked_idle_since.get_or_insert(now);
+        if now.saturating_duration_since(since) >= PARKED_OUTPUT_IDLE {
+            self.close_piano_output();
+            self.owe_free_memory();
         }
     }
 

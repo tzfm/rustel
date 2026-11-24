@@ -403,6 +403,10 @@ each plugin plays out its tail with no sound, until it is quiet for as long
 as the tail it reports, 0.25 seconds at least and 3 seconds at most. A start
 after that has no old tail under its first note.
 
+Outside Piano mode, a stopped output that plays nothing for 30 seconds
+closes, which frees its memory. Its copies go back to the host, and the next
+start opens a new output.
+
 On Linux, with no output chosen, the next start after a Stop opens a new
 output to follow the default device. If you open Piano mode or play a note
 in it before that start, Piano mode opens the new output. When the stopped
