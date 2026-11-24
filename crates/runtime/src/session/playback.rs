@@ -720,7 +720,7 @@ impl Session {
         // The mp3 door is the same render; only the container differs, so a
         // tape bounced either way is the same audio.
         let (plugin_lines, voices_refused) = self.render_under_diagnostic_policy(|session| {
-            if mp3 {
+            if mp3 && session.export_limiter.is_none() {
                 crate::render::write_scalar_mp3_with_dispatch(
                     out_path,
                     session.config.sample_rate,
@@ -733,6 +733,36 @@ impl Session {
                     Some(&csound),
                     &session.render_stop(None),
                 )
+            } else if mp3 {
+                // The limiter runs on the rendered audio: stage it as WAV
+                // beside the target, then encode what it kept.
+                let staged = out_path.with_extension("rendering.wav");
+                let encoded = crate::render::write_scalar_wav_controlled_with_dispatch(
+                    &staged,
+                    session.config.sample_rate,
+                    end_secs,
+                    &onsets,
+                    session.config.cps,
+                    session.samples.as_deref(),
+                    print_progress,
+                    rustel_audio::RenderControl {
+                        limiter: session.export_limiter,
+                        ..rustel_audio::RenderControl::default()
+                    },
+                    rustel_audio::WavSampleFormat::Pcm16,
+                    session.config.dsp_dispatch,
+                    session.max_polyphony(),
+                    Some(&csound),
+                    false,
+                    &session.render_stop(None),
+                )
+                .and_then(|(bytes, refused, lines)| {
+                    let pcm = crate::render::read_pcm16_stereo_wav(&staged)?;
+                    crate::render::encode_mp3(out_path, session.config.sample_rate, &pcm)?;
+                    Ok((bytes, refused, lines))
+                });
+                let _ = std::fs::remove_file(&staged);
+                encoded
             } else {
                 crate::render::write_scalar_wav_controlled_with_dispatch(
                     out_path,
@@ -747,7 +777,7 @@ impl Session {
                         cancelled: None,
                         finish: None,
                         stop_when_silent: None,
-                        limiter: None,
+                        limiter: session.export_limiter,
                     },
                     rustel_audio::WavSampleFormat::Pcm16,
                     session.config.dsp_dispatch,

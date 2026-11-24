@@ -1293,6 +1293,12 @@ impl StudioPrefs {
         Self::load_from(path.as_deref())
     }
 
+    /// The preferences on disk, for a reader that changes nothing: a file
+    /// that does not read stays where it is.
+    pub fn read_only() -> Self {
+        Self::load_from(super::config::read_path(prefs_file_name().as_ref()).as_deref())
+    }
+
     pub fn load_from(path: Option<&std::path::Path>) -> Self {
         let mut prefs: Self = path
             .and_then(|path| bounded_file::read_to_string(path, MAX_DOCUMENT_BYTES).ok())
