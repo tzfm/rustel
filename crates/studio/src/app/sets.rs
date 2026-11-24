@@ -533,7 +533,8 @@ impl App {
     }
 
     /// Enter on the question: a score off the disk, and off the strip when
-    /// open; a tape off the disk. The last score of a set stays.
+    /// open; a tape off the disk. The last score open gives the strip to
+    /// the folder's next one, or to a new empty score.
     pub(super) fn confirm_delete_set_line(&mut self) {
         // Only the armed line goes. The question is what makes a delete a
         // delete, and holding that invariant here rather than at the one
@@ -560,15 +561,15 @@ impl App {
             .find(|scene| scene.path == path)
             .map(|scene| scene.id);
         let result = match line {
-            Some(SetLine::File(_)) => self.scenes.delete_file(&path).map(|_| ()),
+            Some(SetLine::File(_)) => self.scenes.delete_file(&path).map(|gone| gone.stand_in),
             _ => match std::fs::remove_file(&path) {
-                Ok(()) => Ok(()),
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+                Ok(()) => Ok(None),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
                 Err(error) => Err(SceneError::Io(error)),
             },
         };
         match result {
-            Ok(()) => {
+            Ok(stand_in) => {
                 if matches!(line, Some(SetLine::File(_))) {
                     if let Some(id) = open {
                         self.forget_scene(id);
@@ -581,6 +582,16 @@ impl App {
                     "deleted {}",
                     status_file_path(&path, self.ui_settings.show_full_paths)
                 );
+                // The last score open handed the strip to another.
+                if let Some(stand_in) = stand_in {
+                    let how = if stand_in.created {
+                        "new empty score"
+                    } else {
+                        "opened"
+                    };
+                    let name = self.scenes.current().name();
+                    self.status.push_str(&format!(" · {how} {name}"));
+                }
                 self.refresh_set_panel(None);
                 // The list stays where it was: the row that took the
                 // deleted one's place, not the top of the panel.
@@ -2791,9 +2802,9 @@ mod tests {
         }
 
         /// Delete in the panel asks and Enter answers: an open score off the
-        /// strip and the disk, a closed one off the disk, and the last score
-        /// never. Esc keeps what was asked about, and Scene > Delete scene
-        /// asks the same question.
+        /// strip and the disk, a closed one off the disk, and the last one
+        /// open for a new empty score. Esc keeps what was asked about, and
+        /// Scene > Delete scene asks the same question.
         #[test]
         fn the_set_panel_deletes_after_asking() {
             let directory = tempfile::tempdir().expect("temp dir");
@@ -2866,19 +2877,18 @@ mod tests {
             press(&mut app, KeyCode::Enter, KeyModifiers::NONE);
             assert!(!directory.path().join("spare.strudel").exists());
 
-            // The last score stays.
+            // The last score goes too, and a new empty one takes the strip.
             press(&mut app, KeyCode::Home, KeyModifiers::NONE);
             press(&mut app, KeyCode::Delete, KeyModifiers::NONE);
             press(&mut app, KeyCode::Enter, KeyModifiers::NONE);
-            assert!(directory.path().join("first.strudel").exists());
-            assert!(
-                app.set_panel
-                    .as_ref()
-                    .and_then(|panel| panel.error.as_deref())
-                    .is_some_and(|error| error.contains("last scene")),
-                "{:?}",
-                app.set_panel.as_ref().and_then(|panel| panel.error.clone())
-            );
+            assert!(!directory.path().join("first.strudel").exists());
+            assert_eq!(app.scenes.score_count(), 1);
+            assert!(app.scenes.current().is_blank());
+            assert!(app.status.contains("new empty score"), "{}", app.status);
+            let panel = app.set_panel.as_ref().expect("open");
+            assert_eq!(panel.files.len(), 1);
+            assert!(panel.files[0].empty && panel.files[0].current);
+            assert_eq!(app.panes[app.focused].scene, app.scenes.current().id);
 
             // The Scene menu's row arms the panel the same way.
             press(&mut app, KeyCode::Esc, KeyModifiers::NONE);
@@ -2886,6 +2896,42 @@ mod tests {
                 .expect("menu");
             assert_eq!(app.focus, Focus::Panel(PanelKind::Set));
             assert!(app.set_panel.as_ref().expect("open").deleting.is_some());
+        }
+
+        /// Deleting the only open score from the Scene menu opens the next
+        /// score of the set in the pane, and the panel marks empty scores.
+        #[test]
+        fn deleting_the_last_open_score_opens_the_next_one() {
+            let directory = tempfile::tempdir().expect("temp dir");
+            std::fs::write(directory.path().join("blank.strudel"), "  \n").expect("blank");
+            std::fs::write(directory.path().join("zed.strudel"), "// zed\n").expect("zed");
+            // Only `first` is open on the strip.
+            std::fs::write(
+                directory.path().join(crate::scenes::SET_FILE_NAME),
+                r#"{"scenes":[{"file":"first.strudel"}]}"#,
+            )
+            .expect("set file");
+            let mut app = app_over(directory.path());
+            assert_eq!(app.scenes.score_count(), 1);
+            let first = app.scenes.current().id;
+            press(&mut app, KeyCode::Char('b'), KeyModifiers::CONTROL);
+            let panel = app.set_panel.as_ref().expect("open");
+            let empty: Vec<_> = panel
+                .files
+                .iter()
+                .map(|file| (file.name.as_str(), file.empty))
+                .collect();
+            assert_eq!(empty, [("blank", true), ("first", false), ("zed", false)]);
+            press(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+
+            app.dispatch_menu_action(crate::menu::MenuAction::DeleteScene)
+                .expect("menu");
+            press(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+            assert!(!directory.path().join("first.strudel").exists());
+            assert!(app.scenes.get(first).is_none());
+            assert_eq!(app.scenes.current().name(), "zed");
+            assert_eq!(app.panes[app.focused].scene, app.scenes.current().id);
+            assert!(app.status.contains("opened zed"), "{}", app.status);
         }
 
         /// File > Open set… offers the sets folder's sets, Tab browses from

@@ -153,6 +153,15 @@ impl Scene {
         }
     }
 
+    /// No music in it yet: nothing but whitespace, saved or not.
+    pub fn is_blank(&self) -> bool {
+        self.editor
+            .document()
+            .rope()
+            .chars()
+            .all(char::is_whitespace)
+    }
+
     fn file_name(&self) -> String {
         self.path
             .file_name()
@@ -630,6 +639,22 @@ pub struct SetFile {
     pub path: PathBuf,
     /// The scene showing this file, when one is.
     pub open: Option<SceneId>,
+}
+
+/// What a delete took, and the score it opened in place of the last one
+/// on the strip, when it did.
+#[derive(Clone, Debug)]
+pub struct Deleted {
+    pub path: PathBuf,
+    pub stand_in: Option<StandIn>,
+}
+
+/// The score opened in place of the last one on the strip, and whether
+/// it was written for the purpose: a new empty score.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct StandIn {
+    pub id: SceneId,
+    pub created: bool,
 }
 
 #[derive(Debug)]
@@ -1634,8 +1659,8 @@ impl SceneSet {
     }
 
     /// Take a score of the folder off the disk: its tab too, when it has
-    /// one. The last score on the strip stays, as it does for closing.
-    pub fn delete_file(&mut self, path: &Path) -> Result<PathBuf, SceneError> {
+    /// one.
+    pub fn delete_file(&mut self, path: &Path) -> Result<Deleted, SceneError> {
         let open = self
             .scores()
             .find(|scene| scene.path == path)
@@ -1648,12 +1673,19 @@ impl SceneSet {
             self.oversized
                 .retain(|(_, entry)| entry.file != file_name.to_string_lossy());
         }
-        Ok(path.to_path_buf())
+        Ok(Deleted {
+            path: path.to_path_buf(),
+            stand_in: None,
+        })
     }
 
-    /// Take a scene off the strip, out of the set and off the disk. The
-    /// last score of a set stays, as it does for closing.
-    pub fn delete_scene(&mut self, id: SceneId) -> Result<PathBuf, SceneError> {
+    /// Take a scene off the strip, out of the set and off the disk.
+    ///
+    /// The strip never runs out of scores. Deleting the last one open
+    /// opens the folder's score after it in the list, or the one before
+    /// it at the end, and a new empty score when the folder has no other;
+    /// that score is then the current one.
+    pub fn delete_scene(&mut self, id: SceneId) -> Result<Deleted, SceneError> {
         let Some(index) = self.index_of(id) else {
             return Err(SceneError::Io(io::Error::new(
                 io::ErrorKind::NotFound,
@@ -1663,20 +1695,63 @@ impl SceneSet {
         if !self.scenes[index].is_score() {
             return Err(SceneError::Prebake);
         }
-        if self.score_count() <= 1 {
-            return Err(SceneError::Last);
-        }
+        let path = self.scenes[index].path.clone();
+        let current = self.current().id;
+        // The stand-in comes before the delete, so a failure to find one
+        // leaves the set as it was.
+        let stand_in = if self.score_count() <= 1 {
+            Some(self.open_stand_in(&path)?)
+        } else {
+            None
+        };
         // The file first: a delete the disk refuses leaves the tab where
         // it was, rather than gone from the strip with its file still there
         // and nothing told it was closed.
-        remove_score_file(&self.scenes[index].path)?;
-        let removed = self.scenes.remove(index);
-        if self.current >= self.scenes.len() {
-            self.current = self.scenes.len() - 1;
-        } else if index < self.current {
-            self.current -= 1;
+        if let Err(error) = remove_score_file(&path) {
+            if let Some(stand_in) = stand_in {
+                self.drop_stand_in(stand_in);
+            }
+            self.current = self.index_of(current).unwrap_or(0);
+            return Err(error);
         }
-        Ok(removed.path)
+        let index = self.index_of(id).expect("the scene is still on the strip");
+        self.scenes.remove(index);
+        self.current = match stand_in {
+            Some(StandIn { id, .. }) => self.index_of(id).expect("the stand-in is on the strip"),
+            None if id == current => index.min(self.scenes.len() - 1),
+            None => self.index_of(current).expect("the current scene stays"),
+        };
+        Ok(Deleted { path, stand_in })
+    }
+
+    /// The score that takes the strip when its last open one is deleted:
+    /// the folder's next score, else the one before it, else a new empty
+    /// one written beside the set.
+    fn open_stand_in(&mut self, leaving: &Path) -> Result<StandIn, SceneError> {
+        let files = self.folder_files();
+        let at = files.iter().position(|file| file.path == leaving);
+        let after = at.map_or(0, |at| at + 1);
+        let neighbours = files[after.min(files.len())..]
+            .iter()
+            .chain(files[..at.unwrap_or(0)].iter().rev())
+            .filter(|file| file.path != leaving);
+        for file in neighbours {
+            if let Ok(id) = self.open_file(&file.path) {
+                return Ok(StandIn { id, created: false });
+            }
+        }
+        self.create("").map(|id| StandIn { id, created: true })
+    }
+
+    /// Undo `open_stand_in` after the delete it stood in for failed.
+    fn drop_stand_in(&mut self, stand_in: StandIn) {
+        let Some(index) = self.index_of(stand_in.id) else {
+            return;
+        };
+        let scene = self.scenes.remove(index);
+        if stand_in.created {
+            let _ = std::fs::remove_file(&scene.path);
+        }
     }
 
     /// Bind a pad to the current scene. One pad launches one scene and one
@@ -2666,9 +2741,8 @@ mod tests {
         assert!(set.current().dirty, "a starter, unsaved");
     }
 
-    /// Deleting a scene from the strip takes its file with it; the last
-    /// score of a set stays, as it does for closing. A file of the folder
-    /// that is not open is deleted as a file.
+    /// Deleting a scene from the strip takes its file with it. A file of
+    /// the folder that is not open is deleted as a file.
     #[test]
     fn deleting_a_scene_takes_its_file_with_it() {
         let directory = tempfile::tempdir().unwrap();
@@ -2678,7 +2752,9 @@ mod tests {
         let mut set = SceneSet::open(directory.path(), "starter").unwrap();
         let drop = set.scenes()[0].id;
         set.select(1);
-        let path = set.delete_scene(drop).unwrap();
+        let gone = set.delete_scene(drop).unwrap();
+        let path = gone.path;
+        assert_eq!(gone.stand_in, None);
         assert_eq!(path, directory.path().join("drop.strudel"));
         assert!(!path.exists());
         assert_eq!(
@@ -2693,13 +2769,74 @@ mod tests {
         set.delete_file(&spare).unwrap();
         assert!(!spare.exists());
         assert_eq!(set.len(), 1);
-        let last = set.current().id;
-        assert!(matches!(set.delete_scene(last), Err(SceneError::Last)));
         assert!(directory.path().join("intro.strudel").exists());
         assert!(matches!(
             set.open_file(directory.path()),
             Err(SceneError::NotAFile(_))
         ));
+    }
+
+    /// Deleting the last score open opens the folder's next score in its
+    /// place, the one before it at the end of the list, and a new empty
+    /// score when the folder has no other.
+    #[test]
+    fn deleting_the_last_open_score_opens_another() {
+        let directory = tempfile::tempdir().unwrap();
+        write(directory.path(), "a.strudel", "// a");
+        write(directory.path(), "b.strudel", "// b");
+        write(directory.path(), "c.strudel", "// c");
+        write(
+            directory.path(),
+            SET_FILE_NAME,
+            r#"{"scenes":[{"file":"b.strudel"}]}"#,
+        );
+        let mut set = SceneSet::open(directory.path(), "starter").unwrap();
+        assert_eq!(set.score_count(), 1);
+        let b = set.current().id;
+
+        let gone = set.delete_scene(b).unwrap();
+        assert!(!gone.path.exists());
+        let stand_in = gone.stand_in.expect("a score took the strip");
+        assert!(!stand_in.created);
+        assert_eq!(set.current().id, stand_in.id);
+        assert_eq!(set.current().name(), "c", "the next in the list");
+        assert_eq!(set.score_count(), 1);
+
+        let c = set.current().id;
+        set.delete_scene(c).unwrap();
+        assert_eq!(set.current().name(), "a", "the one before, at the end");
+
+        let a = set.current().id;
+        let gone = set.delete_scene(a).unwrap();
+        assert!(gone.stand_in.expect("a new score").created);
+        assert_eq!(set.score_count(), 1);
+        assert!(set.current().is_blank());
+        assert!(set.current().path.is_file(), "written beside the set");
+        assert_eq!(set.folder_files().len(), 1);
+    }
+
+    /// A refused delete of the last open score takes back the score it
+    /// opened in its place.
+    #[test]
+    fn a_refused_last_delete_takes_back_its_stand_in() {
+        let directory = tempfile::tempdir().unwrap();
+        write(directory.path(), "only.strudel", "// only");
+        let mut set = SceneSet::open(directory.path(), "starter").unwrap();
+        let only = set.current().id;
+        let path = set.current().path.clone();
+        std::fs::remove_file(&path).unwrap();
+        std::fs::create_dir(&path).unwrap();
+
+        assert!(matches!(set.delete_scene(only), Err(SceneError::Io(_))));
+        assert_eq!(set.score_count(), 1);
+        assert_eq!(set.current().id, only);
+        let files: Vec<_> = std::fs::read_dir(directory.path())
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|entry| entry.path().extension().is_some_and(|ext| ext == "strudel"))
+            .filter(|entry| entry.path().is_file())
+            .collect();
+        assert!(files.is_empty(), "the new empty score went again");
     }
 
     /// A delete the disk refuses changes nothing: the tab stays on the

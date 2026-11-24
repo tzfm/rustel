@@ -220,8 +220,13 @@ the box. Esc leaves typing, and `j k h l` walk the list again. Press `i` or
 `a` to type.
 
 Delete asks for confirmation before it removes a file. Confirming also discards
-its unsaved edits. Studio does not delete the last score or the active session
-tape. Keep a separate backup of sets you want to preserve.
+its unsaved edits. Deleting the last open score opens the next score in the
+list, or the one before it at the end; with no other score, a new empty score.
+Studio does not delete the active session tape. Keep a separate backup of sets
+you want to preserve.
+
+The list marks a score with `○` when it holds nothing but whitespace, and its
+details block says empty.
 
 ### Prebakes
 
