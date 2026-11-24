@@ -25,6 +25,7 @@
 - Fixed: `rustel replay --export` of a tape from a set goes through the set's master limiter, so it no longer clips where the take did not.
 - Fixed: a playing score with a cycle past a native limit, such as `euclid(3, "<8 1000000>")`, loses only that cycle, as on strudel.cc, instead of a longer gap and a "fell behind" warning.
 - Fixed: a sample source turned off while its map was loading, then allowed again, brings its sounds back instead of leaving them unknown.
+- Changed: stem files are named by their orbit number. The default orbit's stem is now `1.wav` (it was `2.wav`), and `o(0)` writes `0.wav` (it was `1.wav`).
 - Fixed: the Studio footer stops saying an update "swaps in on the next cycle" once it plays, and says why when the engine refused it.
 - Fixed: an Alt key over the mixer or another panel holding the keyboard no longer types into or edits the score.
 - Fixed: an export of a score with an unknown chord, from the command line or the Studio sheet, says which chord, instead of writing a silent file with no message. The chord stays silent, as on strudel.cc.

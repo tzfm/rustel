@@ -90,8 +90,8 @@ Ctrl+C stops a WAV or MP3 export. A WAV export keeps a partial file once
 writing has started.
 
 `--stems` writes a `<name> stems` folder beside the file: the same bounce as
-`main.wav`, plus one stereo WAV per sounding orbit, named `1.wav` upward, in
-the export format.
+`main.wav`, plus one stereo WAV per sounding orbit, named by its orbit number
+(`1.wav` for the default orbit, `0.wav` for `o(0)`), in the export format.
 The stems are tapped after each orbit's delay, reverb, filter, duck and fader,
 before the master, so they sum back to an unmastered main and mastering stays
 in the DAW. Stems need a WAV format and refuse to overwrite an existing
