@@ -1943,7 +1943,7 @@ mod stems_export_tests {
             })
             .collect();
         names.sort();
-        assert_eq!(names, ["2.wav", "3.wav", "main.wav"]);
+        assert_eq!(names, ["1.wav", "2.wav", "main.wav"]);
         assert_eq!(
             report.path,
             folder.join("main.wav").display().to_string(),
@@ -2191,7 +2191,7 @@ mod plugin_render_tests {
         };
         let dry = stems(DRY, "dry.wav").expect("dry stems");
         let wet = stems(&delayed(DRY), "wet.wav").expect("stems");
-        assert_eq!(names(&dry), ["2.wav", "main.wav"]);
+        assert_eq!(names(&dry), ["1.wav", "main.wav"]);
         assert_eq!(names(&wet), names(&dry));
         for name in names(&dry) {
             let (dry, wet) = (f32_wav(&dry.join(&name)), f32_wav(&wet.join(&name)));
@@ -2237,7 +2237,7 @@ mod plugin_render_tests {
         assert!(refused.to_string().contains("already exists"), "{refused}");
         host.wait_idle();
         assert!(!marks.exists(), "a copy started");
-        assert!(wet.join("main.wav").exists() && wet.join("2.wav").exists());
+        assert!(wet.join("main.wav").exists() && wet.join("1.wav").exists());
         // The plan parks the copy it builds for the first note, so a render
         // with one copy builds it one time.
         let plain = plugin_session(&format!("{DRY}.vst('rustel fixture')")).render_pcm(1.0);

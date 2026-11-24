@@ -1289,7 +1289,8 @@ an export with another render.
 
 Turn stems on to write a `<name> stems` folder beside the take instead of the
 one file. It holds `main.wav` with the same bounce, plus one stereo WAV for
-each orbit that sounds, named `1.wav` upward. Each stem is tapped after its
+each orbit that sounds, named by its orbit number (`1.wav` for the default
+orbit). Each stem is tapped after its
 orbit's delay, reverb, filter, duck and fader, before the master limiter, so
 the stems sum back to an unmastered main and mastering stays in the DAW. Stems
 need the WAV format: turning them on takes the format back to WAV, and MP3

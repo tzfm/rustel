@@ -335,7 +335,7 @@ fn stems_write_the_main_and_one_wav_a_sounding_orbit() {
     names.sort();
     assert_eq!(
         names,
-        ["1.wav", "2.wav", "main.wav"],
+        ["0.wav", "1.wav", "main.wav"],
         "one a sounding orbit"
     );
     for name in &names {
