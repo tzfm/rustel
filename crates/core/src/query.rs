@@ -1274,37 +1274,43 @@ fn meet_steps_small(
     // Single-allocation StepPatch fast path: one `Arc<StepPatch>` covers all
     // `count` steps AND every chord note sharing the same uniform-key base
     // (or the same `(base, row)` for non-uniform bases).
-    if let Value::Object(map) = &hf.value
-        && let Some((base, row, layer_idx, uniform)) = map.step_base()
-    {
-        let fixed_row = (!uniform).then_some(row);
-        let sp = if let Some((_, _, cached)) = slot
-            .step_patches
-            .iter()
-            .flatten()
-            .find(|(b, r, _)| b.same_source(&base) && *r == fixed_row)
-        {
-            Some(cached.clone())
-        } else if let Some(mut built) =
-            value::StepPatch::new_for_row(base.clone(), row, layer_idx, &[key], true, count)
-        {
-            for (i, &num) in slot.nums.iter().enumerate().take(count) {
-                built.set_single_slot(i, num);
+    if let Value::Object(map) = &hf.value {
+        let mut hit: Option<(value::StepPatch, u32, u16)> = None;
+        for (b, fixed_row, cached) in slot.step_patches.iter().flatten() {
+            if let Some((row, layer_idx)) = map.matches_step_base(b)
+                && fixed_row.is_none_or(|r| r == row)
+            {
+                hit = Some((cached.clone(), row, layer_idx));
+                break;
             }
-            let sp = built.finish();
-            let idx = if let Some(empty) = slot.step_patches.iter().position(Option::is_none) {
-                empty
+        }
+        let resolved = if let Some(found) = hit {
+            Some(found)
+        } else if let Some((base, row, layer_idx, uniform)) = map.step_base() {
+            let fixed_row = (!uniform).then_some(row);
+            if let Some(mut built) =
+                value::StepPatch::new_for_row(base.clone(), row, layer_idx, &[key], true, count)
+            {
+                for (i, &num) in slot.nums.iter().enumerate().take(count) {
+                    built.set_single_slot(i, num);
+                }
+                let sp = built.finish();
+                let idx = if let Some(empty) = slot.step_patches.iter().position(Option::is_none) {
+                    empty
+                } else {
+                    let v = usize::from(slot.step_next & 3);
+                    slot.step_next = slot.step_next.wrapping_add(1);
+                    v
+                };
+                slot.step_patches[idx] = Some((base, fixed_row, sp.clone()));
+                Some((sp, row, layer_idx))
             } else {
-                let v = usize::from(slot.step_next & 3);
-                slot.step_next = slot.step_next.wrapping_add(1);
-                v
-            };
-            slot.step_patches[idx] = Some((base, fixed_row, sp.clone()));
-            Some(sp)
+                None
+            }
         } else {
             None
         };
-        if let Some(sp) = sp {
+        if let Some((sp, row, layer_idx)) = resolved {
             if !hf.keys.is_empty() {
                 let live = controls::live_slot(key.as_str());
                 let k = hf.keys.get();
@@ -1317,18 +1323,24 @@ fn meet_steps_small(
                     hf.keys.trim();
                 }
             }
-            // Drop the base map once so cloning `template` per step does not
-            // bump and immediately drop the base `Arc` on every step.
-            hf.value = Value::Undefined;
-            let mut template = Some(hf);
-            for (i, &piece) in slot.pieces.iter().enumerate().take(count) {
-                let mut hap = if i + 1 == count {
-                    template.take().expect("last step moves template")
+            let whole = hf.whole;
+            let last = count - 1;
+            for (i, &piece) in slot.pieces[..count].iter().enumerate() {
+                let (context, keys) = if i == last {
+                    (
+                        std::mem::take(&mut hf.context),
+                        std::mem::take(&mut hf.keys),
+                    )
                 } else {
-                    template.as_ref().expect("template present").clone()
+                    (hf.context.clone(), hf.keys.clone())
                 };
-                hap.value = Value::Object(OrderedMap::from_step_patch(&sp, row, layer_idx, i));
-                hap.part = piece;
+                let hap = Hap {
+                    whole,
+                    part: piece,
+                    value: Value::Object(OrderedMap::from_step_patch(&sp, row, layer_idx, i)),
+                    context,
+                    keys,
+                };
                 if bulk_ok {
                     out.push(hap);
                 } else if thread.stop_requested() || !thread.push_budgeted(out, from, hap) {
@@ -3293,6 +3305,7 @@ impl Pattern {
                     victim
                 };
                 let slot = &mut slots[target_idx];
+                let was_active = slot.active;
                 slot.active = false;
                 let grid_steps = grid.steps();
                 let grid_start = grid_steps.start;
@@ -3332,9 +3345,11 @@ impl Pattern {
                 slot.met = met;
                 slot.part = hf.part;
                 slot.count = count as u8;
-                slot.step_patches = [None, None, None, None];
-                slot.step_next = 0;
-                slot.fallback_caches = None;
+                if was_active {
+                    slot.step_patches = [None, None, None, None];
+                    slot.step_next = 0;
+                    slot.fallback_caches = None;
+                }
                 slot.active = true;
                 target_idx
             };
@@ -3466,6 +3481,10 @@ impl Pattern {
     /// multi-step segmented waves (`steps > 0`) spanning multiple steps of
     /// `state.span`: avoids rebuilding `AppLeft` + `OnceLock` graphs and uses
     /// stack buffers for `count <= 8` window steps.
+    /// Kept out-of-line (and adjacent to `try_query_app_wave_uniform_steps_onto`)
+    /// so `answer_onto` stays compact and multi-step wave helpers share warm
+    /// code pages.
+    #[inline(never)]
     pub(crate) fn try_query_app_wave_steps_onto(
         &self,
         app: &AppWaveNode,
@@ -3504,18 +3523,18 @@ impl Pattern {
                 break;
             }
         }
+        let min_uniform_steps = if items.len() == 1 { 2 } else { 1 };
+        let use_uniform = uniform_steps
+            && shared_steps > 0
+            && !items.is_empty()
+            && out[from..].iter().all(|hf| {
+                fused::StepWave::takes(hf)
+                    && (!has_continuous || (hf.whole.is_some() && hf.part.within_one_cycle()))
+                    && fused::StepWave::step_grid_over(shared_steps, hf.part)
+                        .is_some_and(|g| (min_uniform_steps..=8).contains(&g.len()))
+            });
         if inner_len <= 4 {
-            let min_uniform_steps = if items.len() == 1 { 2 } else { 1 };
-            if uniform_steps
-                && shared_steps > 0
-                && !items.is_empty()
-                && out[from..].iter().all(|hf| {
-                    fused::StepWave::takes(hf)
-                        && (!has_continuous || (hf.whole.is_some() && hf.part.within_one_cycle()))
-                        && fused::StepWave::step_grid_over(shared_steps, hf.part)
-                            .is_some_and(|g| (min_uniform_steps..=8).contains(&g.len()))
-                })
-            {
+            if use_uniform {
                 let mut stack_haps: [Option<Hap>; 4] = [None, None, None, None];
                 for (slot, hf) in stack_haps.iter_mut().zip(out.drain(from..)) {
                     *slot = Some(hf);
@@ -3665,17 +3684,7 @@ impl Pattern {
         }
         let ok = with_list(|buf| {
             buf.extend(out.drain(from..));
-            let min_uniform_steps = if items.len() == 1 { 2 } else { 1 };
-            if uniform_steps
-                && shared_steps > 0
-                && !items.is_empty()
-                && buf.iter().all(|hf| {
-                    fused::StepWave::takes(hf)
-                        && (!has_continuous || (hf.whole.is_some() && hf.part.within_one_cycle()))
-                        && fused::StepWave::step_grid_over(shared_steps, hf.part)
-                            .is_some_and(|g| (min_uniform_steps..=8).contains(&g.len()))
-                })
-            {
+            if use_uniform {
                 let mut iter = buf.drain(..);
                 return Self::try_query_app_wave_uniform_steps_onto(
                     items,

@@ -1120,7 +1120,6 @@ impl Patched {
             .flatten()
     }
 
-    #[cold]
     #[inline(never)]
     fn return_to_pool(mut arc: Arc<Self>) {
         let _ = PATCHED_POOL.try_with(|cell| {
@@ -1283,7 +1282,6 @@ impl StepPatchData {
             .flatten()
     }
 
-    #[cold]
     #[inline(never)]
     fn return_to_pool(mut arc: Arc<Self>) {
         let _ = STEP_PATCH_POOL.try_with(|cell| {
