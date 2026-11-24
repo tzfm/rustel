@@ -179,6 +179,7 @@ jobs:
   bench:
     name: Engine benchmark (Linux x64)
     runs-on: ubuntu-24.04
+    cache-mode: read
     concurrency:
       group: ${{ github.workflow }}-bench-${{ inputs.pr_number || github.ref }}
       cancel-in-progress: true
