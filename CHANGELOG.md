@@ -23,6 +23,7 @@
 - Fixed: in an export, an infinite `note` or `freq`, such as the log2 of 0, is a refused voice, and so is NaN on a sample, as on strudel.cc, instead of a note at the default pitch. A synth still reads a NaN note as absent.
 - Fixed: the update a permission re-runs waits for the engine to start fetching the source, instead of sometimes being refused again with an unknown sound.
 - Fixed: `rustel replay --export` of a tape from a set goes through the set's master limiter, so it no longer clips where the take did not.
+- Fixed: `rustel replay --export` plays the master fader the take was played at, ahead of the limiter as live, so it sounds at the level of the take.
 - Fixed: a playing score with a cycle past a native limit, such as `euclid(3, "<8 1000000>")`, loses only that cycle, as on strudel.cc, instead of a longer gap and a "fell behind" warning.
 - Fixed: a sample source turned off while its map was loading, then allowed again, brings its sounds back instead of leaving them unknown.
 - Changed: stem files are named by their orbit number. The default orbit's stem is now `1.wav` (it was `2.wav`), and `o(0)` writes `0.wav` (it was `1.wav`).

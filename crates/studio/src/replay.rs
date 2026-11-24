@@ -344,6 +344,7 @@ impl ReplayTab {
             baseline_cps: self.baseline_cps,
             saves: saves.into_iter().map(|(_, save)| save).collect(),
             logs: 0,
+            faders: Vec::new(),
         }
     }
 
