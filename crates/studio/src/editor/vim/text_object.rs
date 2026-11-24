@@ -90,7 +90,12 @@ impl Editor {
             self.vim.message = Some("Text object not found");
             return Ok(false);
         };
-        let start = range.start;
+        // Yanking a text object keeps the caret in place.
+        let start = if operator == Operator::Yank {
+            self.vim_head()
+        } else {
+            range.start
+        };
         self.vim_apply_operator(operator, range, linewise, !linewise, start, moment)
     }
 

@@ -1233,11 +1233,11 @@ impl Editor {
         Ok(())
     }
 
-    /// Run `operator` over `range`. A yank leaves the caret at `start`, the
-    /// start of the text as Vim takes it: where a motion back ended, or the
-    /// caret itself on the first line of a linewise command. An `exclusive`
-    /// range follows [`Self::vim_exclusive_range`]. Returns `true` when the
-    /// command deleted text or entered Insert for a change.
+    /// Run `operator` over `range`. A yank leaves the caret at `start`: where
+    /// a motion back ended, the start of a Visual range, or the caret itself
+    /// for a text object or on the first line of a linewise command. An
+    /// `exclusive` range follows [`Self::vim_exclusive_range`]. Returns `true`
+    /// when the command deleted text or entered Insert for a change.
     fn vim_apply_operator(
         &mut self,
         operator: Operator,
@@ -1892,8 +1892,6 @@ mod tests {
             ("foo bar", 4, "yb", 0),
             ("foo bar", 4, "yh", 3),
             ("foo bar", 4, "y0", 0),
-            ("f(ab)", 3, "yi(", 2),
-            ("x \"ab\"", 4, "ya\"", 1),
             ("ab\ncd", 4, "yk", 1),
             ("ab\ncd", 4, "ygg", 0),
             ("ab\ncd", 1, "yj", 1),
@@ -2742,5 +2740,49 @@ mod tests {
         assert_eq!(editor.source(), "a b c\nd\ne");
         type_keys(&mut editor, "u");
         assert_eq!(editor.source(), "a\nb\nc\nd\ne");
+    }
+
+    /// Yanking a text object fills the register and leaves the caret where it
+    /// started. Delete, change, and Visual mode keep their own caret rules.
+    #[test]
+    fn a_yank_over_a_text_object_keeps_the_caret() {
+        for (source, caret, keys, register, linewise) in [
+            ("aaa\nbbb\n\nccc\n", 5, "yap", "aaa\nbbb\n\n", true),
+            ("aaa\nbbb\n\nccc\n", 5, "yip", "aaa\nbbb\n", true),
+            ("aaa\n\nbbb\nccc\n", 10, "yap", "\nbbb\nccc\n", true),
+            ("f(ab)", 3, "yi(", "ab", false),
+            ("f(ab)", 3, "ya(", "(ab)", false),
+            ("x \"ab\"", 4, "ya\"", " \"ab\"", false),
+            ("{\n  ab\n  cd\n}", 9, "yi{", "  ab\n  cd\n", true),
+        ] {
+            let editor = typed(source, caret, keys);
+            assert_eq!(head(&editor), caret, "{keys} in {source:?}");
+            assert_eq!(
+                editor.vim_register(),
+                Some(register),
+                "{keys} in {source:?}"
+            );
+            assert_eq!(
+                editor.vim.linewise_register, linewise,
+                "{keys} in {source:?}"
+            );
+        }
+
+        // An empty text object ahead of the caret also keeps the caret.
+        let empty = typed("f()", 0, "yi(");
+        assert_eq!(head(&empty), 0);
+        assert_eq!(empty.vim_register(), None);
+
+        // Delete, change, and Visual yank keep their existing caret behavior.
+        let deleted = typed("f(ab)", 3, "di(");
+        assert_eq!(deleted.source(), "f()");
+        assert_eq!(head(&deleted), 2);
+        let changed = typed("f(ab)", 3, "ci(");
+        assert_eq!(changed.source(), "f()");
+        assert!(changed.vim_is_insert());
+        assert_eq!(head(&changed), 2);
+        let visual = typed("aaa\nbbb\n\nccc\n", 5, "vipy");
+        assert_eq!(head(&visual), 0);
+        assert_eq!(visual.vim_register(), Some("aaa\nbbb\n"));
     }
 }
