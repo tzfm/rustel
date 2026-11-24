@@ -209,6 +209,8 @@ pub(crate) struct CallbackIr {
     pub(crate) gate: RefCell<LoweringGate>,
     /// Recognition outcomes by callback source text.
     pub(crate) cache: RefCell<PatternTransformIrCache>,
+    /// Whether `setStringParser(...)` currently holds a truthy parser.
+    pub(crate) string_parser_active: Cell<bool>,
 }
 
 impl CallbackIr {
@@ -218,6 +220,7 @@ impl CallbackIr {
             stats: Cell::new(PatternTransformIrStats::default()),
             gate: RefCell::new(LoweringGate::default()),
             cache: RefCell::new(PatternTransformIrCache::default()),
+            string_parser_active: Cell::new(false),
         }
     }
 

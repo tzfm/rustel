@@ -3348,7 +3348,7 @@ fn flat_word_end(_src: &str, bytes: &[u8], start: usize, limit: usize) -> Option
     if end == start {
         return None;
     }
-    if end - start == 1 && matches!(bytes[start], b'.' | b'_') {
+    if bytes[start] == b'_' || (end - start == 1 && bytes[start] == b'.') {
         return None;
     }
     if end < limit && bytes[end] == b':' {
@@ -3522,8 +3522,9 @@ fn try_plain_flat_into(
         let wlen = end - start;
         if !(wlen == 1 && matches!(bytes[start], b'~' | b'-')) {
             let value_idx = intern_flat_word(bytes, &mut seen_words, &mut seen_len, start, end)?;
-            let loc_begin = u32::try_from(start + 1 + offset).ok()?;
-            let loc_len = u16::try_from(wlen).ok()?;
+            let (lb, le) = leaf_place(src, offset, &Span { start, end });
+            let loc_begin = u32::try_from(lb).ok()?;
+            let loc_len = u16::try_from(le.checked_sub(lb)?).ok()?;
             if loc_len > 0 {
                 min_begin = min_begin.min(loc_begin);
                 max_begin = max_begin.max(loc_begin);
@@ -5570,7 +5571,7 @@ fn flat_range(src: &str, offset: usize) -> Option<Pattern> {
         limit -= 1;
     }
     let scan_int = |mut pos: usize| -> Option<usize> {
-        if pos < limit && matches!(bytes[pos], b'-' | b'+') {
+        if pos < limit && bytes[pos] == b'-' {
             pos += 1;
         }
         let digits_start = pos;
@@ -5581,7 +5582,7 @@ fn flat_range(src: &str, offset: usize) -> Option<Pattern> {
     };
     let a_end = scan_int(start)?;
     let dots = score_whitespace_end(bytes, a_end).min(limit);
-    if dots + 2 > limit || bytes[dots] != b'.' || bytes[dots + 1] != b'.' {
+    if dots == a_end || dots + 2 > limit || bytes[dots] != b'.' || bytes[dots + 1] != b'.' {
         return None;
     }
     if dots + 2 < limit && bytes[dots + 2] == b'.' {
@@ -5747,6 +5748,9 @@ fn try_flat_stack(src: &str, offset: usize) -> Option<Option<Pattern>> {
         }
         let mut te = raw_end;
         while te > ts && matches!(bytes[te - 1], b' ' | b'\t' | b'\r' | b'\n') {
+            if bytes[te - 1] != b' ' {
+                return Some(None);
+            }
             te -= 1;
         }
         if ts >= te || te - ts > usize::from(u16::MAX) {
@@ -5823,7 +5827,7 @@ pub fn mini_non_word_in(room: &mut Room, src: &str, offset: usize) -> Result<Pat
                     return Ok(pattern);
                 }
                 if (mask & CLS_DOT) != 0
-                    && (mask & (CLS_PAREN | CLS_BRACKET | CLS_MODIFIER)) == 0
+                    && (mask & (CLS_PAREN | CLS_BRACKET | CLS_MODIFIER | CLS_PLUS)) == 0
                     && let Some(pattern) = flat_range(src, offset)
                 {
                     return Ok(pattern);
@@ -7120,5 +7124,98 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn rest_huge_replication_and_rate_do_not_exhaust_fractions() {
+        for source in ["~!1e18", "~*1e18", "~!1000000", "~*1000000"] {
+            let pat = super::mini_at(source, 0).expect(source);
+            let haps = pat.query_arc_sorted(Fraction::ZERO, Fraction::ONE);
+            assert!(haps.is_empty(), "expected silence for {source}");
+        }
+    }
+
+    #[test]
+    fn euclid_plan_localizes_each_atom_id_once() {
+        let source = "x, <y(126,128) z w v>";
+        let fast = super::mini_at(source, 0).expect(source);
+        let slow = {
+            let ast = parse(source).expect(source);
+            let _scope = super::BuildSource::install_at(source, 0);
+            let pat = super::build_validated(&ast);
+            let meta = super::step_metadata(&ast).expect(source);
+            pat.with_steps(Some(meta.steps))
+        };
+        let haps_fast = fast.query_arc_sorted(Fraction::ZERO, Fraction::from(4));
+        let haps_slow = slow.query_arc_sorted(Fraction::ZERO, Fraction::from(4));
+        assert_eq!(haps_fast.len(), haps_slow.len());
+        let y_count = haps_fast
+            .iter()
+            .filter(|h| h.value == Value::Str("y".into()))
+            .count();
+        assert_eq!(y_count, 126, "all 126 euclid pulses must play y, not x");
+        for (i, (a, b)) in haps_fast.iter().zip(&haps_slow).enumerate() {
+            assert_eq!(a.whole, b.whole, "whole[{i}]");
+            assert_eq!(a.part, b.part, "part[{i}]");
+            assert_eq!(a.value, b.value, "value[{i}]");
+            assert_eq!(
+                a.context.iter().collect::<Vec<_>>(),
+                b.context.iter().collect::<Vec<_>>(),
+                "context[{i}]"
+            );
+        }
+    }
+
+    #[test]
+    fn flat_paths_match_full_ast_for_underscore_weights_ranges_and_whitespace() {
+        for source in [
+            "bd _3 sd",
+            "bd _ sd",
+            "bd _3 sd, hh _2 cp",
+            "1..3",
+            "1.. 3",
+            "1 .. 3",
+            "-2 .. 2",
+            "bd\nsd",
+            "bd\tsd",
+            "bd\r\nsd",
+            "<bd\nsd>",
+            "bd\n, sd",
+            "bd sd,\nhh\ncp",
+        ] {
+            let fast = super::mini_at(source, 0).expect(source);
+            let slow = {
+                let ast = parse(source).expect(source);
+                let _scope = super::BuildSource::install_at(source, 0);
+                let pat = super::build_validated(&ast);
+                let meta = super::step_metadata(&ast).expect(source);
+                pat.with_steps(Some(meta.steps))
+            };
+            assert_eq!(fast.steps(), slow.steps(), "steps mismatch on {source:?}");
+            let haps_fast = fast.query_arc_sorted(Fraction::ZERO, Fraction::from(4));
+            let haps_slow = slow.query_arc_sorted(Fraction::ZERO, Fraction::from(4));
+            assert_eq!(
+                haps_fast.len(),
+                haps_slow.len(),
+                "len mismatch on {source:?}"
+            );
+            for (i, (a, b)) in haps_fast.iter().zip(&haps_slow).enumerate() {
+                assert_eq!(a.whole, b.whole, "whole[{i}] on {source:?}");
+                assert_eq!(a.part, b.part, "part[{i}] on {source:?}");
+                assert_eq!(a.value, b.value, "value[{i}] on {source:?}");
+                assert_eq!(
+                    a.context.iter().collect::<Vec<_>>(),
+                    b.context.iter().collect::<Vec<_>>(),
+                    "context[{i}] on {source:?}"
+                );
+            }
+        }
+        // `+1 .. 3` is a parse error in the grammar and must not be accepted by `flat_range`.
+        assert!(parse("+1 .. 3").is_err());
+        assert!(super::mini_at("+1 .. 3", 0).is_err());
+        // Verify exact multi-line highlight span for `"bd\nsd"`.
+        let nl = super::mini_at("bd\nsd", 0).expect("bd\\nsd");
+        let haps = nl.query_arc_sorted(Fraction::ZERO, Fraction::ONE);
+        assert_eq!(haps[0].context.iter().collect::<Vec<_>>(), vec![(1, 4)]);
     }
 }

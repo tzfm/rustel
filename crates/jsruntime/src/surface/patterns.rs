@@ -228,7 +228,9 @@ pub(crate) fn transpiled_mini(source: &str, offset: i64) -> Result<Pattern, Stri
         return Ok(word);
     }
     // A handle of the remembered graph.
-    if let Some(pattern) = MINI_MEMO.with(|memo| memo.borrow().get(source, offset).cloned()) {
+    if source.len() <= 256
+        && let Some(pattern) = MINI_MEMO.with(|memo| memo.borrow().get(source, offset).cloned())
+    {
         return Ok(pattern);
     }
     let at = usize::try_from(offset).unwrap_or(0);
@@ -242,7 +244,9 @@ pub(crate) fn transpiled_mini(source: &str, offset: i64) -> Result<Pattern, Stri
     } else {
         pattern
     };
-    MINI_MEMO.with(|memo| memo.borrow_mut().insert(source, offset, pattern.clone()));
+    if source.len() <= 256 {
+        MINI_MEMO.with(|memo| memo.borrow_mut().insert(source, offset, pattern.clone()));
+    }
     Ok(pattern)
 }
 
@@ -768,5 +772,21 @@ mod tests {
         assert_eq!(held(), 0);
         transpiled_mini("bd sd", 3).expect("a literal");
         assert_eq!(held(), 1);
+    }
+
+    #[test]
+    fn oversized_transpiled_mini_literal_is_not_pinned_in_memo() {
+        let held = || MINI_MEMO.with(|memo| memo.borrow().held);
+        forget_mini_literals();
+        let big = "bd ".repeat(100);
+        assert!(big.len() > 256);
+        for offset in 0..8 {
+            transpiled_mini(&big, offset).expect("oversized literal parses");
+        }
+        assert_eq!(
+            held(),
+            0,
+            "oversized literals (>256 B) must not be pinned in MINI_MEMO"
+        );
     }
 }

@@ -3681,7 +3681,9 @@ fn collect_widgets(
             index = kabelsalat[call].stringified().end;
             continue;
         }
-        let member = bytes.get(name_start.wrapping_sub(1)) == Some(&b'.');
+        let member = name_start >= 1
+            && bytes[name_start - 1] == b'.'
+            && !(name_start >= 3 && &bytes[name_start - 3..name_start] == b"...");
         // `all(pianoroll)` or `all(pianoroll({ labels: 1 }))` names a
         // page-level painter other than `markcss`; the painter's own call
         // carries the options.
@@ -7834,5 +7836,26 @@ p._scope({ text: "/* not a comment */" });"#;
             registration_hints("const setFunction = () => {}\nsetFunction({ name: 'mine' })");
         assert!(local.names.is_empty());
         assert!(!local.has_dynamic_names);
+    }
+
+    #[test]
+    fn spread_widget_named_call_is_not_treated_as_member_widget() {
+        let options = TranspileOptions {
+            emit_widgets: true,
+            default_widget_methods: true,
+            ..Default::default()
+        };
+        let spread = transpile("const xs = [...scope(a)]", &options);
+        assert!(
+            spread.widgets.is_empty(),
+            "spread `...scope(` is a free call, not a `.scope(` member widget: {:?}",
+            spread.widgets
+        );
+        let member = transpile("s(\"bd\").scope()", &options);
+        assert_eq!(
+            member.widgets.len(),
+            1,
+            "actual `.scope()` member call must still register a widget"
+        );
     }
 }

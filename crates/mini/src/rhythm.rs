@@ -304,6 +304,17 @@ impl Rhythm {
             return None;
         }
         let turns = lcm(count.numer(), self.turns()?)?;
+        if turns > i128::from(MAX_STEPS as u64) {
+            return None;
+        }
+        let mut total_parts = 0i128;
+        for cycle in 0..turns {
+            let idx = usize::try_from(cycle % count.numer()).ok()?;
+            total_parts = total_parts.checked_add(rate_vals[idx])?;
+            if total_parts > i128::from(MAX_STEPS as u64) {
+                return None;
+            }
+        }
         let own_per_cycle = if own.period == Fraction::ONE {
             own.steps.len()
         } else {
@@ -386,6 +397,9 @@ impl Rhythm {
             let count_int = count.numer();
             let turns = self.turns()?;
             let slot_denom = count_int.checked_mul(turns)?;
+            if slot_denom > i128::from(MAX_STEPS as u64) {
+                return None;
+            }
             let scale = Fraction::checked_new(1, slot_denom)?;
             let held: usize = self.layers.iter().map(|layer| layer.steps.len()).sum();
             let est = held
@@ -2010,7 +2024,14 @@ impl Plans {
     /// of the text. `local` holds, for each value of the text, its place
     /// in the layer and one more, or zero for a value that the layer does
     /// not hold yet.
-    fn localize(&mut self, id: Id, local: &mut [u32], held: &mut Vec<u32>) {
+    fn localize(&mut self, id: Id, local: &mut [u32], held: &mut Vec<u32>, seen: &mut [u64]) {
+        let idx = id.0 as usize;
+        let word = idx >> 6;
+        let bit = 1u64 << (idx & 63);
+        if seen[word] & bit != 0 {
+            return;
+        }
+        seen[word] |= bit;
         match self.kind(id) {
             Kind::Rest => {}
             Kind::Atom { value, begin, len } => {
@@ -2019,7 +2040,7 @@ impl Plans {
                     held.push(value);
                     *place = held.len() as u32;
                 }
-                self.kinds[id.0 as usize] = PackedKind::pack(
+                self.kinds[idx] = PackedKind::pack(
                     Kind::Atom {
                         value: *place - 1,
                         begin,
@@ -2031,28 +2052,34 @@ impl Plans {
             }
             kind @ (Kind::EqualSequence(parts) | Kind::WeightedSequence(parts)) => {
                 let equal = kind.is_equal();
-                self.localize_steps(Steps { parts, equal }, local, held)
+                self.localize_steps(Steps { parts, equal }, local, held, seen)
             }
             kind @ (Kind::Stack(patterns) | Kind::StackRun(patterns)) => {
                 for at in patterns.range() {
-                    self.localize(self.stacked_at(at, kind.is_run()), local, held);
+                    self.localize(self.stacked_at(at, kind.is_run()), local, held, seen);
                 }
             }
             Kind::Alternation(lanes) => {
                 for lane in lanes.range() {
-                    self.localize_steps(self.lanes[lane], local, held);
+                    self.localize_steps(self.lanes[lane], local, held, seen);
                 }
             }
             Kind::Faster(pattern, ..) | Kind::Slower(pattern, ..) | Kind::Repeated(pattern, _) => {
-                self.localize(pattern, local, held);
+                self.localize(pattern, local, held, seen);
             }
         }
     }
 
     /// [`Self::localize`] for each step of `steps`.
-    fn localize_steps(&mut self, steps: Steps, local: &mut [u32], held: &mut Vec<u32>) {
+    fn localize_steps(
+        &mut self,
+        steps: Steps,
+        local: &mut [u32],
+        held: &mut Vec<u32>,
+        seen: &mut [u64],
+    ) {
         for at in 0..steps.len() {
-            self.localize(self.step(steps, at).0, local, held);
+            self.localize(self.step(steps, at).0, local, held, seen);
         }
     }
 
@@ -2066,9 +2093,18 @@ impl Plans {
     ) -> Arc<[Value]> {
         local.resize(values.len(), 0);
         let mut held = Vec::new();
+        let words = self.kinds.len().div_ceil(64);
+        let mut seen_stack = [0u64; 8];
+        let mut seen_heap = Vec::new();
+        let seen: &mut [u64] = if words <= seen_stack.len() {
+            &mut seen_stack[..words]
+        } else {
+            seen_heap.resize(words, 0);
+            &mut seen_heap
+        };
         match layer.root {
-            Root::Plan { plan, .. } => self.localize(plan, local, &mut held),
-            Root::Steps(steps) => self.localize_steps(steps, local, &mut held),
+            Root::Plan { plan, .. } => self.localize(plan, local, &mut held, seen),
+            Root::Steps(steps) => self.localize_steps(steps, local, &mut held, seen),
         }
         // The next layer holds none of these values yet.
         for value in &held {

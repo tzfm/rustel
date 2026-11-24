@@ -1047,6 +1047,15 @@ impl Names<'_, '_> {
             Self::Listed(_) => true,
         }
     }
+
+    fn raw_strings(&self) -> bool {
+        match self {
+            Self::Realm(ctx) => {
+                crate::host::host_callback_ir(ctx).is_ok_and(|ir| !ir.string_parser_active.get())
+            }
+            Self::Listed(_) => true,
+        }
+    }
 }
 
 impl JsRuntime {
@@ -2134,7 +2143,7 @@ impl<'p> Turn<'p> {
     ) -> Option<ChainArgument> {
         Some(match call.argument {
             ScoreExpr::Number(number) => ChainArgument::Number(*number),
-            ScoreExpr::String(text) => ChainArgument::Constant(
+            ScoreExpr::String(text) if names.raw_strings() => ChainArgument::Constant(
                 rustel_core::Value::Str(self.held.text(*text).into()),
                 rustel_core::Locations::new(),
             ),
@@ -2616,7 +2625,9 @@ impl<'p> Turn<'p> {
         let Some(reuse) = self.reuse.as_mut().filter(|_| written.len > 0) else {
             return self.evaluate(names, expression, runtime);
         };
-        if let Some(pattern) = reuse.find(written) {
+        if self.frames.is_empty()
+            && let Some(pattern) = reuse.find(written)
+        {
             return Some(Native::Pattern(pattern));
         }
         if !keep {
@@ -2974,7 +2985,9 @@ impl<'p> Turn<'p> {
             let mut mini_step = false;
             let scalar = match only {
                 ScoreExpr::Number(n) => Some(Value::F64(*n)),
-                ScoreExpr::String(s) => Some(Value::Str(self.held.text(*s).into())),
+                ScoreExpr::String(s) if names.raw_strings() => {
+                    Some(Value::Str(self.held.text(*s).into()))
+                }
                 ScoreExpr::Mini { source, offset }
                     if names.mini()
                         && self.mini_is_host()
@@ -3326,5 +3339,92 @@ mod tests {
         for name in SPECIAL_REGISTERED_METHODS.iter().chain(PLUGIN_METHODS) {
             assert!(ListedNames.method(name).is_none(), "{name}");
         }
+    }
+
+    #[test]
+    fn editing_binding_to_shadow_host_name_does_not_reuse_stale_pattern() {
+        let runtime = JsRuntime::new().expect("runtime");
+        let opts = rustel_transpiler::TranspileOptions::default();
+        let cancel = std::sync::atomic::AtomicBool::new(false);
+        let budget = std::time::Duration::from_secs(5);
+
+        runtime
+            .evaluate_score_cancellable("const x = 1\n$: s(\"bd\")", &opts, budget, &cancel)
+            .expect("initial score evaluates natively");
+        assert!(runtime.evaluated_natively());
+
+        let err =
+            runtime.evaluate_score_cancellable("const s = 1\n$: s(\"bd\")", &opts, budget, &cancel);
+        assert!(
+            err.is_err(),
+            "shadowing host `s` on edit must fail like cold eval, not reuse stale pattern"
+        );
+
+        let rt2 = JsRuntime::new().expect("runtime");
+        rt2.evaluate_score_cancellable(
+            "function f(x) { return s(\"bd\"); }\n$: f(1)",
+            &opts,
+            budget,
+            &cancel,
+        )
+        .expect("initial function score evaluates");
+        let err2 = rt2.evaluate_score_cancellable(
+            "function f(s) { return s(\"bd\"); }\n$: f(1)",
+            &opts,
+            budget,
+            &cancel,
+        );
+        assert!(
+            err2.is_err(),
+            "shadowing host `s` in parameter edit must fail like cold eval"
+        );
+    }
+
+    #[test]
+    fn native_tier_respects_set_string_parser_on_subsequent_scores() {
+        let runtime = JsRuntime::new().expect("runtime");
+        let opts = rustel_transpiler::TranspileOptions::default();
+        let cancel = std::sync::atomic::AtomicBool::new(false);
+        let budget = std::time::Duration::from_secs(5);
+
+        runtime
+            .evaluate_score_cancellable(
+                "setStringParser(mini)\n$: s(\"bd\")",
+                &opts,
+                budget,
+                &cancel,
+            )
+            .expect("setStringParser score evaluates");
+
+        runtime
+            .evaluate_score_cancellable("$: s(\"bd\").n('0 1')", &opts, budget, &cancel)
+            .expect("subsequent score with single-quoted string evaluates");
+        let haps = runtime.active_pattern().expect("active pattern").query_arc(
+            rustel_fraction::Fraction::ZERO,
+            rustel_fraction::Fraction::ONE,
+        );
+        assert_eq!(
+            haps.len(),
+            2,
+            "setStringParser(mini) must split `'0 1'` into two events"
+        );
+
+        runtime
+            .evaluate_score_cancellable(
+                "$: s(\"bd\").every(1, x => x.n('0 1'))",
+                &opts,
+                budget,
+                &cancel,
+            )
+            .expect("arrow callback with single-quoted string evaluates");
+        let haps = runtime.active_pattern().expect("active pattern").query_arc(
+            rustel_fraction::Fraction::ZERO,
+            rustel_fraction::Fraction::ONE,
+        );
+        assert_eq!(
+            haps.len(),
+            2,
+            "setStringParser(mini) must split `'0 1'` in arrow callbacks too"
+        );
     }
 }

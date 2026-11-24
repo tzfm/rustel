@@ -489,6 +489,25 @@ impl<'p> Reuse<'p> {
                 }
             }
         }
+        // Drop kept parts and name versions when the set of declared names
+        // changed (a new binding can shadow a host global that a kept part
+        // resolved before without recording a read), or when assigning fresh
+        // versions in this build could wrap `next` back onto an old version.
+        let same_declared_names = names.len() == before.names.len()
+            && names.iter().all(|name| name.was.is_some())
+            && now.iter().all(Option::is_some);
+        let would_wrap =
+            usize::from(before.next).saturating_add(names.len()) >= usize::from(UNREAD_VERSION);
+        let (before, next) = if same_declared_names && !would_wrap {
+            let next = before.next;
+            (before, next)
+        } else {
+            for name in &mut names {
+                name.was = None;
+            }
+            now.clear();
+            (Memo::default(), 0)
+        };
         let shared_extras = before.shared_extras.clone();
         let mut scratch = SPARE_REUSE
             .try_with(|cell| cell.borrow_mut().take())
@@ -516,7 +535,7 @@ impl<'p> Reuse<'p> {
             source,
             unchanged,
             taken,
-            next: before.next,
+            next,
             before,
             made: scratch.made,
             shared_extras,
@@ -749,11 +768,12 @@ impl<'p> Reuse<'p> {
             return version;
         }
         // A name that reads itself, through any number of names, is new.
-        let new = self.next;
-        self.next = self.next.wrapping_add(1);
         if self.next == UNREAD_VERSION {
-            self.next = 0;
+            self.names[at].version = Some(UNREAD_VERSION);
+            return UNREAD_VERSION;
         }
+        let new = self.next;
+        self.next = new + 1;
         self.names[at].version = Some(new);
         let Some(was) = self.names[at].was else {
             return new;
@@ -783,6 +803,15 @@ impl<'p> Reuse<'p> {
         cps: Option<f64>,
         shared_source: Option<Arc<str>>,
     ) -> (Memo, Vec<PatternNodeRef>) {
+        if self.next == UNREAD_VERSION {
+            return (
+                Memo {
+                    cps,
+                    ..Memo::default()
+                },
+                Vec::new(),
+            );
+        }
         let now = mem::take(&mut self.now);
         let taken = mem::take(&mut self.taken);
         let before_slots = mem::take(&mut self.before.part_slots);
@@ -944,41 +973,45 @@ impl<'p> Reuse<'p> {
         let before_reads = mem::take(&mut self.before.reads);
         let made_reads = &self.made_reads;
         let mut reads: Vec<(u16, u16)> = Vec::with_capacity(reads_cap);
-        let push_renumbered = |reads: &mut Vec<(u16, u16)>, span: ReadSpan| -> ReadSpan {
+        let push_renumbered = |reads: &mut Vec<(u16, u16)>, span: ReadSpan| -> Option<ReadSpan> {
             if span.len == 0 {
-                return ReadSpan::default();
+                return Some(ReadSpan::default());
             }
             let start = reads.len();
             for &(was, version) in span.get(&before_reads) {
-                if let Some(number) = now.get(usize::from(was)).copied().flatten()
-                    && let Ok(number) = u16::try_from(number)
-                {
-                    reads.push((number, version));
-                }
+                let Some(number) = now.get(usize::from(was)).copied().flatten() else {
+                    reads.truncate(start);
+                    return None;
+                };
+                let Ok(number) = u16::try_from(number) else {
+                    reads.truncate(start);
+                    return None;
+                };
+                reads.push((number, version));
             }
             let len = reads.len() - start;
             match (u16::try_from(start), u16::try_from(len)) {
-                (Ok(start), Ok(len)) if len > 0 => ReadSpan { start, len },
+                (Ok(start), Ok(len)) if len > 0 => Some(ReadSpan { start, len }),
                 _ => {
                     reads.truncate(start);
-                    ReadSpan::default()
+                    None
                 }
             }
         };
-        let push_made = |reads: &mut Vec<(u16, u16)>, span: ReadSpan| -> ReadSpan {
+        let push_made = |reads: &mut Vec<(u16, u16)>, span: ReadSpan| -> Option<ReadSpan> {
             if span.len == 0 {
-                return ReadSpan::default();
+                return Some(ReadSpan::default());
             }
             let start = reads.len();
             reads.extend_from_slice(span.get(made_reads));
             match u16::try_from(start) {
-                Ok(start) => ReadSpan {
+                Ok(start) => Some(ReadSpan {
                     start,
                     len: span.len,
-                },
+                }),
                 Err(_) => {
                     reads.truncate(start);
-                    ReadSpan::default()
+                    None
                 }
             }
         };
@@ -990,14 +1023,21 @@ impl<'p> Reuse<'p> {
         let mut part_meta: Vec<(u16, PatternHandleMeta)> = Vec::with_capacity(meta_count);
         let mut reused_nodes: Vec<PatternNodeRef> = Vec::new();
         let mut parts_vec: Vec<Part> = Vec::with_capacity(self.made.len());
-        for (idx, (mut entry, from_before)) in self.made.drain(..).enumerate() {
-            let next_read = if from_before {
-                reused_nodes.push(entry.part.node.clone());
+        for (mut entry, from_before) in self.made.drain(..) {
+            let Some(next_read) = (if from_before {
                 push_renumbered(&mut reads, entry.part.read())
             } else {
                 push_made(&mut reads, entry.part.read())
+            }) else {
+                // Drop parts whose read set overflowed or lost a dependency
+                // instead of recording an empty read set that allows stale reuse.
+                continue;
             };
+            if from_before {
+                reused_nodes.push(entry.part.node.clone());
+            }
             entry.part.set_read(next_read);
+            let idx = parts_vec.len();
             if let Some(meta) = entry.meta
                 && let Ok(idx_u16) = u16::try_from(idx)
             {
@@ -1017,12 +1057,18 @@ impl<'p> Reuse<'p> {
                 .map(|was| (before_names[was].read, before_names[was].version));
             // What the statement read now, or what it read before when
             // this build took each part that called it.
-            let read = match (kept, name.read) {
-                (_, Some(span)) => push_made(&mut reads, span),
+            let (read, read_ok) = match (kept, name.read) {
+                (_, Some(span)) => match push_made(&mut reads, span) {
+                    Some(span) => (span, true),
+                    None => (ReadSpan::default(), false),
+                },
                 (Some((span, version)), None) if name.version == Some(version) => {
-                    push_renumbered(&mut reads, span)
+                    match push_renumbered(&mut reads, span) {
+                        Some(span) => (span, true),
+                        None => (ReadSpan::default(), false),
+                    }
                 }
-                _ => ReadSpan::default(),
+                _ => (ReadSpan::default(), true),
             };
             let (text_start, text_len) = match subslice_span(self.source, name.text) {
                 Some((start, len)) => {
@@ -1047,7 +1093,11 @@ impl<'p> Reuse<'p> {
                 len: written_len,
                 // A name that nothing read takes a version that no name
                 // has, so the next build finds it new.
-                version: name.version.unwrap_or(UNREAD_VERSION),
+                version: if read_ok {
+                    name.version.unwrap_or(UNREAD_VERSION)
+                } else {
+                    UNREAD_VERSION
+                },
                 text_start,
                 slots,
                 read,
@@ -1114,5 +1164,29 @@ mod tests {
         assert!(unchanged.holds(0, 20));
         assert!(!unchanged.holds(0, 21));
         assert!(!unchanged.holds(30, 40));
+    }
+
+    #[test]
+    fn version_near_wrap_resets_memo_instead_of_reusing_old_versions() {
+        let source = "const a = 1\n$: s(\"bd\")";
+        let program = rustel_transpiler::transpile(
+            source,
+            &rustel_transpiler::TranspileOptions {
+                add_return: false,
+                wrap_async: false,
+                allow_module_syntax: false,
+                ..Default::default()
+            },
+        )
+        .program
+        .expect("read score");
+        let near_wrap = super::Memo {
+            next: super::UNREAD_VERSION - 1,
+            ..super::Memo::default()
+        };
+        let reuse = super::Reuse::new(source, near_wrap, &program);
+        assert_eq!(reuse.next, 0);
+        assert!(reuse.before.parts.is_empty());
+        assert!(reuse.before.names.is_empty());
     }
 }

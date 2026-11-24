@@ -127,7 +127,7 @@ pub fn lower_pattern_transform_callback(
     else {
         return Err(PatternTransformFallbackReason::NotArrowExpression);
     };
-    arrow_candidate(arrow, source, 0)
+    arrow_candidate(arrow, source, 0, false)
 }
 
 /// Recognise one arrow of either recognised shape, at `depth` levels of
@@ -137,6 +137,7 @@ fn arrow_candidate(
     arrow: &ArrowFunctionExpression<'_>,
     source: &str,
     depth: usize,
+    mini_shadowed: bool,
 ) -> Result<PatternTransformCandidate, PatternTransformFallbackReason> {
     if arrow.r#async {
         return Err(PatternTransformFallbackReason::AsyncArrow);
@@ -158,6 +159,7 @@ fn arrow_candidate(
         return Err(PatternTransformFallbackReason::ParameterShape);
     };
     let parameter = parameter.name.as_str();
+    let mini_shadowed = mini_shadowed || parameter == MINI_CALLEE;
     let body = match &arrow.body {
         ArrowFunctionBody::FunctionBody(_) => {
             return Err(PatternTransformFallbackReason::BodyShape);
@@ -168,7 +170,9 @@ fn arrow_candidate(
         Expression::Identifier(identifier) if identifier.name == parameter => {
             Ok(PatternTransformCandidate::Identity)
         }
-        Expression::CallExpression(_) => method_chain(body, parameter, source, depth),
+        Expression::CallExpression(_) => {
+            method_chain(body, parameter, source, depth, mini_shadowed)
+        }
         _ => Err(PatternTransformFallbackReason::BodyShape),
     }
 }
@@ -179,6 +183,7 @@ fn method_chain(
     parameter: &str,
     source: &str,
     depth: usize,
+    mini_shadowed: bool,
 ) -> Result<PatternTransformCandidate, PatternTransformFallbackReason> {
     let mut calls = Vec::new();
     let mut receiver = body;
@@ -190,7 +195,7 @@ fn method_chain(
                 let arguments = call
                     .arguments
                     .iter()
-                    .map(|argument| literal_argument(argument, parameter, source, depth))
+                    .map(|argument| literal_argument(argument, source, depth, mini_shadowed))
                     .collect::<Result<Box<[_]>, _>>()?;
                 calls.push(CallbackMethodCall {
                     method: method.into(),
@@ -225,9 +230,9 @@ fn method_callee<'s, 'a>(
 
 fn literal_argument(
     argument: &Argument<'_>,
-    parameter: &str,
     source: &str,
     depth: usize,
+    mini_shadowed: bool,
 ) -> Result<CallbackArgument, PatternTransformFallbackReason> {
     let Some(expression) = argument.as_expression() else {
         return Err(PatternTransformFallbackReason::ArgumentShape);
@@ -241,7 +246,7 @@ fn literal_argument(
         Expression::StringLiteral(literal) if !literal.lone_surrogates => {
             Ok(CallbackArgument::String(literal.value.as_str().into()))
         }
-        Expression::CallExpression(call) => mini_call(call, parameter),
+        Expression::CallExpression(call) => mini_call(call, mini_shadowed),
         // A nested arrow is a method's function argument. Recognising it
         // against the same two shapes proves it capture-free, so its own
         // source is all a runtime needs to bridge an equivalent fallback.
@@ -249,7 +254,7 @@ fn literal_argument(
             if depth >= MAX_CALLBACK_TRANSFORM_DEPTH {
                 return Err(PatternTransformFallbackReason::ArgumentShape);
             }
-            let candidate = arrow_candidate(arrow, source, depth + 1)?;
+            let candidate = arrow_candidate(arrow, source, depth + 1, mini_shadowed)?;
             let span = arrow.span();
             let text = source
                 .get(span.start as usize..span.end as usize)
@@ -281,7 +286,7 @@ fn number_literal(expression: &Expression<'_>) -> Option<f64> {
 /// literal.
 fn mini_call(
     call: &CallExpression<'_>,
-    parameter: &str,
+    mini_shadowed: bool,
 ) -> Result<CallbackArgument, PatternTransformFallbackReason> {
     let Expression::Identifier(callee) = call.callee.without_parentheses() else {
         return Err(PatternTransformFallbackReason::ArgumentShape);
@@ -289,7 +294,7 @@ fn mini_call(
     if callee.name != MINI_CALLEE {
         return Err(PatternTransformFallbackReason::ArgumentShape);
     }
-    if parameter == MINI_CALLEE {
+    if mini_shadowed {
         return Err(PatternTransformFallbackReason::MiniCalleeShadowed);
     }
     if call.optional || call.type_arguments.is_some() {
@@ -535,6 +540,10 @@ mod tests {
                 Reason::MiniCallShape,
             ),
             ("m => m.fast(m('1 2', 3))", Reason::MiniCalleeShadowed),
+            (
+                "m => m.sometimesBy(1, y => y.ply(m('2', 10)))",
+                Reason::MiniCalleeShadowed,
+            ),
         ] {
             assert_eq!(
                 lower_pattern_transform_callback(source),
