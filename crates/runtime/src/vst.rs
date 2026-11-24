@@ -128,19 +128,40 @@ pub fn folders() -> Vec<PathBuf> {
 }
 
 /// Test support: these folders take the place of [`standard_folders`], so a
-/// test never reads the plugins of the machine.
+/// test never reads the plugins of the machine. The scan cache and the
+/// preset folders go to a folder of the test process: see
+/// [`presets_folder`].
 #[cfg(any(test, feature = "test-support"))]
 pub fn pin_standard_folders(folders: Vec<PathBuf>) {
     *PINNED_FOLDERS.lock().expect("plugin folders") = Some(folders);
     if let Some(host) = started() {
+        host.set_preset_folder(test_presets_folder().to_owned());
         host.scan(&self::folders());
         host.wait_idle();
     }
 }
 
-/// The folder with the preset folders: `~/.rustel/vst`.
+/// The folder with the preset folders and the scan cache: `~/.rustel/vst`.
+/// After [`pin_standard_folders`], a folder of the test process, so a test
+/// never writes the plugin data of the user.
 pub fn presets_folder() -> Option<PathBuf> {
+    #[cfg(any(test, feature = "test-support"))]
+    if PINNED_FOLDERS.lock().expect("plugin folders").is_some() {
+        return Some(test_presets_folder().to_owned());
+    }
     crate::config_dir::canonical().map(|data| data.join(PRESETS_DIRECTORY_NAME))
+}
+
+/// The preset folder of this test process. A new process id can be the id
+/// of an old run, so the first use empties the folder.
+#[cfg(any(test, feature = "test-support"))]
+fn test_presets_folder() -> &'static std::path::Path {
+    static FOLDER: OnceLock<PathBuf> = OnceLock::new();
+    FOLDER.get_or_init(|| {
+        let folder = std::env::temp_dir().join(format!("rustel-test-vst-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&folder);
+        folder
+    })
 }
 
 /// The folders with `.vstpreset` files the player added, in any folder
