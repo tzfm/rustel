@@ -61,15 +61,18 @@ fn completion_home(shell: clap_complete::Shell) -> Result<(PathBuf, Option<Strin
                 needs.then(|| format!("fpath+=(~/.zfunc)   # in {} before compinit", rc.display())),
             )
         }
-        clap_complete::Shell::Bash => (
-            xdg("XDG_DATA_HOME", ".local/share")
+        clap_complete::Shell::Bash => {
+            let path = xdg("XDG_DATA_HOME", ".local/share")
                 .join("bash-completion/completions")
-                .join(name),
-            Some(
-                "needs the bash-completion package, which loads it by itself; without it: source the file from ~/.bashrc"
-                    .to_owned(),
-            ),
-        ),
+                .join(name);
+            // The bash-completion package loads the file by itself; this
+            // line is for a shell without it.
+            let line = format!(
+                "source {}   # in ~/.bashrc, unless the bash-completion package is installed",
+                path.display()
+            );
+            (path, Some(line))
+        }
         clap_complete::Shell::Fish => (
             xdg("XDG_CONFIG_HOME", ".config")
                 .join("fish/completions")

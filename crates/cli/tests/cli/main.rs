@@ -8967,6 +8967,64 @@ fn a_replay_export_plays_the_fader_of_its_take() {
     }
 }
 
+/// A function given more inputs than it takes says how many it takes, after
+/// strudel's own text.
+#[test]
+fn an_over_applied_function_names_the_inputs_it_takes() {
+    let out = run(&["check", "-e", r#"euclidLegato(5, 8, 2, n("0").s("sine"))"#]);
+    let said = String::from_utf8_lossy(&out.stdout);
+    assert!(!out.status.success(), "{said}");
+    assert!(
+        said.contains("euclidLegato() takes 2 inputs and a pattern but got 3 inputs"),
+        "{said}"
+    );
+}
+
+/// A word where K() wants a number is named, with the delay form K() has.
+#[test]
+fn a_word_in_a_kabelsalat_graph_is_named() {
+    let out = run(&[
+        "check",
+        "-e",
+        r#"note("c3").s("sine").K(sine(sFreq).mul(0.2).delay("d1", 0.1).out())"#,
+    ]);
+    let said = String::from_utf8_lossy(&out.stdout);
+    assert!(!out.status.success(), "{said}");
+    assert!(
+        said.contains(r#"KabelSalat input "d1" is not a number"#),
+        "{said}"
+    );
+    assert!(said.contains("use delay(input, seconds)"), "{said}");
+}
+
+/// The line bash completions ask for is a line: a source of the file
+/// written, which a shell without bash-completion needs.
+#[test]
+fn bash_completions_print_a_line_to_add() {
+    let home = tempfile::tempdir().expect("home");
+    let args = ["completions", "bash", "--install"];
+    let child = rustel()
+        .args(args)
+        .env("HOME", home.path())
+        .env_remove("XDG_DATA_HOME")
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn rustel");
+    let out = wait_within(child, &args, RUN_LIMIT);
+    let said = String::from_utf8_lossy(&out.stdout);
+    assert!(out.status.success(), "{out:?}");
+    let script = home
+        .path()
+        .join(".local/share/bash-completion/completions/rustel");
+    assert!(script.is_file(), "{said}");
+    let line = said.lines().last().expect("the line").trim();
+    assert!(
+        line.starts_with(&format!("source {}", script.display())),
+        "{said}"
+    );
+}
+
 /// A `--from` past the last save bounces the closing state for `--duration`.
 #[test]
 fn a_replay_export_past_the_end_of_the_tape_bounces_the_closing_state() {
