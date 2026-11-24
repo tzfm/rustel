@@ -543,7 +543,10 @@ impl StepWave {
             && matches!(hf.value, Value::Object(_))
             && hf.value.is_data(0)
             && hf.part.begin < hf.part.end
-            && hf.part.intersection(&hf.whole_or_part()) == Some(hf.part)
+            && hf
+                .whole
+                .as_ref()
+                .is_none_or(|w| w.begin <= hf.part.begin && hf.part.end <= w.end)
     }
 
     /// Whether `span` lies entirely inside a single step of `steps`, so every

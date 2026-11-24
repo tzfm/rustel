@@ -268,25 +268,22 @@ pub fn sort_haps_for_query(mut haps: Vec<Hap>) -> Vec<Hap> {
 /// sorts first.
 #[inline(always)]
 pub(crate) fn query_order(a: &Hap, b: &Hap) -> std::cmp::Ordering {
-    if a.part.begin != b.part.begin {
-        return a.part.begin.cmp(&b.part.begin);
+    match a.part.begin.cmp(&b.part.begin) {
+        std::cmp::Ordering::Equal => {}
+        ord => return ord,
     }
-    if a.part.end != b.part.end {
-        return a.part.end.cmp(&b.part.end);
+    match a.part.end.cmp(&b.part.end) {
+        std::cmp::Ordering::Equal => {}
+        ord => return ord,
     }
     match (&a.whole, &b.whole) {
         (None, None) => std::cmp::Ordering::Equal,
         (None, Some(_)) => std::cmp::Ordering::Less,
         (Some(_), None) => std::cmp::Ordering::Greater,
-        (Some(aw), Some(bw)) => {
-            if aw.begin != bw.begin {
-                aw.begin.cmp(&bw.begin)
-            } else if aw.end != bw.end {
-                aw.end.cmp(&bw.end)
-            } else {
-                std::cmp::Ordering::Equal
-            }
-        }
+        (Some(aw), Some(bw)) => match aw.begin.cmp(&bw.begin) {
+            std::cmp::Ordering::Equal => aw.end.cmp(&bw.end),
+            ord => ord,
+        },
     }
 }
 
@@ -595,8 +592,8 @@ pub(crate) fn stable_sort_in_place(haps: &mut [Hap]) {
     else {
         return;
     };
-    if n <= 24 {
-        sort_few_haps_direct::<24>(haps, first_bad);
+    if n <= 32 {
+        sort_few_haps_direct::<32>(haps, first_bad);
         return;
     }
     if n <= FEW_HAPS {
