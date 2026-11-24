@@ -128,14 +128,13 @@ pub fn folders() -> Vec<PathBuf> {
 }
 
 /// Test support: these folders take the place of [`standard_folders`], so a
-/// test never reads the plugins of the machine. The scan cache and the
-/// preset folders go to a folder of the test process: see
-/// [`presets_folder`].
+/// test never reads the plugins of the machine. A host that starts after
+/// the pin keeps its scan cache and preset folders in a folder of the test
+/// process: see [`presets_folder`].
 #[cfg(any(test, feature = "test-support"))]
 pub fn pin_standard_folders(folders: Vec<PathBuf>) {
     *PINNED_FOLDERS.lock().expect("plugin folders") = Some(folders);
     if let Some(host) = started() {
-        host.set_preset_folder(test_presets_folder().to_owned());
         host.scan(&self::folders());
         host.wait_idle();
     }
