@@ -511,6 +511,9 @@ pub struct Scheduler {
     horizon: f64,
     /// Maximum haps one query may materialise before the scheduler refuses it.
     query_hap_budget: u64,
+    /// Whether a query the pattern itself put past a native limit gives up
+    /// its cycle instead of holding the cursor for a retry.
+    moves_past_fixed_refusals: bool,
     /// Where each cycle is on the clock.
     tempo: TempoMap,
     /// Whether a hap's `cps` control changes the tempo. An outside clock
@@ -733,6 +736,7 @@ impl Scheduler {
             transport,
             horizon,
             query_hap_budget: rustel_core::DEFAULT_HAP_BUDGET,
+            moves_past_fixed_refusals: false,
             tempo: TempoMap::new(cps),
             pattern_tempo: true,
             tempo_changed: false,
@@ -1810,6 +1814,13 @@ impl Scheduler {
         refill_floor_secs(self.horizon)
     }
 
+    /// Let a refusal no retry can lift cost only its own cycle: the part
+    /// before the next cycle is tried alone, and a cycle still refused is
+    /// left silent, as a scheduler that catches the error plays on.
+    pub fn set_moves_past_fixed_refusals(&mut self, moves: bool) {
+        self.moves_past_fixed_refusals = moves;
+    }
+
     /// The refusal from the last [`TickStatus::Refused`], if any.
     pub fn refusal(&self) -> Option<&QueryLimit> {
         self.refused.as_ref()
@@ -2034,8 +2045,17 @@ impl Scheduler {
                 Vec::new()
             }
             Err(limit) => {
-                // The cursor does not advance, by design. A refusal means
-                // the work could not be done, and the same span must be
+                if self.moves_past_fixed_refusals && limit.is_fixed() {
+                    let next_cycle = begin.next_sam();
+                    let to_next = next_cycle.sub(begin).to_f64();
+                    if end > next_cycle && to_next >= 0.001 {
+                        return self.fill(clock, to_next, profile);
+                    }
+                    self.queried_to = next_cycle;
+                    self.last_fill_time = now;
+                }
+                // Otherwise the cursor does not advance, by design. A refusal
+                // means the work could not be done, and the same span must be
                 // schedulable when the pressure passes (the recovery tests
                 // check this). The live layer bounds the retries: see the
                 // starvation rollback in `live.rs`.
@@ -2328,6 +2348,46 @@ mod tests {
             scheduler.set_query_hap_budget(16);
             assert_eq!(scheduler.tick(&clock), TickStatus::Filled);
             assert_eq!(scheduler.queued(), 16);
+        }
+
+        /// A cycle past a native limit costs that cycle alone: the one
+        /// before it plays, and the next is queried at once.
+        #[test]
+        fn a_fixed_refusal_gives_up_only_its_own_cycle() {
+            let bad = rustel_core::combinators::euclid_with_steps(&atom("b"), 1, 1e6, 0);
+            let pattern = rustel_core::slowcat(vec![atom("a"), bad, atom("c")]);
+            let clock = VirtualClock::new(0.0);
+            let mut scheduler = Scheduler::new(Arc::new(Transport::default()), 1.0, 4.0);
+            scheduler.set_pattern(pattern, clock.now());
+            scheduler.set_moves_past_fixed_refusals(true);
+
+            assert_eq!(scheduler.tick(&clock), TickStatus::Filled);
+            assert_eq!(scheduler.queued(), 1, "the cycle before the refusal");
+            assert_eq!(scheduler.queried_to, Fraction::from(1));
+
+            clock.set(1.0);
+            assert_eq!(scheduler.tick(&clock), TickStatus::Refused);
+            assert!(matches!(
+                scheduler.refusal(),
+                Some(QueryLimit::EuclidSteps { .. })
+            ));
+            assert_eq!(scheduler.queried_to, Fraction::from(2));
+
+            assert_eq!(scheduler.tick(&clock), TickStatus::Filled);
+            assert_eq!(scheduler.queued(), 2, "the cycle after it");
+        }
+
+        /// A refusal the machine caused still holds the cursor for a retry.
+        #[test]
+        fn a_budget_refusal_holds_the_cursor_when_fixed_ones_move_on() {
+            let clock = VirtualClock::new(0.0);
+            let mut scheduler = Scheduler::new(Arc::new(Transport::default()), 1.0, 1.0);
+            scheduler.set_pattern(fastcat(vec![atom("hh"); 16]), clock.now());
+            scheduler.set_query_hap_budget(8);
+            scheduler.set_moves_past_fixed_refusals(true);
+
+            assert_eq!(scheduler.tick(&clock), TickStatus::Refused);
+            assert_eq!(scheduler.queried_to, Fraction::ZERO);
         }
     }
 
