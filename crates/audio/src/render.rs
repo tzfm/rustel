@@ -211,6 +211,7 @@ pub fn write_wav_reporting(
             finish: None,
             stop_when_silent,
             limiter: None,
+            fader: None,
         },
         format,
     )
@@ -249,6 +250,9 @@ pub struct RenderControl<'o, 'f> {
     /// Applied before observing, detecting silence and encoding. Its lookahead
     /// is compensated so the file keeps its original timing and length.
     pub limiter: Option<RenderLimiter>,
+    /// The master fader ahead of the limiter, as live: a gain from each frame
+    /// on, ramped over 10 ms as the live fader is.
+    pub fader: Option<&'f [(usize, f32)]>,
 }
 
 /// [`write_pcm16_wav`] under a [`RenderControl`].
@@ -309,6 +313,22 @@ pub fn write_wav_events_controlled(
         format,
         None,
     )
+}
+
+/// The gain of a fader timeline at `frame`: each step takes over from the
+/// one before over 10 ms, as the live fader ramps. Unity before the first.
+fn fader_gain(steps: &[(usize, f32)], frame: usize, sample_rate: u32) -> f32 {
+    let ramp = (sample_rate as usize / 100).max(1);
+    let at = steps.partition_point(|(from, _)| *from <= frame);
+    let Some(&(from, gain)) = at.checked_sub(1).and_then(|index| steps.get(index)) else {
+        return 1.0;
+    };
+    let before = at
+        .checked_sub(2)
+        .and_then(|index| steps.get(index))
+        .map_or(gain, |(_, gain)| *gain);
+    let progress = ((frame - from) as f32 / ramp as f32).min(1.0);
+    before + (gain - before) * progress
 }
 
 /// Stream a stems bounce beside `path`: [`stems_folder`] holds a `main.wav`
@@ -479,6 +499,7 @@ fn write_render_wav_events(
         finish,
         stop_when_silent,
         limiter,
+        fader,
     } = control;
     let mut limiter = limiter.map(|config| {
         let processor = crate::Limiter::new(
@@ -596,6 +617,19 @@ fn write_render_wav_events(
         // beyond the requested end. The backend still sees its usual blocks.
         pcm[render_count * CHANNELS as usize..input_count * CHANNELS as usize].fill(0.0);
         input_offset += input_count;
+        if let Some(steps) = fader {
+            let first = input_offset - input_count;
+            for (index, frame) in pcm[..input_count * CHANNELS as usize]
+                .as_chunks_mut::<2>()
+                .0
+                .iter_mut()
+                .enumerate()
+            {
+                let gain = fader_gain(steps, first + index, sample_rate);
+                frame[0] *= gain;
+                frame[1] *= gain;
+            }
+        }
         if let Some((processor, makeup)) = &mut limiter {
             processor.process_stereo(&mut pcm[..input_count * CHANNELS as usize]);
             for sample in &mut pcm[..input_count * CHANNELS as usize] {
@@ -1103,6 +1137,7 @@ mod finish_tests {
                 finish: Some(&finish),
                 stop_when_silent: None,
                 limiter: None,
+                fader: None,
             },
         )
         .unwrap();

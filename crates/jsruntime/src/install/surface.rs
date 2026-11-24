@@ -2040,8 +2040,8 @@ pub(super) const REFERENCE_ENTRIES: &[ReferenceEntry] = &[
     ReferenceEntry {
         name: "removeUndefineds",
         synonyms: &[],
-        summary: "Returns a new pattern, with haps containing undefined values removed from query results.",
-        description: "Returns a new pattern, with haps containing undefined values removed from\nquery results.",
+        summary: "Returns an array without its undefined values.",
+        description: "Takes an array and returns it without its undefined values, as strudel does, for example removeUndefineds([s(\"bd\"), undefined]). It is not a pattern method.",
         params: &[],
         examples: &[],
         tags: &["internals"],

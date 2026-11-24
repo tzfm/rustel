@@ -8907,6 +8907,66 @@ fn a_replay_export_goes_through_the_limiter_of_its_set() {
     let _ = std::fs::remove_file(&out);
 }
 
+/// The master fader the take was played at plays in its replay export, ahead
+/// of any limiter, as live: a tape whose fader sat at -6 dB exports at half
+/// the level of the same tape at 0 dB, and a later move takes over at its time.
+#[test]
+fn a_replay_export_plays_the_fader_of_its_take() {
+    use rustel_runtime::session_log::{SaveStatus, SessionMode, SessionRecorder};
+
+    let peak = |data: &[u8]| {
+        data.as_chunks::<2>()
+            .0
+            .iter()
+            .map(|sample| i32::from(i16::from_le_bytes(*sample)).abs())
+            .max()
+            .unwrap_or(0) as f64
+            / 32768.0
+    };
+    let tape = |name: &str, faders: &[(f64, f64)]| {
+        let path = scratch(name);
+        let mut recorder =
+            SessionRecorder::create(path.clone(), SessionMode::Debug, None).expect("recorder");
+        recorder.record_save(0.0, SaveStatus::Installed, &format!("{C3_SCORE}\n"), None);
+        for (at, db) in faders {
+            recorder
+                .try_record_control(*at, serde_json::json!({ "fader_db": db }))
+                .expect("a fader move");
+        }
+        path
+    };
+    let unity = tape("replay-fader-unity.rustel-session", &[(0.0, 0.0)]);
+    let low = tape("replay-fader-low.rustel-session", &[(0.0, -6.0)]);
+    let moved = tape(
+        "replay-fader-moved.rustel-session",
+        &[(0.0, -6.0), (1.0, 0.0)],
+    );
+    let out = scratch("replay-fader.wav");
+    let export = |from: &std::path::Path| {
+        ok_output(&replay_export_args(from, &out, "0", &["--duration", "2"]));
+        wav_pcm_of_length(&out, 2.0)
+    };
+    let full = peak(&export(&unity));
+    let half = peak(&export(&low));
+    assert!(full > 0.1, "the score sounds: {full}");
+    let ratio = half / full;
+    assert!(
+        (0.48..=0.52).contains(&ratio),
+        "-6 dB is half the level: {ratio}"
+    );
+    let data = export(&moved);
+    let (first, second) = data.split_at(pcm_bytes(1.0));
+    let (first, second) = (peak(first), peak(second));
+    assert!(
+        (0.48..=0.52).contains(&(first / full)) && (0.95..=1.05).contains(&(second / full)),
+        "the move at 1 s takes over: {first} then {second} of {full}"
+    );
+
+    for path in [&unity, &low, &moved, &out] {
+        let _ = std::fs::remove_file(path);
+    }
+}
+
 /// A `--from` past the last save bounces the closing state for `--duration`.
 #[test]
 fn a_replay_export_past_the_end_of_the_tape_bounces_the_closing_state() {

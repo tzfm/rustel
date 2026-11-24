@@ -1371,6 +1371,7 @@ pub fn write_scalar_wav_reporting(
             finish: None,
             stop_when_silent,
             limiter: None,
+            fader: None,
         },
         format,
         stop,
@@ -1582,6 +1583,7 @@ pub(crate) fn write_scalar_wav_controlled_with_dispatch(
         mut observer,
         stop_when_silent,
         limiter,
+        fader,
         ..
     } = control;
     let mut spoke_at = std::time::Instant::now();
@@ -1617,6 +1619,7 @@ pub(crate) fn write_scalar_wav_controlled_with_dispatch(
         finish: stop.finish.as_deref(),
         stop_when_silent,
         limiter,
+        fader,
     };
     let written = if stems {
         rustel_audio::write_stems_wav_events_controlled(

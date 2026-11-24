@@ -65,6 +65,23 @@ impl ReplayPlan {
 
     /// Whether any save in the plan installed. A plan where none did has
     /// nothing to bounce.
+    /// The fader steps of an export from `from`: the level in force at
+    /// `from` at once, then each later move at its offset.
+    pub fn export_faders(script: &SessionScript, from: f64) -> Vec<(f64, f32)> {
+        let opening = script
+            .faders
+            .iter()
+            .rev()
+            .find(|(at, _)| *at <= from)
+            .map(|(_, db)| (0.0, *db));
+        let later = script
+            .faders
+            .iter()
+            .filter(|(at, _)| *at > from)
+            .map(|(at, db)| (at - from, *db));
+        opening.into_iter().chain(later).collect()
+    }
+
     pub fn any_installed(&self) -> bool {
         self.installed_saves().next().is_some()
     }
@@ -185,6 +202,7 @@ mod replay_plan_tests {
             baseline_cps: None,
             saves,
             logs: 0,
+            faders: Vec::new(),
         }
     }
 

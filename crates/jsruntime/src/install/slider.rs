@@ -72,7 +72,7 @@ pub(crate) const REFERENCE_ENTRIES: &[ReferenceEntry] = &[
             ReferenceParam {
                 name: "id",
                 r#type: "string",
-                description: "the slider ID; calls sharing an ID share one value.",
+                description: "the slider ID, in single quotes: a double-quoted string is a mini pattern; calls sharing an ID share one value.",
             },
             ReferenceParam {
                 name: "value",
@@ -80,7 +80,7 @@ pub(crate) const REFERENCE_ENTRIES: &[ReferenceEntry] = &[
                 description: "the value assigned to this ID; later calls replace it.",
             },
         ],
-        examples: &["$: s(\"bd*4\").gain(sliderWithID(\"mix\", 0.5))"],
+        examples: &["$: s(\"bd*4\").gain(sliderWithID('mix', 0.5))"],
         tags: &["rustel", "control"],
         no_autocomplete: false,
         deprecated: false,

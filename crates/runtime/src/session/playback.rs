@@ -719,8 +719,20 @@ impl Session {
 
         // The mp3 door is the same render; only the container differs, so a
         // tape bounced either way is the same audio.
+        // The fader of the take, in frames, ahead of the limiter as live.
+        let fader_steps: Vec<(usize, f32)> = self
+            .export_fader
+            .iter()
+            .map(|(secs, db)| {
+                (
+                    (secs.max(0.0) * f64::from(self.config.sample_rate)).round() as usize,
+                    10f32.powf(db / 20.0),
+                )
+            })
+            .collect();
+        let fader = (!fader_steps.is_empty()).then_some(&fader_steps[..]);
         let (plugin_lines, voices_refused) = self.render_under_diagnostic_policy(|session| {
-            if mp3 && session.export_limiter.is_none() {
+            if mp3 && session.export_limiter.is_none() && fader.is_none() {
                 crate::render::write_scalar_mp3_with_dispatch(
                     out_path,
                     session.config.sample_rate,
@@ -747,6 +759,7 @@ impl Session {
                     print_progress,
                     rustel_audio::RenderControl {
                         limiter: session.export_limiter,
+                        fader,
                         ..rustel_audio::RenderControl::default()
                     },
                     rustel_audio::WavSampleFormat::Pcm16,
@@ -778,6 +791,7 @@ impl Session {
                         finish: None,
                         stop_when_silent: None,
                         limiter: session.export_limiter,
+                        fader,
                     },
                     rustel_audio::WavSampleFormat::Pcm16,
                     session.config.dsp_dispatch,
@@ -850,6 +864,12 @@ impl Session {
     /// score-level `.limit()` effects are independent of this setting.
     pub fn set_export_limiter(&mut self, limiter: Option<rustel_audio::RenderLimiter>) {
         self.export_limiter = limiter;
+    }
+
+    /// The master fader of a replayed take for [`Self::render_session`]:
+    /// `(seconds, dB)` steps, each from its time on. Empty is unity.
+    pub fn set_export_fader(&mut self, steps: Vec<(f64, f32)>) {
+        self.export_fader = steps;
     }
 
     /// Write a `<name> stems` folder beside each scalar WAV export:
@@ -1073,6 +1093,7 @@ impl Session {
                         finish: None,
                         stop_when_silent,
                         limiter: session.export_limiter,
+                        fader: None,
                     },
                     rustel_audio::WavSampleFormat::Pcm16,
                     session.config.dsp_dispatch,
@@ -1112,6 +1133,7 @@ impl Session {
                         finish: None,
                         stop_when_silent,
                         limiter: session.export_limiter,
+                        fader: None,
                     },
                     match format {
                         RenderFormat::ScalarF32Wav => rustel_audio::WavSampleFormat::Float32,

@@ -424,6 +424,8 @@ pub struct SessionScript {
     pub saves: Vec<SessionSave>,
     /// Diagnostics kept alongside the saves (debug recordings only).
     pub logs: usize,
+    /// Each master fader move the tape recorded: `(seconds, dB)`.
+    pub faders: Vec<(f64, f32)>,
 }
 
 impl SessionScript {
@@ -464,6 +466,7 @@ impl SessionScript {
 
         let mut saves = Vec::new();
         let mut logs = 0usize;
+        let mut faders = Vec::new();
         for line_number in 2.. {
             let Some(line) = read_session_line(&mut reader, path, line_number)? else {
                 break;
@@ -528,6 +531,14 @@ impl SessionScript {
                     });
                 }
                 Some("log") => logs += 1,
+                Some("control") => {
+                    if let Some(db) = record.get("fader_db").and_then(|db| db.as_f64())
+                        && db.is_finite()
+                    {
+                        let at = record.get("t").and_then(|t| t.as_f64()).unwrap_or(0.0);
+                        faders.push((at, db as f32));
+                    }
+                }
                 _ => {}
             }
         }
@@ -551,6 +562,7 @@ impl SessionScript {
                 .and_then(|c| c.as_f64()),
             saves,
             logs,
+            faders,
         })
     }
 
