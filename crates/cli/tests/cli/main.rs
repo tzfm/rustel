@@ -8835,8 +8835,10 @@ fn a_replay_export_opens_on_the_state_sounding_at_from() {
 fn a_replay_export_goes_through_the_limiter_of_its_set() {
     const LOUD: &str = r#"$: note("c3*4").s("sawtooth").gain(4)"#;
     let peak = |data: &[u8]| {
-        data.chunks_exact(2)
-            .map(|sample| i32::from(i16::from_le_bytes([sample[0], sample[1]])).abs())
+        data.as_chunks::<2>()
+            .0
+            .iter()
+            .map(|sample| i32::from(i16::from_le_bytes(*sample)).abs())
             .max()
             .unwrap_or(0) as f64
             / 32768.0
