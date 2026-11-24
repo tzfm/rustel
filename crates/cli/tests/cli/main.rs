@@ -9019,10 +9019,12 @@ fn bash_completions_print_a_line_to_add() {
         .join(".local/share/bash-completion/completions/rustel");
     assert!(script.is_file(), "{said}");
     let line = said.lines().last().expect("the line").trim();
-    assert!(
-        line.starts_with(&format!("source {}", script.display())),
-        "{said}"
-    );
+    let sourced = line
+        .strip_prefix("source ")
+        .and_then(|rest| rest.split("   #").next())
+        .unwrap_or_else(|| panic!("a source line: {said}"));
+    // Compared as paths: Windows joins this one with both separators.
+    assert_eq!(std::path::Path::new(sourced), script, "{said}");
 }
 
 /// A `--from` past the last save bounces the closing state for `--duration`.
