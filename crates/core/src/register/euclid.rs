@@ -82,7 +82,7 @@ const EUCLID_LEGATO: crate::reference::ReferenceEntry = crate::reference::Refere
     name: "euclidLegato",
     synonyms: &[],
     summary: "Similar to `euclid`, but each pulse is held until the next pulse, so there will be no gaps.",
-    description: "Holds each pulse until the next pulse. Negative pulses select the gaps before extending them. Negative steps use ordinary pulses with gaps. Extra pulses extend the rhythm across more cycles.",
+    description: "Holds each pulse until the next pulse. It takes no rotation, as on strudel: euclidLegatoRot rotates. Negative pulses select the gaps before extending them. Negative steps use ordinary pulses with gaps. Extra pulses extend the rhythm across more cycles.",
     params: &[
         crate::reference::ReferenceParam {
             name: "pulses",
@@ -93,16 +93,6 @@ const EUCLID_LEGATO: crate::reference::ReferenceEntry = crate::reference::Refere
             name: "steps",
             r#type: "number",
             description: "the number of steps to fill",
-        },
-        crate::reference::ReferenceParam {
-            name: "rotation",
-            r#type: "",
-            description: "offset in steps",
-        },
-        crate::reference::ReferenceParam {
-            name: "pat",
-            r#type: "",
-            description: "",
         },
     ],
     examples: &["note(\"c3\").euclidLegato(3,8)"],

@@ -1603,17 +1603,10 @@ mod reference_honesty_tests {
             .map(|reg| reg.reference.name)
             .collect();
         deviating.sort_unstable();
-        let mut argued: Vec<&str> = vec![
-            // One `attack:decay:sustain:release` argument, documented as the
-            // four envelope components it encodes.
-            "adsr",
-            // One argument documented as its parts.
-            "euclidLegato",
-            // The message plus the device it is sent to.
-            "midi",
-            // The message plus the device it is sent to.
-            "sysex",
-        ];
+        // adsr: one `attack:decay:sustain:release` argument, documented as
+        // the four envelope components it encodes. midi and sysex: the
+        // message plus the device it is sent to.
+        let mut argued: Vec<&str> = vec!["adsr", "midi", "sysex"];
         argued.sort_unstable();
         assert_eq!(
             deviating, argued,
