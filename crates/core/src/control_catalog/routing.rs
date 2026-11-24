@@ -206,10 +206,10 @@ pub(super) const DELAYTIME: ControlRow = ControlRow {
 
 pub(super) const DELAYSYNC: ControlRow = ControlRow {
     names: &["delaysync"],
-    aliases: &["delays", "ds"],
+    aliases: &["delays"],
     reference: ReferenceEntry {
         name: "delaysync",
-        synonyms: &["delays", "ds"],
+        synonyms: &["delays"],
         summary: "Delay time in cycles; requires a positive delay send.",
         description: "Defaults to 3/16 cycles. Dividing by cycles per second gives seconds, capped at 1 second. An explicit delaytime overrides it. delay, the resulting time, and delayfeedback must all be positive.",
         params: &[
