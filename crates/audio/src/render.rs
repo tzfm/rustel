@@ -313,7 +313,7 @@ pub fn write_wav_events_controlled(
 
 /// Stream a stems bounce beside `path`: [`stems_folder`] holds a `main.wav`
 /// with what [`write_wav_events_controlled`] would have written, plus one
-/// stereo WAV a sounding orbit, named `1.wav` upward. The stems tap every
+/// stereo WAV a sounding orbit, named by its orbit number. The stems tap every
 /// orbit after its delay, reverb, filter, duck and fader, before the
 /// limiter, so mastering stays in the DAW and the stems sum back to the
 /// unmastered main. Orbits that never sound leave no file. A backend
@@ -414,7 +414,7 @@ impl StemTracks {
     ) -> Result<Self, String> {
         let mut files = Vec::with_capacity(crate::scalar::MAX_ORBITS);
         for orbit in 0..crate::scalar::MAX_ORBITS {
-            let path = folder.join(format!("{}.wav", orbit + 1));
+            let path = folder.join(format!("{orbit}.wav"));
             let mut file = File::create(&path)
                 .map_err(|error| format!("cannot write {}: {error}", path.display()))?;
             write_wav_header(&mut file, sample_rate, frames, 2, format)?;
@@ -1494,7 +1494,7 @@ mod stems_tests {
         )
         .expect("limited bounce");
 
-        for stem in ["1.wav", "2.wav"] {
+        for stem in ["0.wav", "1.wav"] {
             let plain = float_wav(&stems_folder(&plain).join(stem));
             assert!(plain.iter().any(|sample| *sample != 0.0), "{stem} sounds");
             assert_eq!(
@@ -1506,7 +1506,7 @@ mod stems_tests {
 
         // A pre-roll of 256 frames, with each note 256 frames later, gives
         // the same files. A note on orbit 2 that ends in a pre-roll of 4 096
-        // frames leaves no stem, so the folder has no 3.wav.
+        // frames leaves no stem, so the folder has no 2.wav.
         let shifted = dir.join("shifted").join("bounce.wav");
         bounce_after(&shifted, RenderControl::default(), 256, None).expect("shifted bounce");
         let early = dir.join("early").join("bounce.wav");
@@ -1515,14 +1515,14 @@ mod stems_tests {
             ..Default::default()
         });
         bounce_after(&early, RenderControl::default(), 4_096, Some(short)).expect("early bounce");
-        for file in ["main.wav", "1.wav", "2.wav"] {
+        for file in ["main.wav", "0.wav", "1.wav"] {
             let plain = float_wav(&stems_folder(&plain).join(file));
             for bounce in [&shifted, &early] {
                 let moved = float_wav(&stems_folder(bounce).join(file));
                 assert!(moved == plain, "{file} of {}", bounce.display());
             }
         }
-        assert!(!stems_folder(&early).join("3.wav").exists());
+        assert!(!stems_folder(&early).join("2.wav").exists());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1549,10 +1549,10 @@ mod stems_tests {
             })
             .collect();
         files.sort();
-        assert_eq!(files, ["1.wav", "2.wav", "main.wav"]);
+        assert_eq!(files, ["0.wav", "1.wav", "main.wav"]);
         let main = float_wav(&folder.join("main.wav"));
-        let first = float_wav(&folder.join("1.wav"));
-        let second = float_wav(&folder.join("2.wav"));
+        let first = float_wav(&folder.join("0.wav"));
+        let second = float_wav(&folder.join("1.wav"));
         assert_eq!(main.len(), 48_000);
         assert_eq!(main.len(), first.len());
         assert_eq!(main.len(), second.len());
@@ -1620,8 +1620,8 @@ mod stems_tests {
 
         let folder = stems_folder(&path);
         let main = float_wav(&folder.join("main.wav"));
-        let first = float_wav(&folder.join("1.wav"));
-        let second = float_wav(&folder.join("2.wav"));
+        let first = float_wav(&folder.join("0.wav"));
+        let second = float_wav(&folder.join("1.wav"));
         assert_eq!(main.len(), 1024 * 2);
         for index in 0..main.len() {
             assert_eq!(
