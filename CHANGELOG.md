@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Fixed: `rustel replay --export` plays the master fader the take was played at, ahead of the limiter as live, so it sounds at the level of the take.
+
 ## v0.1.8
 
 - Fixed: a live orbit that changes its `roomsize` back, or takes the `roomsize` of another orbit, reuses that reverb instead of making it again, so frequent room changes no longer cause audio underruns.

@@ -182,6 +182,8 @@ pub(super) fn run_replay(
         // The file sounds like the take: through the limiter of the tape's set.
         #[cfg(feature = "studio")]
         session.set_export_limiter(rustel_studio::replay::tape_limiter(session_path));
+        // Ahead of the limiter, as live: the fader the take was played at.
+        session.set_export_fader(ReplayPlan::export_faders(&script, from));
         // Ctrl-C has to reach a render that runs for minutes. The watcher keeps
         // re-asserting the stop, which is what makes it stick across windows
         // that each start the transport again.

@@ -303,6 +303,7 @@ impl Session {
         }
         fresh.stop_when_silent = self.stop_when_silent;
         fresh.export_limiter = self.export_limiter;
+        fresh.export_fader = self.export_fader.clone();
         fresh.render_tail_secs = self.render_tail_secs;
         fresh.score_cps = self.score_cps;
         fresh.render_cycles = self.render_cycles;

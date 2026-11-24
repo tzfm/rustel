@@ -115,7 +115,8 @@ repeated scores can use `{"ref": n}` to refer to an earlier save.
 The header describes the format version, recording time, and retained events.
 An optional `baseline_cps` records a non-default initial tempo.
 A save's `via` can identify a slider update or stop. Control records, including
-fader moves and audio-take markers, are recorded but not applied by replay.
+fader moves and audio-take markers, are recorded. Live replay does not apply
+them; `--export` plays the recorded master fader ahead of the limiter, as live.
 A `--export` of a tape in a set's `sessions` folder goes through that set's
 master limiter, so it does not clip where the take did not.
 
