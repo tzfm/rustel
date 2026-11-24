@@ -2,13 +2,15 @@
 
 ## Unreleased
 
+- Fixed: `rustel replay --export` plays the master fader the take was played at, ahead of the limiter as live, so it sounds at the level of the take.
+
+## v0.1.8
+
 - Fixed: a live orbit that changes its `roomsize` back, or takes the `roomsize` of another orbit, reuses that reverb instead of making it again, so frequent room changes no longer cause audio underruns.
 - Scene > Save, and `:w` in Vim mode, save the scene without playing it. `:wq` and `:x` save it and close the tab.
 - A Studio crash saves unsaved edits, as quit does.
 - Fixed: a plugin made with DPF, such as the Dragonfly reverbs, no longer prints an assertion on every audio block: the host gives it a list for the parameter values it changes itself.
-- Changed: `.midi()` sends a pattern to MIDI in place of local audio, as on strudel.cc. A `ccn`/`ccv` pattern sent to MIDI no longer plays a sound. To hear a pattern and send it to MIDI, use `stack(p, p.midi())`.
 - Fixed: `cc(id, channel)` from `midin()` refuses a channel that is not a whole number from 1 to 16, instead of reading silence or cutting 1.5 to channel 1.
-- Fixed: a `vsti` note ends 1 ms early, as a MIDI note does, so a plugin such as TripleCheese no longer clicks where one note follows the next.
 - A `pickF` or `pick` name its lookup does not hold says which name is missing, without the JavaScript error text, also for a list picked by a name.
 - Fixed: a refused orbit, bus or input channel names the last one allowed (`orbit 16 is outside the orbits 0 to 15`), instead of a range that read as if 16 were allowed.
 - Fixed: Enter on a preset or a parameter of the plugin in a `vsti("name"` call still being typed writes the options object and closes the call, instead of doing nothing.
@@ -17,13 +19,9 @@
 - `rustel check` names a note that a `gm_*` soundfont has no note for, such as `note("c2").s("gm_clarinet")`, instead of finding no issues while the note plays as silence.
 - `rustel check` names a `talkit` setting the render refuses, such as `pitch: 49` or `quality: "garbled"`, instead of finding no issues while the voice is silent.
 - `rustel check` and `rustel query` take `--prebake setup.js`, so a score calling a prebake's helpers checks clean.
-- Fixed: a voice a shift moves before the start of an export, such as the first voice of a `strum` at cycle zero, is silent as on strudel.cc, with no refusal, so a Studio export of such a score no longer fails. Live play says so in plain words.
 - A sample source can be a repository page such as `https://github.com/user/repo`. It reads as `github:user/repo`, and a web page or a missing map says what to write instead.
 - Fixed: a sample source turned off and on again on the Permissions page brings its sounds back, and the update it refused while off runs again.
-- Fixed: in an export, an infinite `note` or `freq`, such as the log2 of 0, is a refused voice, and so is NaN on a sample, as on strudel.cc, instead of a note at the default pitch. A synth still reads a NaN note as absent.
 - Fixed: the update a permission re-runs waits for the engine to start fetching the source, instead of sometimes being refused again with an unknown sound.
-- Fixed: `rustel replay --export` of a tape from a set goes through the set's master limiter, so it no longer clips where the take did not.
-- Fixed: `rustel replay --export` plays the master fader the take was played at, ahead of the limiter as live, so it sounds at the level of the take.
 - Fixed: a playing score with a cycle past a native limit, such as `euclid(3, "<8 1000000>")`, loses only that cycle, as on strudel.cc, instead of a longer gap and a "fell behind" warning.
 - Fixed: a sample source turned off while its map was loading, then allowed again, brings its sounds back instead of leaving them unknown.
 - Changed: stem files are named by their orbit number. The default orbit's stem is now `1.wav` (it was `2.wav`), and `o(0)` writes `0.wav` (it was `1.wav`).
@@ -31,7 +29,6 @@
 - Fixed: an Alt key over the mixer or another panel holding the keyboard no longer types into or edits the score.
 - Fixed: an export of a score with an unknown chord, from the command line or the Studio sheet, says which chord, instead of writing a silent file with no message. The chord stays silent, as on strudel.cc.
 - `rustel check` queries the first 8 cycles, so a patterned value that is refused in a later one, such as `euclid(3, "<8 1000000>")`, is found and its cycle named.
-- Fixed: a `gain` that is no number, such as `"0.1..0.4"` or `"0.2:0.4"`, plays at 1 with a warning, as on strudel.cc, instead of a refused, silent voice.
 - A pattern can set the tempo: `cps("<0.5 1>")` changes it at each onset, unless Link or MIDI clock leads.
 - Fixed: a live output that fell behind and resumed is printed as a warning, not as an error, since the run plays on.
 - Fixed: leaving a Link session or letting go of an incoming MIDI clock plays the score's own tempo again, instead of the bent tempo the follow left until the next update.
@@ -49,21 +46,17 @@
 - The knobs column moves a plain number live while the set plays, as a slider does: the number of an audio control such as `lpf(4000)`, or of a function such as `pg(0.8)`, `fast(2)`, an `FX` stage's `soft(4.5)`, or a plugin option such as `vsti("Diva", { output: 0.111 })`. It needs no update, and edits not yet evaluated stay out of the sound. A plugin key turned on goes in as an update of its own. A rail that waits for an update is muted, dashed and marked "not live". A live move is written to the session tape.
 - Hold Shift or Alt while you drag any slider for a fine drag, a tenth as far. f in the knobs column or the expanded slider locks it on.
 - Fixed: the documented prebake helper `window.bpm = b => setcpm(b/4)` works after a score has run `initHydra()`, and a prebake that throws after an `await` reports its own line.
-- Fixed: the documented second argument of `asym`, `diode`, `fold` and the other distortions sets the volume, as `.asym(.5, .3)` reads.
 - Fixed: an update that starts on a rest and cannot play any of its notes no longer silences the set. The last good score keeps playing.
-- Fixed: loop points outside 0 to 1, or a loopBegin after loopEnd, loop the whole sample as Web Audio does, instead of playing loud clipped noise.
 - Fixed: a slider move is written to the session tape once it settles, so a replay plays it.
 - `samples('local:kits/q.json')` reads a sample map file in the granted folder, as a URL does. Its entries are relative to the file's folder and stay inside the grant.
 - Fixed: an export of N cycles with a `cps` pattern lane lasts N cycles at the tempo the lane sets, in `rustel export --cycles` and the Studio export sheet.
 - Fixed: with Vim editor keys on, text a remote client types arrives in order, as the docs say, instead of each character going in before the last.
 - Fixed: the events pane uses the theme's palette so monochrome themes stay monochrome. In Vim mode, `ip` and `ap` select paragraphs, `.` repeats the last change, and Ctrl+[ steps to the previous scene from Normal mode.
-- Fixed: `up` with values that name no controls, such as `up("7 12")` or `up(7)`, keeps the controls of the events underneath instead of replacing each event.
 - Fixed: a sample bank named by digits, such as the docs' own `samples('local:808')`, plays with `s("808")` instead of refusing every note.
 - Fixed: a visuals dock moved from a side to the top or bottom starts at the band's own size, so it no longer vanishes beside the mixer; a dock with no room says the keys go to the score.
 - Fixed: a General MIDI note outside its font's range says which notes the font plays instead of "failed to load", and Studio no longer counts such a font as a failed sound.
 - Fixed: `talkit("42")` speaks the number instead of a silent refused voice.
 - Fixed: `check` and Studio's update refuse an unknown `wtshape`, `warpshape`, `lpshape`, `hpshape` or `bpshape` name, which the voice would refuse when it plays.
-- Fixed: a KabelSalat signal past the range of a sample is silent on both channels, as the docs say, instead of full-scale noise on one.
 - Fixed: a scene can call a name from a script that another scene of the set imports, as the docs say, instead of the check refusing it as unknown.
 - Fixed: `rustel check` queries the score's first cycle, so a score that evaluates but refuses when it plays, such as a Euclid step past its limit or a KabelSalat `out(16)`, fails the check as query and export do.
 - Fixed: one sample source in Settings that will not read fails only its own row; the other remote sources still load.
@@ -77,6 +70,19 @@
 - Fixed: a `limit` above 0 dBFS is refused and says why, since a ceiling above full scale holds nothing back.
 - Fixed: a Hydra file with a hidden name, one that starts with `.`, is refused for being hidden, instead of a message about `..`.
 - Fixed: Studio's footer says an update was refused, and that the last good score keeps playing, instead of still evaluating.
+
+### Sound changes
+
+- Changed: `.midi()` sends a pattern to MIDI in place of local audio, as on strudel.cc. A `ccn`/`ccv` pattern sent to MIDI no longer plays a sound. To hear a pattern and send it to MIDI, use `stack(p, p.midi())`.
+- Fixed: a `vsti` note ends 1 ms early, as a MIDI note does, so a plugin such as TripleCheese no longer clicks where one note follows the next.
+- Fixed: a voice a shift moves before the start of an export, such as the first voice of a `strum` at cycle zero, is silent as on strudel.cc, with no refusal, so a Studio export of such a score no longer fails. Live play says so in plain words.
+- Fixed: in an export, an infinite `note` or `freq`, such as the log2 of 0, is a refused voice, and so is NaN on a sample, as on strudel.cc, instead of a note at the default pitch. A synth still reads a NaN note as absent.
+- Fixed: `rustel replay --export` of a tape from a set goes through the set's master limiter, so it no longer clips where the take did not.
+- Fixed: a `gain` that is no number, such as `"0.1..0.4"` or `"0.2:0.4"`, plays at 1 with a warning, as on strudel.cc, instead of a refused, silent voice.
+- Fixed: the documented second argument of `asym`, `diode`, `fold` and the other distortions sets the volume, as `.asym(.5, .3)` reads.
+- Fixed: loop points outside 0 to 1, or a loopBegin after loopEnd, loop the whole sample as Web Audio does, instead of playing loud clipped noise.
+- Fixed: `up` with values that name no controls, such as `up("7 12")` or `up(7)`, keeps the controls of the events underneath instead of replacing each event.
+- Fixed: a KabelSalat signal past the range of a sample is silent on both channels, as the docs say, instead of full-scale noise on one.
 
 ## v0.1.7
 
