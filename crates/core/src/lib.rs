@@ -6036,6 +6036,30 @@ impl Pattern {
         F: Fn(&Hap) -> Option<Hap> + Send + Sync + 'static,
         G: Fn(&Value) -> Option<Value> + Send + Sync + 'static,
     {
+        const MAX_CACHED_KEY_BYTES: usize = 64;
+        let build = || {
+            let (of_hap, of_note, scale_tag) = make();
+            let hap: HapMapFn = Arc::new(move |hap: &Hap| {
+                of_hap(hap).map(|mapped| mapped.with_pitch_live_controls(hap))
+            });
+            let keys = scale_tag.map(|tag| {
+                context_keys::ContextKeys::of(context_keys::Keys {
+                    scale: Some(tag),
+                    ..Default::default()
+                })
+            });
+            let bare_dress = keys.as_ref().and_then(sequence::Dress::for_bare_renote);
+            Arc::new(PitchRewrite {
+                key: Arc::from(key),
+                hap,
+                note: Box::new(of_note),
+                keys,
+                bare_dress,
+            })
+        };
+        if key.len() > MAX_CACHED_KEY_BYTES {
+            return build();
+        }
         thread_local! {
             static TLS_CACHE: std::cell::RefCell<([Option<Arc<PitchRewrite>>; 4], usize)> =
                 const { std::cell::RefCell::new(([const { None }; 4], 0)) };
@@ -6060,28 +6084,7 @@ impl Pattern {
             .lock()
             .ok()
             .and_then(|entries| entries.get(key).and_then(std::sync::Weak::upgrade));
-        let rewrite = held.unwrap_or_else(|| {
-            interned_closure(pool, key.to_owned(), || {
-                let (of_hap, of_note, scale_tag) = make();
-                let hap: HapMapFn = Arc::new(move |hap: &Hap| {
-                    of_hap(hap).map(|mapped| mapped.with_pitch_live_controls(hap))
-                });
-                let keys = scale_tag.map(|tag| {
-                    context_keys::ContextKeys::of(context_keys::Keys {
-                        scale: Some(tag),
-                        ..Default::default()
-                    })
-                });
-                let bare_dress = keys.as_ref().and_then(sequence::Dress::for_bare_renote);
-                Arc::new(PitchRewrite {
-                    key: Arc::from(key),
-                    hap,
-                    note: Box::new(of_note),
-                    keys,
-                    bare_dress,
-                })
-            })
-        });
+        let rewrite = held.unwrap_or_else(|| interned_closure(pool, key.to_owned(), build));
         let _ = TLS_CACHE.try_with(|cell| {
             if let Ok(mut cache) = cell.try_borrow_mut() {
                 let idx = cache.1 & 3;

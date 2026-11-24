@@ -2511,12 +2511,19 @@ pub(crate) fn with_tick_grid_if<R>(
     let Some(built) = TickGrid::new(denom) else {
         return f(None);
     };
-    let index = TICK_GRIDS.with_borrow_mut(|grids| {
+    const MAX_TICK_GRIDS: usize = 16;
+    let stored = TICK_GRIDS.with_borrow_mut(|grids| {
+        if grids.len() >= MAX_TICK_GRIDS {
+            return Err(built);
+        }
         let idx = grids.len();
         grids.push(built);
-        idx
+        Ok(idx)
     });
-    TICK_GRIDS.with_borrow(|grids| f(Some(&grids[index])))
+    match stored {
+        Ok(idx) => TICK_GRIDS.with_borrow(|grids| f(Some(&grids[idx]))),
+        Err(built) => f(Some(&built)),
+    }
 }
 
 /// The greatest common divisor of two numbers above zero.

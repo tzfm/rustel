@@ -303,8 +303,8 @@ pub(crate) const FEW_HAPS: usize = 64;
 #[inline(always)]
 pub(crate) fn order_key(time: Fraction) -> f64 {
     /// The first whole number that a float skips.
-    const EXACT: i128 = 1 << 53;
-    match time.numer().abs() < EXACT && time.denom() < EXACT {
+    const EXACT: u128 = 1 << 53;
+    match time.numer().unsigned_abs() < EXACT && time.denom().unsigned_abs() < EXACT {
         true => time.to_f64(),
         false => f64::NAN,
     }

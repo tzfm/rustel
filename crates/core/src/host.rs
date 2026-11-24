@@ -2255,6 +2255,13 @@ impl QueryThread {
         }
     }
 
+    /// Whether `n` fits inside any active hap budget without recording a
+    /// refusal. Used to guard speculative buffer reservations.
+    #[inline(always)]
+    pub(crate) fn within_hap_budget(&self, n: usize) -> bool {
+        self.hap_budget.get().is_none_or(|limit| n as u64 <= limit)
+    }
+
     /// Record a vector that has just grown to `len`.
     #[inline(always)]
     pub(crate) fn note_accumulated(&self, len: usize) {

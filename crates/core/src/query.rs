@@ -1046,7 +1046,7 @@ fn try_query_fast_pow2_slowcat_onto(
         };
         if first_steps > 0 {
             let want = first_steps.saturating_mul(est_cycles).min(65_536);
-            if thread.charge(want) {
+            if thread.within_hap_budget(want) {
                 out.reserve_exact(want);
                 first_cycle = false;
             }
@@ -4082,14 +4082,39 @@ impl Pattern {
             if haps.iter().any(|hap| hap.part.begin >= hap.part.end) {
                 return false;
             }
+            // Count the split pieces first and charge any active hap budget
+            // before allocating `met` or reserving `out`.
+            let mut total_met = 0usize;
+            for (index, hap) in haps.iter().enumerate() {
+                if (index & 63) == 0 && thread.stop_requested() {
+                    return true;
+                }
+                let first = parts.partition_point(|part| part.end <= hap.part.begin);
+                let after = parts.partition_point(|part| part.begin < hap.part.end);
+                let Some(next_total) = total_met.checked_add(after.saturating_sub(first)) else {
+                    let _ = thread.charge(usize::MAX);
+                    return thread.stop_requested();
+                };
+                total_met = next_total;
+            }
+            if !thread.charge(out.len().saturating_add(total_met)) {
+                return true;
+            }
             // Each hap at each part that it meets, and whether the part is the
             // last one, which takes the hap.
             let mut met = SPARE_MET
                 .try_with(|cell| std::mem::take(&mut *cell.borrow_mut()))
                 .unwrap_or_default();
             met.clear();
-            met.reserve(haps.len());
+            met.reserve(total_met);
             for (index, hap) in haps.iter().enumerate() {
+                if (index & 63) == 0 && thread.stop_requested() {
+                    met.clear();
+                    if met.capacity() > 0 && met.capacity() <= 128 {
+                        let _ = SPARE_MET.try_with(|cell| *cell.borrow_mut() = met);
+                    }
+                    return true;
+                }
                 let first = parts.partition_point(|part| part.end <= hap.part.begin);
                 let after = parts.partition_point(|part| part.begin < hap.part.end);
                 met.extend((first..after).map(|part| (part, index, part + 1 == after)));
@@ -4117,7 +4142,13 @@ impl Pattern {
             let from = out.len();
             out.reserve(met.len());
             let mut ok = true;
-            for &(part_idx, index, last) in &met {
+            let mut stopped = false;
+            for (step, &(part_idx, index, last)) in met.iter().enumerate() {
+                if (step & 63) == 0 && thread.stop_requested() {
+                    stopped = true;
+                    ok = false;
+                    break;
+                }
                 let hap = match last {
                     true => slots[index].take(),
                     false => slots[index].clone(),
@@ -4142,7 +4173,7 @@ impl Pattern {
             if met.capacity() > 0 && met.capacity() <= 128 {
                 let _ = SPARE_MET.try_with(|cell| *cell.borrow_mut() = met);
             }
-            ok
+            ok || stopped
         })
     }
 
@@ -4902,7 +4933,7 @@ impl Pattern {
                             let met = hap.whole_or_part();
                             let r = rng::rand_at_time(met.begin.to_f64(), random_seed);
                             let coin = if inverted { 1.0 - r } else { r };
-                            if coin <= amount {
+                            if coin.partial_cmp(&amount) != Some(std::cmp::Ordering::Greater) {
                                 return false;
                             }
                             let part = match hap.whole {

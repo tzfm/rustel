@@ -2475,10 +2475,14 @@ pub(crate) fn reversed(pattern: &Pattern) -> Option<Pattern> {
             let GridStepsRef::Small(steps) = grid.steps else {
                 return None;
             };
-            if !steps.is_empty()
-                && (steps[steps.len() - 1].part_end > period_ticks
-                    || !steps.windows(2).all(|w| w[0].part_end <= w[1].part_begin))
-            {
+            // Multi-step cycles emit haps in reversed order on the graph path
+            // (which downstream index-seeded effects such as `humanize` observe),
+            // whereas a grid keeps steps sorted by `part_begin`. Only fold
+            // single-step or empty layers where emission order is identical.
+            if steps.len() > 1 {
+                return None;
+            }
+            if !steps.is_empty() && steps[0].part_end > period_ticks {
                 return None;
             }
             let grid_steps = if steps.len() <= MAX_INLINE_GRID_LEN {
@@ -2542,15 +2546,15 @@ pub(super) fn shift_one_layer(layer: &Layer, by: Fraction) -> Option<Layer> {
             return None;
         };
         let ticks_i = i128::from(grid.ticks.get());
+        let ticks_u16 = u16::try_from(ticks_i).ok()?;
         let prod = by.checked_mul(Fraction::int(ticks_i))?;
         if prod.denom() != 1 {
             return None;
         }
-        let shift_mod = prod.numer().rem_euclid(ticks_i) as u16;
+        let shift_mod = u16::try_from(prod.numer().rem_euclid(ticks_i)).ok()?;
         if shift_mod == 0 {
             return Some(None);
         }
-        let ticks_u16 = u16::try_from(ticks_i).ok()?;
         let cut = ticks_u16 - shift_mod;
         if !steps
             .iter()

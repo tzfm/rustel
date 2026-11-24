@@ -565,6 +565,7 @@ fn same_node<'g>(
                     && a.waves.iter().zip(b.waves.iter()).all(|(x, y)| {
                         x.key_id == y.key_id
                             && x.math_inside == y.math_inside
+                            && x.steps == y.steps
                             && x.wave.same(&y.wave)
                     }) =>
             {

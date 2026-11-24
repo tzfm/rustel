@@ -1377,7 +1377,7 @@ pub(crate) fn interned_control_map(spec: &ControlSpec, unnamed_only: bool) -> cr
             return found;
         }
         let made = make();
-        if pool.maps.len() >= 32 {
+        if pool.maps.len() >= 32 || pool.names.len() >= 32 {
             let ControlMaps {
                 maps,
                 names: name_map,

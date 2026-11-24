@@ -68,20 +68,49 @@ struct WideStore {
     intern: Mutex<WideIntern>,
 }
 
-static WIDE_STORE: OnceLock<Box<WideStore>> = OnceLock::new();
-
-#[cold]
-#[inline(never)]
-fn wide_store() -> &'static WideStore {
-    WIDE_STORE.get_or_init(|| {
-        Box::new(WideStore {
+impl WideStore {
+    fn new() -> Box<Self> {
+        Box::new(Self {
             slabs: [const { OnceLock::new() }; WIDE_MAX_SLABS],
             intern: Mutex::new(WideIntern {
                 map: HashMap::new(),
                 next: 0,
             }),
         })
-    })
+    }
+
+    fn try_intern(&self, n: i128, d: i128, max_slabs: usize) -> Option<Fraction> {
+        debug_assert!(d > 0);
+        let mut guard = self
+            .intern
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(&idx) = guard.map.get(&(n, d)) {
+            return Some(Fraction(
+                NonZeroU64::new(WIDE_FLAG | (idx as u64)).expect("wide flag is non-zero"),
+            ));
+        }
+        let idx = guard.next;
+        let slab_idx = idx >> WIDE_SLAB_SHIFT;
+        if slab_idx >= max_slabs {
+            return None;
+        }
+        let slab = self.slabs[slab_idx].get_or_init(WideSlab::new);
+        let _ = slab.slots[idx & (WIDE_SLAB_LEN - 1)].set((n, d));
+        guard.map.insert((n, d), idx);
+        guard.next = idx + 1;
+        Some(Fraction(
+            NonZeroU64::new(WIDE_FLAG | (idx as u64)).expect("wide flag is non-zero"),
+        ))
+    }
+}
+
+static WIDE_STORE: OnceLock<Box<WideStore>> = OnceLock::new();
+
+#[cold]
+#[inline(never)]
+fn wide_store() -> &'static WideStore {
+    WIDE_STORE.get_or_init(WideStore::new)
 }
 
 /// Lock-free O(1) lookup for a wide `(i128, i128)` fraction handle.
@@ -97,30 +126,19 @@ fn wide_parts(idx: usize) -> (i128, i128) {
         .expect("wide fraction slot initialized before handle")
 }
 
+/// Intern a reduced `(n, d)` pair that does not fit inline (`i39` / `u24`),
+/// returning `None` if the wide table is full.
+#[cold]
+#[inline(never)]
+fn try_intern_wide(n: i128, d: i128) -> Option<Fraction> {
+    wide_store().try_intern(n, d, WIDE_MAX_SLABS)
+}
+
 /// Intern a reduced `(n, d)` pair that does not fit inline (`i39` / `u24`).
 #[cold]
 #[inline(never)]
 fn intern_wide(n: i128, d: i128) -> Fraction {
-    debug_assert!(d > 0);
-    let store = wide_store();
-    let mut guard = store
-        .intern
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    if let Some(&idx) = guard.map.get(&(n, d)) {
-        return Fraction(NonZeroU64::new(WIDE_FLAG | (idx as u64)).expect("wide flag is non-zero"));
-    }
-    let idx = guard.next;
-    let slab_idx = idx >> WIDE_SLAB_SHIFT;
-    assert!(
-        slab_idx < WIDE_MAX_SLABS,
-        "rustel-fraction: wide fraction table capacity exceeded"
-    );
-    let slab = store.slabs[slab_idx].get_or_init(WideSlab::new);
-    let _ = slab.slots[idx & (WIDE_SLAB_LEN - 1)].set((n, d));
-    guard.map.insert((n, d), idx);
-    guard.next = idx + 1;
-    Fraction(NonZeroU64::new(WIDE_FLAG | (idx as u64)).expect("wide flag is non-zero"))
+    try_intern_wide(n, d).expect("rustel-fraction: wide fraction table capacity exceeded")
 }
 
 /// An exact rational. Always normalised: `d > 0`, `gcd(|n|, d) == 1`, and
@@ -159,12 +177,37 @@ const fn decode_inline_n(raw: u64) -> i64 {
 }
 
 #[inline(always)]
+fn try_from_reduced_i64(n: i64, d: i64) -> Option<Fraction> {
+    debug_assert!(d > 0);
+    if (INLINE_NUM_MIN..=INLINE_NUM_MAX).contains(&n) && (d as u64) <= DEN_MASK {
+        Some(pack_inline(n, d as u64))
+    } else {
+        try_intern_wide(i128::from(n), i128::from(d))
+    }
+}
+
+#[inline(always)]
 fn from_reduced_i64(n: i64, d: i64) -> Fraction {
     debug_assert!(d > 0);
     if (INLINE_NUM_MIN..=INLINE_NUM_MAX).contains(&n) && (d as u64) <= DEN_MASK {
         pack_inline(n, d as u64)
     } else {
         intern_wide(i128::from(n), i128::from(d))
+    }
+}
+
+/// Pack a reduced `(n, d)` pair (`d > 0`) inline when it fits in `(i39, u24)`,
+/// or intern it in the wide table otherwise, returning `None` if the wide
+/// table is full.
+#[inline(always)]
+fn try_from_reduced(n: i128, d: i128) -> Option<Fraction> {
+    debug_assert!(d > 0);
+    if (i128::from(INLINE_NUM_MIN)..=i128::from(INLINE_NUM_MAX)).contains(&n)
+        && d <= i128::from(DEN_MASK)
+    {
+        Some(pack_inline(n as i64, d as u64))
+    } else {
+        try_intern_wide(n, d)
     }
 }
 
@@ -297,35 +340,42 @@ impl TickGrid {
     }
 }
 
-/// Reduce a numerator and a positive denominator from the 64-bit path.
+/// Reduce a numerator and a positive denominator from the 64-bit path,
+/// returning `None` if the result needs a full wide table.
 #[inline]
-fn reduced_small(n: i64, d: i64) -> Fraction {
+fn try_reduced_small(n: i64, d: i64) -> Option<Fraction> {
     debug_assert!(d > 0);
     if n == 0 {
-        return Fraction::ZERO;
+        return Some(Fraction::ZERO);
     }
     if d == 1 || n == 1 || n == -1 {
-        return from_reduced_i64(n, d);
+        return try_from_reduced_i64(n, d);
     }
     // A power of two takes out its common factor of two with no division.
     if d & (d - 1) == 0 {
         let shift = n.trailing_zeros().min(d.trailing_zeros());
-        return from_reduced_i64(n >> shift, d >> shift);
+        return try_from_reduced_i64(n >> shift, d >> shift);
     }
-    reduced_small_gcd(n, d)
+    try_reduced_small_gcd(n, d)
 }
 
 #[inline(never)]
-fn reduced_small_gcd(n: i64, d: i64) -> Fraction {
+fn try_reduced_small_gcd(n: i64, d: i64) -> Option<Fraction> {
     let divisor = gcd_u64(n.unsigned_abs(), d as u64) as i64;
     if divisor == 1 {
-        return from_reduced_i64(n, d);
+        return try_from_reduced_i64(n, d);
     }
     if divisor & (divisor - 1) == 0 {
         let shift = divisor.trailing_zeros();
-        return from_reduced_i64(n >> shift, d >> shift);
+        return try_from_reduced_i64(n >> shift, d >> shift);
     }
-    from_reduced_i64(n / divisor, d / divisor)
+    try_from_reduced_i64(n / divisor, d / divisor)
+}
+
+/// Reduce a numerator and a positive denominator from the 64-bit path.
+#[inline]
+fn reduced_small(n: i64, d: i64) -> Fraction {
+    try_reduced_small(n, d).expect("rustel-fraction: wide fraction table capacity exceeded")
 }
 
 fn gcd_biguint(mut a: BigUint, mut b: BigUint) -> BigUint {
@@ -402,7 +452,7 @@ fn checked_normalised(n: i128, d: i128) -> Option<Fraction> {
     } else {
         i128::try_from(numerator).ok()?
     };
-    Some(from_reduced(numerator, denominator as i128))
+    try_from_reduced(numerator, denominator as i128)
 }
 
 /// fraction.js's bounded Stern-Brocot search, with consecutive moves batched.
@@ -709,12 +759,12 @@ impl Fraction {
         let tz = n.trailing_zeros().min(shift);
         let rem = shift - tz;
         if rem == 0 {
-            return Some(from_reduced(n >> tz, d));
+            return try_from_reduced(n >> tz, d);
         }
         if rem >= 127 || (d as u128).leading_zeros() <= rem {
             return None;
         }
-        Some(from_reduced(n >> tz, d << rem))
+        try_from_reduced(n >> tz, d << rem)
     }
 
     /// Exact multiplication by `2^shift` using bit shifts with no GCD or multiplication.
@@ -749,17 +799,14 @@ impl Fraction {
         let rem = shift - tz;
         let shifted_d = d >> tz;
         if rem == 0 {
-            return Some(from_reduced(n, shifted_d));
+            return try_from_reduced(n, shifted_d);
         }
         let mag = n.unsigned_abs();
         if rem >= 127 || mag.leading_zeros() <= rem {
             return None;
         }
         let shifted = (mag << rem) as i128;
-        Some(from_reduced(
-            if n < 0 { -shifted } else { shifted },
-            shifted_d,
-        ))
+        try_from_reduced(if n < 0 { -shifted } else { shifted }, shifted_d)
     }
 
     /// The reduced cycle time of a signed tick on a uniform grid.
@@ -793,7 +840,7 @@ impl Fraction {
             return Self::checked_new(n, 1i128 << shift);
         }
         let drop = n.trailing_zeros().min(shift);
-        Some(from_reduced(n >> drop, 1i128 << (shift - drop)))
+        try_from_reduced(n >> drop, 1i128 << (shift - drop))
     }
 
     #[inline(always)]
@@ -883,13 +930,13 @@ impl Fraction {
             // The negative limit is valid as i128::MIN; the positive limit is not.
             const I128_MAX_EXCLUSIVE: f64 = 170_141_183_460_469_231_731_687_303_715_884_105_728.0;
             if negative && p1 == I128_MAX_EXCLUSIVE {
-                return Some(Fraction::int(i128::MIN));
+                return try_from_reduced(i128::MIN, 1);
             }
             if p1 >= I128_MAX_EXCLUSIVE {
                 return None;
             }
             let n = p1 as i128;
-            return Some(Fraction::int(if negative { -n } else { n }));
+            return try_from_reduced(if negative { -n } else { n }, 1);
         }
         if p1 <= 0.0 {
             return Some(Fraction::ZERO);
@@ -913,11 +960,8 @@ impl Fraction {
         if den == 0 {
             return None;
         }
-        let n = ck(i128::from(n).checked_mul(z), "from_f64 scale");
-        Some(Fraction::new(
-            if negative { -n } else { n },
-            i128::from(den),
-        ))
+        let n = i128::from(n).checked_mul(z)?;
+        checked_normalised(if negative { -n } else { n }, i128::from(den))
     }
 
     // -- arithmetic --------------------------------------------------------
@@ -1000,9 +1044,9 @@ impl Fraction {
         let scaled = match cycles.checked_mul(d) {
             Some(scaled) => scaled,
             // The sum can fit when the product does not.
-            None => return self.checked_add(Fraction::int(cycles)),
+            None => return self.checked_add(try_from_reduced(cycles, 1)?),
         };
-        Some(from_reduced(sn.checked_add(scaled)?, d))
+        try_from_reduced(sn.checked_add(scaled)?, d)
     }
 
     /// Exact addition, returning `None` if the reduced result cannot fit in
@@ -1018,7 +1062,7 @@ impl Fraction {
                 if (d & (d - 1)) == 0 {
                     return Self::dyadic_i64(n + on, d.trailing_zeros());
                 }
-                return Some(reduced_small(n + on, d));
+                return try_reduced_small(n + on, d);
             }
             if ((d & (d - 1)) | (od & (od - 1))) == 0 {
                 let sa = d.trailing_zeros();
@@ -1030,7 +1074,7 @@ impl Fraction {
                 };
                 return Self::dyadic_i64(sum, shift);
             }
-            return Some(reduced_small(n * od + on * d, d * od));
+            return try_reduced_small(n * od + on * d, d * od);
         }
         self.checked_add_wide(o)
     }
@@ -1070,7 +1114,7 @@ impl Fraction {
                 if (d & (d - 1)) == 0 {
                     return Self::dyadic_i64(n - on, d.trailing_zeros());
                 }
-                return Some(reduced_small(n - on, d));
+                return try_reduced_small(n - on, d);
             }
             if ((d & (d - 1)) | (od & (od - 1))) == 0 {
                 let sa = d.trailing_zeros();
@@ -1082,7 +1126,7 @@ impl Fraction {
                 };
                 return Self::dyadic_i64(diff, shift);
             }
-            return Some(reduced_small(n * od - on * d, d * od));
+            return try_reduced_small(n * od - on * d, d * od);
         }
         self.checked_sub_wide(o)
     }
@@ -1140,7 +1184,7 @@ impl Fraction {
     #[inline]
     pub fn checked_mul(self, o: Self) -> Option<Self> {
         if let (Some((n, d)), Some((on, od))) = (self.small(), o.small()) {
-            return Some(reduced_small(n * on, d * od));
+            return try_reduced_small(n * on, d * od);
         }
         self.checked_mul_wide(o)
     }
@@ -1173,11 +1217,11 @@ impl Fraction {
         if let (Some((n, d)), Some((on, od))) = (self.small(), o.small()) {
             // The divisor's sign moves to the numerator.
             let (numerator, denominator) = (n * od, d * on);
-            return Some(if denominator < 0 {
-                reduced_small(-numerator, -denominator)
+            return if denominator < 0 {
+                try_reduced_small(-numerator, -denominator)
             } else {
-                reduced_small(numerator, denominator)
-            });
+                try_reduced_small(numerator, denominator)
+            };
         }
         self.checked_div_wide(o)
     }
@@ -1224,7 +1268,7 @@ impl Fraction {
             return Some(pack_inline(-n, d as u64));
         }
         let (sn, sd) = self.parts();
-        Some(from_reduced(sn.checked_neg()?, sd))
+        try_from_reduced(sn.checked_neg()?, sd)
     }
 
     /// Checked truncated modulo, reducing arbitrary-precision intermediates
@@ -1390,7 +1434,15 @@ impl Fraction {
             // test, and no overflow for products below 2^62.
             Some((n, d)) if d & (d - 1) == 0 => Some(-i128::from((-n) >> d.trailing_zeros())),
             Some((n, d)) => Some(-i128::from((-n).div_euclid(d))),
-            None => Some(self.checked_div(o)?.ceil().numer()),
+            None => {
+                let q = self.checked_div(o)?;
+                let (n, d) = q.parts();
+                if d == 1 {
+                    Some(n)
+                } else {
+                    q.floor_int().checked_add(1)
+                }
+            }
         }
     }
 
@@ -2573,5 +2625,22 @@ mod native_fast_path_tests {
         }
         assert_eq!(grid.ticks(Fraction::int(i128::MAX)), None);
         assert_eq!(grid.ticks(Fraction::new(1, i128::MAX)), None);
+    }
+
+    #[test]
+    fn wide_store_returns_none_when_full_without_panicking() {
+        let store = WideStore::new();
+        for i in 0..WIDE_SLAB_LEN {
+            let n = i128::from(INLINE_NUM_MAX) + 1 + i as i128;
+            let got = store.try_intern(n, 1, 1);
+            assert!(got.is_some(), "slot {i} should fit in one slab");
+        }
+        // Existing interned pair still resolves via dedup even when full.
+        let existing = store.try_intern(i128::from(INLINE_NUM_MAX) + 1, 1, 1);
+        assert!(existing.is_some());
+        // A new wide value past capacity returns None instead of panicking.
+        let overflow =
+            store.try_intern(i128::from(INLINE_NUM_MAX) + 1 + WIDE_SLAB_LEN as i128, 1, 1);
+        assert!(overflow.is_none());
     }
 }

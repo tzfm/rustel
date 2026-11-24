@@ -2760,4 +2760,122 @@ mod restart_tests {
         }
         assert!(!discrete(&crate::signal::saw()));
     }
+
+    #[test]
+    fn met_bounds_turns_for_large_coprime_periods() {
+        use crate::compose::{Alignment, ComposeOp, compose};
+        let a = fastcat(vec![note(1.0), note(2.0)]).fast(Fraction::int(1_048_576));
+        let b = fastcat(vec![silence(), note(1.0)]).slow(Fraction::int(1_048_575));
+        let combined = compose(&a, &b, ComposeOp::Add, Alignment::In);
+        // Must return promptly without folding 10^12 turns and query cleanly over a small window.
+        let haps = combined.query_arc(Fraction::ZERO, Fraction::new(1, 1024));
+        assert!(haps.len() <= 4096);
+    }
+
+    #[test]
+    fn split_queries_fast_path_charges_hap_budget() {
+        let long = note(60.0).slow(Fraction::int(1000)).split_queries();
+        let (haps, limit) =
+            with_hap_budget(10, || long.query_arc(Fraction::ZERO, Fraction::int(100)));
+        assert!(
+            matches!(limit, Some(QueryLimit::HapBudget { budget: 10 })),
+            "{limit:?}"
+        );
+        assert!(haps.is_empty());
+    }
+
+    #[test]
+    fn degrade_by_nan_silences_all_haps() {
+        use crate::combinators::{degrade_by, undegrade_by};
+        let pat = fastcat(vec![note(1.0), note(2.0), note(3.0)]);
+        assert!(
+            degrade_by(&pat, f64::NAN)
+                .query_arc(Fraction::ZERO, whole(4))
+                .is_empty()
+        );
+        assert!(
+            undegrade_by(&pat, f64::NAN)
+                .query_arc(Fraction::ZERO, whole(4))
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn shift_does_not_truncate_ticks_above_u16_max() {
+        let base = fastcat(vec![note(1.0), silence()]).fast(Fraction::int(65_536));
+        let shifted = base.late(Fraction::new(1, 131_072));
+        let orig = base.query_arc(Fraction::ZERO, Fraction::new(1, 65_536));
+        let moved = shifted.query_arc(Fraction::ZERO, Fraction::new(1, 65_536));
+        assert_eq!(orig.len(), 1);
+        assert_eq!(moved.len(), 1);
+        assert_ne!(
+            orig[0].part, moved[0].part,
+            "shift by 1/131072 must not wrap to 0"
+        );
+    }
+
+    #[test]
+    fn reversed_multi_step_sequence_preserves_graph_order() {
+        let pat = fastcat(vec![note(1.0), note(2.0)]);
+        let folded_rev = pat.rev();
+        let graph_rev = Pattern::of(Node::Rev(Box::new(pat.clone())));
+        let state = State::new(TimeSpan::new(Fraction::ZERO, whole(1)));
+        let show =
+            |haps: Vec<Hap>| -> Vec<String> { haps.iter().map(|hap| format!("{hap:?}")).collect() };
+        assert_eq!(
+            show(folded_rev.query(&state)),
+            show(graph_rev.query(&state))
+        );
+    }
+
+    #[test]
+    fn sorted_sequence_enforces_max_query_span_cycles() {
+        let single = fastcat(vec![note(1.0), note(2.0)]);
+        let stacked = stack(vec![note(1.0), note(2.0)]);
+        let wide = MAX_QUERY_SPAN_CYCLES + 5;
+        let (_, limit_single) = with_hap_budget(u64::MAX, || {
+            single.query_arc(Fraction::ZERO, Fraction::int(wide))
+        });
+        assert!(
+            matches!(limit_single, Some(QueryLimit::QuerySpan { .. })),
+            "single-layer sorted query must enforce MAX_QUERY_SPAN_CYCLES: {limit_single:?}"
+        );
+        let (_, limit_stack) = with_hap_budget(u64::MAX, || {
+            stacked.query_arc(Fraction::ZERO, Fraction::int(wide))
+        });
+        assert!(
+            matches!(limit_stack, Some(QueryLimit::QuerySpan { .. })),
+            "multi-layer sorted query must enforce MAX_QUERY_SPAN_CYCLES: {limit_stack:?}"
+        );
+    }
+
+    #[test]
+    fn same_construction_distinguishes_app_wave_segment_steps() {
+        use crate::combinators::segment;
+        use crate::compose::{Alignment, ComposeOp, compose};
+        use crate::controls::ControlSpec;
+        let lpf = ControlSpec::new([Arc::from("lpf")]);
+        let base = fastcat(vec![note(1.0), note(2.0)]);
+        let w4 = compose(
+            &base,
+            &lpf.pattern(&segment(&crate::signal::sine(), Fraction::int(4))),
+            ComposeOp::Set,
+            Alignment::In,
+        );
+        let w8 = compose(
+            &base,
+            &lpf.pattern(&segment(&crate::signal::sine(), Fraction::int(8))),
+            ComposeOp::Set,
+            Alignment::In,
+        );
+        assert!(
+            !w4.same_construction(&w8),
+            "AppWave with different segment step counts must not compare equal"
+        );
+    }
+
+    #[test]
+    fn order_key_handles_i128_min_without_panicking() {
+        assert!(crate::order_key(Fraction::int(i128::MIN)).is_nan());
+    }
 }

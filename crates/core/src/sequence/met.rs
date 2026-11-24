@@ -281,6 +281,9 @@ impl Layer {
             return None;
         }
         let turns = period.checked_div(own_period)?.numer();
+        if turns <= 0 || turns > MAX_FOLDED_STEPS as i128 {
+            return None;
+        }
         let moved = |span: TimeSpan, start: Fraction| {
             Some(TimeSpan::new(
                 span.begin.checked_add(start)?,

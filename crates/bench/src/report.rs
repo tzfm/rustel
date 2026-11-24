@@ -160,7 +160,17 @@ pub fn regressions(base: &Report, new: &Report, gate: Gate) -> Vec<String> {
         let Ok(base_seams) = base_seams else {
             continue;
         };
-        let Some((_, new_seams)) = new.scores.iter().find(|(name, _)| name == score) else {
+        let Some((_, new_seams)) =
+            new.scores
+                .iter()
+                .find(|(name, _)| name == score)
+                .or_else(|| {
+                    new.scores
+                        .iter()
+                        .find(|(name, _)| short(name) == short(score))
+                })
+        else {
+            out.push(format!("{}: missing from new report", short(score)));
             continue;
         };
         let new_seams = match new_seams {
@@ -246,6 +256,44 @@ mod tests {
         assert_eq!(
             regressions(&base, &failed, Gate::All),
             ["b.strudel: now fails: refused"]
+        );
+        // Different path prefixes still match by score file name.
+        let mut abs = Report::default();
+        abs.push(
+            "/work/crates/runtime/examples/songs/a.strudel".into(),
+            Ok(vec![(
+                "steady query",
+                Cost {
+                    allocations: 1100,
+                    held: 1 << 20,
+                    ..Cost::default()
+                },
+            )]),
+        );
+        abs.push(
+            "/work/crates/runtime/examples/songs/b.strudel".into(),
+            Ok(vec![("steady query", Cost::default())]),
+        );
+        assert_eq!(
+            regressions(&base, &abs, Gate::MemoryOnly),
+            ["a.strudel steady query allocations: 1000 -> 1100"]
+        );
+        // Missing base scores are reported as regressions instead of silently skipped.
+        let mut missing = Report::default();
+        missing.push(
+            "songs/a.strudel".into(),
+            Ok(vec![(
+                "steady query",
+                Cost {
+                    allocations: 1000,
+                    held: 1 << 20,
+                    ..Cost::default()
+                },
+            )]),
+        );
+        assert_eq!(
+            regressions(&base, &missing, Gate::All),
+            ["b.strudel: missing from new report"]
         );
     }
 }

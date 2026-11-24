@@ -9017,8 +9017,7 @@ fn no_save_session_conflicts_with_asking_for_one() {
 /// A deep pattern graph is refused with a resource-limit error. A stack overflow
 /// aborts the process and no recovery catches it. A debug frame is larger, so
 /// this test runs in debug too. A signal or exit 134 means the abort is back.
-/// Each `fastGap` is a node of its own: speed, shift, and `rev` combinators fold
-/// into the sequence node.
+/// Uses `fastGap` because speed, shift, and `rev` fold into the sequence node.
 #[test]
 fn a_deep_pattern_graph_is_refused_instead_of_aborting_the_process() {
     for wrappers in [8_192, 20_000] {

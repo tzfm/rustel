@@ -644,6 +644,7 @@ fn query_single_layer_sorted_onto(
     let span_e = span.end.numer();
     if span_b.abs() > (1i128 << 30)
         || span_e.abs() > (1i128 << 30)
+        || (span_e - span_b) > MAX_QUERY_SPAN_CYCLES
         || p_cycles > (1i128 << 20)
         || span_b.rem_euclid(p_cycles) != 0
         || span_e.rem_euclid(p_cycles) != 0
@@ -1159,7 +1160,10 @@ fn query_multi_sorted_inner<
     }
     let span_b = span.begin.numer();
     let span_e = span.end.numer();
-    if span_b.abs() > (1i128 << 30) || span_e.abs() > (1i128 << 30) {
+    if span_b.abs() > (1i128 << 30)
+        || span_e.abs() > (1i128 << 30)
+        || (span_e - span_b) > MAX_QUERY_SPAN_CYCLES
+    {
         return false;
     }
     #[derive(Clone, Copy)]
