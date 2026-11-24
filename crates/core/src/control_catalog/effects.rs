@@ -348,7 +348,7 @@ pub(super) const TRANSIENT: ControlRow = ControlRow {
     aliases: &[],
     reference: ReferenceEntry {
         name: "transient",
-        synonyms: &[],
+        synonyms: &["transsustain"],
         summary: "Shape a voice's attacks and sustained body independently.",
         description: "Absent by default. transient(attack) sets the attack emphasis and creates the shaper even at 0. The compound form transient(\"attack:sustain\") also sets the sustain emphasis, which defaults to 0; transsustain is only that second part, not a method of its own. Values usually range from -1 (reduce) to 1 (emphasize).",
         params: &[
