@@ -2817,6 +2817,12 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(2));
         }
         assert_eq!(device.shared.samples.leaked.load(Ordering::Relaxed), 0);
+        // The callback takes the lines first and gives the lines before back
+        // after, in the same run: wait out that run before the flush.
+        let run_over = device.clock_frames() + 1_024;
+        until("the callback did not run again", || {
+            device.clock_frames() >= run_over
+        });
         LiveReverbBatch::default().flush_inserts(&device);
         assert_eq!(replaced.len(), 0);
         turn(96_000);
