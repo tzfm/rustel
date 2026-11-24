@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- Fixed: a session tape that the first save opens records the master fader at its start, so a replay export plays its first seconds at the level of the take.
 - Fixed: an export where a voice's `roomsize` changes from note to note, such as `roomsize("<4, 1, 2>")` on stacked tracks, reuses the reverb it made for each size instead of making it again: 8 such tracks render in about a sixth of the time.
 - Fixed: `rustel replay --export` plays the master fader the take was played at, ahead of the limiter as live, so it sounds at the level of the take.
 
