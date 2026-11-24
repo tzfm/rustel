@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- Studio: View ▸ Score outline shows the score as a tree, with native parts and script parts in two colours. The memory breakdown says native or script in one word.
 - Studio deletes the last open score of a set: the next score in the set panel opens in its place, or a new empty score when it was the only one.
 - The set panel marks empty scores with `○`.
 - Fixed: when the set open last time is gone from the disk, `rustel studio` opens the newest recent set that is still there, instead of a new empty set.

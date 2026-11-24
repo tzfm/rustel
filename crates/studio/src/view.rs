@@ -121,6 +121,8 @@ pub enum PanelKind {
     /// The knobs column, a rail for each numeric parameter of the call
     /// at the caret.
     Knobs,
+    /// The score outline column.
+    Outline,
 }
 
 impl PanelKind {
@@ -140,6 +142,7 @@ impl PanelKind {
             Self::Mixer => "mixer",
             Self::Memory => "memory",
             Self::Knobs => "knobs",
+            Self::Outline => "outline",
         }
     }
 }
@@ -793,6 +796,8 @@ pub struct StudioView<'a> {
     /// The knobs column, while it is open: each frame's reading of the
     /// call at the caret, and what the hand is doing to it.
     pub knobs: Option<super::knobs_panel::KnobsData<'a>>,
+    /// The score outline column, while it is open.
+    pub outline: Option<&'a super::outline_panel::OutlinePanel>,
     /// A drag selection over the mixer's devices block, painted while its
     /// rows are still the ones on screen.
     pub mixer_selection: Option<&'a super::mixer_panel::MixerSelection>,
@@ -976,6 +981,7 @@ pub fn render(frame: &mut Frame<'_>, view: StudioView<'_>, chrome: StudioChrome<
         view.log.and_then(|(_, panel)| log_dock(panel, area)),
         view.memory.as_ref().map(|(_, dock)| *dock),
         view.knobs.is_some(),
+        view.outline.is_some(),
         u16::from(chrome.error.is_some()) + u16::from(chrome.audio_warning.is_some()),
         chrome.piano_notes.is_some(),
     );
@@ -1322,6 +1328,19 @@ pub fn render(frame: &mut Frame<'_>, view: StudioView<'_>, chrome: StudioChrome<
                 theme,
                 focused: view.focused_panel == Some(PanelKind::Knobs),
                 area: layout.knobs,
+            },
+            area,
+        );
+    }
+    if let Some(panel) = view.outline
+        && !layout.outline.is_empty()
+    {
+        frame.render_widget(
+            super::outline_panel::OutlineView {
+                panel,
+                theme,
+                focused: view.focused_panel == Some(PanelKind::Outline),
+                area: layout.outline,
             },
             area,
         );
@@ -2232,6 +2251,7 @@ mod tests {
                 band(Edge::Bottom, 13),
                 memory,
                 false,
+                false,
                 0,
                 false,
             )
@@ -2595,6 +2615,7 @@ mod tests {
                 log,
                 None,
                 false,
+                false,
                 0,
                 false,
             )
@@ -2946,6 +2967,7 @@ mod tests {
                 None,
                 None,
                 false,
+                false,
                 0,
                 false,
             )
@@ -3029,6 +3051,7 @@ mod tests {
                 None,
                 None,
                 None,
+                false,
                 false,
                 notices,
                 piano,
@@ -3257,6 +3280,7 @@ mod tests {
                         mixer: None,
                         mixer_panel: None,
                         knobs: None,
+                        outline: None,
                         mixer_selection: None,
                         reference_on_top: false,
                         theme_camera: None,
@@ -3384,6 +3408,7 @@ mod tests {
                         mixer: None,
                         mixer_panel: None,
                         knobs: None,
+                        outline: None,
                         mixer_selection: None,
                         reference_on_top: false,
                         theme_camera: None,
@@ -3499,6 +3524,7 @@ mod tests {
                         mixer: None,
                         mixer_panel: None,
                         knobs: None,
+                        outline: None,
                         mixer_selection: None,
                         reference_on_top: false,
                         theme_camera: None,
@@ -3635,6 +3661,7 @@ mod tests {
                         mixer: None,
                         mixer_panel: None,
                         knobs: None,
+                        outline: None,
                         mixer_selection: None,
                         reference_on_top: false,
                         theme_camera: None,

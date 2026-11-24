@@ -809,6 +809,19 @@ or a click adds a key, and a call with nothing in it, such as
 is. A key that takes text, such as a colour, a key the terminal ignores,
 and the FX stage index `fxi` have no rail.
 
+## Score outline
+
+View ▸ Score outline opens a column beside the score. It shows the score as a
+tree: each statement, each call of a chain and each argument with parts of
+its own. A part in the theme's native colour runs without the script engine.
+A part in the script colour needs it, such as an operator, a loop, or a call
+that only JavaScript has. The column reads the score again when the text
+changes, and only while it is open. ↑ and ↓ choose a node, Enter or a click
+puts the caret on it, and Esc returns the keyboard to the score.
+
+The memory breakdown says the same for the whole score in one word: native
+or script.
+
 ## Mixer and limiter
 
 Press F4 to open the mixer. Change master volume with Ctrl+Shift+Up / Down.

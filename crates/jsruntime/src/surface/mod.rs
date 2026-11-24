@@ -727,3 +727,14 @@ pub(crate) use builtin_methods::*;
 pub(crate) use effects::*;
 pub(crate) use patterns::*;
 pub(crate) use setup::*;
+
+/// Whether the native tier knows `name` as a method of a pattern. A call
+/// it knows can still go to the script engine for its arguments.
+pub fn native_method(name: &str) -> bool {
+    ListedNames.method(name).is_some()
+}
+
+/// Whether the native tier knows `name` as a global function or value.
+pub fn native_global(name: &str) -> bool {
+    ListedNames.global(name).is_some()
+}

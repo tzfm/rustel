@@ -35,6 +35,7 @@ mod arrange_marks;
 mod callback_ir;
 mod frequency_sliders;
 mod live_numbers;
+mod outline;
 mod score_program;
 mod surface_writes;
 pub use callback_ir::{
@@ -44,6 +45,7 @@ pub use callback_ir::{
 };
 pub use frequency_sliders::is_frequency_control;
 pub use live_numbers::{LIVE_NUMBER_WIDGET, live_number_id, live_number_range};
+pub use outline::{OutlineForm, OutlineNode, outline};
 pub use rustel_score::{
     At, CallForm, Held, LaneStatement, Row, ScoreExpr, ScoreFunction, ScoreProgram, ScoreProperty,
     ScoreStatement, Written,

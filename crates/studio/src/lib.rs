@@ -36,6 +36,7 @@ pub mod meter;
 pub mod minimap;
 pub mod mixer_panel;
 pub mod number_form;
+pub mod outline_panel;
 pub mod pads;
 mod performance;
 mod piano;

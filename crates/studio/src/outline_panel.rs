@@ -1,0 +1,309 @@
+//! The score outline: a column at the score's right edge that shows the
+//! score as a tree of its statements and calls, each one in the colour of
+//! what runs it, native or the script engine.
+//!
+//! The outline is read only while the column is open, and again only when
+//! the text of the score changes, so a closed column costs nothing.
+
+use ratatui::{
+    buffer::Buffer,
+    layout::Rect,
+    style::{Modifier, Style},
+    widgets::Widget,
+};
+use rustel_transpiler::{OutlineForm, OutlineNode};
+
+use super::editor::Revision;
+use super::scenes::SceneId;
+use super::theme::Theme;
+
+/// The column's width, its rule and its margins included.
+pub const OUTLINE_WIDTH: u16 = 34;
+/// The least height the column takes: a title, a row, two hint rows.
+pub const OUTLINE_HEIGHT: u16 = 6;
+
+/// The open column: the outline of the score on screen, and the row the
+/// hand is on.
+#[derive(Clone, Debug)]
+pub struct OutlinePanel {
+    pub selected: usize,
+    pub scroll: usize,
+    /// The score and the text the outline was read from.
+    read_of: Option<(SceneId, Revision)>,
+    /// The nodes, or why the text has none.
+    pub nodes: Result<Vec<OutlineNode>, String>,
+}
+
+impl Default for OutlinePanel {
+    fn default() -> Self {
+        Self {
+            selected: 0,
+            scroll: 0,
+            read_of: None,
+            nodes: Ok(Vec::new()),
+        }
+    }
+}
+
+impl OutlinePanel {
+    /// Read the outline of `source` again when it is another score or
+    /// another text than the last one read.
+    pub fn refresh(&mut self, scene: SceneId, revision: Revision, source: impl FnOnce() -> String) {
+        if self.read_of == Some((scene, revision)) {
+            return;
+        }
+        if self.read_of.is_some_and(|(read, _)| read != scene) {
+            self.selected = 0;
+            self.scroll = 0;
+        }
+        self.read_of = Some((scene, revision));
+        self.nodes = rustel_transpiler::outline(&source());
+        self.clamp();
+    }
+
+    pub fn node_count(&self) -> usize {
+        self.nodes.as_ref().map_or(0, Vec::len)
+    }
+
+    fn clamp(&mut self) {
+        self.selected = self.selected.min(self.node_count().saturating_sub(1));
+    }
+
+    /// Move the hand `delta` rows, and keep it in view of `rows` rows.
+    pub fn step(&mut self, delta: isize, rows: usize) {
+        let last = self.node_count().saturating_sub(1);
+        self.selected = self.selected.saturating_add_signed(delta).min(last);
+        self.follow(rows);
+    }
+
+    pub fn jump(&mut self, to: usize, rows: usize) {
+        self.selected = to.min(self.node_count().saturating_sub(1));
+        self.follow(rows);
+    }
+
+    fn follow(&mut self, rows: usize) {
+        let rows = rows.max(1);
+        if self.selected < self.scroll {
+            self.scroll = self.selected;
+        } else if self.selected >= self.scroll + rows {
+            self.scroll = self.selected + 1 - rows;
+        }
+    }
+
+    /// The byte of the score where the node under the hand starts.
+    pub fn selected_start(&self) -> Option<usize> {
+        let nodes = self.nodes.as_ref().ok()?;
+        nodes.get(self.selected).map(|node| node.start as usize)
+    }
+}
+
+/// Whether the native tier can take `node`. A call is native when the
+/// score binds its name or the native tier lists it.
+pub fn native(node: &OutlineNode) -> bool {
+    match &node.form {
+        OutlineForm::Read => true,
+        OutlineForm::Script => false,
+        OutlineForm::Call { bound: true, .. } => true,
+        OutlineForm::Call { name, .. } => rustel_jsruntime::native_global(name),
+        OutlineForm::Method { name } => rustel_jsruntime::native_method(name),
+    }
+}
+
+/// The column's rooms: its rule, title, body and hint rows.
+pub struct OutlineParts {
+    pub rule: Rect,
+    pub title: Rect,
+    pub body: Rect,
+    pub hint: Rect,
+}
+
+pub fn parts(area: Rect) -> Option<OutlineParts> {
+    if area.height < OUTLINE_HEIGHT || area.width < OUTLINE_WIDTH {
+        return None;
+    }
+    // The rule and a space on the score's side, and a space on the other.
+    let inner = Rect::new(
+        area.x + 2,
+        area.y,
+        area.width.saturating_sub(3),
+        area.height,
+    );
+    Some(OutlineParts {
+        rule: Rect::new(area.x, area.y, 1, area.height),
+        title: Rect::new(inner.x, inner.y, inner.width, 1),
+        body: Rect::new(
+            inner.x,
+            inner.y + 1,
+            inner.width,
+            inner.height.saturating_sub(3),
+        ),
+        hint: Rect::new(inner.x, inner.bottom() - 2, inner.width, 2),
+    })
+}
+
+/// The row of the outline a point is on.
+pub fn row_at(area: Rect, scroll: usize, x: u16, y: u16) -> Option<usize> {
+    let body = parts(area)?.body;
+    let inside = x >= body.x && x < body.right() && y >= body.y && y < body.bottom();
+    inside.then(|| scroll + usize::from(y - body.y))
+}
+
+pub struct OutlineView<'a> {
+    pub panel: &'a OutlinePanel,
+    pub theme: &'a Theme,
+    pub focused: bool,
+    pub area: Rect,
+}
+
+impl Widget for OutlineView<'_> {
+    fn render(self, _: Rect, buffer: &mut Buffer) {
+        let theme = self.theme;
+        let Some(parts) = parts(self.area) else {
+            return;
+        };
+        super::view::clear_overlay(
+            buffer,
+            self.area,
+            Style::default().bg(theme.background).fg(theme.foreground),
+        );
+        let rule = Style::default().fg(theme.rule);
+        for y in parts.rule.y..parts.rule.bottom() {
+            buffer.set_stringn(parts.rule.x, y, "│", 1, rule);
+        }
+        let title_style = if self.focused {
+            Style::default()
+                .fg(theme.accent)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(theme.muted)
+        };
+        buffer.set_stringn(
+            parts.title.x,
+            parts.title.y,
+            "outline",
+            usize::from(parts.title.width),
+            title_style,
+        );
+        // The key of the colours, at the title's end.
+        let key = [("native", true), ("script", false)];
+        let mut x = parts.title.right();
+        for (word, native) in key.iter().rev() {
+            x = x.saturating_sub(word.len() as u16 + 1);
+            if x <= parts.title.x + 8 {
+                break;
+            }
+            buffer.set_stringn(
+                x,
+                parts.title.y,
+                word,
+                word.len(),
+                Style::default().fg(theme.engine(*native)),
+            );
+        }
+        let body = parts.body;
+        let muted = Style::default().fg(theme.muted);
+        match &self.panel.nodes {
+            Err(message) => {
+                buffer.set_stringn(
+                    body.x,
+                    body.y,
+                    "the score does not parse",
+                    usize::from(body.width),
+                    muted,
+                );
+                let message = super::view::ellipsize(message, body.width);
+                buffer.set_stringn(body.x, body.y + 1, &message, usize::from(body.width), muted);
+            }
+            Ok(nodes) if nodes.is_empty() => {
+                buffer.set_stringn(body.x, body.y, "- empty -", usize::from(body.width), muted);
+            }
+            Ok(nodes) => {
+                let rows = usize::from(body.height);
+                for (row, (index, node)) in nodes
+                    .iter()
+                    .enumerate()
+                    .skip(self.panel.scroll)
+                    .take(rows)
+                    .enumerate()
+                {
+                    let y = body.y + row as u16;
+                    let chosen = self.focused && index == self.panel.selected;
+                    let indent = (usize::from(node.depth) * 2).min(usize::from(body.width) / 2);
+                    let branch = if node.depth == 0 { "" } else { "· " };
+                    let text = format!("{}{branch}{}", " ".repeat(indent), node.label);
+                    let text = super::view::ellipsize(&text, body.width);
+                    let mut style = Style::default().fg(theme.engine(native(node)));
+                    if chosen {
+                        style = style.bg(theme.selection).add_modifier(Modifier::BOLD);
+                    }
+                    buffer.set_stringn(body.x, y, &text, usize::from(body.width), style);
+                }
+            }
+        }
+        let hints: [&str; 2] = if self.focused {
+            ["↑/↓ node · Enter go to it", "Esc back to the score"]
+        } else {
+            ["", ""]
+        };
+        for (row, hint) in hints.iter().enumerate() {
+            buffer.set_stringn(
+                parts.hint.x,
+                parts.hint.y + row as u16,
+                hint,
+                usize::from(parts.hint.width),
+                muted,
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn panel(source: &str) -> OutlinePanel {
+        let mut panel = OutlinePanel::default();
+        panel.refresh(SceneId(1), Revision(1), || source.to_owned());
+        panel
+    }
+
+    #[test]
+    fn a_known_call_is_native_and_an_operator_is_not() {
+        let panel = panel("$: s(\"bd\").fast(2).nosuchmethod()\nconst a = 1 + 2");
+        let nodes = panel.nodes.as_ref().expect("nodes");
+        let said: Vec<_> = nodes
+            .iter()
+            .map(|node| (node.label.as_str(), native(node)))
+            .collect();
+        assert_eq!(
+            said,
+            [
+                ("$:", true),
+                ("s \"bd\"", true),
+                (".fast 2", true),
+                (".nosuchmethod", false),
+                ("const a", true),
+                ("1 + 2", false),
+            ]
+        );
+    }
+
+    #[test]
+    fn the_outline_is_read_again_only_for_new_text() {
+        let mut panel = panel("s(\"bd\")");
+        panel.refresh(SceneId(1), Revision(1), || unreachable!("same text"));
+        panel.refresh(SceneId(1), Revision(2), || "s(\"bd\")\nn(\"0\")".to_owned());
+        assert_eq!(panel.node_count(), 2);
+    }
+
+    #[test]
+    fn the_hand_stays_in_view() {
+        let mut panel = panel("a()\nb()\nc()\nd()");
+        panel.step(3, 2);
+        assert_eq!((panel.selected, panel.scroll), (3, 2));
+        panel.step(-3, 2);
+        assert_eq!((panel.selected, panel.scroll), (0, 0));
+        panel.step(9, 2);
+        assert_eq!(panel.selected, 3);
+    }
+}

@@ -3823,6 +3823,7 @@ mod tests {
                 None,
                 None,
                 false,
+                false,
                 0,
                 false,
             );

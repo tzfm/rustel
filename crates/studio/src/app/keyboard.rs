@@ -445,6 +445,17 @@ impl App {
                     self.handle_knobs_key(code, primary, shift, alt)
                 }
             }
+            PanelKind::Outline => {
+                if self.regions.outline.is_empty() {
+                    if code == KeyCode::Esc {
+                        self.focus = Focus::Editor;
+                        self.dirty_frame = true;
+                    }
+                    code == KeyCode::Esc
+                } else {
+                    self.handle_outline_key(code)
+                }
+            }
         })
     }
 
