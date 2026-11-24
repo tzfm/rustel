@@ -22,8 +22,29 @@ use ratatui::widgets::Widget;
 
 use super::editor::{DEFAULT_MAX_DOCUMENT_BYTES, Document};
 use super::minimap::{Minimap, MinimapView};
+use super::prefs::StudioPrefs;
+use super::scenes::{SetLimiter, SetManifest};
 use super::theme::Theme;
 use rustel_runtime::session_log::{STOP_SOURCE, SaveStatus, SessionMode, SessionScript};
+
+/// The master limiter a tape was played through, for its replay export: the
+/// one of the set whose `sessions` folder holds it, or the studio's for a set
+/// that defers to it. A tape outside a set has none.
+pub fn tape_limiter(tape: &Path) -> Option<rustel_audio::RenderLimiter> {
+    let sessions = tape.parent()?;
+    if sessions.file_name()? != "sessions" {
+        return None;
+    }
+    let stored = SetManifest::load(sessions.parent()?).and_then(|manifest| manifest.limiter);
+    let settings = StudioPrefs::read_only().ui_settings();
+    let limiter = SetLimiter::read(stored.as_deref())
+        .resolve()
+        .unwrap_or_else(|| settings.master_limiter())?;
+    Some(rustel_audio::RenderLimiter {
+        settings: limiter,
+        makeup: settings.master_limiter_makeup,
+    })
+}
 
 /// Rows the timeline takes off the top of the editor: a header, three rows
 /// of thumbnail, the ruler, and a scrollbar.

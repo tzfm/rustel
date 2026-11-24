@@ -22,6 +22,7 @@
 - Fixed: a sample source turned off and on again on the Permissions page brings its sounds back, and the update it refused while off runs again.
 - Fixed: in an export, an infinite `note` or `freq`, such as the log2 of 0, is a refused voice, and so is NaN on a sample, as on strudel.cc, instead of a note at the default pitch. A synth still reads a NaN note as absent.
 - Fixed: the update a permission re-runs waits for the engine to start fetching the source, instead of sometimes being refused again with an unknown sound.
+- Fixed: `rustel replay --export` of a tape from a set goes through the set's master limiter, so it no longer clips where the take did not.
 - Fixed: a playing score with a cycle past a native limit, such as `euclid(3, "<8 1000000>")`, loses only that cycle, as on strudel.cc, instead of a longer gap and a "fell behind" warning.
 - Fixed: a sample source turned off while its map was loading, then allowed again, brings its sounds back instead of leaving them unknown.
 - Fixed: an Alt key over the mixer or another panel holding the keyboard no longer types into or edits the score.

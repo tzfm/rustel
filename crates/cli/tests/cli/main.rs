@@ -8828,6 +8828,85 @@ fn a_replay_export_opens_on_the_state_sounding_at_from() {
     let _ = std::fs::remove_file(&out);
 }
 
+/// A take under its set's limiter does not clip in its replay export. The
+/// same tape outside a set has no limiter and runs to full scale.
+#[cfg(feature = "studio")]
+#[test]
+fn a_replay_export_goes_through_the_limiter_of_its_set() {
+    const LOUD: &str = r#"$: note("c3*4").s("sawtooth").gain(4)"#;
+    let peak = |data: &[u8]| {
+        data.as_chunks::<2>()
+            .0
+            .iter()
+            .map(|sample| i32::from(i16::from_le_bytes(*sample)).abs())
+            .max()
+            .unwrap_or(0) as f64
+            / 32768.0
+    };
+    let loose = installed_tape("replay-limiter.rustel-session", &[(0.0, LOUD)]);
+    let set = scratch("replay-limiter-set");
+    std::fs::create_dir_all(set.join("sessions")).expect("the set's tapes");
+    std::fs::write(
+        set.join("rustel-set.json"),
+        r#"{"limiter":"-6.0:transparent"}"#,
+    )
+    .expect("the set file");
+    let tape = set.join("sessions/take.rustel-session");
+    std::fs::copy(&loose, &tape).expect("the tape in its set");
+
+    // Makeup off, so the file stands at the ceiling instead of full scale.
+    let config = set.join("config");
+    std::fs::create_dir_all(&config).expect("a config folder");
+    std::fs::write(
+        config.join("studio.json"),
+        r#"{"master_limiter_makeup":false}"#,
+    )
+    .expect("the preferences");
+    let out = scratch("replay-limiter.wav");
+    let export = |from: &std::path::Path| {
+        let args = replay_export_args(from, &out, "0", &["--duration", "2"]);
+        let child = rustel()
+            .args(&args)
+            .env("RUSTEL_CONFIG_DIR", &config)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .expect("spawn rustel");
+        let done = wait_within(child, &args, RUN_LIMIT);
+        assert!(done.status.success(), "{done:?}");
+        peak(&wav_pcm_of_length(&out, 2.0))
+    };
+    let without = export(&loose);
+    let through = export(&tape);
+    assert!(without > 0.99, "the score is hot enough to clip: {without}");
+    assert!(
+        (0.4..=0.51).contains(&through),
+        "the export holds the set's -6 dB ceiling: {through}"
+    );
+    // The mp3 door renders the same limited audio and leaves no stage file.
+    let mp3 = scratch("replay-limiter.mp3");
+    let bounce = |from: &std::path::Path| {
+        let args = replay_export_args(from, &mp3, "0", &["--duration", "2"]);
+        let child = rustel()
+            .args(&args)
+            .env("RUSTEL_CONFIG_DIR", &config)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .expect("spawn rustel");
+        let done = wait_within(child, &args, RUN_LIMIT);
+        assert!(done.status.success(), "{done:?}");
+        std::fs::read(&mp3).expect("the mp3")
+    };
+    assert_ne!(bounce(&loose), bounce(&tape), "the mp3 went through it");
+    assert!(!mp3.with_extension("rendering.wav").exists());
+    let _ = std::fs::remove_file(&mp3);
+
+    let _ = std::fs::remove_dir_all(&set);
+    let _ = std::fs::remove_file(&loose);
+    let _ = std::fs::remove_file(&out);
+}
+
 /// A `--from` past the last save bounces the closing state for `--duration`.
 #[test]
 fn a_replay_export_past_the_end_of_the_tape_bounces_the_closing_state() {
