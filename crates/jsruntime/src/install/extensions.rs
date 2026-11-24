@@ -173,7 +173,13 @@ pub(super) fn install<'js>(
 ) -> Result<(), String> {
     initialize_pattern_states(ctx)?;
     for declaration in rustel_ext::pattern_callables() {
-        install_pattern_callable(ctx, proto, globals, &runtime.cycle_time, *declaration)?;
+        install_pattern_callable(
+            ctx,
+            proto,
+            globals,
+            &runtime.bridge().cycle_time,
+            *declaration,
+        )?;
     }
     for declaration in rustel_ext::value_callables() {
         install_value_callable(ctx, globals, *declaration)?;

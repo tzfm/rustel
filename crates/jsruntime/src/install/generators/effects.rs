@@ -83,7 +83,7 @@ fn stage_samples<'js>(
     ctx: &Ctx<'js>,
     args: &[rquickjs::Value<'js>],
     policy: &Cell<EffectPolicy>,
-    transaction: &RefCell<Option<ScoreEffects>>,
+    transaction: &RefCell<EffectTransaction>,
     refusal: &RefCell<Option<String>>,
 ) -> rquickjs::Result<()> {
     let map = argument(ctx, args, 0);
@@ -314,7 +314,7 @@ fn stage_preload<'js>(
     ctx: &Ctx<'js>,
     args: Vec<rquickjs::Value<'js>>,
     policy: &Cell<EffectPolicy>,
-    transaction: &RefCell<Option<ScoreEffects>>,
+    transaction: &RefCell<EffectTransaction>,
     refusal: &RefCell<Option<String>>,
 ) -> rquickjs::Result<()> {
     let outer = rquickjs::Array::new(ctx.clone())?;
@@ -360,9 +360,10 @@ fn stage_preload<'js>(
 
 pub(super) fn install<'js>(runtime: &JsRuntime, ctx: &Ctx<'js>) -> Result<(), String> {
     let globals = ctx.globals();
-    let samples_transaction = runtime.effect_transaction.clone();
-    let samples_policy = runtime.effect_policy.clone();
-    let samples_refusal = runtime.effect_policy_refusal.clone();
+    let bridge = runtime.bridge();
+    let samples_transaction = bridge.effect_transaction.clone();
+    let samples_policy = bridge.effect_policy.clone();
+    let samples_refusal = bridge.effect_policy_refusal.clone();
     let samples = Function::new(
         ctx.clone(),
         hr_effect(move |ctx, args| {
@@ -382,9 +383,9 @@ pub(super) fn install<'js>(runtime: &JsRuntime, ctx: &Ctx<'js>) -> Result<(), St
         .set("samples", samples)
         .map_err(|error| error.to_string())?;
 
-    let preload_transaction = runtime.effect_transaction.clone();
-    let preload_policy = runtime.effect_policy.clone();
-    let preload_refusal = runtime.effect_policy_refusal.clone();
+    let preload_transaction = bridge.effect_transaction.clone();
+    let preload_policy = bridge.effect_policy.clone();
+    let preload_refusal = bridge.effect_policy_refusal.clone();
     let preload = Function::new(
         ctx.clone(),
         hr_effect(move |ctx, args| {

@@ -81,7 +81,7 @@ fn apply_scale(pattern: &Pattern, state: &Pattern, mode: Option<Pattern>) -> Pat
                 let root = root.clone();
                 let pattern = pattern.clone();
                 mode.inner_bind(move |mode| {
-                    c::scale(&pattern, Value::List(vec![root.clone(), mode.clone()]))
+                    c::scale(&pattern, Value::list(vec![root.clone(), mode.clone()]))
                 })
             }
         }

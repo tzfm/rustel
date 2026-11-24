@@ -21,7 +21,7 @@ fn render_graph(value: &Value, source: &str) -> usize {
         count += 1;
     }
     if let Some(Value::List(effects)) = value.get("FX") {
-        for effect in effects {
+        for effect in effects.iter() {
             count += render_graph(effect, source);
         }
     }

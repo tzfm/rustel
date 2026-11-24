@@ -101,7 +101,7 @@ impl ExtensionPatternNode for BlockLaneNode {
                         return Vec::new();
                     };
                     if !predicate
-                        .apply_value(&Value::Str(marker.clone()))
+                        .apply_value(&Value::Str(marker.as_str().into()))
                         .js_truthy()
                     {
                         continue;
@@ -152,8 +152,8 @@ fn modifiers(pattern: Option<&Pattern>) -> Result<Vec<(Pattern, Pattern)>, &'sta
                 return Err("blockArrange modifier callback must be a function");
             };
             Ok((
-                rustel_core::pure(Value::Function(Box::new(predicate.clone()))),
-                rustel_core::pure(Value::Function(Box::new(transform.clone()))),
+                rustel_core::pure(Value::function(predicate.clone())),
+                rustel_core::pure(Value::function(transform.clone())),
             ))
         })
         .collect()

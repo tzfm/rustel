@@ -178,15 +178,17 @@ pub(crate) fn control_arguments<T>(
     }
 }
 
-/// What a control method builds from its reified arguments.
+/// What a control method builds from its reified arguments. The receiver
+/// moves in, so a receiver that no other handle holds takes a constant
+/// control where it is.
 pub(crate) fn apply_control_method(
     spec: &rustel_core::controls::ControlSpec,
-    receiver: &Pattern,
+    receiver: Pattern,
     arguments: ControlArguments<Pattern>,
 ) -> Pattern {
     match arguments {
-        ControlArguments::Positional(parts) => spec.apply_positional(receiver, &parts),
-        ControlArguments::Single(value) => spec.apply(receiver, value),
+        ControlArguments::Positional(parts) => spec.apply_positional(&receiver, &parts),
+        ControlArguments::Single(value) => spec.apply_to(receiver, value),
     }
 }
 
@@ -428,16 +430,41 @@ pub(super) fn install_raw_or<'js>(
 /// alignment methods, and it must close over `pat`. QuickJS cannot express
 /// "callable object with properties" from Rust directly, so the callable is
 /// built in JS from a Rust-provided table - the bodies are still native.
-pub(super) fn install_composer<'js>(
-    ctx: &Ctx<'js>,
-    proto: &rquickjs::Object<'js>,
-    op: rustel_core::compose::ComposeOp,
-    alignments: rquickjs::Object<'js>,
-    default_apply: rquickjs::Function<'js>,
-) -> Result<(), String> {
-    let make: rquickjs::Function = ctx
-        .eval(
-            r#"(function (alignments, defaultApply) {
+/// The JavaScript helpers that every combinator and composer install uses.
+///
+/// Each is the same source for every install, so one realm compiles each
+/// once. A helper closes over nothing and is never exposed: every call still
+/// makes fresh functions, so what a score sees does not change.
+pub(super) struct InstallHelpers<'js> {
+    /// Makes the curried free function of a combinator.
+    curry: rquickjs::Function<'js>,
+    /// Makes the getter of a composer.
+    composer: rquickjs::Function<'js>,
+    /// Defines a configurable getter property.
+    define_getter: rquickjs::Function<'js>,
+}
+
+impl<'js> InstallHelpers<'js> {
+    pub(super) fn compile(ctx: &Ctx<'js>) -> Result<Self, String> {
+        let compile = |source: &str| -> Result<rquickjs::Function<'js>, String> {
+            ctx.eval(source).map_err(|e: rquickjs::Error| e.to_string())
+        };
+        Ok(Self {
+            curry: compile(
+                r#"(function (raw, arity, name) {
+                 const make = (collected) => {
+                   const f = (...more) => {
+                     const args = collected.concat(more);
+                     return args.length >= arity ? raw(...args) : make(args);
+                   };
+                   f.__rustel_combinator = { name, args: collected };
+                   return f;
+                 };
+                 return make([]);
+               })"#,
+            )?,
+            composer: compile(
+                r#"(function (alignments, defaultApply) {
                  return function () {
                    const pat = this;
                    const wrapper = (...other) => defaultApply.apply(pat, other);
@@ -447,19 +474,30 @@ pub(super) fn install_composer<'js>(
                    return wrapper;
                  };
                })"#,
-        )
-        .map_err(|e| e.to_string())?;
-    let getter: rquickjs::Function = make
-        .call((alignments, default_apply))
-        .map_err(|e: rquickjs::Error| e.to_string())?;
-    let define: rquickjs::Function = ctx
-        .eval(
-            r#"(function (target, name, getter) {
+            )?,
+            define_getter: compile(
+                r#"(function (target, name, getter) {
                  Object.defineProperty(target, name, { get: getter, configurable: true });
                })"#,
-        )
-        .map_err(|e| e.to_string())?;
-    define
+            )?,
+        })
+    }
+}
+
+pub(super) fn install_composer<'js>(
+    ctx: &Ctx<'js>,
+    helpers: &InstallHelpers<'js>,
+    proto: &rquickjs::Object<'js>,
+    op: rustel_core::compose::ComposeOp,
+    alignments: rquickjs::Object<'js>,
+    default_apply: rquickjs::Function<'js>,
+) -> Result<(), String> {
+    let getter: rquickjs::Function = helpers
+        .composer
+        .call((alignments, default_apply))
+        .map_err(|e: rquickjs::Error| e.to_string())?;
+    helpers
+        .define_getter
         .call::<_, ()>((proto.clone(), op.name(), getter.clone()))
         .map_err(|e: rquickjs::Error| e.to_string())?;
     record_builtin_method(
@@ -475,21 +513,22 @@ pub(super) fn install_composer<'js>(
 /// function, exactly as `register()` does.
 pub(super) fn install_combinator<'js>(
     ctx: &Ctx<'js>,
+    helpers: &InstallHelpers<'js>,
     proto: &rquickjs::Object<'js>,
     globals: &rquickjs::Object<'js>,
     name: &str,
-    registration: rustel_core::register::Registration,
+    registration: &'static rustel_core::register::Registration,
 ) -> Result<(), String> {
     let arity = registration.arity;
     let indexed_transformer = matches!(name, "echoWith" | "echowith" | "stutWith" | "stutwith");
     let method_name: std::sync::Arc<str> = std::sync::Arc::from(name);
-    let method_registration = registration.clone();
     let compilable = !SPECIAL_REGISTERED_METHODS.contains(&name)
         && matches!(
             registration.func,
             rustel_core::register::CombinatorFn::Native(_)
+                | rustel_core::register::CombinatorFn::NativeTransformer(_)
         );
-    let builtin = compilable.then(|| BuiltinMethod::Registered(Box::new(registration.clone())));
+    let builtin = compilable.then_some(BuiltinMethod::Registered(registration));
     let method_indexed_transformer = indexed_transformer;
     let method = Function::new(
         ctx.clone(),
@@ -504,7 +543,7 @@ pub(super) fn install_combinator<'js>(
             // Dropping the extra arguments would make
             // `.scale('C:major', 'C:minor')` play only the first and would
             // hide typos.
-            let expected = method_registration.arity.saturating_sub(1);
+            let expected = registration.arity.saturating_sub(1);
             let midi = method_name.as_ref() == "midi";
             let serial = method_name.as_ref() == "serial";
             // A bare `.osc()` means the default port, as its entry promises
@@ -563,7 +602,7 @@ pub(super) fn install_combinator<'js>(
             reject_unexpected_registered_functions(
                 &ctx,
                 method_name.as_ref(),
-                method_registration.takes_function(),
+                registration.takes_function(),
                 &args.0,
             )?;
             if method_name.as_ref() == "xen"
@@ -612,7 +651,7 @@ pub(super) fn install_combinator<'js>(
             // The body may apply a transformer EAGERLY and hand it this
             // receiver; the callback can keep what it is given.
             publish_owner_cells(&sidecars)?;
-            let pattern = method_registration.call(&arg_pats, receiver);
+            let pattern = registration.call(&arg_pats, receiver);
             rethrow_eager_callback_exception(&ctx)?;
             derive_wrapper(ctx, pattern, &sidecars)
         }),
@@ -665,23 +704,9 @@ pub(super) fn install_combinator<'js>(
     globals
         .set(raw_name.as_str(), free)
         .map_err(|e| e.to_string())?;
-    let curry: rquickjs::Function = ctx
-        .eval(
-            r#"(function (raw, arity, name) {
-                 const make = (collected) => {
-                   const f = (...more) => {
-                     const args = collected.concat(more);
-                     return args.length >= arity ? raw(...args) : make(args);
-                   };
-                   f.__rustel_combinator = { name, args: collected };
-                   return f;
-                 };
-                 return make([]);
-               })"#,
-        )
-        .map_err(|e| e.to_string())?;
     let raw: rquickjs::Value = globals.get(raw_name.as_str()).map_err(|e| e.to_string())?;
-    let curried: rquickjs::Value = curry
+    let curried: rquickjs::Value = helpers
+        .curry
         .call((raw, arity, name))
         .map_err(|e: rquickjs::Error| e.to_string())?;
     globals.set(name, curried).map_err(|e| e.to_string())?;
@@ -694,7 +719,7 @@ pub(super) fn install_combinator<'js>(
 mod array_guard;
 mod builtin_methods;
 pub(crate) mod effects;
-mod patterns;
+pub(crate) mod patterns;
 mod setup;
 
 pub(crate) use array_guard::*;

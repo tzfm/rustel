@@ -74,13 +74,15 @@ pub fn query_inner(outer: &Hap, pattern: &Pattern, state: &State) -> Vec<Hap> {
             Hap {
                 whole: inner.whole,
                 part: inner.part,
-                pick_lookup: crate::joined_pick_lookup(outer, &inner),
-                keys: crate::context_keys::ContextKeys::merge(&inner.keys, &outer.keys),
+                keys: crate::context_keys::ContextKeys::merge_with(
+                    &inner.keys,
+                    &outer.keys,
+                    inner.live_controls(),
+                    inner.slider_binding(),
+                    crate::joined_pick_lookup(outer, &inner),
+                ),
                 value: inner.value,
                 context,
-                ui_visuals: inner.ui_visuals | outer.ui_visuals,
-                live_controls: inner.live_controls,
-                slider_binding: inner.slider_binding,
             },
         ) {
             return Vec::new();

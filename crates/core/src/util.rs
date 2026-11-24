@@ -28,12 +28,39 @@ pub struct NoteToken {
     pub octave: Option<f64>,
 }
 
-pub fn is_note_with_octave(name: &str) -> bool {
-    tokenize_note_impl(name, false).is_some()
+#[inline]
+fn is_note_impl(note: &str, signed_octave: bool) -> bool {
+    let bytes = note.as_bytes();
+    let Some(&first) = bytes.first() else {
+        return false;
+    };
+    if !matches!(first | 0x20, b'a'..=b'g') {
+        return false;
+    }
+    let mut i = 1;
+    while i < bytes.len() && matches!(bytes[i], b'#' | b'b' | b's' | b'f') {
+        i += 1;
+    }
+    if i == bytes.len() {
+        return true;
+    }
+    if bytes[i] == b'-' {
+        if !signed_octave {
+            return false;
+        }
+        i += 1;
+    }
+    bytes[i..].iter().all(u8::is_ascii_digit)
 }
 
+#[inline]
+pub fn is_note_with_octave(name: &str) -> bool {
+    is_note_impl(name, false)
+}
+
+#[inline]
 pub fn is_note(name: &str) -> bool {
-    tokenize_note_impl(name, true).is_some()
+    is_note_impl(name, true)
 }
 
 pub fn tokenize_note(note: &str) -> Option<NoteToken> {
@@ -76,31 +103,65 @@ fn tokenize_note_impl(note: &str, signed_octave: bool) -> Option<NoteToken> {
 
 pub fn accidentals_offset(accidentals: &str) -> i32 {
     accidentals
-        .chars()
-        .map(|ch| match ch {
-            '#' | 's' => 1,
-            'b' | 'f' => -1,
+        .bytes()
+        .map(|b| match b {
+            b'#' | b's' => 1,
+            b'b' | b'f' => -1,
             _ => 0,
         })
         .sum()
 }
 
+#[inline]
 pub fn note_to_midi(note: &str, default_octave: i32) -> Result<f64, String> {
-    let token = tokenize_note(note).ok_or_else(|| format!("not a note: \"{note}\""))?;
-    let chroma = match token.pitch_class.to_ascii_lowercase() {
-        'c' => 0,
-        'd' => 2,
-        'e' => 4,
-        'f' => 5,
-        'g' => 7,
-        'a' => 9,
-        'b' => 11,
-        _ => unreachable!(),
+    let bytes = note.as_bytes();
+    let Some(&first) = bytes.first() else {
+        return Err(format!("not a note: \"{note}\""));
     };
-    Ok(
-        (token.octave.unwrap_or(f64::from(default_octave)) + 1.0) * 12.0
-            + f64::from(chroma + accidentals_offset(&token.accidentals)),
-    )
+    let chroma: i32 = match first | 0x20 {
+        b'c' => 0,
+        b'd' => 2,
+        b'e' => 4,
+        b'f' => 5,
+        b'g' => 7,
+        b'a' => 9,
+        b'b' => 11,
+        _ => return Err(format!("not a note: \"{note}\"")),
+    };
+    let mut i = 1;
+    let mut acc: i32 = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'#' | b's' => acc += 1,
+            b'b' | b'f' => acc -= 1,
+            _ => break,
+        }
+        i += 1;
+    }
+    let octave = if i == bytes.len() {
+        f64::from(default_octave)
+    } else {
+        let rest = &bytes[i..];
+        let (neg, digits) = if rest[0] == b'-' {
+            (true, &rest[1..])
+        } else {
+            (false, rest)
+        };
+        if !digits.iter().all(u8::is_ascii_digit) {
+            return Err(format!("not a note: \"{note}\""));
+        }
+        if digits.is_empty() {
+            f64::NAN
+        } else if digits.len() == 1 {
+            let v = f64::from(digits[0] - b'0');
+            if neg { -v } else { v }
+        } else {
+            note[i..]
+                .parse::<f64>()
+                .map_err(|_| format!("not a note: \"{note}\""))?
+        }
+    };
+    Ok((octave + 1.0) * 12.0 + f64::from(chroma + acc))
 }
 
 /// A MIDI note number as a name, for a display a musician can read.
@@ -255,7 +316,7 @@ pub fn parse_fractional(value: &Value) -> Result<f64, String> {
             let Value::Str(name) = value else {
                 return Err(format!("cannot parse as fractional: \"{}\"", value.show()));
             };
-            match name.as_str() {
+            match &**name {
                 "pi" => Ok(std::f64::consts::PI),
                 "w" => Ok(1.0),
                 "h" => Ok(0.5),

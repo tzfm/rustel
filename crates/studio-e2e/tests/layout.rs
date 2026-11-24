@@ -14,7 +14,7 @@ static AUDIO_CALLBACK_ALLOCATOR: rustel_audio::tripwire::TripwireAlloc =
     rustel_audio::tripwire::TripwireAlloc;
 
 use crossterm::event::{KeyCode, KeyModifiers};
-use rustel_studio_e2e::{assert_golden, hermetic, hermetic_sized};
+use rustel_studio_e2e::{Hermetic, assert_golden, hermetic, hermetic_sized};
 
 /// The empty studio's shape at the standard size, as a golden. Live values
 /// (meter, playhead, stats) make rows differ by platform-neutral
@@ -65,6 +65,21 @@ fn a_split_opens_hops_and_closes() {
     assert_ne!(split, closed, "closing the split changes the frame");
 }
 
+/// The frame when no job shows in the header. The read of the presets
+/// starts when the runner gets to it, and the header shows it while it
+/// runs: a frame taken then differs from one taken before or after.
+fn frame_at_rest(studio: &mut Hermetic) -> String {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        studio.settle();
+        let frame = studio.screen();
+        if !frame.contains("read presets") || std::time::Instant::now() > deadline {
+            return frame;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+}
+
 /// F11 toggles zen: the chrome folds away, and F11 brings it back. The
 /// restored frame is the old frame except the status line, which zen's
 /// exit legitimately rewrites ("stage restored") - so the comparison
@@ -73,15 +88,14 @@ fn a_split_opens_hops_and_closes() {
 fn zen_folds_the_chrome_away_and_back() {
     let mut studio = hermetic();
 
-    let before = studio.screen();
+    let before = frame_at_rest(&mut studio);
     studio.press(KeyCode::F(11), KeyModifiers::NONE);
     studio.settle();
     let zen = studio.screen();
     assert_ne!(before, zen, "zen changed the frame");
 
     studio.press(KeyCode::F(11), KeyModifiers::NONE);
-    studio.settle();
-    let restored = studio.screen();
+    let restored = frame_at_rest(&mut studio);
     let before_rows: Vec<&str> = before.lines().collect();
     let restored_rows: Vec<&str> = restored.lines().collect();
     assert_eq!(

@@ -140,6 +140,13 @@ pub fn ply<P: PatOps>(pat: &P, factor: Fraction) -> P {
         Ok(steps) => steps,
         Err(refused) => return refused,
     };
+    // A whole count of each step of a sequence is a sequence.
+    let count = (factor.denom() == 1)
+        .then(|| usize::try_from(factor.numer()).ok())
+        .flatten();
+    if let Some(plied) = count.and_then(|count| pat.plied(count)) {
+        return plied.set_steps(steps);
+    }
     pat.squeeze_bind(move |v| checked_fast(&P::pat_pure(v.clone()), factor, "ply"))
         .set_steps(steps)
 }
@@ -230,8 +237,8 @@ fn sliced_value(slices: &Value, index: &Value, value: &Value) -> Value {
             }
         }
         Value::List(values) => {
-            for (index, value) in values.into_iter().enumerate() {
-                controls.insert(index.to_string(), value);
+            for (index, value) in values.iter().enumerate() {
+                controls.insert(index.to_string(), value.clone());
             }
         }
         Value::Function(_) | Value::Pattern(_) | Value::JsValue(_) | Value::Haps(_) => {}
@@ -320,7 +327,7 @@ pub fn press<P: PatOps>(pat: &P) -> P {
 /// Samples `pat` at `rate` events per cycle: structure from the pulse
 /// pattern, values from `pat` - what turns a continuous signal discrete.
 pub fn segment<P: PatOps>(pat: &P, rate: Fraction) -> P {
-    let pulse = P::pat_pure(Value::Bool(true)).fast(rate);
+    let pulse = P::pat_pulse(rate);
     compose(pat, &pulse, ComposeOp::KeepIf, Alignment::Out).set_steps(Some(rate))
 }
 
@@ -477,7 +484,7 @@ pub fn ribbon<P: PatOps>(pat: &P, offset: Fraction, cycles: Fraction) -> P {
 /// A window outside the native fraction range refuses as
 /// `NativeFraction { operation: "bite" }`.
 pub fn bite<P: PatOps>(pat: &P, npat: &P, ipat: &P) -> P {
-    let pairs = ipat.app_left_with(npat.clone(), |i, n| Value::List(vec![i.clone(), n.clone()]));
+    let pairs = ipat.app_left_with(npat.clone(), |i, n| Value::list(vec![i.clone(), n.clone()]));
     let pat = pat.clone();
     pairs.squeeze_bind(move |v| {
         let Value::List(items) = v else {
@@ -578,18 +585,13 @@ pub fn invert<P: PatOps>(pat: &P) -> P {
 /// Rescales a unipolar pattern to `[min, max]`. Built from the `mul`/`add`
 /// composers so control objects are respected.
 pub fn range<P: PatOps>(pat: &P, min: f64, max: f64) -> P {
-    let scaled = compose(
-        pat,
-        &P::pat_pure(Value::F64(max - min)),
-        ComposeOp::Mul,
-        Alignment::In,
-    );
-    compose(
-        &scaled,
-        &P::pat_pure(Value::F64(min)),
-        ComposeOp::Add,
-        Alignment::In,
-    )
+    let numbers = [(ComposeOp::Mul, max - min), (ComposeOp::Add, min)];
+    // A pattern that takes the run in one node makes no pattern of a number.
+    pat.met_numbers(&numbers).unwrap_or_else(|| {
+        numbers.iter().fold(pat.clone(), |pat, (op, number)| {
+            compose(&pat, &P::pat_pure(Value::F64(*number)), *op, Alignment::In)
+        })
+    })
 }
 
 /// Exponential [`range`]: linear in log space.
@@ -620,6 +622,14 @@ fn call<P: PatOps>(pat: &P, f: Option<&FunctionRef>) -> P {
     }
 }
 
+/// Owned variant of [`call`], moving `pat` into `f` without cloning its handle.
+pub(crate) fn call_owned<P: PatOps>(pat: P, f: Option<&FunctionRef>) -> P {
+    match f {
+        Some(f) => pat.apply_fn_owned(f),
+        None => pat,
+    }
+}
+
 /// Applies `f` when `on` - patternified, so the branch is chosen per hap of
 /// the boolean.
 pub fn when<P: PatOps>(pat: &P, on: bool, f: Option<&FunctionRef>) -> P {
@@ -643,7 +653,7 @@ pub fn apply_n<P: PatOps>(pat: &P, n: i64, f: Option<&FunctionRef>) -> P {
     }
     let mut out = pat.clone();
     for _ in 0..n.max(0) {
-        out = call(&out, f);
+        out = call_owned(out, f);
     }
     out
 }
@@ -689,23 +699,39 @@ pub fn inside<P: PatOps>(pat: &P, factor: Fraction, f: Option<&FunctionRef>) -> 
 
 /// Applies `f` with the pattern sped up by `factor`, then slows back down.
 pub fn outside<P: PatOps>(pat: &P, factor: Fraction, f: Option<&FunctionRef>) -> P {
-    call(&pat.fast(factor), f).slow(factor)
+    call_owned(pat.fast(factor), f).slow(factor)
 }
 
 /// Stacks the pattern with a delayed, transformed copy of itself.
 pub fn off<P: PatOps>(pat: &P, time: Fraction, f: Option<&FunctionRef>) -> P {
-    P::pat_stack(vec![pat.clone(), call(&pat.late(time), f)])
+    pat.pat_off(time, f)
 }
 
 /// Stacks the pattern with `f(pat)` for every `f`.
 pub fn superimpose<P: PatOps>(pat: &P, fs: &[FunctionRef]) -> P {
-    let mut pats = vec![pat.clone()];
+    if fs.len() < 8 {
+        let mut buf: [Option<P>; 8] = [const { None }; 8];
+        buf[0] = Some(pat.clone());
+        for (slot, f) in buf[1..=fs.len()].iter_mut().zip(fs.iter()) {
+            *slot = Some(pat.apply_fn(f));
+        }
+        return P::pat_stack_opt(&mut buf[..=fs.len()]);
+    }
+    let mut pats = Vec::with_capacity(fs.len() + 1);
+    pats.push(pat.clone());
     pats.extend(fs.iter().map(|f| pat.apply_fn(f)));
     P::pat_stack(pats)
 }
 
 /// Stacks `f(pat)` for every `f`; the untransformed pattern is not included.
 pub fn layer<P: PatOps>(pat: &P, fs: &[FunctionRef]) -> P {
+    if fs.len() <= 8 {
+        let mut buf: [Option<P>; 8] = [const { None }; 8];
+        for (slot, f) in buf[..fs.len()].iter_mut().zip(fs.iter()) {
+            *slot = Some(pat.apply_fn(f));
+        }
+        return P::pat_stack_opt(&mut buf[..fs.len()]);
+    }
     P::pat_stack(fs.iter().map(|f| pat.apply_fn(f)).collect())
 }
 
@@ -715,7 +741,7 @@ pub fn layer<P: PatOps>(pat: &P, fs: &[FunctionRef]) -> P {
 pub fn jux_by<P: PatOps>(pat: &P, by: f64, f: Option<&FunctionRef>) -> P {
     let by = by / 2.0;
     let left = pat.fmap(move |v| with_pan(v, -by));
-    let right = call(&pat.fmap(move |v| with_pan(v, by)), f);
+    let right = call_owned(pat.fmap(move |v| with_pan(v, by)), f);
     let steps = match (left.pat_steps(), right.pat_steps()) {
         (Some(a), Some(b)) => match a.checked_lcm(b) {
             Some(steps) => Some(steps),
@@ -724,7 +750,8 @@ pub fn jux_by<P: PatOps>(pat: &P, by: f64, f: Option<&FunctionRef>) -> P {
         (Some(a), None) => Some(a),
         (None, b) => b,
     };
-    P::pat_stack(vec![left, right]).set_steps(steps)
+    let mut pair = [Some(left), Some(right)];
+    P::pat_stack_opt(&mut pair).set_steps(steps)
 }
 
 /// [`jux_by`] at 1.
@@ -1034,7 +1061,7 @@ pub fn chop<P: PatOps>(pat: &P, n: i64) -> P {
         }
         P::pat_fastcat(slices)
     })
-    .map_haps_native(|hap| {
+    .map_haps_native_static(|hap| {
         let mut hap = hap.clone();
         hap.context.clear();
         Some(hap)
@@ -1132,12 +1159,12 @@ pub fn euclidish<P: PatOps>(pat: &P, pulses: i32, steps: i32, by: Fraction) -> P
 
 pub fn as_controls<P: PatOps>(pat: &P, mapping: &Value) -> P {
     let mapping = match crate::materialize_js_value(mapping) {
-        Value::List(values) => values,
+        Value::List(values) => values.to_vec(),
         value => vec![value],
     };
     pat.fmap(move |value| {
         let values = match crate::materialize_js_value(value) {
-            Value::List(values) => values,
+            Value::List(values) => values.to_vec(),
             value => vec![value],
         };
         let entries = mapping.iter().zip(values).filter_map(|(name, value)| {
@@ -1145,7 +1172,7 @@ pub fn as_controls<P: PatOps>(pat: &P, mapping: &Value) -> P {
                 return None;
             }
             let name = match name {
-                Value::Str(name) => name.clone(),
+                Value::Str(name) => name.to_string(),
                 value => value.show(),
             };
             let canonical = crate::controls::canonical_control_name(&name)
@@ -1882,12 +1909,58 @@ fn pure_signal<P: PatOps>(pattern: crate::Pattern) -> P {
     )
 }
 
+/// The gate of each [`degrade_by_with`], by the bits of its threshold: a
+/// gate is a pure function of the threshold, so the same degrade built by a
+/// later evaluation is the same payload.
+type WeakValuePredicate = std::sync::Weak<dyn Fn(&Value) -> bool + Send + Sync>;
+type GatePool = std::sync::Mutex<std::collections::HashMap<u64, WeakValuePredicate>>;
+
+static GATES: std::sync::OnceLock<GatePool> = std::sync::OnceLock::new();
+
+/// The combine of each [`degrade_by_with`], which keeps the left value
+/// whatever the gate says: one closure object for every degrade, so that
+/// node agrees by pointer.
+static KEEP_LEFT: std::sync::OnceLock<crate::CombineFn> = std::sync::OnceLock::new();
+
+/// The threshold of `gate`, when a [`degrade_by_with`] made it: the gate
+/// passes each number above the threshold, and nothing more.
+pub(crate) fn gate_threshold(gate: &crate::ValuePredicate) -> Option<f64> {
+    let gates = GATES.get()?.lock().ok()?;
+    gates
+        .iter()
+        .find(|(_, known)| {
+            std::ptr::addr_eq(known.as_ptr(), std::sync::Arc::as_ptr(gate))
+                && known.strong_count() > 0
+        })
+        .map(|(bits, _)| f64::from_bits(*bits))
+}
+
+/// Whether `combine` is the combine of a [`degrade_by_with`], which gives
+/// the left value as it is.
+pub(crate) fn keeps_left(combine: &crate::CombineFn) -> bool {
+    KEEP_LEFT
+        .get()
+        .is_some_and(|keep| std::sync::Arc::ptr_eq(keep, combine))
+}
+
 /// Keeps only events whose `with_pat` sample exceeds `x` - strictly `>`.
 /// Structure comes from `pat` (app-left); the chooser is sampled over each
 /// hap's whole.
 pub fn degrade_by_with<P: PatOps>(pat: &P, with_pat: &P, x: f64) -> P {
-    let gate = with_pat.filter_values(move |v| util::parse_numeral(v).is_ok_and(|n| n > x));
-    pat.app_left_with_lookup(gate, |a, _| a.clone(), crate::LookupFlow::Left)
+    let gate_predicate =
+        crate::interned_closure(GATES.get_or_init(Default::default), x.to_bits(), || {
+            let predicate: crate::ValuePredicate =
+                std::sync::Arc::new(move |v| util::parse_numeral(v).is_ok_and(|n| n > x));
+            predicate
+        });
+    let gate = with_pat.filter_values_with(gate_predicate);
+    let keep_left = KEEP_LEFT
+        .get_or_init(|| {
+            let combine: crate::CombineFn = std::sync::Arc::new(|a: &Value, _: &Value| a.clone());
+            combine
+        })
+        .clone();
+    pat.app_left_interned(gate, keep_left, crate::LookupFlow::Left)
         .set_steps(pat.pat_steps())
 }
 
@@ -1897,47 +1970,65 @@ pub(crate) fn degrade_by_with_value<P: PatOps>(pat: &P, chooser: &Value, x: f64)
 
 /// [`degrade_by_with`] over `rand`.
 pub fn degrade_by<P: PatOps>(pat: &P, x: f64) -> P {
-    degrade_by_with(pat, &pure_signal::<P>(crate::signal::rand()), x)
+    pat.degrade_by_rand(x, false)
 }
 
 /// [`degrade_by_with`] over `1 - rand`: the exact complement of [`degrade_by`].
 pub fn undegrade_by<P: PatOps>(pat: &P, x: f64) -> P {
-    let inverted = pure_signal::<P>(crate::signal::rand())
-        .fmap(|v| Value::F64(1.0 - util::parse_numeral(v).unwrap_or(f64::NAN)));
-    degrade_by_with(pat, &inverted, x)
+    pat.degrade_by_rand(x, true)
 }
 
 /// Applies `f` to roughly `x` of the events. The halves are complementary:
 /// the transformed copy takes exactly the events the plain copy dropped.
-/// The scalar carrier and `inner_bind` are required: they split crossing
-/// wholes at cycle boundaries and invoke `f` lazily, per queried carrier hap.
+/// The bind to the scalar carrier is required: it splits crossing wholes at
+/// cycle boundaries. Its closure ignores the carrier.
+///
+/// A transform whose one application stands for every later one has its
+/// halves built once, here, as [`first_of`]/[`last_of`] build their
+/// transformed part: the carrier hap carries nothing the transform reads,
+/// and building the halves per carrier hap re-ran the transform for every
+/// hap of every query. Any other transform keeps its application per
+/// carrier hap, where a query runs it: a JavaScript transform runs at query
+/// time, exactly once per carrier hap, and a lowered transform whose
+/// program can go stale must reach its callback again once it does. What
+/// that application is wrapped in — both halves, the coin signals — is
+/// pure, so it is still built once, and only the application itself is
+/// rebuilt per carrier hap.
 pub fn sometimes_by<P: PatOps>(pat: &P, x: f64, f: Option<&FunctionRef>) -> P {
-    let pat = pat.clone();
-    let f = f.cloned();
+    let plain = degrade_by(pat, x);
+    let transformed_base = undegrade_by(pat, 1.0 - x);
+    applied_halves(x, plain, transformed_base, f)
+}
+
+/// The two halves of [`sometimes_by`] and [`some_cycles_by`], bound to the
+/// coin. A transform that stands for every application applies once, here:
+/// the bind then asks the same halves for each cycle of the carrier and
+/// adds nothing to their haps, which is a split of the queries. Any other
+/// transform applies inside the bind, per coin hap.
+fn applied_halves<P: PatOps>(x: f64, plain: P, transformed_base: P, f: Option<&FunctionRef>) -> P {
+    let Some(f) = f.filter(|f| !f.stands_for_every_application()) else {
+        let transformed = call(&transformed_base, f);
+        return P::pat_stack(vec![plain, transformed]).split_queries();
+    };
+    let f = f.clone();
     P::pat_pure(Value::F64(x)).inner_bind(move |_| {
-        let plain = degrade_by(&pat, x);
-        let transformed = call(&undegrade_by(&pat, 1.0 - x), f.as_ref());
-        P::pat_stack(vec![plain, transformed])
+        let transformed = call(&transformed_base, Some(&f));
+        P::pat_stack(vec![plain.clone(), transformed])
     })
 }
 
 /// [`sometimes_by`], but `segment(1)` on the rand signal makes the coin
 /// flip once per CYCLE rather than per hap.
 pub fn some_cycles_by<P: PatOps>(pat: &P, x: f64, f: Option<&FunctionRef>) -> P {
-    let pat = pat.clone();
-    let f = f.cloned();
-    P::pat_pure(Value::F64(x)).inner_bind(move |_| {
-        let per_cycle = segment(&pure_signal::<P>(crate::signal::rand()), Fraction::ONE);
-        let inverted = segment(
-            &pure_signal::<P>(crate::signal::rand())
-                .fmap(|v| Value::F64(1.0 - util::parse_numeral(v).unwrap_or(f64::NAN))),
-            Fraction::ONE,
-        );
-        P::pat_stack(vec![
-            degrade_by_with(&pat, &per_cycle, x),
-            call(&degrade_by_with(&pat, &inverted, 1.0 - x), f.as_ref()),
-        ])
-    })
+    let per_cycle = segment(&pure_signal::<P>(crate::signal::rand()), Fraction::ONE);
+    let inverted = segment(
+        &pure_signal::<P>(crate::signal::rand())
+            .fmap(|v| Value::F64(1.0 - util::parse_numeral(v).unwrap_or(f64::NAN))),
+        Fraction::ONE,
+    );
+    let plain = degrade_by_with(pat, &per_cycle, x);
+    let transformed_base = degrade_by_with(pat, &inverted, 1.0 - x);
+    applied_halves(x, plain, transformed_base, f)
 }
 
 // -- envelope shorthands ----------------------------------------------------
@@ -1962,7 +2053,7 @@ pub fn serial<P: PatOps>(pat: &P, baud: f64, send_crc: bool, short_ids: bool, po
     set_object(
         pat,
         vec![
-            ("serialport", Value::Str(port.to_string())),
+            ("serialport", Value::Str(port.into())),
             ("serialbaud", Value::F64(baud)),
             ("serialcrc", Value::F64(if send_crc { 1.0 } else { 0.0 })),
             ("serialshort", Value::F64(if short_ids { 1.0 } else { 0.0 })),
@@ -1985,7 +2076,7 @@ pub fn serial<P: PatOps>(pat: &P, baud: f64, send_crc: bool, short_ids: bool, po
 /// becomes four events whose first is "IAC". A port name is a literal. The
 /// `midiport` control still patterns, to move a phrase between devices.
 pub fn midi<P: PatOps>(pat: &P, port: &str, options: &Value) -> P {
-    let mut pairs = vec![("midiport".to_string(), Value::Str(port.to_string()))];
+    let mut pairs = vec![("midiport".to_string(), Value::Str(port.into()))];
     // Connection options are fallbacks: carried under one nested key with
     // the same Keep semantics as the port, so per-hap controls always win.
     if let Value::Object(map) = options {
@@ -2034,7 +2125,7 @@ pub fn osc<P: PatOps>(pat: &P, port: f64) -> P {
 /// Select a Csound instrument with frequency or MIDI pfields.
 pub fn csound<P: PatOps>(pat: &P, instrument: &Value, midi: bool) -> P {
     let instrument = if !midi && !instrument.js_truthy() {
-        Value::Str("triangle".to_string())
+        Value::Str("triangle".into())
     } else {
         instrument.clone()
     };
@@ -2058,7 +2149,7 @@ pub fn csound<P: PatOps>(pat: &P, instrument: &Value, midi: bool) -> P {
 /// wrapped, and missing positions are `undefined`.
 fn slots(value: &Value, n: usize) -> Vec<Value> {
     let items: Vec<Value> = match value {
-        Value::List(items) => items.clone(),
+        Value::List(items) => items.to_vec(),
         other => vec![other.clone()],
     };
     (0..n)
@@ -2193,7 +2284,7 @@ pub fn transpose<P: PatOps>(pat: &P, amount: Value) -> P {
                     None => amount.show(),
                 };
                 match crate::tonaljs::note_transpose_defaulted(s, &interval) {
-                    Some(out) => Value::Str(out),
+                    Some(out) => Value::Str(out.into()),
                     None => {
                         // Names tonal cannot parse (Strudel's 's' sharps
                         // included) abort the query with this TypeError -
@@ -2240,17 +2331,17 @@ pub fn scale_transpose<P: PatOps>(pat: &P, offset: Value) -> P {
         // A non-string note is never in any scale; scale_offset raises the
         // same not-in-scale error for it.
         let note_str = match &note_value {
-            Value::Str(s) => s.clone(),
+            Value::Str(s) => s.to_string(),
             other => other.show(),
         };
         match crate::tonaljs::scale_offset(&scale, offset_number, &note_str) {
             Ok(transposed) => Some(hap.with_value(|value| match value {
                 Value::Object(map) => {
                     let mut map = map.clone();
-                    map.insert("note".into(), Value::Str(transposed.clone()));
+                    map.insert("note".into(), Value::Str(transposed.as_str().into()));
                     Value::Object(map)
                 }
-                _ => Value::Str(transposed.clone()),
+                _ => Value::Str(transposed.as_str().into()),
             })),
             Err(error) => {
                 crate::signal_query_error(move || error.clone());
@@ -2273,22 +2364,32 @@ pub fn scale<P: PatOps>(pat: &P, scale_arg: Value) -> P {
         scale_arg
     };
     // The mini `:` list syntax arrives as a list: flatten, join with spaces.
-    let scale_name: Result<String, ()> = match &scale_arg {
-        Value::Str(s) => Ok(s.clone()),
+    let mut owned_name = String::new();
+    let scale_name: Result<&str, ()> = match &scale_arg {
+        Value::Str(s) => Ok(s.as_str()),
         Value::List(items) => {
-            fn flatten(items: &[Value], out: &mut Vec<String>) {
+            fn append_flat(items: &[Value], out: &mut String) {
                 for item in items {
                     match item {
-                        // Depth-1 flattening would do; deeper elements
-                        // stringify to the same strings anyway.
-                        Value::List(inner) => flatten(inner, out),
-                        other => out.push(other.show()),
+                        Value::List(inner) => append_flat(inner, out),
+                        Value::Str(s) => {
+                            if !out.is_empty() {
+                                out.push(' ');
+                            }
+                            out.push_str(s.as_str());
+                        }
+                        other => {
+                            if !out.is_empty() {
+                                out.push(' ');
+                            }
+                            out.push_str(&other.show());
+                        }
                     }
                 }
             }
-            let mut parts = Vec::new();
-            flatten(items, &mut parts);
-            Ok(parts.join(" "))
+            owned_name.reserve(24);
+            append_flat(items, &mut owned_name);
+            Ok(owned_name.as_str())
         }
         // A non-string scale name throws; the text below is the observable message.
         _ => Err(()),
@@ -2306,31 +2407,197 @@ pub fn scale<P: PatOps>(pat: &P, scale_arg: Value) -> P {
             });
         }
     };
-    let scale_tag: std::sync::Arc<str> = std::sync::Arc::from(scale_name.as_str());
-    pat.map_pitch_haps_native(move |hap| {
+    // The notes of the scale are kept with its body, one time for the name.
+    pat.map_pitch_haps_native_interned(scale_name, || {
+        let steps = std::sync::Arc::new(ScaleSteps::new(scale_name.to_owned()));
+        let tag = std::sync::Arc::clone(&steps.tag);
+        // A handle of the notes, for the note of a hap and of a value.
+        let kept = std::sync::Arc::clone(&steps);
+        let of_hap = move |hap: &crate::Hap| scale_hap(hap, &kept);
+        let of_note = move |note: &Value| scale_note(&steps, note, None);
+        (of_hap, of_note, Some(tag))
+    })
+}
+
+/// Owned variant of [`scale`] that mutates uniquely-owned `Sequence` and `Pick`
+/// subtrees in place rather than cloning layers and value arrays.
+pub fn scale_owned<P: PatOps>(pat: P, scale_arg: Value) -> P {
+    let scale_arg = if matches!(scale_arg, Value::JsValue(_)) {
+        crate::materialize_js_value(&scale_arg)
+    } else {
+        scale_arg
+    };
+    let mut stack_buf = [0u8; 64];
+    let mut stack_len = 0usize;
+    let mut owned_name = String::new();
+    let scale_name: Result<&str, ()> = match &scale_arg {
+        Value::Str(s) => Ok(s.as_str()),
+        Value::List(items) => {
+            fn push_part(
+                part: &str,
+                stack_buf: &mut [u8; 64],
+                stack_len: &mut usize,
+                overflow: &mut String,
+            ) {
+                if !overflow.is_empty() {
+                    overflow.push(' ');
+                    overflow.push_str(part);
+                    return;
+                }
+                let sep = usize::from(*stack_len > 0);
+                if *stack_len + sep + part.len() <= stack_buf.len() {
+                    if sep != 0 {
+                        stack_buf[*stack_len] = b' ';
+                        *stack_len += 1;
+                    }
+                    stack_buf[*stack_len..*stack_len + part.len()].copy_from_slice(part.as_bytes());
+                    *stack_len += part.len();
+                } else {
+                    overflow.reserve(*stack_len + sep + part.len());
+                    overflow.push_str(
+                        std::str::from_utf8(&stack_buf[..*stack_len]).expect("valid utf8"),
+                    );
+                    if sep != 0 {
+                        overflow.push(' ');
+                    }
+                    overflow.push_str(part);
+                }
+            }
+            fn append_flat(
+                items: &[Value],
+                stack_buf: &mut [u8; 64],
+                stack_len: &mut usize,
+                overflow: &mut String,
+            ) {
+                for item in items {
+                    match item {
+                        Value::List(inner) => append_flat(inner, stack_buf, stack_len, overflow),
+                        Value::Str(s) => push_part(s.as_str(), stack_buf, stack_len, overflow),
+                        other => push_part(&other.show(), stack_buf, stack_len, overflow),
+                    }
+                }
+            }
+            append_flat(items, &mut stack_buf, &mut stack_len, &mut owned_name);
+            if !owned_name.is_empty() {
+                Ok(owned_name.as_str())
+            } else {
+                Ok(std::str::from_utf8(&stack_buf[..stack_len]).expect("valid utf8"))
+            }
+        }
+        _ => Err(()),
+    };
+    let scale_name = match scale_name {
+        Ok(name) => name,
+        Err(()) => {
+            let shown = scale_arg.show();
+            return pat.map_pitch_haps_native(move |_| {
+                let shown = shown.clone();
+                crate::signal_query_error(move || {
+                    format!("scaleName.replaceAll is not a function (scale: {shown})")
+                });
+                None
+            });
+        }
+    };
+    pat.map_pitch_haps_native_interned_owned(scale_name, || {
+        let steps = std::sync::Arc::new(ScaleSteps::new(scale_name.to_owned()));
+        let tag = std::sync::Arc::clone(&steps.tag);
+        let kept = std::sync::Arc::clone(&steps);
+        let of_hap = move |hap: &crate::Hap| scale_hap(hap, &kept);
+        let of_note = move |note: &Value| scale_note(&steps, note, None);
+        (of_hap, of_note, Some(tag))
+    })
+}
+
+/// The key of the note that `scale` and `voicing` set, which each map of
+/// their haps shares.
+pub(crate) static NOTE: std::sync::LazyLock<crate::Key> =
+    std::sync::LazyLock::new(|| crate::Key::from("note"));
+
+/// One scale as a `scale` call site reads it: the name, the tag its haps
+/// carry, and its pre-parsed tonic/interval coordinates for zero-allocation
+/// degree lookups.
+struct ScaleSteps {
+    name: String,
+    tag: std::sync::Arc<str>,
+    /// The keys of a hap that held none before the scale tagged it: each
+    /// such hap shares them.
+    tagged: crate::context_keys::ContextKeys,
+    resolved: Result<crate::tonaljs::ResolvedScale, String>,
+    /// Precomputed note names for integer scale degrees `-8..24` when `resolved`
+    /// is valid, turning common scale-degree lookups into a single array index.
+    degree_cache: Option<Box<[crate::value::SharedStr; 32]>>,
+}
+
+/// The note of a degree of a scale, or why the scale gives none.
+type Degree = Result<crate::value::SharedStr, String>;
+
+impl ScaleSteps {
+    const DEGREE_MIN: i64 = -8;
+    const DEGREE_MAX: i64 = 24;
+
+    fn new(name: String) -> Self {
+        let tag: std::sync::Arc<str> = std::sync::Arc::from(name.as_str());
+        let resolved = crate::tonaljs::ResolvedScale::parse(&name);
+        let degree_cache = resolved.as_ref().ok().and_then(|res| {
+            let mut entries: Vec<crate::value::SharedStr> = Vec::with_capacity(32);
+            for deg in Self::DEGREE_MIN..Self::DEGREE_MAX {
+                entries.push(res.step_shared(deg as f64).ok()?);
+            }
+            entries.into_boxed_slice().try_into().ok()
+        });
+        Self {
+            tagged: crate::context_keys::ContextKeys::of(crate::context_keys::Keys {
+                // A handle of the tag.
+                scale: Some(std::sync::Arc::clone(&tag)),
+                ..Default::default()
+            }),
+            tag,
+            name,
+            resolved,
+            degree_cache,
+        }
+    }
+
+    /// [`crate::tonaljs::scale_step`] of `step` in this scale. Resolves in
+    /// integer coordinate math into an inline [`crate::SharedStr`].
+    #[inline]
+    fn step(&self, step: f64) -> Degree {
+        if let Some(cache) = &self.degree_cache
+            && step.fract() == 0.0
+        {
+            let i = step as i64;
+            if (Self::DEGREE_MIN..Self::DEGREE_MAX).contains(&i) {
+                return Ok(cache[(i - Self::DEGREE_MIN) as usize].clone());
+            }
+        }
+        match &self.resolved {
+            Ok(resolved) => resolved.step_shared(step),
+            Err(error) => Err(error.clone()),
+        }
+    }
+}
+
+/// The body of one `scale` rewrite: a pure function of the hap and the
+/// scale name. Kept as a named function so [`scale`] can intern its map by
+/// the name alone - see [`crate::interned_closure`].
+fn scale_hap(hap: &crate::Hap, steps: &ScaleSteps) -> Option<crate::Hap> {
+    {
         let hap = &*materialized_hap(hap);
         // A plain value behaves as `{ n: value }`; note / n / value is
         // picked out and the rest carried along.
-        let (note_or_step, others, is_object) = match &hap.value {
+        let (note_or_step, others) = match &hap.value {
             Value::Object(map) => {
                 let pick = ["note", "n", "value"]
                     .iter()
                     .filter_map(|key| map.get(key))
                     .find(|v| !v.is_nullish())
                     .cloned();
-                let mut rest = crate::value::OrderedMap::new();
-                for (key, value) in map.iter() {
-                    if !matches!(key, "note" | "n" | "value") {
-                        rest.insert(key.to_string(), value.clone());
-                    }
-                }
-                (pick, rest, true)
+                (pick, Some(map))
             }
             // Lists and other object-likes yield no note/n/value - the
             // pass-through path below.
-            Value::List(_) | Value::Pattern(_) | Value::JsValue(_) => {
-                (None, crate::value::OrderedMap::new(), true)
-            }
+            Value::List(_) | Value::Pattern(_) | Value::JsValue(_) => (None, None),
             // Destructuring null throws.
             Value::Null => {
                 crate::signal_query_error(|| {
@@ -2338,114 +2605,182 @@ pub fn scale<P: PatOps>(pat: &P, scale_arg: Value) -> P {
                 });
                 return None;
             }
-            plain => (
-                (!plain.is_nullish()).then(|| plain.clone()),
-                crate::value::OrderedMap::new(),
-                false,
-            ),
+            plain => ((!plain.is_nullish()).then(|| plain.clone()), None),
         };
         let Some(note_or_step) = note_or_step else {
             // No usable value: the hap passes through UNTAGGED.
             return Some(hap.clone());
         };
 
-        let is_note = matches!(&note_or_step, Value::Str(s) if crate::tonaljs::is_score_note(s));
-        let scale_note: Value = if is_note {
-            // Note case: quantize. A bad scale name aborts the query.
-            let note = note_or_step.as_str().expect("checked is_note");
-            let midi = match crate::util::note_to_midi(note, 3) {
-                Ok(midi) => midi,
-                Err(error) => {
-                    crate::signal_query_error(move || error.clone());
-                    return None;
-                }
-            };
-            match crate::tonaljs::nearest_scale_note(&scale_name, midi) {
-                Ok(quantized) => Value::Str(quantized),
-                Err(error) => {
-                    crate::signal_query_error(move || error.clone());
-                    return None;
-                }
+        let anchor = others.and_then(|others| others.get("anchor"));
+        let scale_note = scale_note(steps, &note_or_step, anchor)?;
+        let value = match others {
+            // The other keys in their order, then the note.
+            Some(others) => {
+                let kept = others
+                    .into_iter()
+                    .filter(|(key, _)| !matches!(key.as_str(), "note" | "n" | "value"))
+                    .map(|(key, value)| (key.clone(), value.clone()));
+                let note = (NOTE.clone(), scale_note);
+                Value::Object(crate::OrderedMap::of_keys(kept.chain([note])))
             }
-        } else {
-            // Step case: errors remove the hap.
-            let converted = match &note_or_step {
-                Value::Str(s) => crate::tonaljs::convert_step_string(s),
-                other => match tonal_js_number(other) {
-                    Some(n) => Ok((n, 0)),
-                    None => Err(format!(
-                        "invalid scale step \"{}\", expected number or integer with optional # b suffixes",
-                        other.show()
-                    )),
-                },
-            };
-            let Ok((number, accidental_offset)) = converted else {
-                return None;
-            };
-            let anchor = others.get("anchor").filter(|anchor| {
-                // Truthiness gates the anchor path.
-                match anchor {
-                    Value::F64(n) => *n != 0.0 && !n.is_nan(),
-                    Value::Str(s) => !s.is_empty(),
-                    Value::Bool(b) => *b,
-                    Value::Undefined | Value::Null => false,
-                    _ => true,
-                }
-            });
-            let stepped: Result<Value, String> = match anchor {
-                Some(anchor) => {
-                    // Numbers pass through, strings via note_to_midi,
-                    // anything else is NaN.
-                    let anchor_midi = match anchor {
-                        Value::F64(n) => *n,
-                        Value::Str(s) => {
-                            crate::util::note_to_midi(s, 3).unwrap_or(f64::NAN)
-                        }
-                        _ => f64::NAN,
-                    };
-                    crate::tonaljs::step_in_named_scale(number, &scale_name, Some(anchor_midi))
-                        .map(Value::F64)
-                }
-                None => crate::tonaljs::scale_step(number, &scale_name).map(Value::Str),
-            };
-            let stepped = match stepped {
-                Ok(value) => value,
-                // An error removes the hap and is reported, as strudel.cc
-                // logs `[tonal]` and drops it: a silent lane with nothing
-                // said is what a misspelt scale left before.
-                Err(error) => {
-                    crate::signal_callback_failure(|| error);
-                    return None;
-                }
-            };
-            if accidental_offset != 0 {
-                // Accidental suffixes transpose the result; a numeric
-                // scale note (anchor path) yields "".
-                let base = match &stepped {
-                    Value::Str(s) => s.clone(),
-                    _ => String::new(),
-                };
-                Value::Str(crate::tonaljs::note_transpose(
-                    &base,
-                    &crate::tonaljs::interval_from_semitones(accidental_offset),
-                ))
-            } else {
-                stepped
-            }
+            None => scale_note,
         };
+        let scaled = hap.with_value(|_| value.clone());
+        Some(match scaled.keys.is_empty() {
+            true => crate::Hap {
+                keys: steps.tagged.clone(),
+                ..scaled
+            },
+            false => scaled.with_scale_context(steps.tag.clone()),
+        })
+    }
+}
 
-        let value = if is_object {
-            let mut map = others;
-            map.insert("note".into(), scale_note);
-            Value::Object(map)
-        } else {
-            scale_note
+/// The note of the scale of `steps` that `note_or_step` names: a note is
+/// set on the scale, and a step is counted on it, from the anchor that
+/// the hap holds, if any. `None` removes the hap, after the error that
+/// stops the query, if the note or the scale has one.
+fn scale_note(steps: &ScaleSteps, note_or_step: &Value, anchor: Option<&Value>) -> Option<Value> {
+    // Fast path for the overwhelmingly common numeric degree without anchor
+    // (e.g. `n("0 1 2 3").scale("C:minor")`).
+    if anchor.is_none()
+        && let Value::F64(number) = note_or_step
+    {
+        return match steps.step(*number) {
+            Ok(note) => Some(Value::Str(note)),
+            Err(error) => {
+                crate::signal_callback_failure(|| error);
+                None
+            }
         };
-        Some(
-            hap.with_value(|_| value.clone())
-                .with_scale_context(scale_tag.clone()),
-        )
-    })
+    }
+    let scale_name = steps.name.as_str();
+    if let Value::Str(note) = note_or_step
+        && crate::tonaljs::is_score_note(note)
+    {
+        // Note case: quantize. A bad scale name aborts the query.
+        let midi = match crate::util::note_to_midi(note, 3) {
+            Ok(midi) => midi,
+            Err(error) => {
+                crate::signal_query_error(move || error.clone());
+                return None;
+            }
+        };
+        return match &steps.resolved {
+            Ok(resolved) => Some(Value::Str(resolved.nearest_note_shared(midi))),
+            Err(error) => {
+                let error = error.clone();
+                crate::signal_query_error(move || error.clone());
+                None
+            }
+        };
+    }
+    // Step case: errors remove the hap.
+    let (number, accidental_offset) = match note_or_step {
+        Value::Str(s) => crate::tonaljs::convert_step_string(s).ok()?,
+        other => (tonal_js_number(other)?, 0),
+    };
+    // Truthiness gates the anchor path.
+    let anchor = anchor.filter(|anchor| match anchor {
+        Value::F64(n) => *n != 0.0 && !n.is_nan(),
+        Value::Str(s) => !s.is_empty(),
+        Value::Bool(b) => *b,
+        Value::Undefined | Value::Null => false,
+        _ => true,
+    });
+    let stepped = match anchor {
+        Some(anchor) => {
+            // Numbers pass through, strings via note_to_midi, anything
+            // else is NaN.
+            let anchor_midi = match anchor {
+                Value::F64(n) => *n,
+                Value::Str(s) => crate::util::note_to_midi(s, 3).unwrap_or(f64::NAN),
+                _ => f64::NAN,
+            };
+            crate::tonaljs::step_in_named_scale(number, scale_name, Some(anchor_midi))
+                .map(Value::F64)
+        }
+        None => steps.step(number).map(Value::Str),
+    };
+    let stepped = match stepped {
+        Ok(value) => value,
+        // An error removes the hap and is reported so a misspelt scale does
+        // not leave a silent lane with no diagnostic.
+        Err(error) => {
+            crate::signal_callback_failure(|| error);
+            return None;
+        }
+    };
+    if accidental_offset == 0 {
+        return Some(stepped);
+    }
+    // Accidental suffixes transpose the result; a numeric scale note
+    // (anchor path) yields "".
+    let base = match &stepped {
+        Value::Str(s) => s.as_str(),
+        _ => "",
+    };
+    let transposed = crate::tonaljs::note_transpose(
+        base,
+        &crate::tonaljs::interval_from_semitones(accidental_offset),
+    );
+    Some(Value::Str(transposed.into()))
+}
+
+#[cfg(test)]
+mod scale_steps_tests {
+    use super::{ScaleSteps, scale_hap};
+    use crate::{Hap, TimeSpan, Value};
+    use rustel_fraction::Fraction;
+
+    #[test]
+    fn a_scaled_hap_keeps_its_other_controls_and_the_keys_of_its_context() {
+        let steps = ScaleSteps::new("C:major".to_string());
+        let text = |text: &str| Value::Str(text.into());
+        let controls = Value::object([("n".into(), Value::F64(2.0)), ("s".into(), text("piano"))]);
+        let cycle = TimeSpan::new(Fraction::ZERO, Fraction::ONE);
+        let mut hap = Hap::new(Some(cycle), cycle, controls);
+        hap.keys.edit().log_line = Some("a line".into());
+        let scaled = scale_hap(&hap, &steps).expect("a note of the scale");
+        let note = Value::Str(steps.step(2.0).expect("a degree of the scale"));
+        // The step gives way to its note, after the other controls.
+        let expected = Value::object([("s".into(), text("piano")), ("note".into(), note)]);
+        assert_eq!(scaled.value, expected);
+        assert_eq!(scaled.scale_context(), Some("C:major"));
+        assert_eq!(scaled.log_line(), Some("a line"));
+    }
+
+    #[test]
+    fn a_kept_degree_is_the_note_scale_step_resolves() {
+        let mut steps: Vec<f64> = (-67..67).map(|degree| degree as f64).collect();
+        steps.extend([
+            -0.5,
+            0.25,
+            2.5,
+            -0.0,
+            f64::NAN,
+            f64::INFINITY,
+            -1e300,
+            1e300,
+        ]);
+        let tonics = ["C", "C#", "Eb4", "B2", "Fb", ""];
+        for (type_name, _, _) in crate::tonaljs_scales::SCALE_DICTIONARY {
+            for tonic in tonics {
+                let name = format!("{tonic}:{type_name}");
+                let kept = ScaleSteps::new(name.clone());
+                for &step in &steps {
+                    let expected = crate::tonaljs::scale_step(step, &name);
+                    assert_eq!(kept.step(step).is_ok(), expected.is_ok(), "{name} {step}");
+                    if let Ok(note) = expected {
+                        assert_eq!(kept.step(step).as_deref(), Ok(&*note), "{name} {step}");
+                    }
+                }
+            }
+        }
+        let unknown = ScaleSteps::new("C:no such scale".to_string());
+        assert!(unknown.step(1.0).is_err());
+    }
 }
 
 #[cfg(test)]
@@ -2484,7 +2819,11 @@ mod degrade_tests {
         for (pattern_index, pattern) in patterns.iter().enumerate() {
             let generic = degrade_by(pattern, 0.5);
             let dedicated = pattern.degrade_by_seeded(0.5, 0);
-            assert_eq!(generic.steps, dedicated.steps, "pattern {pattern_index}");
+            assert_eq!(
+                generic.steps(),
+                dedicated.steps(),
+                "pattern {pattern_index}"
+            );
             for seed in [0.0, 1.0, -2.5, f64::NAN] {
                 let mut controls = OrderedMap::new();
                 controls.insert("randSeed".into(), Value::F64(seed));
@@ -2644,11 +2983,17 @@ mod step_scaling_overflow_tests {
     #[test]
     fn legal_factors_still_scale_the_step_count() {
         let pat = stepped_pattern();
-        assert_eq!(expand(&pat, Fraction::int(2)).steps, Some(Fraction::int(4)));
-        assert_eq!(expand(&pat, Fraction::new(1, 2)).steps, Some(Fraction::ONE));
+        assert_eq!(
+            expand(&pat, Fraction::int(2)).steps(),
+            Some(Fraction::int(4))
+        );
+        assert_eq!(
+            expand(&pat, Fraction::new(1, 2)).steps(),
+            Some(Fraction::ONE)
+        );
         // A step-less receiver still passes through step-less.
         let stepless = pat.clone().with_steps(None);
-        assert_eq!(expand(&stepless, Fraction::int(2)).steps, None);
+        assert_eq!(expand(&stepless, Fraction::int(2)).steps(), None);
         // extend keeps its events: two per cycle, doubled into one cycle.
         let haps = extend(&pat, Fraction::int(2))
             .try_query_arc_sorted(Fraction::ZERO, Fraction::ONE)
@@ -2709,7 +3054,10 @@ mod step_scaling_overflow_tests {
     fn legal_contracts_and_paces_still_scale() {
         let pat = stepped_pattern();
         // contract(2) halves a two-step count; contract(0) stays `nothing()`.
-        assert_eq!(contract(&pat, Fraction::int(2)).steps, Some(Fraction::ONE));
+        assert_eq!(
+            contract(&pat, Fraction::int(2)).steps(),
+            Some(Fraction::ONE)
+        );
         let zero = contract(&pat, Fraction::ZERO);
         assert!(
             zero.try_query_arc_sorted(Fraction::ZERO, Fraction::ONE)
@@ -2719,7 +3067,7 @@ mod step_scaling_overflow_tests {
         // pace(4) on a two-step pattern doubles the rate: steps 4, four
         // events per cycle.
         let paced = pace(&pat, Fraction::int(4));
-        assert_eq!(paced.steps, Some(Fraction::int(4)));
+        assert_eq!(paced.steps(), Some(Fraction::int(4)));
         let haps = paced
             .try_query_arc_sorted(Fraction::ZERO, Fraction::ONE)
             .expect("pace(4) is legal");
@@ -2731,7 +3079,7 @@ mod step_scaling_overflow_tests {
         // target/steps ≈ 5e37 fits, so construction succeeds; the speed-up's
         // query-time multiply then leaves i128 from cycle 4 on (4 × 5e37).
         let paced = pace(&stepped_pattern(), overflowing_factor());
-        assert_eq!(paced.steps, Some(overflowing_factor()));
+        assert_eq!(paced.steps(), Some(overflowing_factor()));
         for cycle in [4, 1000] {
             assert_eq!(
                 refusal_in_cycle(&paced, cycle),
@@ -2750,7 +3098,7 @@ mod step_scaling_overflow_tests {
             (extend(&one_step(), factor), "extend"),
             (replicate(&one_step(), factor), "replicate"),
         ] {
-            assert_eq!(built.steps, Some(factor), "{operation}(1e38) steps");
+            assert_eq!(built.steps(), Some(factor), "{operation}(1e38) steps");
             assert_eq!(
                 refusal_in_cycle(&built, 2),
                 native_fraction(operation),
@@ -2767,7 +3115,7 @@ mod step_scaling_overflow_tests {
         let factor = overflowing_factor();
         let halves = stepped_pattern().with_steps(Some(Fraction::ONE));
         let built = extend(&halves, factor);
-        assert_eq!(built.steps, Some(factor));
+        assert_eq!(built.steps(), Some(factor));
         assert_eq!(
             built
                 .try_query_arc_sorted(Fraction::ZERO, Fraction::ONE.div(factor))
@@ -2781,7 +3129,7 @@ mod step_scaling_overflow_tests {
         // The step product fits for a one-step receiver; each event's
         // `fast(1e38)` overflows once cycle 2 is queried.
         let plied = ply(&one_step(), overflowing_factor());
-        assert_eq!(plied.steps, Some(overflowing_factor()));
+        assert_eq!(plied.steps(), Some(overflowing_factor()));
         assert_eq!(refusal_in_cycle(&plied, 2), native_fraction("ply"));
     }
 
@@ -2798,13 +3146,13 @@ mod step_scaling_overflow_tests {
         assert_eq!(late(&extend(&pat, Fraction::int(2))), 4, "extend(2)");
         assert_eq!(late(&replicate(&pat, Fraction::int(2))), 4, "replicate(2)");
         let plied = ply(&pat, Fraction::int(3));
-        assert_eq!(plied.steps, Some(Fraction::int(6)));
+        assert_eq!(plied.steps(), Some(Fraction::int(6)));
         assert_eq!(late(&plied), 6, "ply(3)");
         // fast(0) is still silence, steps included.
         let still = pace(&pat, Fraction::ZERO);
-        assert_eq!(still.steps, Some(Fraction::ZERO));
+        assert_eq!(still.steps(), Some(Fraction::ZERO));
         assert_eq!(late(&still), 0, "pace(0)");
-        assert_eq!(ply(&pat, Fraction::ZERO).steps, Some(Fraction::ZERO));
+        assert_eq!(ply(&pat, Fraction::ZERO).steps(), Some(Fraction::ZERO));
     }
 
     #[test]
@@ -2966,7 +3314,7 @@ mod step_scaling_overflow_tests {
                 "drop(-3)",
             ),
         ] {
-            assert_eq!(built.steps, zoomed.steps, "{what} steps");
+            assert_eq!(built.steps(), zoomed.steps(), "{what} steps");
             for (begin, end) in [
                 (Fraction::ZERO, Fraction::ONE),
                 (Fraction::new(1, 3), Fraction::new(7, 3)),
@@ -3067,7 +3415,7 @@ mod tonal_range_tests {
     }
 
     fn empty_notes(count: usize) -> Vec<Value> {
-        vec![Value::Str(String::new()); count]
+        vec![Value::Str("".into()); count]
     }
 
     /// `note("c4 e5").transpose(-1e19)` once panicked: `n as i64` saturated
@@ -3157,7 +3505,7 @@ mod tonal_range_tests {
             "c-".to_string(),
         ] {
             let pat = scale(
-                &pure(Value::Str(note.clone())),
+                &pure(Value::Str(note.as_str().into())),
                 Value::Str("C:major".into()),
             );
             assert_eq!(queried_values(&pat), empty_notes(1), "note {note:.24}");
@@ -3267,13 +3615,13 @@ mod tests {
         let bd_cp = || fastcat(vec![s("bd"), s("cp")]);
         for (operation, by_four) in fourfold_combinators() {
             let built = by_four(&bd_cp());
-            assert_eq!(built.steps, Some(Fraction::int(8)), "{operation}(4)");
+            assert_eq!(built.steps(), Some(Fraction::int(8)), "{operation}(4)");
             let paced = pace(&built, Fraction::int(4))
                 .try_query_arc_sorted(Fraction::ZERO, Fraction::ONE)
                 .expect("a legal pace is not a refusal");
             assert_eq!(paced.len(), 4, "{operation}(4).pace(4)");
             assert_eq!(
-                by_four(&bd_cp().with_steps(None)).steps,
+                by_four(&bd_cp().with_steps(None)).steps(),
                 None,
                 "{operation}(4) of a step-less receiver"
             );
@@ -3289,16 +3637,16 @@ mod tests {
         let indices = fastcat(vec![pure(Value::F64(0.0)), pure(Value::F64(1.0))]);
         let sliced = slice(&sample, &four, &indices);
         for (operation, built) in [("slice", sliced.clone()), ("splice", sliced.splice())] {
-            assert_eq!(built.steps, Some(Fraction::int(2)), "{operation}");
+            assert_eq!(built.steps(), Some(Fraction::int(2)), "{operation}");
             let paced = pace(&built, Fraction::int(4))
                 .try_query_arc_sorted(Fraction::ZERO, Fraction::ONE)
                 .expect("a legal pace is not a refusal");
             assert_eq!(paced.len(), 4, "{operation}.pace(4)");
         }
         let stepless = slice(&sample, &four, &indices.with_steps(None));
-        assert_eq!(stepless.steps, None, "slice over step-less indices");
+        assert_eq!(stepless.steps(), None, "slice over step-less indices");
         assert_eq!(
-            stepless.splice().steps,
+            stepless.splice().steps(),
             None,
             "splice over step-less indices"
         );
@@ -3367,7 +3715,7 @@ mod tests {
                 .to_vec()
         };
         let bd = OrderedMap::from_entries([("s".into(), Value::Str("bd".into()))]);
-        let function = Value::Function(Box::new(FunctionRef::registered(
+        let function = Value::Function(std::sync::Arc::new(FunctionRef::registered(
             "id",
             std::sync::Arc::new(|pat| pat),
             true,

@@ -4,7 +4,7 @@
 //! https://strudel.cc, where an entry carries upstream's words; entries this
 //! port wrote itself say so in their own words.
 
-use super::{Registry, add, add_fn, arg_function, arg_number};
+use super::{Registry, add, add_fn, arg_number};
 use crate::combinators as c;
 use crate::ops::PatOps;
 
@@ -343,10 +343,10 @@ pub(super) fn register(r: &mut Registry) {
         SOMETIMES_BY,
         3,
         false,
-        crate::native_combinator!(|args, pat| c::sometimes_by(
+        super::native_transformer!(1, |args, func, pat| c::sometimes_by(
             &pat,
             arg_number(args, 0),
-            arg_function(args, 1)
+            func
         )),
     );
 
@@ -356,10 +356,10 @@ pub(super) fn register(r: &mut Registry) {
         SOME_CYCLES_BY,
         3,
         false,
-        crate::native_combinator!(|args, pat| c::some_cycles_by(
+        super::native_transformer!(1, |args, func, pat| c::some_cycles_by(
             &pat,
             arg_number(args, 0),
-            arg_function(args, 1)
+            func
         )),
     );
 
@@ -369,7 +369,7 @@ pub(super) fn register(r: &mut Registry) {
         SOME_CYCLES,
         2,
         false,
-        crate::native_combinator!(|args, pat| c::some_cycles_by(&pat, 0.5, arg_function(args, 0))),
+        super::native_transformer!(0, |_args, func, pat| c::some_cycles_by(&pat, 0.5, func)),
     );
 
     add_fn(
@@ -378,7 +378,7 @@ pub(super) fn register(r: &mut Registry) {
         SOMETIMES,
         2,
         false,
-        crate::native_combinator!(|args, pat| c::sometimes_by(&pat, 0.5, arg_function(args, 0))),
+        super::native_transformer!(0, |_args, func, pat| c::sometimes_by(&pat, 0.5, func)),
     );
 
     add_fn(
@@ -387,7 +387,7 @@ pub(super) fn register(r: &mut Registry) {
         OFTEN,
         2,
         false,
-        crate::native_combinator!(|args, pat| c::sometimes_by(&pat, 0.75, arg_function(args, 0))),
+        super::native_transformer!(0, |_args, func, pat| c::sometimes_by(&pat, 0.75, func)),
     );
 
     add_fn(
@@ -396,7 +396,7 @@ pub(super) fn register(r: &mut Registry) {
         RARELY,
         2,
         false,
-        crate::native_combinator!(|args, pat| c::sometimes_by(&pat, 0.25, arg_function(args, 0))),
+        super::native_transformer!(0, |_args, func, pat| c::sometimes_by(&pat, 0.25, func)),
     );
 
     add_fn(
@@ -405,7 +405,7 @@ pub(super) fn register(r: &mut Registry) {
         ALMOST_NEVER,
         2,
         false,
-        crate::native_combinator!(|args, pat| c::sometimes_by(&pat, 0.1, arg_function(args, 0))),
+        super::native_transformer!(0, |_args, func, pat| c::sometimes_by(&pat, 0.1, func)),
     );
 
     add_fn(
@@ -414,7 +414,7 @@ pub(super) fn register(r: &mut Registry) {
         ALMOST_ALWAYS,
         2,
         false,
-        crate::native_combinator!(|args, pat| c::sometimes_by(&pat, 0.9, arg_function(args, 0))),
+        super::native_transformer!(0, |_args, func, pat| c::sometimes_by(&pat, 0.9, func)),
     );
 
     add_fn(
@@ -423,7 +423,7 @@ pub(super) fn register(r: &mut Registry) {
         NEVER,
         2,
         false,
-        crate::native_combinator!(|_args, pat| pat),
+        super::native_transformer!(0, |_args, _func, pat| pat),
     );
 
     add_fn(
@@ -432,6 +432,6 @@ pub(super) fn register(r: &mut Registry) {
         ALWAYS,
         2,
         false,
-        crate::native_combinator!(|args, pat| c::apply(&pat, arg_function(args, 0))),
+        super::native_transformer!(0, |_args, func, pat| c::apply(&pat, func)),
     );
 }

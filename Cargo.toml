@@ -6,6 +6,7 @@ members = [
     "crates/core",
     "crates/ext",
     "crates/mini",
+    "crates/score",
     "crates/transpiler",
     "crates/jsruntime",
     "crates/scheduler",
@@ -23,6 +24,7 @@ members = [
     "crates/vst3-fixture",
     "crates/kabel",
     "crates/studio-e2e",
+    "crates/bench",
     "xtask",
 ]
 
@@ -38,6 +40,7 @@ default-members = [
     "crates/core",
     "crates/ext",
     "crates/mini",
+    "crates/score",
     "crates/transpiler",
     "crates/jsruntime",
     "crates/scheduler",

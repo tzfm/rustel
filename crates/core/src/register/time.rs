@@ -5,8 +5,7 @@
 //! port wrote itself say so in their own words.
 
 use super::{
-    Registry, add, add_fn, add_unpatternified, arg_fraction, arg_function, arg_number,
-    stepwise_input_refusal,
+    Registry, add, add_fn, add_unpatternified, arg_fraction, arg_number, stepwise_input_refusal,
 };
 use crate::combinators as c;
 use crate::ops::PatOps;
@@ -913,7 +912,7 @@ pub(super) fn register(r: &mut Registry) {
         SLOW,
         2,
         false,
-        crate::native_combinator!(|args, pat| pat.slow(arg_fraction(args, 0))),
+        crate::native_combinator!(|args, pat| pat.slow_owned(arg_fraction(args, 0))),
     );
 
     add(
@@ -1186,10 +1185,10 @@ pub(super) fn register(r: &mut Registry) {
         CHUNK,
         3,
         false,
-        crate::native_combinator!(|args, pat| c::chunk(
+        super::native_transformer!(1, |args, func, pat| c::chunk(
             &pat,
             arg_number(args, 0) as i64,
-            arg_function(args, 1),
+            func,
             false,
             false
         )),
@@ -1201,10 +1200,10 @@ pub(super) fn register(r: &mut Registry) {
         CHUNK_BACK,
         3,
         false,
-        crate::native_combinator!(|args, pat| c::chunk(
+        super::native_transformer!(1, |args, func, pat| c::chunk(
             &pat,
             arg_number(args, 0) as i64,
-            arg_function(args, 1),
+            func,
             true,
             false
         )),
@@ -1216,10 +1215,10 @@ pub(super) fn register(r: &mut Registry) {
         FASTCHUNK,
         3,
         false,
-        crate::native_combinator!(|args, pat| c::chunk(
+        super::native_transformer!(1, |args, func, pat| c::chunk(
             &pat,
             arg_number(args, 0) as i64,
-            arg_function(args, 1),
+            func,
             false,
             true
         )),
@@ -1240,10 +1239,10 @@ pub(super) fn register(r: &mut Registry) {
         INSIDE,
         3,
         false,
-        crate::native_combinator!(|args, pat| c::inside(
+        super::native_transformer!(1, |args, func, pat| c::inside(
             &pat,
             arg_fraction(args, 0),
-            arg_function(args, 1)
+            func
         )),
     );
 
@@ -1253,10 +1252,10 @@ pub(super) fn register(r: &mut Registry) {
         OUTSIDE,
         3,
         false,
-        crate::native_combinator!(|args, pat| c::outside(
+        super::native_transformer!(1, |args, func, pat| c::outside(
             &pat,
             arg_fraction(args, 0),
-            arg_function(args, 1)
+            func
         )),
     );
 
@@ -1266,10 +1265,10 @@ pub(super) fn register(r: &mut Registry) {
         OFF,
         3,
         false,
-        crate::native_combinator!(|args, pat| c::off(
+        super::native_transformer!(1, |args, func, pat| c::off(
             &pat,
             arg_fraction(args, 0),
-            arg_function(args, 1)
+            func
         )),
     );
 
@@ -1309,11 +1308,11 @@ pub(super) fn register(r: &mut Registry) {
         ECHO_WITH,
         4,
         false,
-        crate::native_combinator!(|args, pat| c::echo_with(
+        super::native_transformer!(2, |args, func, pat| c::echo_with(
             &pat,
             arg_number(args, 0) as i64,
             arg_fraction(args, 1),
-            arg_function(args, 2),
+            func,
             "echoWith"
         )),
     );
@@ -1324,11 +1323,11 @@ pub(super) fn register(r: &mut Registry) {
         WITHIN,
         4,
         false,
-        crate::native_combinator!(|args, pat| c::within(
+        super::native_transformer!(2, |args, func, pat| c::within(
             &pat,
             arg_fraction(args, 0),
             arg_fraction(args, 1),
-            arg_function(args, 2)
+            func
         )),
     );
 

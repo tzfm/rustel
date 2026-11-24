@@ -625,7 +625,7 @@ fn binary_nl_keeps_the_list_returning_strudel_definition() {
     let haps = session.query(Fraction::ZERO, Fraction::ONE).expect("query");
     assert_eq!(
         haps[0].value,
-        rustel_core::Value::List(vec![
+        rustel_core::Value::list(vec![
             rustel_core::Value::F64(0.0),
             rustel_core::Value::F64(1.0),
             rustel_core::Value::F64(0.0),

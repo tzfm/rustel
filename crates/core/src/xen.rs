@@ -138,7 +138,7 @@ fn parse_numeral(value: &Value) -> Result<f64, String> {
 /// Error-message display: strings bare, other values via [`Value::show`].
 fn js_display(value: &Value) -> String {
     match value {
-        Value::Str(s) => s.clone(),
+        Value::Str(s) => s.to_string(),
         other => other.show(),
     }
 }
@@ -233,11 +233,12 @@ fn get_xen_scale(arg: &Value) -> Result<Vec<f64>, String> {
         Value::Str(name) => {
             if is_edo(name) {
                 edo(name)?
-            } else if let Some((_, ratios)) = XEN_PRESETS.iter().find(|(preset, _)| preset == name)
+            } else if let Some((_, ratios)) =
+                XEN_PRESETS.iter().find(|(preset, _)| *preset == &**name)
             {
                 ratios.to_vec()
             } else {
-                let spec = crate::tune::ScaleSpec::Name(name.clone());
+                let spec = crate::tune::ScaleSpec::Name(name.to_string());
                 if crate::tune::Tune::is_valid_scale(&spec) {
                     let mut tune = crate::tune::Tune::new();
                     tune.load_scale(&spec)?;
@@ -285,9 +286,9 @@ fn xen_ratio(value: &Value) -> f64 {
 /// Tune each note from the intersected patterns of its scale degrees.
 pub fn xen_patterns(pat: &crate::Pattern, ratios: Vec<crate::Pattern>) -> crate::Pattern {
     if ratios.is_empty() {
-        return xen(pat, Value::List(Vec::new()));
+        return xen(pat, Value::list(Vec::new()));
     }
-    crate::Pattern::of(crate::Node::XenPatterns(pat.clone(), ratios)).with_steps(pat.steps)
+    crate::Pattern::of(crate::Node::XenPatterns(Box::new((pat.clone(), ratios)))).with_steps_of(pat)
 }
 
 pub(crate) fn query_xen_patterns(
@@ -301,21 +302,21 @@ pub(crate) fn query_xen_patterns(
     }
     let scale = ratios
         .iter()
-        .fold(crate::pure(Value::List(Vec::new())), |scale, ratio| {
+        .fold(crate::pure(Value::list(Vec::new())), |scale, ratio| {
             scale.app_both_with(ratio.clone(), |values, value| {
                 let Value::List(values) = values else {
                     return Value::Undefined;
                 };
-                let mut values = values.clone();
-                values.push(value.clone());
-                Value::List(values)
+                let mut out = values.to_vec();
+                out.push(value.clone());
+                Value::list(out)
             })
         })
         .fmap(|value| {
             let Value::List(ratios) = value else {
                 return Value::Undefined;
             };
-            Value::List(
+            Value::list(
                 ratios
                     .iter()
                     .map(|ratio| Value::F64(xen_ratio(ratio)))
@@ -613,7 +614,7 @@ pub fn tune<P: PatOps>(pat: &P, arg: Value) -> P {
                     .all(|item| matches!(item, Value::F64(n) if !n.is_nan()))
         }
         Value::Str(name) => {
-            crate::tune::Tune::is_valid_scale(&crate::tune::ScaleSpec::Name(name.clone()))
+            crate::tune::Tune::is_valid_scale(&crate::tune::ScaleSpec::Name(name.to_string()))
         }
         _ => false,
     };
@@ -627,7 +628,7 @@ pub fn tune<P: PatOps>(pat: &P, arg: Value) -> P {
     }
     let mut tune_engine = crate::tune::Tune::new();
     let spec = match &arg {
-        Value::Str(name) => crate::tune::ScaleSpec::Name(name.clone()),
+        Value::Str(name) => crate::tune::ScaleSpec::Name(name.to_string()),
         Value::List(items) => {
             crate::tune::ScaleSpec::Frequencies(items.iter().filter_map(Value::as_f64).collect())
         }
@@ -949,7 +950,7 @@ pub fn edo_scale<P: PatOps>(pat: &P, arg: Value) -> P {
     // Arrays only. A string definition fails with the verbatim flat()
     // TypeError rather than inventing string parsing that never existed.
     let definition: Vec<Value> = match &arg {
-        Value::List(items) => items.clone(),
+        Value::List(items) => items.to_vec(),
         _ => {
             return query_error_pattern::<P>(|| {
                 "scaleDefinition.flat is not a function".to_string()
@@ -1060,19 +1061,22 @@ pub fn edo_scale<P: PatOps>(pat: &P, arg: Value) -> P {
             rest.insert("degree".into(), Value::F64(degree));
             rest.insert(
                 "degreeIndexes".into(),
-                Value::List(pitches.divisions.iter().map(|d| Value::F64(*d)).collect()),
+                Value::list(pitches.divisions.iter().map(|d| Value::F64(*d)).collect()),
             );
             rest.insert(
                 "intLabels".into(),
-                Value::List(
+                Value::list(
                     pitches
                         .int_labels
                         .iter()
-                        .map(|l| l.clone().map_or(Value::Null, Value::Str))
+                        .map(|label| match label {
+                            Some(label) => Value::Str(label.as_str().into()),
+                            None => Value::Null,
+                        })
                         .collect(),
                 ),
             );
-            rest.insert("root".into(), Value::Str(pitches.base_freq.clone()));
+            rest.insert("root".into(), Value::Str(pitches.base_freq.as_str().into()));
             // An undefined freq means no key at all.
             if !matches!(freq, Value::Undefined) {
                 rest.insert("freq".into(), freq);
@@ -1176,7 +1180,7 @@ mod tests {
         let definition = |sequence: String| {
             vec![
                 Value::Str("C3".into()),
-                Value::Str(sequence),
+                Value::Str(sequence.into()),
                 Value::F64(2.0),
                 Value::F64(1.0),
             ]
@@ -1210,7 +1214,7 @@ mod tests {
                 Value::Str("LLsLLLs".into()),
                 Value::F64(large),
                 Value::F64(1.0),
-                Value::Str(padding.clone()),
+                Value::Str(padding.as_str().into()),
             ]
         };
         let key = |definition: &[Value]| {
@@ -1242,7 +1246,7 @@ mod tests {
 
         let held = cache.key_bytes;
         let mut oversized = definition(40.0);
-        oversized[4] = Value::Str("x".repeat(MAX_CACHED_EDO_KEY_BYTES));
+        oversized[4] = Value::Str("x".repeat(MAX_CACHED_EDO_KEY_BYTES).into());
         let built = cache.get_or_build(key(&oversized), &oversized).unwrap();
         assert_eq!(built.divisions.len(), 7);
         assert_eq!(
@@ -1260,11 +1264,11 @@ mod tests {
         assert_eq!(scale[0], 220.0);
         assert!((scale[8] - 220.0 * 2f64.powf(8.0 / 31.0)).abs() < 1e-9);
         // A raw ratio list is scaled by the base too.
-        let raw = get_xen_scale(&Value::List(vec![Value::F64(1.0), Value::F64(2.0)])).unwrap();
+        let raw = get_xen_scale(&Value::list(vec![Value::F64(1.0), Value::F64(2.0)])).unwrap();
         assert_eq!(raw, vec![220.0, 440.0]);
-        let ratios = get_xen_scale(&Value::List(vec![
+        let ratios = get_xen_scale(&Value::list(vec![
             Value::Str("3:2".into()),
-            Value::List(vec![Value::F64(5.0), Value::F64(4.0)]),
+            Value::list(vec![Value::F64(5.0), Value::F64(4.0)]),
             Value::Str("bad".into()),
             Value::F64(2.0),
         ]))
@@ -1351,8 +1355,8 @@ mod tests {
         assert_eq!(js_number(&Value::Str("0x10".into())), 16.0);
         assert_eq!(js_number(&Value::Str("-7".into())), -7.0);
         assert!(js_number(&Value::Str("12ed".into())).is_nan());
-        assert_eq!(js_number(&Value::List(vec![Value::Str("5".into())])), 5.0);
-        assert!(js_number(&Value::List(vec![Value::F64(1.0), Value::F64(2.0)])).is_nan());
+        assert_eq!(js_number(&Value::list(vec![Value::Str("5".into())])), 5.0);
+        assert!(js_number(&Value::list(vec![Value::F64(1.0), Value::F64(2.0)])).is_nan());
     }
 
     /// Fractional offsets miss the table and stay NaN through the octave
@@ -1378,7 +1382,7 @@ mod tests {
         for scale in [
             Value::Str("hexany15".into()),
             Value::Str("tranh3".into()),
-            Value::List(vec![
+            Value::list(vec![
                 Value::F64(220.0),
                 Value::F64(330.0),
                 Value::F64(440.0),
@@ -1433,10 +1437,10 @@ mod tests {
     fn build_edo_pitches_for_test(definition: &str) -> EdoPitches {
         let parts: Vec<&str> = definition.split(':').collect();
         let values = vec![
-            Value::Str(parts[0].to_string()),
-            Value::Str(parts[1].to_string()),
-            Value::Str(parts[2].to_string()),
-            Value::Str(parts[3].to_string()),
+            Value::Str(parts[0].into()),
+            Value::Str(parts[1].into()),
+            Value::Str(parts[2].into()),
+            Value::Str(parts[3].into()),
         ];
         build_edo_pitches(definition, &values).unwrap()
     }
@@ -1448,7 +1452,7 @@ mod tests {
             m.insert("n".into(), Value::F64(2.0));
             m
         }));
-        let arg = Value::List(vec![
+        let arg = Value::list(vec![
             Value::Str("C".into()),
             Value::Str("LLsLLLs".into()),
             Value::F64(2.0),

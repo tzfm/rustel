@@ -873,7 +873,7 @@ fn continued_replacement_leaves_a_changed_onset_to_the_outgoing_copy() {
 /// The controls of one sound, as a hap value.
 fn sound(controls: &[(&str, &str)]) -> Pattern {
     pure(Value::object(controls.iter().map(|(name, value)| {
-        ((*name).to_owned(), Value::Str((*value).to_owned()))
+        ((*name).to_owned(), Value::Str((*value).into()))
     })))
 }
 
@@ -1450,7 +1450,7 @@ impl Device {
 fn slid(per_cycle: usize, slider: &Arc<AtomicU64>) -> Pattern {
     let slider = Arc::clone(slider);
     fastcat(vec![atom("bd"); per_cycle])
-        .fmap(move |_| Value::Str(format!("bd:{}", slider.load(Ordering::Relaxed))))
+        .fmap(move |_| Value::Str(format!("bd:{}", slider.load(Ordering::Relaxed)).into()))
 }
 
 /// As [`slid`], with a number that goes up by one from onset to onset. One
@@ -1459,7 +1459,7 @@ fn stepped(per_cycle: usize, slider: &Arc<AtomicU64>) -> Pattern {
     let slider = Arc::clone(slider);
     fastcat((0..per_cycle).map(|step| atom(&step.to_string())).collect()).fmap(move |step| {
         let step: u64 = step.show().parse().expect("a step number");
-        Value::Str(format!("n:{}", step + slider.load(Ordering::Relaxed)))
+        Value::Str(format!("n:{}", step + slider.load(Ordering::Relaxed)).into())
     })
 }
 
@@ -1585,7 +1585,7 @@ fn a_requery_after_a_clock_bend_sounds_each_onset_once() {
 fn lane(name: &'static str, slider: &Arc<AtomicU64>) -> Pattern {
     let slider = Arc::clone(slider);
     fastcat(vec![atom(name); 32])
-        .fmap(move |_| Value::Str(format!("{name} x:{}", slider.load(Ordering::Relaxed))))
+        .fmap(move |_| Value::Str(format!("{name} x:{}", slider.load(Ordering::Relaxed)).into()))
 }
 
 /// Each onset of `steps` on the 1/32 grid sounds once in each lane.

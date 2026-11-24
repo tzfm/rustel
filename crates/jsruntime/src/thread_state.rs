@@ -140,7 +140,7 @@ pub(super) fn discard_eager_callback_exception() {
 
 pub(super) fn with_ctx<R>(runtime: &JsRuntime, f: impl FnOnce(Ctx<'_>) -> R) -> R {
     runtime.script_may_have_run.set(true);
-    enter_ctx(&runtime.ctx, f)
+    enter_ctx(&runtime.realm().ctx, f)
 }
 
 /// [`with_ctx`] for host reads that run no score code: reading a host slot,
@@ -151,7 +151,7 @@ pub(super) fn with_ctx_running_no_script<R>(
     runtime: &JsRuntime,
     f: impl FnOnce(Ctx<'_>) -> R,
 ) -> R {
-    enter_ctx(&runtime.ctx, f)
+    enter_ctx(&runtime.realm().ctx, f)
 }
 
 fn enter_ctx<R>(ctx_owner: &Context, f: impl FnOnce(Ctx<'_>) -> R) -> R {

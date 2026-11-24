@@ -97,7 +97,7 @@ impl Session {
             // `play()` is a new transport lifetime. A key placed before a
             // caller stopped the exposed Transport handle must not replay in
             // the new offline/render pass.
-            self.js.midi_input_bus().clear_keys();
+            self.js.clear_midi_keys();
         }
         self.transport.start();
         let generation = if reanchor {
@@ -443,7 +443,7 @@ impl Session {
         let mut report = self.play(duration_secs)?;
         let device = rustel_audio::ScalarDevice::open_default()
             .map_err(|error| RuntimeError::Audio(error.to_string()))?;
-        let csound = self.csound.for_render();
+        let csound = self.csound().for_render();
         let (events, notices) =
             rustel_voice::with_diagnostic_policy(self.direct_diagnostic_logging, || {
                 if let Some(library) = &self.samples {
@@ -679,7 +679,7 @@ impl Session {
             // that fails, or one that never plays, leaves them.
             if *at < end_secs && self.generation() != generation_before {
                 held.retain(|onset| onset.target_time < *at);
-                let snapshot = self.csound.snapshot();
+                let snapshot = self.csound_snapshot();
                 if csound_saves.last().is_some_and(|(last, _)| last == at) {
                     csound_saves.pop();
                 }
@@ -715,12 +715,12 @@ impl Session {
                 .then_with(|| a.onset_id.cmp(&b.onset_id))
         });
         onsets.dedup_by_key(|onset| onset.onset_id);
-        let csound = self.csound.with_render_timeline(csound_saves);
+        let csound = self.csound().with_render_timeline(csound_saves);
 
         // The mp3 door is the same render; only the container differs, so a
         // tape bounced either way is the same audio.
         let (plugin_lines, voices_refused) = self.render_under_diagnostic_policy(|session| {
-            if mp3 {
+            if mp3 && session.export_limiter.is_none() {
                 crate::render::write_scalar_mp3_with_dispatch(
                     out_path,
                     session.config.sample_rate,
@@ -733,6 +733,36 @@ impl Session {
                     Some(&csound),
                     &session.render_stop(None),
                 )
+            } else if mp3 {
+                // The limiter runs on the rendered audio: stage it as WAV
+                // beside the target, then encode what it kept.
+                let staged = out_path.with_extension("rendering.wav");
+                let encoded = crate::render::write_scalar_wav_controlled_with_dispatch(
+                    &staged,
+                    session.config.sample_rate,
+                    end_secs,
+                    &onsets,
+                    session.config.cps,
+                    session.samples.as_deref(),
+                    print_progress,
+                    rustel_audio::RenderControl {
+                        limiter: session.export_limiter,
+                        ..rustel_audio::RenderControl::default()
+                    },
+                    rustel_audio::WavSampleFormat::Pcm16,
+                    session.config.dsp_dispatch,
+                    session.max_polyphony(),
+                    Some(&csound),
+                    false,
+                    &session.render_stop(None),
+                )
+                .and_then(|(bytes, refused, lines)| {
+                    let pcm = crate::render::read_pcm16_stereo_wav(&staged)?;
+                    crate::render::encode_mp3(out_path, session.config.sample_rate, &pcm)?;
+                    Ok((bytes, refused, lines))
+                });
+                let _ = std::fs::remove_file(&staged);
+                encoded
             } else {
                 crate::render::write_scalar_wav_controlled_with_dispatch(
                     out_path,
@@ -747,7 +777,7 @@ impl Session {
                         cancelled: None,
                         finish: None,
                         stop_when_silent: None,
-                        limiter: None,
+                        limiter: session.export_limiter,
                     },
                     rustel_audio::WavSampleFormat::Pcm16,
                     session.config.dsp_dispatch,
@@ -890,7 +920,7 @@ impl Session {
                 session.samples.as_deref(),
                 session.config.dsp_dispatch,
                 session.max_polyphony(),
-                Some(&session.csound),
+                Some(session.csound()),
                 &session.render_stop(None),
             )
             .map(|(pcm, refused, _)| (pcm, refused))
@@ -1017,7 +1047,7 @@ impl Session {
                     session.samples.as_deref(),
                     session.config.dsp_dispatch,
                     session.max_polyphony(),
-                    Some(&session.csound),
+                    Some(session.csound()),
                     &stop,
                 )
                 .map_err(render_error)?;
@@ -1047,7 +1077,7 @@ impl Session {
                     rustel_audio::WavSampleFormat::Pcm16,
                     session.config.dsp_dispatch,
                     session.max_polyphony(),
-                    Some(&session.csound),
+                    Some(session.csound()),
                     // The staged WAV feeds the mp3 encoder; stems are refused
                     // for mp3 before this point.
                     false,
@@ -1089,7 +1119,7 @@ impl Session {
                     },
                     session.config.dsp_dispatch,
                     session.max_polyphony(),
-                    Some(&session.csound),
+                    Some(session.csound()),
                     session.stems_export,
                     &stop,
                 )
@@ -1097,7 +1127,7 @@ impl Session {
                 .map_err(render_error)
             }
             RenderFormat::OnsetJson => {
-                write_onset_dump(out_path, &play.onsets)?;
+                write_onset_dump_until(out_path, &play.onsets, &stop)?;
                 Ok(((None, Vec::new()), Vec::new()))
             }
             RenderFormat::Midi => {

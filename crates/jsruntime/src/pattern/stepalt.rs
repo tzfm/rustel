@@ -155,7 +155,7 @@ pub(crate) fn native_stepalt<'js>(
             // this loop. Every group here therefore has an indexed source.
             let index = cycle % group.len();
             let source = &mut group[index];
-            if let Some(steps) = source.0.steps
+            if let Some(steps) = source.0.steps()
                 && steps > Fraction::ZERO
             {
                 let Some(next) = total.checked_add(steps) else {
@@ -228,7 +228,7 @@ pub(crate) fn native_stepalt<'js>(
     for cycle in 0..cycle_count {
         for group in &groups {
             let pattern = &group[cycle % group.len()].0;
-            if let Some(steps) = pattern.steps
+            if let Some(steps) = pattern.steps()
                 && steps > Fraction::ZERO
             {
                 items.push(pattern.clone());
@@ -253,7 +253,7 @@ pub(crate) fn native_stepalt<'js>(
     } else {
         let mut begin = Fraction::ZERO;
         for item in &items {
-            let steps = item.steps.expect("retained stepalt item has steps");
+            let steps = item.steps().expect("retained stepalt item has steps");
             let Some((end, cat_begin, factor)) = (|| {
                 let end = begin.checked_add(steps)?;
                 let cat_begin = begin.checked_div(total)?;

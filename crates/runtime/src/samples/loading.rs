@@ -1867,6 +1867,7 @@ pub(super) mod tests {
         #[cfg(unix)]
         #[test]
         fn an_endless_local_sample_is_refused_rather_than_read() {
+            let _turn = crate::samples::ceiling_test_turn();
             // `/dev/zero` reports a length of zero and never ends, so the stat
             // says nothing and the bounded read is what refuses it. That is the
             // case the bound exists for.

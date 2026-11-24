@@ -301,11 +301,11 @@ fn impure_pattern_without_host_panics() {
 #[test]
 fn query_time_javascript_is_always_impure() {
     for source in [
-        // Patterned first argument: the transformer is chosen per hap.
-        r#"s("bd sd").every("<2 3>", x => x.fast(2))"#,
-        r#"s("bd sd").sometimesBy("<0.3 0.6>", x => x.speed(2))"#,
-        // Scalar probability: the combinator body's own fmap is lazy. A free
-        // variable keeps the callback JavaScript.
+        // Patterned first argument: each hap applies the transformer at the
+        // query. A free variable keeps the callback JavaScript.
+        r#"const k = 2; s("bd sd").every("<2 3>", x => x.fast(k))"#,
+        r#"const k = 2; s("bd sd").sometimesBy("<0.3 0.6>", x => x.speed(k))"#,
+        // Scalar probability: the combinator body's own fmap is lazy.
         r#"const k = 2; s("bd sd").sometimesBy(1, x => x.speed(k))"#,
         r#"const k = 2; s("bd sd").someCyclesBy(1, x => x.speed(k))"#,
     ] {
@@ -350,6 +350,13 @@ fn eager_and_compiled_callbacks_leave_a_genuinely_pure_graph() {
         (r#"s("bd sd").superimpose(x => x.fast(2))"#, true),
         (r#"s("bd sd").sometimesBy(1, x => x.speed(2))"#, true),
         (r#"s("bd sd").someCyclesBy(1, x => x.speed(2))"#, true),
+        // A patterned first argument applies the compiled callback at the
+        // query, once for each value.
+        (r#"s("bd sd").every("<2 3>", x => x.fast(2))"#, true),
+        (
+            r#"s("bd sd").sometimesBy("<0.3 0.6>", x => x.speed(2))"#,
+            true,
+        ),
     ] {
         let rt = JsRuntime::new().unwrap();
         rt.install_semantic_bindings().unwrap();
@@ -654,7 +661,7 @@ fn raw_range_pair_scalar_graphs_remain_host_free_after_runtime_teardown() {
                 pattern.reachable_callbacks().is_empty(),
                 "{source}: scalar graph retained a callback"
             );
-            assert_eq!(pattern.steps, Some(Fraction::int(3)));
+            assert_eq!(pattern.steps(), Some(Fraction::int(3)));
             pattern
         }; // The stable native composer wrappers are gone before this query.
 
@@ -863,7 +870,7 @@ fn raw_apply_stable_native_terminals_remain_host_free_after_runtime_teardown() {
                 pattern.reachable_callbacks().is_empty(),
                 "{source}: eager callback leaked into the returned graph"
             );
-            assert_eq!(pattern.steps, Some(expected_steps));
+            assert_eq!(pattern.steps(), Some(expected_steps));
             pattern
         };
 
@@ -1026,7 +1033,7 @@ fn raw_when_native_branches_remain_host_free_after_runtime_teardown() {
                 pattern.reachable_callbacks().is_empty(),
                 "{branch}: eager branch retained a JavaScript callback"
             );
-            assert_eq!(pattern.steps, Some(Fraction::int(2)));
+            assert_eq!(pattern.steps(), Some(Fraction::int(2)));
             pattern
         };
 
@@ -1227,7 +1234,7 @@ fn raw_never_always_native_terminals_remain_host_free_after_runtime_teardown() {
                 pattern.reachable_callbacks().is_empty(),
                 "{name}: construction-time callable leaked into the returned graph"
             );
-            assert_eq!(pattern.steps, Some(Fraction::int(2)));
+            assert_eq!(pattern.steps(), Some(Fraction::int(2)));
             pattern
         };
 
@@ -1474,7 +1481,8 @@ fn raw_swing_native_scalar_graphs_remain_host_free_after_runtime_teardown() {
                 "{name}: native swing graph retained a callback"
             );
             assert_eq!(
-                pattern.steps, expected_steps,
+                pattern.steps(),
+                expected_steps,
                 "{name}: scalar swing step metadata changed"
             );
             pattern
@@ -1662,7 +1670,8 @@ fn raw_signal_quartet_tagged_transformers_remain_host_free_after_runtime_teardow
                 "{raw_name}: canonical tagged transformer lost pure dispatch"
             );
             assert_eq!(
-                pattern.steps, None,
+                pattern.steps(),
+                None,
                 "{raw_name}: outer raw signal graph retained source steps"
             );
             assert!(
@@ -1946,7 +1955,7 @@ fn raw_set_canonical_fmap_retains_exact_js_owners_and_prunes_dispatch_objects() 
     assert_eq!(rt.get_number("rawSetFmapCalls"), Some(1.0));
     assert_eq!(rt.get_number("rawSetCanonicalShape"), Some(1.0));
     let active = rt.active_pattern().expect("active canonical raw set");
-    assert_eq!(active.steps, Some(Fraction::int(7)));
+    assert_eq!(active.steps(), Some(Fraction::int(7)));
     assert!(
         !active.is_pure() && (!active.reachable_callbacks().is_empty() || active.purity().opaque),
         "raw set's generated JS fmap callback was granted host-free purity"
@@ -2216,7 +2225,7 @@ fn raw_keep_canonical_fmap_retains_source_and_ignored_pattern_without_querying_i
     assert_eq!(rt.get_number("rawKeepCanonicalShape"), Some(1.0));
     assert_eq!(rt.get_number("rawKeepIgnoredQueryCalls"), Some(0.0));
     let active = rt.active_pattern().expect("active canonical raw keep");
-    assert_eq!(active.steps, Some(Fraction::int(7)));
+    assert_eq!(active.steps(), Some(Fraction::int(7)));
     assert!(
         !active.is_pure() && (!active.reachable_callbacks().is_empty() || active.purity().opaque),
         "raw keep's generated JS fmap callback was granted host-free purity"
@@ -2540,7 +2549,7 @@ fn raw_keepif_canonical_fmap_retains_unqueried_pattern_owners_on_both_branches()
         assert_eq!(rt.get_number("rawKeepifRetainedQueryCalls"), Some(0.0));
         assert_eq!(rt.get_number("rawKeepifExtraQueryCalls"), Some(0.0));
         let active = rt.active_pattern().expect("active canonical raw keepif");
-        assert_eq!(active.steps, Some(Fraction::int(7)));
+        assert_eq!(active.steps(), Some(Fraction::int(7)));
         assert!(
             rt.active_needs_host(),
             "{truthy}: canonical raw keepif lost its generated mapper host"
@@ -2885,7 +2894,7 @@ fn raw_eqt_canonical_fmap_retains_source_and_captured_owners_for_both_results() 
         assert_eq!(rt.get_number("rawEqtCanonicalShape"), Some(1.0));
         assert_eq!(rt.get_number("rawEqtExtraQueryCalls"), Some(0.0));
         let active = rt.active_pattern().expect("active canonical raw eqt");
-        assert_eq!(active.steps, Some(Fraction::int(7)));
+        assert_eq!(active.steps(), Some(Fraction::int(7)));
         assert!(
             rt.active_needs_host(),
             "{equal}: canonical raw eqt lost its generated mapper host"
@@ -3210,7 +3219,7 @@ fn raw_net_canonical_fmap_retains_source_and_captured_owners_for_both_results() 
         assert_eq!(rt.get_number("rawNetCanonicalShape"), Some(1.0));
         assert_eq!(rt.get_number("rawNetExtraQueryCalls"), Some(0.0));
         let active = rt.active_pattern().expect("active canonical raw net");
-        assert_eq!(active.steps, Some(Fraction::int(7)));
+        assert_eq!(active.steps(), Some(Fraction::int(7)));
         assert!(
             rt.active_needs_host(),
             "{different}: canonical raw net lost its generated mapper host"
@@ -3536,7 +3545,7 @@ fn raw_and_canonical_fmap_retains_both_branch_owners_and_ignored_capture() {
         assert_eq!(rt.get_number("rawAndSourceQueryCalls"), Some(0.0));
         assert_eq!(rt.get_number("rawAndExtraQueryCalls"), Some(0.0));
         let active = rt.active_pattern().expect("active canonical raw and");
-        assert_eq!(active.steps, Some(Fraction::int(7)));
+        assert_eq!(active.steps(), Some(Fraction::int(7)));
         assert!(
             rt.active_needs_host(),
             "{truthy}: canonical raw and lost its lexical mapper/source host"
@@ -3885,7 +3894,7 @@ fn raw_or_canonical_fmap_retains_both_branch_owners_and_ignored_capture() {
         assert_eq!(rt.get_number("rawOrSourceQueryCalls"), Some(0.0));
         assert_eq!(rt.get_number("rawOrExtraQueryCalls"), Some(0.0));
         let active = rt.active_pattern().expect("active canonical raw or");
-        assert_eq!(active.steps, Some(Fraction::int(7)));
+        assert_eq!(active.steps(), Some(Fraction::int(7)));
         assert!(
             rt.active_needs_host(),
             "{truthy}: canonical raw or lost its lexical mapper/source host"
@@ -4325,7 +4334,7 @@ fn js_owned_stepwise_factors_survive_gc_and_keep_step_join_semantics() {
         !replicate.reachable_callbacks().is_empty(),
         "query-time factor is not rooted by the active graph"
     );
-    assert_eq!(replicate.steps, Some(Fraction::int(2)));
+    assert_eq!(replicate.steps(), Some(Fraction::int(2)));
 
     let snapshot = |begin, end| {
         rt.query(Slot::Active, 0, begin, end)
@@ -4375,7 +4384,7 @@ fn js_owned_stepwise_factors_survive_gc_and_keep_step_join_semantics() {
         !contract.reachable_callbacks().is_empty(),
         "contract factor is not rooted by the active graph"
     );
-    assert_eq!(contract.steps, Some(Fraction::int(3)));
+    assert_eq!(contract.steps(), Some(Fraction::int(3)));
     let before = rt
         .query(Slot::Active, 0, Fraction::ZERO, Fraction::ONE)
         .expect("query callback-owned contract")
@@ -4614,7 +4623,7 @@ fn js_owned_take_drop_amounts_survive_gc_and_keep_step_join_windows() {
         !take.reachable_callbacks().is_empty(),
         "query-time take amount is not rooted by the graph"
     );
-    assert_eq!(take.steps, Some(Fraction::ONE));
+    assert_eq!(take.steps(), Some(Fraction::ONE));
 
     let snapshot = |begin, end| {
         rt.query(Slot::Active, 0, begin, end)
@@ -4654,7 +4663,7 @@ fn js_owned_take_drop_amounts_survive_gc_and_keep_step_join_windows() {
         !drop.reachable_callbacks().is_empty(),
         "query-time drop amount is not rooted by the graph"
     );
-    assert_eq!(drop.steps, Some(Fraction::int(2)));
+    assert_eq!(drop.steps(), Some(Fraction::int(2)));
     let drop_joined = rt
         .query(Slot::Active, 0, Fraction::ZERO, Fraction::int(2))
         .expect("query callback-owned drop")
@@ -5063,7 +5072,7 @@ fn js_owned_shrink_grow_amounts_survive_gc_and_keep_step_join_windows() {
         "query-time shrink amount was called pure"
     );
     assert!(!shrink.reachable_callbacks().is_empty());
-    assert_eq!(shrink.steps, Some(Fraction::int(10)));
+    assert_eq!(shrink.steps(), Some(Fraction::int(10)));
     assert_eq!(rt.get_number("shrinkFactorCalls"), Some(1.0));
     assert_eq!(snapshot(Fraction::ZERO, Fraction::int(2)), SHRINK_JOINED);
     assert_eq!(rt.get_number("shrinkFactorCalls"), Some(2.0));
@@ -5090,7 +5099,7 @@ fn js_owned_shrink_grow_amounts_survive_gc_and_keep_step_join_windows() {
     let grow = rt.active_pattern().expect("active grow graph");
     assert!(!grow.is_pure(), "query-time grow amount was called pure");
     assert!(!grow.reachable_callbacks().is_empty());
-    assert_eq!(grow.steps, Some(Fraction::int(10)));
+    assert_eq!(grow.steps(), Some(Fraction::int(10)));
     assert_eq!(rt.get_number("growFactorCalls"), Some(1.0));
     assert_eq!(snapshot(Fraction::ZERO, Fraction::int(2)), GROW_JOINED);
     assert_eq!(rt.get_number("growFactorCalls"), Some(2.0));

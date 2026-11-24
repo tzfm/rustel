@@ -5,6 +5,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use rustel_fraction::Fraction;
+#[cfg(feature = "device-audio")]
 use rustel_runtime::TakeoverCut;
 use rustel_runtime::{
     FileWatch, MAX_WATCH_SOURCE_BYTES, ReloadStatus, Session, WatchLanguage, WatchPoll, WatchTarget,
@@ -464,7 +465,9 @@ fn watched_source_size_is_bounded_before_evaluation() {
 fn live_scheduler_installs_the_callback_host_only_when_needed() {
     let mut impure = Session::new().expect("impure session");
     impure
-        .evaluate(r#"note("c e g").every(fastcat(2, 3), x => x.fast(2))"#)
+        .evaluate(
+            r#"note("c e g").every(fastcat(2, 3), x => { globalThis.__seen = 1; return x.fast(2); })"#,
+        )
         .expect("impure evaluation");
     assert!(impure.active_needs_host());
     assert!(
@@ -3219,7 +3222,7 @@ fn live_producer_repeated_edit_soak_keeps_one_heap_and_exact_generations() {
 
     fn source(identity: usize, callback: bool) -> String {
         let transform = if callback {
-            ".every(fastcat(1, 1), pattern => pattern.fast(2))"
+            ".every(fastcat(1, 1), pattern => { globalThis.__soakCallback = 1; return pattern.fast(2); })"
         } else {
             ""
         };
@@ -3436,7 +3439,7 @@ fn assembled_live_route_survives_two_valid_saves_one_invalid_and_backpressure() 
 
     let source = |label: &str, callback: bool| {
         let transform = if callback {
-            ".every(fastcat(1, 1), pattern => pattern.fast(16))"
+            ".every(fastcat(1, 1), pattern => { globalThis.__assembledCallback = 1; return pattern.fast(16); })"
         } else {
             ".fast(16)"
         };

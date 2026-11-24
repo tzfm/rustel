@@ -179,6 +179,9 @@ pub(super) fn run_replay(
                 .with_cps(script.baseline_cps.unwrap_or(SessionConfig::default().cps)),
             &sample_access,
         )?)?;
+        // The file sounds like the take: through the limiter of the tape's set.
+        #[cfg(feature = "studio")]
+        session.set_export_limiter(rustel_studio::replay::tape_limiter(session_path));
         // Ctrl-C has to reach a render that runs for minutes. The watcher keeps
         // re-asserting the stop, which is what makes it stick across windows
         // that each start the transport again.

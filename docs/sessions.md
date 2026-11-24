@@ -116,6 +116,8 @@ The header describes the format version, recording time, and retained events.
 An optional `baseline_cps` records a non-default initial tempo.
 A save's `via` can identify a slider update or stop. Control records, including
 fader moves and audio-take markers, are recorded but not applied by replay.
+A `--export` of a tape in a set's `sessions` folder goes through that set's
+master limiter, so it does not clip where the take did not.
 
 Each line is limited to 32 MiB, excluding LF or CRLF. Blank event lines and
 an incomplete final JSON record are ignored within that limit, so a truncated
