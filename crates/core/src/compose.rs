@@ -502,9 +502,10 @@ fn compose_inner<P: PatOps>(pat: &P, other: &P, op: ComposeOp, how: Alignment) -
 
 /// The closure of each compose op that a pattern was built with. See
 /// [`interned_combine`].
-static OP_CLOSURES: std::sync::OnceLock<
-    std::sync::Mutex<std::collections::HashMap<(ComposeOp, bool), crate::CombineFn>>,
-> = std::sync::OnceLock::new();
+type WeakCombineFn = std::sync::Weak<dyn Fn(&Value, &Value) -> Value + Send + Sync>;
+type OpClosurePool = std::sync::Mutex<std::collections::HashMap<(ComposeOp, bool), WeakCombineFn>>;
+
+static OP_CLOSURES: std::sync::OnceLock<OpClosurePool> = std::sync::OnceLock::new();
 
 /// Whether `combine` is the closure of a compose op: a function of its two
 /// values and nothing more, which a fold may run when a pattern is built.
@@ -514,7 +515,10 @@ pub(crate) fn is_op_closure(combine: &crate::CombineFn) -> bool {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .values()
-            .any(|closure| Arc::ptr_eq(closure, combine))
+            .any(|closure| {
+                std::ptr::addr_eq(closure.as_ptr(), Arc::as_ptr(combine))
+                    && closure.strong_count() > 0
+            })
     })
 }
 
@@ -526,7 +530,10 @@ pub(crate) fn is_keep_if(combine: &crate::CombineFn) -> bool {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .get(&(ComposeOp::KeepIf, true))
-            .is_some_and(|closure| Arc::ptr_eq(closure, combine))
+            .is_some_and(|closure| {
+                std::ptr::addr_eq(closure.as_ptr(), Arc::as_ptr(combine))
+                    && closure.strong_count() > 0
+            })
     })
 }
 

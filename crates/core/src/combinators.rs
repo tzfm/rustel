@@ -1912,9 +1912,10 @@ fn pure_signal<P: PatOps>(pattern: crate::Pattern) -> P {
 /// The gate of each [`degrade_by_with`], by the bits of its threshold: a
 /// gate is a pure function of the threshold, so the same degrade built by a
 /// later evaluation is the same payload.
-static GATES: std::sync::OnceLock<
-    std::sync::Mutex<std::collections::HashMap<u64, crate::ValuePredicate>>,
-> = std::sync::OnceLock::new();
+type WeakValuePredicate = std::sync::Weak<dyn Fn(&Value) -> bool + Send + Sync>;
+type GatePool = std::sync::Mutex<std::collections::HashMap<u64, WeakValuePredicate>>;
+
+static GATES: std::sync::OnceLock<GatePool> = std::sync::OnceLock::new();
 
 /// The combine of each [`degrade_by_with`], which keeps the left value
 /// whatever the gate says: one closure object for every degrade, so that
@@ -1927,7 +1928,10 @@ pub(crate) fn gate_threshold(gate: &crate::ValuePredicate) -> Option<f64> {
     let gates = GATES.get()?.lock().ok()?;
     gates
         .iter()
-        .find(|(_, known)| std::sync::Arc::ptr_eq(known, gate))
+        .find(|(_, known)| {
+            std::ptr::addr_eq(known.as_ptr(), std::sync::Arc::as_ptr(gate))
+                && known.strong_count() > 0
+        })
         .map(|(bits, _)| f64::from_bits(*bits))
 }
 

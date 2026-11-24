@@ -9017,14 +9017,13 @@ fn no_save_session_conflicts_with_asking_for_one() {
 /// A deep pattern graph is refused with a resource-limit error. A stack overflow
 /// aborts the process and no recovery catches it. A debug frame is larger, so
 /// this test runs in debug too. A signal or exit 134 means the abort is back.
-/// Each shift is a node of its own: a change of speed folds into the node of
-/// the values.
+/// Each `fastGap` is a node of its own: speed, shift, and `rev` combinators fold
+/// into the sequence node.
 #[test]
 fn a_deep_pattern_graph_is_refused_instead_of_aborting_the_process() {
     for wrappers in [8_192, 20_000] {
-        let source = format!(
-            "let p = s('bd'); for (let i = 0; i < {wrappers}; i++) p = p.late(1).early(1); p"
-        );
+        let source =
+            format!("let p = s('bd'); for (let i = 0; i < {wrappers}; i++) p = p.fastGap(1); p");
         let out = run(&["query", "--json", "-e", &source, "--end", "1/64"]);
         let code = out.status.code();
         assert!(

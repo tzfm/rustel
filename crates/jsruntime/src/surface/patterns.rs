@@ -195,7 +195,7 @@ pub(crate) fn parse_mini_non_word_in_room(source: &str, offset: i64) -> Result<P
         } else {
             pattern
         };
-        if pattern.has_sourced_layers() {
+        if pattern.has_sourced_layers() && source.len() <= 256 {
             memo.insert(source, offset, pattern.clone());
         }
         Ok(pattern)

@@ -3232,7 +3232,11 @@ impl Pattern {
                 let mut hap = if s_idx + 1 == count {
                     std::mem::replace(
                         &mut template,
-                        Hap::new(None, TimeSpan::new(Fraction::ZERO, Fraction::ZERO), Value::Undefined),
+                        Hap::new(
+                            None,
+                            TimeSpan::new(Fraction::ZERO, Fraction::ZERO),
+                            Value::Undefined,
+                        ),
                     )
                 } else {
                     template.clone()
@@ -3263,9 +3267,10 @@ impl Pattern {
             } else {
                 hf.part
             };
-            let slot_idx = if let Some(idx) = slots.iter().position(|s| {
-                s.active && s.part == hf.part && (!has_continuous || s.met == met)
-            }) {
+            let slot_idx = if let Some(idx) = slots
+                .iter()
+                .position(|s| s.active && s.part == hf.part && (!has_continuous || s.met == met))
+            {
                 idx
             } else {
                 let grid = fused::StepWave::step_grid_over(shared_steps, hf.part)?;

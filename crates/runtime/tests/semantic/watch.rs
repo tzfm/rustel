@@ -465,7 +465,9 @@ fn watched_source_size_is_bounded_before_evaluation() {
 fn live_scheduler_installs_the_callback_host_only_when_needed() {
     let mut impure = Session::new().expect("impure session");
     impure
-        .evaluate(r#"note("c e g").every(fastcat(2, 3), x => x.fast(2))"#)
+        .evaluate(
+            r#"note("c e g").every(fastcat(2, 3), x => { globalThis.__seen = 1; return x.fast(2); })"#,
+        )
         .expect("impure evaluation");
     assert!(impure.active_needs_host());
     assert!(

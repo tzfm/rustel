@@ -155,9 +155,10 @@ pub(crate) fn lane_tagged(pattern: &rustel_core::Pattern, tag: String) -> rustel
     // One map object per lane name: the tag is the only thing the map
     // reads, so the same lane built by a later evaluation is the same
     // payload and its answers carry across evaluations.
-    static POOL: std::sync::OnceLock<
-        std::sync::Mutex<std::collections::HashMap<String, rustel_core::OwnedHapMapFn>>,
-    > = std::sync::OnceLock::new();
+    type WeakOwnedHapMapFn =
+        std::sync::Weak<dyn Fn(rustel_core::Hap) -> Option<rustel_core::Hap> + Send + Sync>;
+    type LaneTagPool = std::sync::Mutex<std::collections::HashMap<String, WeakOwnedHapMapFn>>;
+    static POOL: std::sync::OnceLock<LaneTagPool> = std::sync::OnceLock::new();
     let map =
         rustel_core::interned_closure(POOL.get_or_init(Default::default), tag.clone(), || {
             let map: rustel_core::OwnedHapMapFn =

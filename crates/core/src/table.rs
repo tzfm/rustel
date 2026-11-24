@@ -62,10 +62,15 @@ impl HapBuffer {
 
 impl Drop for HapBuffer {
     fn drop(&mut self) {
+        const MOST_BUFFERS: usize = 8;
         if self.0.capacity() <= MAX_RESERVED {
             self.0.clear();
-            let _ =
-                HAP_BUFFERS.try_with(|pool| pool.borrow_mut().push(std::mem::take(&mut self.0)));
+            let _ = HAP_BUFFERS.try_with(|pool| {
+                let mut pool = pool.borrow_mut();
+                if pool.len() < MOST_BUFFERS {
+                    pool.push(std::mem::take(&mut self.0));
+                }
+            });
         }
     }
 }

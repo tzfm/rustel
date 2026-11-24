@@ -1924,17 +1924,11 @@ mod tests {
         fn callback_pressure_reports_semantic_fades_without_allocating() {
             let _tripwire_guard = tripwire_assertion_guard();
             let shared = LiveShared::new(1);
-            // Seventy onsets, then sixty in the next block: the second block
-            // passes the cap while the first fills most of a block's
-            // activation budget.
-            for (onset_id, target_frame) in (0..130).map(|id| {
-                let frame = if id < 70 { 0 } else { 128 };
-                (id, frame)
-            }) {
+            for onset_id in 0..130 {
                 assert!(shared.ring.push(AudioEvent {
                     onset_id,
                     generation: 1,
-                    target_frame,
+                    target_frame: 0,
                     onset_lead: 0.0,
                     freq_hz: 220.0,
                     gain: 0.1,
@@ -1995,9 +1989,7 @@ mod tests {
             let mut meters = LiveCallbackMeters::new(48_000, &shared.realtime_load);
             let mut output = [0.0f32; 256];
             let before = tripwire::Violations::capture();
-            // The onset rate settles first: a burst still in the estimate
-            // shortens the retirement fade.
-            for _ in 0..4 * crate::pressure::PRESSURE_PUBLISH_INTERVAL {
+            for _ in 0..crate::pressure::PRESSURE_PUBLISH_INTERVAL {
                 tripwire::audio_scope(|| {
                     write_live_output(&mut backend, &mut meters, &mut output, 2, &shared)
                 });
@@ -2006,9 +1998,7 @@ mod tests {
             assert_eq!(raised.max_polyphony, 256);
             assert_eq!(raised.active_voices, 160);
             assert_eq!(raised.semantic_polyphony_fades, 0);
-            // A pool within twice the cap retires with a fade. Past twice
-            // the cap it retires as fast as a cut.
-            shared.max_polyphony.store(96, Ordering::Relaxed);
+            shared.max_polyphony.store(64, Ordering::Relaxed);
             for _ in 0..crate::pressure::PRESSURE_PUBLISH_INTERVAL {
                 tripwire::audio_scope(|| {
                     write_live_output(&mut backend, &mut meters, &mut output, 2, &shared)
@@ -2019,12 +2009,12 @@ mod tests {
                 "changing polyphony must not allocate in the callback"
             );
             let lowered = shared.report(1).realtime_pressure;
-            assert_eq!(lowered.max_polyphony, 96);
+            assert_eq!(lowered.max_polyphony, 64);
             assert_eq!(
                 lowered.active_voices, 160,
                 "retiring voices must keep their fade"
             );
-            assert_eq!(lowered.semantic_polyphony_fades, 64);
+            assert_eq!(lowered.semantic_polyphony_fades, 96);
             assert_eq!(lowered.voice_ceiling_drops, 0);
             assert_eq!(
                 LiveShared::new(1).max_polyphony.load(Ordering::Relaxed),

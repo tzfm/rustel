@@ -487,9 +487,7 @@ impl Registration {
                 let pure_view = self.admits_pure_view(&vals);
                 self.func.apply(&vals, pat, pure_view)
             }
-        } else if args.len() > self.arity.saturating_sub(1)
-            && !args.iter().all(|a| a.as_pure().is_some())
-        {
+        } else if args.len() > self.arity.saturating_sub(1) {
             // Over-applied call: with more leading arguments than the arity
             // allows, the curry chain ends up applying a Pattern as if it
             // were a function, and the query fails with this exact error.

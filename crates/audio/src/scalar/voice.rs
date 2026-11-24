@@ -118,14 +118,10 @@ pub(super) struct VoiceEnd {
     stop_secs: f32,
     /// The frame a cut starts to fade the voice: 1 to 0 over 10 ms.
     cut_from: Option<u64>,
-    /// The frame the polyphony cap starts to fade the voice. Set once and
-    /// never cleared: a voice the cap has dropped cannot be chosen again.
+    /// The frame the polyphony cap starts to fade the voice: 1 to 0 over
+    /// [`POLYPHONY_FADE_SECS`]. Set once and never cleared: a voice the cap
+    /// has dropped cannot be chosen again.
     cull_from: Option<u64>,
-    /// The length of the cull fade, in seconds. At most
-    /// [`POLYPHONY_FADE_SECS`]; shorter when many voices fade at once, so the
-    /// retiring pool stays near the polyphony cap instead of filling the
-    /// voice ceiling: see [`polyphony_fade_secs`].
-    cull_secs: f32,
     /// The bank slot this voice reads was emptied under it: an uninstall
     /// landed. The voice renders silence for the rest of the block and
     /// retires at the end of the block. Set on the audio thread. The id may
@@ -140,7 +136,6 @@ impl VoiceEnd {
             stop_secs,
             cut_from: None,
             cull_from: None,
-            cull_secs: POLYPHONY_FADE_SECS,
             gone: false,
         }
     }
@@ -186,17 +181,10 @@ impl VoiceEnd {
     }
 
     /// Culls the voice for the polyphony cap: it fades from the frame `from`
-    /// over `fade_secs` and stops at the end of that fade.
-    pub(super) fn cull(&mut self, from: u64, fade_secs: f32, start_frame: u64, sample_rate: u32) {
+    /// and stops at the end of that fade.
+    pub(super) fn cull(&mut self, from: u64, start_frame: u64, sample_rate: u32) {
         self.cull_from = Some(from);
-        self.cull_secs = fade_secs;
-        self.stop_after(from, fade_secs, start_frame, sample_rate);
-    }
-
-    /// The length of this voice's cull fade, in seconds.
-    #[inline]
-    pub(super) fn cull_secs(&self) -> f32 {
-        self.cull_secs
+        self.stop_after(from, POLYPHONY_FADE_SECS, start_frame, sample_rate);
     }
 
     /// Ends the voice of a late event of a preview that a newer preview
@@ -430,105 +418,6 @@ fn polyphony_kills(active: usize, max_polyphony: usize) -> usize {
         killed += 1;
     }
     killed as usize
-}
-
-/// The fade length a polyphony cull hands its voices, in seconds.
-///
-/// A culled voice keeps rendering until its fade ends, so a pool fed faster
-/// than the cap holds `rate x fade` retiring voices. At an extreme onset
-/// rate (`seg(256).fast(32)` asks for thousands a second) a fixed
-/// quarter-second fade fills the whole voice ceiling with retired voices
-/// and the callback misses its deadline on sound the cap had already
-/// dropped. Three signals size the fade, and the shortest wins:
-///
-/// - The rate voices ask to start, culls and ceiling drops alike. A steady
-///   flood measures its own rate, and the fade then holds the retiring pool
-///   near one cap's worth of voices.
-/// - The voices already fading, including this cull's own, squared against
-///   the cap. A burst that arrives before the rate estimate has caught up
-///   (a producer delivers windows in bursts, and the estimate empties
-///   during a rest) still collapses the fade of its own tail at once,
-///   while an ordinary fanfare that culls a handful keeps full fades.
-/// - The whole pool at twice the cap: the shortest fade there is, the
-///   cut's. Whatever the estimates say, a pool the block cannot render
-///   must retire as fast as a cut retires it.
-///
-/// Ordinary music, which culls in single digits and starts at most a few
-/// hundred voices a second, always receives the full quarter second.
-pub(super) fn polyphony_fade_secs(
-    activations_per_sec: f32,
-    fading_after_cull: usize,
-    pool_after_cull: usize,
-    max_polyphony: usize,
-) -> f32 {
-    let budget = max_polyphony.max(1) as f32;
-    if pool_after_cull > 2 * max_polyphony {
-        return CUT_FADE_SECS;
-    }
-    let rate = if activations_per_sec.is_nan() || activations_per_sec <= 1.0 {
-        1.0
-    } else {
-        activations_per_sec
-    };
-    let by_rate = POLYPHONY_FADE_SECS * budget / rate;
-    let share = budget / fading_after_cull.max(1) as f32;
-    let by_population = POLYPHONY_FADE_SECS * share * share;
-    by_rate
-        .min(by_population)
-        .clamp(CUT_FADE_SECS, POLYPHONY_FADE_SECS)
-}
-
-/// Tracks how fast voices ask to start, in onsets per second, as an
-/// exponentially weighted moving average over render blocks. A full queue
-/// or the voice ceiling can refuse most of a flood before it ever sounds,
-/// so the flow that gets through measures nothing exactly when the fade
-/// matters: this counts every due onset, admitted or dropped, and every
-/// onset the intake refuses. See [`polyphony_fade_secs`].
-#[derive(Debug)]
-pub(super) struct TurnoverRate {
-    per_sec: f32,
-    block_activations: u32,
-}
-
-impl Default for TurnoverRate {
-    fn default() -> Self {
-        Self {
-            per_sec: 0.0,
-            block_activations: 0,
-        }
-    }
-}
-
-impl TurnoverRate {
-    /// The smoothed onset rate the next cull sizes its fade with.
-    pub(super) fn per_sec(&self) -> f32 {
-        self.per_sec
-    }
-
-    /// Count one block's due onsets, added as the block schedules them.
-    pub(super) fn record_block_activations(&mut self, onsets: usize) {
-        self.block_activations = self
-            .block_activations
-            .saturating_add(u32::try_from(onsets).unwrap_or(u32::MAX));
-    }
-
-    /// Fold the block that just rendered into the estimate. Called once per
-    /// block, after the last onset of the block, so the fades of the block
-    /// itself were sized by the rate the previous blocks measured. The
-    /// estimate decays over a quarter second, not a block: a producer
-    /// delivers windows in bursts seconds apart, and an estimate that
-    /// emptied between them would size every burst's first fades at full
-    /// length.
-    pub(super) fn advance_block(&mut self, frames: u32, sample_rate: u32) {
-        let decay = f64::from(frames) / (0.25 * f64::from(sample_rate.max(1)));
-        let decay = (-decay).exp();
-        let carried = f64::from(self.per_sec) * decay;
-        let added =
-            f64::from(self.block_activations) * (1.0 - decay) * f64::from(sample_rate.max(1))
-                / f64::from(frames.max(1));
-        self.block_activations = 0;
-        self.per_sec = (carried + added).clamp(0.0, f64::from(f32::MAX)) as f32;
-    }
 }
 
 /// Advance a voice's FM modulators by `steps` samples, with no envelope and
@@ -1314,44 +1203,6 @@ impl ScalarBackend {
         self.try_note_prepared_with_confirmation(event, None, None)
     }
 
-    /// Refuse an onset the live drain has not yet constructed, when the
-    /// intake [`Self::try_note_prepared_with_confirmation`] would refuse it
-    /// for a full pending queue or a full voice pool. Counts the same
-    /// pressure and demand readings, answers the same confirmation offer,
-    /// and returns false when the intake has room after all, so the caller
-    /// can go on and submit the onset.
-    pub fn refuse_saturated_intake(
-        &mut self,
-        confirmation: Option<crate::confirmation::ConfirmationOnset>,
-        musical: u64,
-        generation: u64,
-    ) -> bool {
-        let pending_full = self.pending.len() == self.pending.capacity();
-        let voice_full = self
-            .voices
-            .len()
-            .saturating_add(self.pending.len())
-            .saturating_add(1)
-            > self.voices.capacity();
-        if !pending_full && !voice_full {
-            return false;
-        }
-        if pending_full {
-            self.pressure.pending_ceiling_drops =
-                self.pressure.pending_ceiling_drops.saturating_add(1);
-        } else {
-            self.pressure.voice_ceiling_drops = self.pressure.voice_ceiling_drops.saturating_add(1);
-        }
-        self.turnover.record_block_activations(1);
-        #[cfg(feature = "device-audio")]
-        if let (Some(consumer), Some(tag)) = (&mut self.confirmations, confirmation) {
-            consumer.admission(tag, musical, generation, false);
-        }
-        #[cfg(not(feature = "device-audio"))]
-        let _ = (confirmation, musical, generation);
-        true
-    }
-
     pub(super) fn queue_choke<K>(&mut self, event: OnsetEvent<K>) -> bool {
         let Some(group) = event.cut else {
             return true;
@@ -1398,10 +1249,6 @@ impl ScalarBackend {
         if self.pending.len() == self.pending.capacity() {
             self.pressure.pending_ceiling_drops =
                 self.pressure.pending_ceiling_drops.saturating_add(1);
-            // A refused onset is still demand: the retirement must size
-            // itself by what the score asks for, not by the flow a full
-            // queue lets through.
-            self.turnover.record_block_activations(1);
             #[cfg(feature = "device-audio")]
             if let (Some(consumer), Some(tag)) = (&mut self.confirmations, confirmation) {
                 consumer.admission(tag, musical, event.generation, false);
@@ -1410,7 +1257,6 @@ impl ScalarBackend {
         }
         if required > self.voices.capacity() {
             self.pressure.voice_ceiling_drops = self.pressure.voice_ceiling_drops.saturating_add(1);
-            self.turnover.record_block_activations(1);
             #[cfg(feature = "device-audio")]
             if let (Some(consumer), Some(tag)) = (&mut self.confirmations, confirmation) {
                 consumer.admission(tag, musical, event.generation, false);
@@ -1873,31 +1719,21 @@ impl ScalarBackend {
         lead: u32,
         sample_rate: u32,
         max_polyphony: usize,
-        activations_per_sec: f32,
     ) -> usize {
-        let mut active = 0usize;
-        let mut fading = 0usize;
-        for voice in voices.iter() {
-            if voice.end.is_culled() {
-                fading += 1;
-            } else {
-                active += 1;
-            }
-        }
-        let kills = polyphony_kills(active, max_polyphony);
-        let fade_secs = polyphony_fade_secs(
-            activations_per_sec,
-            fading + kills,
-            voices.len() + 1,
-            max_polyphony,
-        );
+        let active = voices.iter().filter(|voice| !voice.end.is_culled()).count();
         let musical = event.controls.musical(event.onset_frame);
         let led = Self::led(voices, event.controls.lead.max(lead));
         let fade_at = |oldest: &Voice| match led {
             false => event.onset_frame,
             true => musical.saturating_sub(u64::from(oldest.lead)).max(frame),
         };
-        Self::fade_oldest_voices(voices, kills, led, fade_at, fade_secs, sample_rate)
+        Self::fade_oldest_voices(
+            voices,
+            polyphony_kills(active, max_polyphony),
+            led,
+            fade_at,
+            sample_rate,
+        )
     }
 
     /// Whether a note with `lead`, or a voice, orders the voices by their
@@ -1910,14 +1746,13 @@ impl ScalarBackend {
     }
 
     /// Fades the `count` oldest voices still counted, each from the frame
-    /// `fade_at` gives it, over `fade_secs`. With `led` the oldest voice is
-    /// the voice of the earliest musical onset, and else the first triggered.
+    /// `fade_at` gives it. With `led` the oldest voice is the voice of the
+    /// earliest musical onset, and else the first triggered.
     pub(super) fn fade_oldest_voices(
         voices: &mut [Voice],
         count: usize,
         led: bool,
         fade_at: impl Fn(&Voice) -> u64,
-        fade_secs: f32,
         sample_rate: u32,
     ) -> usize {
         let mut faded = 0;
@@ -1935,7 +1770,7 @@ impl ScalarBackend {
             let onset_frame = fade_at(oldest);
             oldest
                 .end
-                .cull(onset_frame, fade_secs, oldest.start_frame, sample_rate);
+                .cull(onset_frame, oldest.start_frame, sample_rate);
             faded += 1;
         }
         faded
@@ -2979,16 +2814,10 @@ mod tests {
         fn populated(limit: usize) -> ScalarBackend {
             let mut backend = ScalarBackend::prepared(8_000, 256).expect("backend");
             backend.set_max_polyphony(limit);
-            // A fast roll, not one chord: eight onsets a block, so each
-            // onset meets the cap the previous ones left. 62.5 Hz completes
-            // exactly one cycle per 128-frame block, so every group of the
-            // roll adds in phase and the energies compare as voice counts.
-            for _ in 0..20 {
-                for _ in 0..8 {
-                    backend.note(OnsetEvent::new(backend.frame, 62.5, 0.001, 2.0));
-                }
-                backend.process_block(&mut [0.0; 256], 128);
+            for _ in 0..160 {
+                backend.note(OnsetEvent::new(0, 220.0, 0.001, 2.0));
             }
+            backend.process_block(&mut [0.0; 256], 128);
             backend
         }
 
@@ -3009,24 +2838,6 @@ mod tests {
             let energy =
                 |samples: &[f32]| samples.iter().map(|sample| sample * sample).sum::<f32>();
             assert!(energy(&raised_output) > energy(&default_output) * 1.4);
-        }
-
-        /// One block constructs at most a cap's worth of voices, so a chord
-        /// wider than the cap drops its excess rather than constructing
-        /// voices the cap culls in the same block.
-        #[test]
-        fn a_same_frame_chord_beyond_the_cap_drops_its_excess() {
-            let mut backend = ScalarBackend::prepared(8_000, 256).expect("backend");
-            backend.set_max_polyphony(MAX_POLYPHONY);
-            for _ in 0..160 {
-                backend.note(OnsetEvent::new(0, 220.0, 0.001, 2.0));
-            }
-            backend.process_block(&mut [0.0; 256], 128);
-            assert_eq!(backend.voices.len(), MAX_POLYPHONY);
-            assert_eq!(
-                backend.pressure.semantic_polyphony_fades, 0,
-                "the dropped onsets never became voices to fade"
-            );
         }
 
         #[test]
@@ -3129,125 +2940,6 @@ mod tests {
             first.init(8_000).expect("backend");
             first.reset();
             assert_eq!(first.max_polyphony(), MAX_CONFIGURABLE_POLYPHONY);
-        }
-
-        /// The retiring fade gives back its room when the cull rate climbs:
-        /// past one cap's worth of culls a second the fade shortens, so the
-        /// retiring pool holds about one cap of voices instead of filling
-        /// the voice ceiling.
-        #[test]
-        fn a_dense_stream_of_culls_shortens_the_retirement_fade() {
-            use super::super::super::{CUT_FADE_SECS, POLYPHONY_FADE_SECS};
-            use super::polyphony_fade_secs;
-            const CAP: usize = 128;
-            assert_eq!(
-                polyphony_fade_secs(0.0, 0, 0, CAP),
-                POLYPHONY_FADE_SECS,
-                "an empty retirement fades at full length"
-            );
-            assert_eq!(
-                polyphony_fade_secs(CAP as f32, CAP, CAP, CAP),
-                POLYPHONY_FADE_SECS,
-                "one cap of culls a second still fits the budget"
-            );
-            let doubled = polyphony_fade_secs(2.0 * CAP as f32, 0, 0, CAP);
-            assert!(
-                (doubled - POLYPHONY_FADE_SECS / 2.0).abs() < 1e-6,
-                "twice the budget halves the fade, got {doubled}"
-            );
-            let burst = polyphony_fade_secs(0.0, 2 * CAP, 2 * CAP, CAP);
-            assert!(
-                (burst - POLYPHONY_FADE_SECS / 4.0).abs() < 1e-6,
-                "a burst sizes its own tail with no rate to read, got {burst}"
-            );
-            let flood = polyphony_fade_secs(f32::INFINITY, 0, 0, 1);
-            assert!(
-                (flood - CUT_FADE_SECS).abs() < 1e-6,
-                "a flood never fades shorter than a cut, got {flood}"
-            );
-            let clamped = polyphony_fade_secs(0.0, 0, 2 * CAP + 1, CAP);
-            assert_eq!(
-                clamped, CUT_FADE_SECS,
-                "a pool past twice the cap retires at cut speed whatever the estimates say"
-            );
-            for (rate, fading, pool) in [
-                (0.0, 0, 0),
-                (1.0, 1, 1),
-                (64.0, CAP, CAP),
-                (512.0, 2 * CAP, 2 * CAP),
-                (1e9, 512, 0),
-            ] {
-                let fade = polyphony_fade_secs(rate, fading, pool, CAP);
-                assert!(
-                    fade.is_finite() && (CUT_FADE_SECS..=POLYPHONY_FADE_SECS).contains(&fade),
-                    "the fade stays a fade at {rate}/s, {fading} fading, pool {pool}: {fade}"
-                );
-            }
-        }
-
-        #[test]
-        fn a_high_onset_rate_keeps_the_pool_near_the_cap() {
-            const CAP: usize = 8;
-            let mut backend = ScalarBackend::prepared(48_000, 512).expect("backend");
-            backend.set_max_polyphony(CAP);
-            let mut output = [0.0f32; 256];
-            let mut peak_pool = 0usize;
-            for _ in 0..400 {
-                // Eight onsets per 256-frame pass, 400 passes: 12.5k onsets a
-                // second, the `seg(256).fast(32)` class of score. At the full
-                // quarter-second fade this retires 3125 voices at once and
-                // pins the pool at the ceiling.
-                for _ in 0..CAP {
-                    backend.note(OnsetEvent::new(backend.frame, 220.0, 0.001, 2.0));
-                }
-                for _ in 0..2 {
-                    backend.process_block(&mut output, 128);
-                }
-                peak_pool = peak_pool.max(backend.voices.len());
-            }
-            assert!(
-                peak_pool <= 8 * CAP,
-                "the pool peaked at {peak_pool} voices, the fade must retire faster"
-            );
-            assert!(
-                backend.voices.len() <= 3 * CAP,
-                "the pool settled at {} voices, near the cap {CAP}",
-                backend.voices.len()
-            );
-        }
-
-        /// The live intake path: bursts of onsets admitted ahead of time,
-        /// as a producer that schedules a window every few blocks delivers
-        /// them. The rate estimate empties between bursts, so the fade must
-        /// also read the fading population or each burst lands at full
-        /// length and pins the pool at the ceiling.
-        #[test]
-        fn a_live_flood_of_burst_onsets_keeps_the_pool_bounded() {
-            use crate::AudioBackend;
-            const CAP: usize = 128;
-            const BURST: usize = 512;
-            let mut backend = ScalarBackend::prepared(48_000, 512).expect("backend");
-            backend.set_max_polyphony(CAP);
-            let mut output = [0.0f32; 512 * 2];
-            let mut next_onset = 0u64;
-            let mut peak_pool = 0usize;
-            for _ in 0..40 {
-                // One window of onsets due over the next quarter second,
-                // then a rest long enough to empty the rate estimate.
-                for _ in 0..BURST {
-                    let event = OnsetEvent::new(next_onset, 220.0, 0.001, 0.12);
-                    let _ = backend.try_note_prepared(event);
-                    next_onset += 45; // 12k onsets a second inside the window
-                }
-                for _ in 0..50 {
-                    backend.process_block(&mut output, 480);
-                    peak_pool = peak_pool.max(backend.voices.len());
-                }
-            }
-            assert!(
-                peak_pool <= 2 * CAP + 64,
-                "the pool peaked at {peak_pool}, the fade must bound the retirement"
-            );
         }
     }
 

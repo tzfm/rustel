@@ -711,6 +711,18 @@ impl ScanScratch {
         self.map_val_ids.clear();
         self.detached.clear();
     }
+
+    fn is_small(&self) -> bool {
+        self.seen_nodes.capacity() <= 512
+            && self.seen_layers.capacity() <= 512
+            && self.seen_ptrs.capacity() <= 512
+            && self.unique_maps.capacity() <= 512
+            && self.map_table.capacity() <= 1024
+            && self.val_meta.capacity() <= 512
+            && self.val_table.capacity() <= 1024
+            && self.map_val_ids.capacity() <= 1024
+            && self.detached.capacity() <= 512
+    }
 }
 
 /// Like [`dedup_score`], pre-seeding already-canonical node references reused
@@ -811,10 +823,10 @@ pub fn dedup_score_with_reused(
     }
     deduper.clear();
     scan.clear();
-    if deduper.visited.capacity() <= 4096 && deduper.nodes.capacity() <= 4096 {
+    if deduper.is_small() {
         let _ = SPARE_DEDUPER.try_with(|cell| *cell.borrow_mut() = Some(deduper));
     }
-    if scan.seen_nodes.capacity() <= 4096 && scan.val_table.capacity() <= 8192 {
+    if scan.is_small() {
         let _ = SPARE_SCAN.try_with(|cell| *cell.borrow_mut() = Some(scan));
     }
 }
@@ -1478,6 +1490,24 @@ impl Deduper {
         self.grids.clear();
         self.layers.clear();
         self.nodes.clear();
+    }
+
+    fn is_small(&self) -> bool {
+        self.visited.capacity() <= 512
+            && self.detached_ids.capacity() <= 512
+            && self.seen_values.capacity() <= 512
+            && self.seen_dresses.capacity() <= 512
+            && self.seen_layers.capacity() <= 512
+            && self.plain_extras.capacity() <= 256
+            && self.pooled_builtins.capacity() <= 512
+            && self.builtins.capacity() <= 512
+            && self.keys.capacity() <= 512
+            && self.values.capacity() <= 512
+            && self.dresses.capacity() <= 512
+            && self.compact_grids.capacity() <= 512
+            && self.grids.capacity() <= 512
+            && self.layers.capacity() <= 512
+            && self.nodes.capacity() <= 512
     }
 
     #[inline]

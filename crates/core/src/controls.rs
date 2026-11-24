@@ -1344,12 +1344,14 @@ pub(crate) fn note_control_id() -> u16 {
 /// node that holds it then agrees with its counterpart by pointer, and the
 /// answers of the unchanged subtree carry across evaluations and edits
 /// instead of rebuilding. See [`crate::interned_closure`].
+type WeakOwnedHapMapFn = std::sync::Weak<dyn Fn(Hap) -> Option<Hap> + Send + Sync>;
+
 #[derive(Default)]
 struct ControlMaps {
-    maps: std::collections::HashMap<(ControlSpec, bool), crate::OwnedHapMapFn>,
-    /// The name of each map of every value, by the address of the map,
-    /// which the pool keeps for the life of the program.
-    names: std::collections::HashMap<usize, Key>,
+    maps: std::collections::HashMap<(ControlSpec, bool), (WeakOwnedHapMapFn, usize)>,
+    /// The name of each live interned map of every value, keyed by the address
+    /// of the map and verified against its weak handle.
+    names: std::collections::HashMap<usize, (WeakOwnedHapMapFn, Key)>,
 }
 
 static INTERNED_CONTROL_MAPS: std::sync::OnceLock<std::sync::Mutex<ControlMaps>> =
@@ -1369,16 +1371,35 @@ pub(crate) fn interned_control_map(spec: &ControlSpec, unnamed_only: bool) -> cr
         let Ok(mut pool) = INTERNED_CONTROL_MAPS.get_or_init(Default::default).lock() else {
             return make();
         };
-        if let Some(found) = pool.maps.get(&(names(), unnamed_only)) {
-            return Arc::clone(found);
+        if let Some((weak, _)) = pool.maps.get(&(names(), unnamed_only))
+            && let Some(found) = weak.upgrade()
+        {
+            return found;
         }
         let made = make();
+        if pool.maps.len() >= 32 {
+            let ControlMaps {
+                maps,
+                names: name_map,
+            } = &mut *pool;
+            maps.retain(|_, (weak, addr)| {
+                if weak.strong_count() > 0 {
+                    true
+                } else {
+                    name_map.remove(addr);
+                    false
+                }
+            });
+            name_map.retain(|_, (weak, _)| weak.strong_count() > 0);
+        }
         // A full pool takes no map: a fresh one only loses the carry.
         if pool.maps.len() < crate::MAX_INTERNED_CLOSURES {
+            let addr = address(&made);
+            let weak = Arc::downgrade(&made);
             if !unnamed_only {
-                pool.names.insert(address(&made), spec.key());
+                pool.names.insert(addr, (weak.clone(), spec.key()));
             }
-            pool.maps.insert((names(), unnamed_only), Arc::clone(&made));
+            pool.maps.insert((names(), unnamed_only), (weak, addr));
         }
         made
     });
@@ -1391,7 +1412,9 @@ pub(crate) fn interned_control_map(spec: &ControlSpec, unnamed_only: bool) -> cr
 /// haps.
 pub(crate) fn named_by(map: &crate::OwnedHapMapFn) -> Option<Key> {
     let pool = INTERNED_CONTROL_MAPS.get()?.lock().ok()?;
-    pool.names.get(&address(map)).cloned()
+    let (weak, key) = pool.names.get(&address(map))?;
+    (std::ptr::addr_eq(weak.as_ptr(), Arc::as_ptr(map)) && weak.strong_count() > 0)
+        .then(|| key.clone())
 }
 
 /// The place of the live binding of the control `name` in

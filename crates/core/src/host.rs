@@ -1199,21 +1199,22 @@ pub(crate) type SpanFn = Arc<dyn Fn(&TimeSpan) -> TimeSpan + Send + Sync>;
 /// The most closures one intern pool keeps.
 pub(crate) const MAX_INTERNED_CLOSURES: usize = 4096;
 
-/// One closure object per key, for the whole process.
+/// One closure object per key while any live pattern holds it.
 ///
 /// A node holds a transform as an opaque closure object, and two builds of
 /// one construction agree on it only while it is the same object. A closure
 /// whose behaviour is a pure function of a small deterministic key - a
-/// capture-free body, or plain data it captured - is interned here: the
-/// same key built again hands out the same object, so the unchanged
-/// subtree carries its answer tables across evaluations and edits instead
-/// of rebuilding them.
+/// capture-free body, or plain data it captured - is interned weakly here:
+/// while any live pattern holds the closure, the same key built again hands
+/// out the same `Arc` so unchanged subtrees agree across evaluations and
+/// edits. Once no live pattern holds it, the closure frees immediately and
+/// dead slots are swept before growing the table.
 ///
-/// Past [`MAX_INTERNED_CLOSURES`] keys a pool stops taking entries: a
+/// Past [`MAX_INTERNED_CLOSURES`] live keys a pool stops taking entries: a
 /// score that mints one key a call must not grow it without end, and a
 /// fresh closure only loses the carry.
 pub fn interned_closure<K, F: ?Sized>(
-    pool: &std::sync::Mutex<std::collections::HashMap<K, Arc<F>>>,
+    pool: &std::sync::Mutex<std::collections::HashMap<K, std::sync::Weak<F>>>,
     key: K,
     make: impl FnOnce() -> Arc<F>,
 ) -> Arc<F>
@@ -1221,15 +1222,22 @@ where
     K: std::hash::Hash + PartialEq + Eq,
 {
     if let Ok(entries) = pool.lock()
-        && let Some(found) = entries.get(&key)
+        && let Some(found) = entries.get(&key).and_then(std::sync::Weak::upgrade)
     {
-        return Arc::clone(found);
+        return found;
     }
     let made = make();
-    if let Ok(mut entries) = pool.lock()
-        && entries.len() < MAX_INTERNED_CLOSURES
-    {
-        entries.insert(key, Arc::clone(&made));
+    if let Ok(mut entries) = pool.lock() {
+        if entries.len() >= 32 {
+            entries.retain(|_, weak| weak.strong_count() > 0);
+            if entries.capacity() > 128 && entries.len().saturating_mul(4) < entries.capacity() {
+                let target = entries.len().saturating_mul(2).max(32);
+                entries.shrink_to(target);
+            }
+        }
+        if entries.len() < MAX_INTERNED_CLOSURES {
+            entries.insert(key, Arc::downgrade(&made));
+        }
     }
     made
 }
@@ -2208,7 +2216,7 @@ impl QueryThread {
 
     /// See [`query_deadline_after`].
     #[inline]
-    fn deadline_after(&self, checks: u32) -> bool {
+    pub(crate) fn deadline_after(&self, checks: u32) -> bool {
         let word = self.stop.get();
         if word & (STOP_DEADLINE_ARMED | STOP_DEADLINE_PASSED) == 0 {
             return false;
@@ -2221,10 +2229,14 @@ impl QueryThread {
         let before = self.deadline_tick.get();
         let after = before.wrapping_add(checks);
         self.deadline_tick.set(after);
-        if (after >> 8) == (before >> 8) {
+        let ticks = (after >> 8).wrapping_sub(before >> 8);
+        if ticks == 0 {
             return false;
         }
-        self.deadline_check_clock()
+        if self.deadline_check_clock() {
+            return true;
+        }
+        ticks >= 2 && self.deadline_check_clock()
     }
 
     /// See [`charge_haps`].

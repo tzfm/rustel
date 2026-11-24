@@ -2702,7 +2702,8 @@ impl Maker<'_> {
             .expect("a step holds a value of its layer");
         let context = if let Some(contexts) = self.contexts {
             contexts[index].clone()
-        } else if (loc & SmallGridStep::SPARE) == 0 && self.loc_dress.is_none_or(|d| d.tail.is_none())
+        } else if (loc & SmallGridStep::SPARE) == 0
+            && self.loc_dress.is_none_or(|d| d.tail.is_none())
         {
             if loc == 0 {
                 match self.loc_dress {
@@ -6492,7 +6493,9 @@ fn sub_start_cycles_fallback(
         span.begin
             .checked_sub(start_frac)
             .ok_or(SequenceStop::Range)?,
-        span.end.checked_sub(start_frac).ok_or(SequenceStop::Range)?,
+        span.end
+            .checked_sub(start_frac)
+            .ok_or(SequenceStop::Range)?,
     ))
 }
 
@@ -6685,15 +6688,13 @@ fn query_layers(
                     // `single_turn` guarantees `span.begin < span.end` (never instant).
                     let (first, last_step) = if steps.len() == 1 {
                         let s = steps[0];
-                        if i64::from(s.part_end) <= begin_low
-                            || i64::from(s.part_begin) >= end_high
+                        if i64::from(s.part_end) <= begin_low || i64::from(s.part_begin) >= end_high
                         {
                             return Some(Ok(()));
                         }
                         (0, 1)
                     } else {
-                        let (Some(first_step), Some(last_step_ref)) =
-                            (steps.first(), steps.last())
+                        let (Some(first_step), Some(last_step_ref)) = (steps.first(), steps.last())
                         else {
                             return Some(Ok(()));
                         };
@@ -6702,8 +6703,8 @@ fn query_layers(
                         {
                             return Some(Ok(()));
                         }
-                        let begun = steps
-                            .partition_point(|step| i64::from(step.part_begin) < begin_high);
+                        let begun =
+                            steps.partition_point(|step| i64::from(step.part_begin) < begin_high);
                         let first = begun
                             - steps[..begun]
                                 .iter()
@@ -6890,6 +6891,10 @@ pub(crate) fn query_sequence_onto(
     }
     let added = out.len() - from;
     if added > 0 {
+        if thread.deadline_after(u32::try_from(added).unwrap_or(u32::MAX)) {
+            out.truncate(from);
+            return;
+        }
         thread.note_materialised(added);
     }
 }
@@ -6905,2872 +6910,2347 @@ pub(crate) use sorted::{
     try_query_fast_pow2_slowcat_static_int,
 };
 
-/// Whether moving these layers by `by` leaves every step in place.
-pub(crate) fn repeats_at(layers: &[Layer], by: Fraction, span: TimeSpan) -> bool {
-    // Both readings must fit, including each whole before the query cuts it.
-    let small =
-        |time: Fraction| i32::try_from(time.numer()).is_ok() && i32::try_from(time.denom()).is_ok();
-    if by.denom() != 1 || !small(by) || !small(span.begin) || !small(span.end) {
-        return false;
-    }
-    layers.iter().all(|layer| {
-        let period = layer.period();
-        // An integer multiple of the reduced numerator is a whole number of periods.
-        layer.listed().is_some_and(Listing::small_denominators)
-            && small(period)
-            && (period.numer() == 1 || (by.numer() as i32) % (period.numer() as i32) == 0)
-    })
-}
-
-/// Whether each hap of `layers` holds data only.
-pub(crate) fn holds_data(layers: &[Layer]) -> bool {
-    layers.iter().all(Layer::is_data)
-}
-
-/// Whether the graph of `pattern` holds each value that it answers, and
-/// each is data only: a sequence or a constant of data values.
-pub(crate) fn is_data(pattern: &Pattern) -> bool {
-    match pattern.node_kind() {
-        Node::Sequence(layers) => holds_data(layers),
-        Node::Pure(value) => value.is_data(0),
-        Node::PureAt(boxed) => boxed.0.is_data(0),
-        Node::AddContext(boxed) => is_data(&boxed.0),
-        _ => false,
-    }
-}
-
-/// The one data value of `layers`, when they are one value that fills each
-/// cycle, as a `pure` is.
-pub(crate) fn constant_value(layers: &[Layer]) -> Option<Cow<'_, Value>> {
-    let cycle = TimeSpan::new(Fraction::ZERO, Fraction::ONE);
-    match layers {
-        // A reader makes a hap of the value alone, so keys make no constant.
-        [layer] if layer.period() == Fraction::ONE && layer.dress().keys().is_empty() => {
-            match layer.one_step() {
-                Some((whole, false, value)) if whole == cycle => layer
-                    .value(value as usize)
-                    .filter(|value| value.is_data(0))
-                    .map(Cow::Owned),
-                _ => None,
-            }
-        }
-        _ => None,
-    }
-}
-
-/// The steps in a cycle of `layers` and their value, when the layers are
-/// one data value that fills each of `steps` equal steps and holds nothing
-/// more, as the pulse of a `segment` is. Nothing is made for a layer that
-/// is not one, so that asking costs no memory.
-pub(crate) fn pulse(layers: &[Layer]) -> Option<(i128, &Value)> {
-    let [layer] = layers else {
-        return None;
-    };
-    let period = layer.period();
-    if period.numer() != 1 || !layer.dress().is_bare() {
-        return None;
-    }
-    let first = TimeSpan::new(Fraction::ZERO, period);
-    let (whole, cut, value) = layer.one_step()?;
-    if whole != first || cut || !layer.locations_of(0).is_empty() {
-        return None;
-    }
-    // A bare dress gives each value as the step holds it.
-    let value = layer.values.get(value as usize)?;
-    value.is_data(0).then_some((period.denom(), value))
-}
+mod folds;
+#[allow(unused_imports)]
+pub(crate) use folds::*;
 
 #[cfg(test)]
-thread_local! {
-    /// Set by a test to build each node that a fold stands for.
-    static UNFOLDED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
-}
+mod tests {
+    use super::*;
+    use crate::compose::{Alignment, compose};
+    use crate::controls::ControlSpec;
+    use crate::{fastcat, pure, stack};
 
-/// Build with each node that a fold stands for: the graph that a fold must
-/// answer as, and the graph of a test that reads the kinds of its nodes.
-#[cfg(test)]
-pub(crate) fn unfolded<R>(build: impl FnOnce() -> R) -> R {
-    struct Restore(bool);
-    impl Drop for Restore {
-        fn drop(&mut self) {
-            UNFOLDED.set(self.0);
+    fn frac((n, d): (i128, i128)) -> Fraction {
+        Fraction::new(n, d)
+    }
+
+    /// A name, and the pattern that a test builds on the layers of a
+    /// sequence.
+    type Base<'a> = (&'a str, &'a dyn Fn(&[SequenceLayer]) -> Pattern);
+
+    fn located_value(value: f64) -> Pattern {
+        pure(Value::F64(value)).with_added_context(vec![(value as usize, value as usize + 1)])
+    }
+
+    fn step(begin: (i128, i128), end: (i128, i128), value: f64) -> SequenceStep {
+        let mut locations = Locations::new();
+        locations.push((value as usize, value as usize + 1));
+        SequenceStep::new(frac(begin), frac(end), Value::F64(value), locations)
+    }
+
+    fn layer(period: (i128, i128), steps: Vec<SequenceStep>) -> SequenceLayer {
+        SequenceLayer {
+            period: frac(period),
+            steps,
         }
     }
-    let _restore = Restore(UNFOLDED.replace(true));
-    build()
-}
 
-/// Whether a test builds each node that a fold stands for now. See
-/// [`unfolded`].
-pub(crate) fn builds_each_node() -> bool {
-    #[cfg(test)]
-    return UNFOLDED.get();
-    #[cfg(not(test))]
-    false
-}
-
-/// Whether an application on `pattern` may fold into its steps: it is a
-/// sequence or a constant.
-pub(crate) fn holds_steps(pattern: &Pattern) -> bool {
-    folded(pattern).is_some() || constant(pattern).is_some()
-}
-
-/// Whether a constructor may fold `pattern`: its handle is not marked
-/// volatile, and the runtime that it binds, if any, changes no answer.
-pub(crate) fn folds(pattern: &Pattern) -> bool {
-    if builds_each_node() {
-        return false;
+    fn spans() -> [(Fraction, Fraction); 8] {
+        [
+            (Fraction::ZERO, frac((3, 1))),
+            (frac((1, 4)), frac((3, 4))),
+            (frac((-5, 4)), frac((1, 8))),
+            (frac((2, 3)), frac((23, 3))),
+            (Fraction::ZERO, frac((13, 1))),
+            // A span of no width asks for what sounds at its one time.
+            (frac((1, 2)), frac((1, 2))),
+            (frac((7, 3)), frac((7, 3))),
+            (frac((3, 1)), frac((3, 1))),
+        ]
     }
-    // A runtime goes to the functions and the patterns that a value holds.
-    // Silence and data hold none, so they answer the same under each
-    // runtime.
-    let reads_no_runtime = || pattern.is_rest() || is_data(pattern);
-    !pattern.is_volatile() && (!pattern.has_runtime_settings() || reads_no_runtime())
-}
 
-/// The layers of `pattern`, when it is a sequence that a constructor folds
-/// into.
-fn folded(pattern: &Pattern) -> Option<&[Layer]> {
-    match pattern.node_kind() {
-        Node::Sequence(layers) if folds(pattern) => Some(layers),
-        _ => None,
-    }
-}
-
-/// A hap of a plain value that fills cycle zero, with no location.
-fn cycle_hap(value: Value) -> Hap {
-    let cycle = TimeSpan::new(Fraction::ZERO, Fraction::ONE);
-    Hap::new(Some(cycle), cycle, value)
-}
-
-/// Whether `hap` holds a value and its locations and nothing more: what a
-/// step of a sequence holds.
-fn is_plain(hap: &Hap) -> bool {
-    hap.keys.is_empty()
-}
-
-/// Whether `hap` holds a value, its locations and the keys of its context,
-/// and nothing more: what a step holds with the keys of its layer.
-fn holds_a_value_and_keys(hap: &Hap) -> bool {
-    hap.keys.has_only_context_keys()
-}
-
-/// The value that `values` answers in each cycle on one hap that fills the
-/// cycle, when the graph says it with no query: a `pure` value, at its
-/// locations, or a sequence of one value that fills each cycle.
-fn constant_value_of(values: &Pattern) -> Option<Cow<'_, Value>> {
-    if !folds(values) {
-        return None;
-    }
-    match values.node_kind() {
-        Node::Pure(value) if value.is_data(0) => Some(Cow::Borrowed(value)),
-        Node::PureAt(boxed) if boxed.0.is_data(0) => Some(Cow::Borrowed(&boxed.0)),
-        Node::AddContext(boxed) => constant_value_of(&boxed.0),
-        Node::Sequence(layers) => constant_value(layers),
-        _ => None,
-    }
-}
-
-/// The locations of the hap of `values`, a [constant](constant_value_of).
-fn constant_locations(values: &Pattern) -> Locations {
-    match values.node_kind() {
-        Node::PureAt(boxed) => boxed.1.clone(),
-        Node::AddContext(boxed) => {
-            let mut context = constant_locations(&boxed.0);
-            context.extend_from_slice(&boxed.1);
-            context
-        }
-        Node::Sequence(layers) => layers[0].context(0),
-        _ => Locations::new(),
-    }
-}
-
-/// The hap that `values` answers in each cycle, as of cycle zero, when the
-/// graph says it with no query. See [`constant_value_of`].
-pub(crate) fn constant(values: &Pattern) -> Option<Hap> {
-    // A handle of the value, for the hap to hold.
-    let mut hap = cycle_hap(constant_value_of(values)?.into_owned());
-    hap.context = constant_locations(values);
-    Some(hap)
-}
-
-/// Whether `values` is a constant of a plain data value, by its kinds
-/// alone. See [`constant_value_at`].
-pub(crate) fn is_constant_value(values: &Pattern) -> bool {
-    constant_value_of(values).is_some()
-}
-
-/// The layers that `pattern` answers as, when it is a sequence or a
-/// constant: a constant is one step that fills each cycle.
-enum Layers<'a> {
-    Borrowed(&'a [Layer]),
-    Single([Layer; 1]),
-}
-
-impl std::ops::Deref for Layers<'_> {
-    type Target = [Layer];
-    #[inline]
-    fn deref(&self) -> &[Layer] {
-        match self {
-            Self::Borrowed(slice) => slice,
-            Self::Single(single) => single,
-        }
-    }
-}
-
-impl Layers<'_> {
-    fn into_owned(self) -> Vec<Layer> {
-        match self {
-            Self::Borrowed(slice) => slice.to_vec(),
-            Self::Single([layer]) => vec![layer],
-        }
-    }
-}
-
-fn layers(pattern: &Pattern) -> Option<Layers<'_>> {
-    if let Some(layers) = folded(pattern) {
-        return Some(Layers::Borrowed(layers));
-    }
-    let hap = constant(pattern)?;
-    let raw = Raw {
-        whole: hap.whole?,
-        part: None,
-        value: 0,
-        locations: hap.context,
-    };
-    Some(Layers::Single([Layer::of_single(
-        Fraction::ONE,
-        raw,
-        crate::arc_single_value(hap.value),
-    )]))
-}
-
-/// `layers` with each value that `change` makes of a value of them, as one
-/// sequence. `None` when `change` gives none, or raises a query error: the
-/// error belongs to each query of the node that the fold stands for.
-fn revalued(
-    layers: Vec<Layer>,
-    mut change: impl FnMut(&Value) -> Option<Value>,
-) -> Option<Pattern> {
-    without_query_signals(|| {
-        let layers = layers
-            .into_iter()
-            .map(|layer| {
-                let values: Option<Vec<Value>> =
-                    layer.each_value().map(|value| change(&value)).collect();
-                Some(layer.valued(values?.into()))
+    fn answers(pattern: &Pattern, begin: Fraction, end: Fraction) -> Vec<String> {
+        pattern
+            .query_arc(begin, end)
+            .iter()
+            .map(|hap| {
+                format!(
+                    "{hap:?} {:?} {} {} {:?} {}",
+                    hap.live_controls(),
+                    hap.slider_binding(),
+                    hap.ui_visuals_context(),
+                    hap.keys,
+                    hap.pick_lookup().is_some()
+                )
             })
-            .collect::<Option<Vec<_>>>()?;
-        Some(node_of_sound(layers))
-    })
-}
-
-/// `pattern` with `locations` after the locations of each hap, as
-/// [`Pattern::with_added_context`] gives, when `pattern` is a sequence. A
-/// `pure` keeps its own node, which says that it is one.
-pub(crate) fn located(pattern: &Pattern, locations: &[(usize, usize)]) -> Option<Pattern> {
-    let layers = folded(pattern)?;
-    if layers.len() <= 8 {
-        let mut buf: [Option<Layer>; 8] = Default::default();
-        let mut last: Option<(*const Dress, Arc<Dress>)> = None;
-        for (slot, layer) in buf.iter_mut().zip(layers.iter()) {
-            let from = layer.dress.as_ref().map_or(std::ptr::null(), Arc::as_ptr);
-            let dress = match &last {
-                Some((seen, dress)) if *seen == from => Arc::clone(dress),
-                _ => {
-                    let mut dress = layer.dress().clone();
-                    dress.extend_after(locations);
-                    let dress = dress.into_arc();
-                    last = Some((from, Arc::clone(&dress)));
-                    dress
-                }
-            };
-            *slot = Some(layer.with(|l| {
-                l.dress = Some(dress);
-                l.refresh_direct();
-            }));
-        }
-        return Some(node_of_sound_stack(&mut buf, layers.len()));
-    }
-    let layers = redressed_arc(layers, |dress| dress.extend_after(locations));
-    Some(Pattern::of(Node::Sequence(layers)))
-}
-
-/// Append `locations` onto `layers` of an owned `Node::Sequence` in place when
-/// unshared, avoiding `Layer`, `Arc<[Layer]>`, and `NodeCell` cloning.
-pub(crate) fn locate_in_place(layers: &mut Arc<[Layer]>, locations: &[(usize, usize)]) -> bool {
-    let Some(slice) = Arc::get_mut(layers) else {
-        return false;
-    };
-    let mut last: Option<(*const Dress, Arc<Dress>)> = None;
-    for layer in slice {
-        let from = layer.dress.as_ref().map_or(std::ptr::null(), Arc::as_ptr);
-        if !from.is_null()
-            && let Some(dress) = layer.dress.as_mut().and_then(Arc::get_mut)
-        {
-            dress.extend_after(locations);
-            layer.refresh_direct();
-            continue;
-        }
-        let dress = match &last {
-            Some((seen, dress)) if *seen == from => Arc::clone(dress),
-            _ => {
-                let mut dress = layer.dress().clone();
-                dress.extend_after(locations);
-                let dress = dress.into_arc();
-                last = Some((from, Arc::clone(&dress)));
-                dress
-            }
-        };
-        layer.dress = Some(dress);
-        layer.refresh_direct();
-    }
-    true
-}
-
-/// Set UI visual `slot` on `layers` of an owned `Node::Sequence` in place when
-/// unshared, avoiding `Layer` and `NodeCell` cloning.
-pub(crate) fn with_ui_visual_slot_in_place(layers: &mut Arc<[Layer]>, slot: u8) -> bool {
-    let Some(slice) = Arc::get_mut(layers) else {
-        return false;
-    };
-    let mut last: Option<(*const Dress, Arc<Dress>)> = None;
-    for layer in slice {
-        if let Some(dress) = layer.dress.as_mut().and_then(Arc::get_mut) {
-            dress.add_ui_visual_slot(slot);
-            continue;
-        }
-        let from = layer.dress.as_ref().map_or(std::ptr::null(), Arc::as_ptr);
-        let dress = match &last {
-            Some((seen, dress)) if *seen == from => Arc::clone(dress),
-            _ => {
-                let mut dress = layer.dress().clone();
-                dress.add_ui_visual_slot(slot);
-                let dress = dress.into_arc();
-                last = Some((from, Arc::clone(&dress)));
-                dress
-            }
-        };
-        layer.dress = Some(dress);
-    }
-    true
-}
-
-/// `layers` with UI visual `slot` folded into every layer's dress.
-pub(crate) fn with_ui_visual_slot_layers(layers: &[Layer], slot: u8) -> Arc<[Layer]> {
-    redressed_arc(layers, |dress| dress.add_ui_visual_slot(slot))
-}
-
-/// `selector`, the sequence that selects for a pick, with `locations`
-/// before the locations of each hap, when each hap of it holds its value
-/// and its locations alone. The join of a pick puts the locations of its
-/// selector first and keeps the keys of the hap that it picked, so a change
-/// of the picked patterns is then a change of the pick. With no location,
-/// the selector as it is.
-///
-/// `whole_cycles` asks more: each step begins on a whole cycle, so a
-/// restart or a reset moves the picked pattern by whole cycles, and its
-/// cycles stay the cycles of the query.
-/// Whether `selector` is a plain selector sequence (no keys, and whole-cycle
-/// steps when `whole_cycles` is true).
-pub(crate) fn is_plain_selector(selector: &Pattern, whole_cycles: bool) -> bool {
-    let whole = |time: Fraction| time.denom() == 1;
-    let Some(layers) = folded(selector) else {
-        return false;
-    };
-    layers.iter().all(|layer| {
-        layer.dress().keys().is_empty()
-            && (!whole_cycles
-                || (whole(layer.period())
-                    && (0..layer.count()).all(|index| whole(layer.listing().whole(index).begin))))
-    })
-}
-
-/// Prepend `locations` onto `selector` in place when `selector` is uniquely
-/// owned, falling back to [`selecting`] otherwise.
-pub(crate) fn selecting_in_place(
-    selector: &mut Pattern,
-    locations: &Locations,
-    whole_cycles: bool,
-) -> bool {
-    if !is_plain_selector(selector, whole_cycles) {
-        return false;
-    }
-    if locations.is_empty() {
-        return true;
-    }
-    let steps = selector.steps();
-    let runtime = selector.runtime_settings().cloned();
-    if let Some(cell) = selector.own_node()
-        && let Node::Sequence(layers) = &mut cell.kind
-    {
-        if let Some(slice) = Arc::get_mut(layers) {
-            let mut last: Option<(*const Dress, Arc<Dress>)> = None;
-            for layer in slice.iter_mut() {
-                let from = layer.dress.as_ref().map_or(std::ptr::null(), Arc::as_ptr);
-                if !from.is_null()
-                    && let Some(dress) = layer.dress.as_mut().and_then(Arc::get_mut)
-                {
-                    dress.prepend_before(locations.clone());
-                    layer.refresh_direct();
-                    continue;
-                }
-                let dress = match &last {
-                    Some((seen, dress)) if *seen == from => Arc::clone(dress),
-                    _ => {
-                        let mut dress = layer.dress().clone();
-                        dress.prepend_before(locations.clone());
-                        let dress = dress.into_arc();
-                        last = Some((from, Arc::clone(&dress)));
-                        dress
-                    }
-                };
-                layer.dress = Some(dress);
-                layer.refresh_direct();
-            }
-        } else {
-            *layers = redressed_arc(layers, |dress| dress.prepend_before(locations.clone()));
-        }
-        let node = Arc::clone(&selector.node);
-        *selector = Pattern::holding(node).with_steps(steps);
-        if let Some(runtime) = runtime {
-            selector.attach_runtime_settings(runtime);
-        }
-        return true;
-    }
-    let Some(next) = selecting(selector, locations, whole_cycles) else {
-        return false;
-    };
-    *selector = next;
-    true
-}
-
-pub(crate) fn selecting(
-    selector: &Pattern,
-    locations: &Locations,
-    whole_cycles: bool,
-) -> Option<Pattern> {
-    if !is_plain_selector(selector, whole_cycles) {
-        return None;
-    }
-    if locations.is_empty() {
-        return Some(selector.clone());
-    }
-    let layers = folded(selector)?;
-    let layers = redressed_arc(layers, |dress| dress.prepend_before(locations.clone()));
-    Some(Pattern::of(Node::Sequence(layers)).with_steps_of(selector))
-}
-
-/// Whether `pattern` is a sequence whose haps each hold a value and nothing
-/// more: no location and no key of the context.
-pub(crate) fn is_bare(pattern: &Pattern) -> bool {
-    folded(pattern).is_some_and(|layers| {
-        layers.iter().all(|layer| {
-            layer.dress().keys().is_empty()
-                && layer.dress().locates_alone()
-                && layer
-                    .listing()
-                    .with_grid_view(|grid| grid.steps.has_no_locations())
-                    .unwrap_or_else(|| {
-                        let listing = layer.listing();
-                        (0..listing.len()).all(|index| listing.locations(index).is_empty())
-                    })
-        })
-    })
-}
-
-/// Whether `pattern` is a sequence whose steps each lie in one cycle, or
-/// silence: a constant, which is another hap in each cycle, then cuts no
-/// hap of it.
-pub(crate) fn lies_in_cycles(pattern: &Pattern) -> bool {
-    match folded(pattern) {
-        Some(layers) => layers.iter().all(Layer::in_cycles),
-        None => pattern.is_rest() && folds(pattern),
-    }
-}
-
-/// The value of `values` and its locations, when `values` is a constant
-/// of a plain data value. See [`constant`].
-pub(crate) fn constant_value_at(values: &Pattern) -> Option<(Value, Locations)> {
-    // A handle of the value, for the caller to hold.
-    let value = constant_value_of(values)?.into_owned();
-    Some((value, constant_locations(values)))
-}
-
-/// Build a single-cycle named sequence directly from a plain constant value
-/// and source locations, skipping an intermediate `Node::PureAt` allocation.
-/// Whether `layers` includes any lazy [`Steps::Source`] layer.
-pub(crate) fn has_source(layers: &[Layer]) -> bool {
-    layers
-        .iter()
-        .any(|layer| matches!(layer.steps.inner(), Steps::Source(_)))
-}
-
-pub(crate) fn of_single_named(
-    value: Value,
-    locations: Locations,
-    spec: &crate::controls::ControlSpec,
-) -> Pattern {
-    let raw = Raw {
-        whole: TimeSpan::new(Fraction::ZERO, Fraction::ONE),
-        part: None,
-        value: 0,
-        locations,
-    };
-    let mut layer = Layer::of_single(Fraction::ONE, raw, crate::value::arc_single_value(value));
-    Layer::named_in_place(std::slice::from_mut(&mut layer), spec);
-    Pattern::of(Node::Sequence(Arc::from([layer]))).with_steps(Some(Fraction::ONE))
-}
-
-/// Build a single-step named sequence for a 2-part compound word (`"bd:2"`)
-/// directly as an `OrderedMap` without allocating a temporary `Arc<[Value; 2]>`.
-pub(crate) fn of_single_named_pair(
-    a: Value,
-    b: Value,
-    locations: Locations,
-    spec: &crate::controls::ControlSpec,
-) -> Pattern {
-    if spec.names.len() >= 2 && a.is_data(0) && b.is_data(0) {
-        let map = crate::OrderedMap::of_keys([
-            (crate::Key::from(Arc::clone(&spec.names[0])), a),
-            (crate::Key::from(Arc::clone(&spec.names[1])), b),
-        ]);
-        let raw = Raw {
-            whole: TimeSpan::new(Fraction::ZERO, Fraction::ONE),
-            part: None,
-            value: 0,
-            locations,
-        };
-        let layer = Layer::of_single(Fraction::ONE, raw, Arc::new([Value::Object(map)]));
-        return Pattern::of(Node::Sequence(Arc::from([layer]))).with_steps(Some(Fraction::ONE));
-    }
-    of_single_named(Value::List(Arc::from([a, b])), locations, spec)
-}
-
-/// `pattern` with each value named by the control of `names`, as
-/// [`Pattern::map_control`] names it, when `pattern` is a sequence or a
-/// constant that holds no name and no control yet. See [`Layer::named`].
-pub(crate) fn named(
-    pattern: &Pattern,
-    spec: &crate::controls::ControlSpec,
-    unnamed_only: bool,
-) -> Option<Pattern> {
-    let layers = layers(pattern)?;
-    if !layers.iter().all(|layer| layer.takes_name(unnamed_only)) {
-        return None;
-    }
-    // Each layer of a node has steps, so each one stays. The layers are
-    // made where the new node holds them.
-    let named = match layers {
-        Layers::Single([mut layer]) => {
-            Layer::named_in_place(std::slice::from_mut(&mut layer), spec);
-            Arc::from([layer])
-        }
-        Layers::Borrowed(slice) => Layer::named_arc(slice, spec),
-    };
-    Some(Pattern::of(Node::Sequence(named)))
-}
-
-/// Try to name `layers` of an owned `Node::Sequence` in place when unshared.
-/// Returns `true` if `layers` were updated in place.
-pub(crate) fn named_in_place(
-    layers: &mut Arc<[Layer]>,
-    spec: &crate::controls::ControlSpec,
-    unnamed_only: bool,
-) -> bool {
-    if !layers.iter().all(|layer| layer.takes_name(unnamed_only)) {
-        return false;
-    }
-    let Some(slice) = Arc::get_mut(layers) else {
-        return false;
-    };
-    Layer::named_in_place(slice, spec);
-    true
-}
-
-/// `pattern` with each hap changed by `map`, a map that reads no span and
-/// no state, when `pattern` is a sequence or a constant of data values and
-/// the map gives a plain value for each.
-pub(crate) fn mapped(pattern: &Pattern, map: &OwnedHapMapFn) -> Option<Pattern> {
-    let layers = layers(pattern)?.into_owned();
-    revalued(layers, |value| {
-        // A value of the script is read through its host, at each query.
-        if !value.is_data(0) {
-            return None;
-        }
-        let hap = map(cycle_hap(value.clone()))?;
-        // A map that reads no span moves no hap.
-        let cycle = TimeSpan::new(Fraction::ZERO, Fraction::ONE);
-        ((hap.whole, hap.part) == (Some(cycle), cycle) && is_plain(&hap) && hap.context.is_empty())
-            .then_some(hap.value)
-    })
-}
-
-/// What a rewrite of pitch makes of a note or a step that a hap holds alone.
-pub(crate) type NoteFn = Box<dyn Fn(&Value) -> Option<Value> + Send + Sync>;
-
-/// `pattern` with each hap changed by `map`, a rewrite of pitch, as
-/// [`mapped_haps`] gives it, when the control `note` or `n` names the steps
-/// of `pattern`: `note` gives the new note of each step, and no map of
-/// controls is made. See [`Layer::renoted`].
-/// Small cache mapping source [`Dress`] pointers to renoted [`Dress`] arcs
-/// across layers and picked branches of a single `.scale(...)` or pitch pass.
-type RenoteDressSlot = (*const Dress, Option<Arc<Dress>>);
-
-type RenoteValuesSlot = (*const Value, usize, Arc<[Value]>, bool);
-
-#[derive(Default)]
-pub(crate) struct RenoteDressCache {
-    slots: [Option<RenoteDressSlot>; 4],
-    next: u8,
-    values: [Option<RenoteValuesSlot>; 4],
-    next_values: u8,
-}
-
-impl RenoteDressCache {
-    #[inline]
-    pub(crate) fn with_bare(bare: Option<Arc<Dress>>) -> Self {
-        let mut cache = Self::default();
-        cache.put(std::ptr::null(), bare);
-        cache
+            .collect()
     }
 
-    #[inline]
-    fn get(&self, from: *const Dress) -> Option<Option<Arc<Dress>>> {
-        self.slots
-            .iter()
-            .flatten()
-            .find_map(|(seen, dress)| (*seen == from).then(|| dress.clone()))
+    fn assert_same_answers(name: &str, one_node: &Pattern, nodes: &Pattern) {
+        assert_eq!(one_node.steps(), nodes.steps(), "the steps of {name}");
+        assert_same_haps(name, one_node, nodes);
     }
 
-    #[inline]
-    fn put(&mut self, from: *const Dress, dress: Option<Arc<Dress>>) {
-        let idx = usize::from(self.next) & 3;
-        self.slots[idx] = Some((from, dress));
-        self.next = self.next.wrapping_add(1);
-    }
-
-    #[inline]
-    fn get_values(&self, src: &Arc<[Value]>) -> Option<(Arc<[Value]>, bool)> {
-        let ptr = Arc::as_ptr(src) as *const Value;
-        let len = src.len();
-        self.values.iter().flatten().find_map(|(p, l, vals, data)| {
-            (*p == ptr && *l == len).then(|| (Arc::clone(vals), *data))
-        })
-    }
-
-    #[inline]
-    fn put_values(&mut self, ptr: *const Value, len: usize, vals: Arc<[Value]>, data: bool) {
-        let idx = usize::from(self.next_values) & 3;
-        self.values[idx] = Some((ptr, len, vals, data));
-        self.next_values = self.next_values.wrapping_add(1);
-    }
-}
-
-/// In-place variant of [`renoted_cached`] when `layers` is uniquely owned:
-/// mutates both `Arc<[Layer]>` and uniquely-owned `Arc<[Value]>` slices in
-/// place with zero heap allocations after validating all values on the stack.
-pub(crate) fn renote_in_place(
-    layers: &mut Arc<[Layer]>,
-    map: &HapMapFn,
-    note: &NoteFn,
-    known_keys: Option<&ContextKeys>,
-    dress_cache: &mut RenoteDressCache,
-) -> bool {
-    if layers.is_empty() {
-        return false;
-    }
-    let Some(slice) = Arc::get_mut(layers) else {
-        return false;
-    };
-    let all_same_values = slice.len() > 1
-        && slice[1..]
-            .iter()
-            .all(|layer| Arc::ptr_eq(&layer.values, &slice[0].values));
-    let mut total_values = 0usize;
-    for (idx, layer) in slice.iter().enumerate() {
-        let Some(names) = layer.named_names().filter(|_| !layer.dress().has_set()) else {
-            return false;
-        };
-        let [name] = names else {
-            return false;
-        };
-        if !matches!(&**name, "note" | "n") {
-            return false;
-        }
-        if !all_same_values || idx == 0 {
-            total_values += layer.values.len();
-        }
-    }
-    without_query_signals(|| {
-        const INLINE_STAGED: usize = 16;
-        let mut stack_staged: [Value; INLINE_STAGED] = [const { Value::Undefined }; INLINE_STAGED];
-        let mut vec_staged: Vec<Value> = if total_values > INLINE_STAGED {
-            Vec::with_capacity(total_values)
-        } else {
-            Vec::new()
-        };
-        let mut cached_shared: Option<(Arc<[Value]>, bool)> = None;
-        if all_same_values {
-            if let Some(hit) = dress_cache.get_values(&slice[0].values) {
-                cached_shared = Some(hit);
-            } else if total_values <= INLINE_STAGED {
-                let mut cursor = 0usize;
-                for val in slice[0].values.iter() {
-                    match val {
-                        Value::F64(_) | Value::Str(_) => {
-                            stack_staged[cursor] = note(val)?;
-                            cursor += 1;
-                        }
-                        _ => return None,
-                    }
-                }
-            } else {
-                for val in slice[0].values.iter() {
-                    match val {
-                        Value::F64(_) | Value::Str(_) => vec_staged.push(note(val)?),
-                        _ => return None,
-                    }
-                }
-            }
-        } else if total_values <= INLINE_STAGED {
-            let mut cursor = 0usize;
-            for layer in slice.iter() {
-                for val in layer.values.iter() {
-                    match val {
-                        Value::F64(_) | Value::Str(_) => {
-                            stack_staged[cursor] = note(val)?;
-                            cursor += 1;
-                        }
-                        _ => return None,
-                    }
-                }
-            }
-        } else {
-            for layer in slice.iter() {
-                for val in layer.values.iter() {
-                    match val {
-                        Value::F64(_) | Value::Str(_) => vec_staged.push(note(val)?),
-                        _ => return None,
-                    }
-                }
-            }
-        }
-        let staged: &mut [Value] = if total_values <= INLINE_STAGED {
-            &mut stack_staged[..total_values]
-        } else {
-            &mut vec_staged
-        };
-        // Resolve every layer's new dress before mutating any layer so a `None`
-        // from `map(&read)` leaves `layers` untouched.
-        let note_id = crate::controls::note_control_id();
-        let mut new_dresses: [Option<Option<Arc<Dress>>>; 8] = Default::default();
-        let mut extra_dresses: Vec<Option<Arc<Dress>>> = Vec::new();
-        for (idx, layer) in slice.iter().enumerate() {
-            let from = layer.dress.as_ref().map_or(std::ptr::null(), Arc::as_ptr);
-            let dress = match dress_cache.get(from) {
-                Some(cached) => cached,
-                None => {
-                    let keys = match known_keys {
-                        Some(added) => {
-                            if layer.dress().keys().is_empty() {
-                                added.clone()
-                            } else if added.is_empty() {
-                                layer.dress().keys().clone()
-                            } else {
-                                ContextKeys::merge(added, layer.dress().keys())
-                            }
-                        }
-                        None => {
-                            let names = layer.named_names()?;
-                            let first_val = layer.values.first()?;
-                            let first = crate::controls::named_value(names, first_val.clone());
-                            let mut read = cycle_hap(first);
-                            read.keys = layer.dress().keys().clone();
-                            map(&read)?.keys
-                        }
-                    };
-                    let dress = if note_id != 0
-                        && layer.dress().custom_named().is_none()
-                        && !layer.dress().has_set()
-                        && keys.arc_ptr() == layer.dress().keys().arc_ptr()
-                    {
-                        layer.dress.clone()
-                    } else {
-                        let mut next = layer.dress().clone();
-                        if note_id != 0 {
-                            next.clear_custom_named();
-                        } else {
-                            next.set_custom_named(&crate::controls::note_names());
-                        }
-                        next.clear_set();
-                        next.set_keys(keys);
-                        (!next.is_bare()).then(|| next.into_arc())
-                    };
-                    dress_cache.put(from, dress.clone());
-                    dress
-                }
-            };
-            if idx < new_dresses.len() {
-                new_dresses[idx] = Some(dress);
-            } else {
-                extra_dresses.push(dress);
-            }
-        }
-        let shared_out = if all_same_values {
-            Some(match cached_shared {
-                Some(hit) => hit,
-                None => {
-                    let len = slice[0].values.len();
-                    let data = staged[..len].iter().all(|v| v.is_data(0));
-                    let built: Arc<[Value]> = staged[..len]
-                        .iter_mut()
-                        .map(|src| std::mem::replace(src, Value::Undefined))
-                        .collect();
-                    dress_cache.put_values(
-                        Arc::as_ptr(&slice[0].values) as *const Value,
-                        len,
-                        Arc::clone(&built),
-                        data,
-                    );
-                    (built, data)
-                }
-            })
-        } else {
-            None
-        };
-        let mut read_at = 0usize;
-        let mut extra_idx = 0usize;
-        for (idx, layer) in slice.iter_mut().enumerate() {
-            let (data, no_objects) = if let Some((shared, data)) = &shared_out {
-                layer.values = Arc::clone(shared);
-                (*data, false)
-            } else {
-                let len = layer.values.len();
-                let mut data = true;
-                let mut no_objects = true;
-                for v in &staged[read_at..read_at + len] {
-                    if data && !v.is_data(0) {
-                        data = false;
-                    }
-                    if matches!(v, Value::Object(_)) {
-                        no_objects = false;
-                    }
-                }
-                if let Some(vals) = Arc::get_mut(&mut layer.values) {
-                    for (dst, src) in vals.iter_mut().zip(&mut staged[read_at..read_at + len]) {
-                        *dst = std::mem::replace(src, Value::Undefined);
-                    }
-                } else {
-                    layer.values = staged[read_at..read_at + len]
-                        .iter_mut()
-                        .map(|src| std::mem::replace(src, Value::Undefined))
-                        .collect();
-                }
-                read_at += len;
-                (data, no_objects)
-            };
-            layer.set_data(data);
-            layer.set_maps(true);
-            layer.named_id = note_id;
-            layer.dress = if idx < new_dresses.len() {
-                new_dresses[idx].take().expect("dress computed")
-            } else {
-                let d = extra_dresses[extra_idx].take();
-                extra_idx += 1;
-                d
-            };
-            layer.refresh_direct_inner(no_objects);
-        }
-        Some(())
-    })
-    .is_some()
-}
-
-pub(crate) fn renoted_cached(
-    pattern: &Pattern,
-    map: &HapMapFn,
-    note: &NoteFn,
-    known_keys: Option<&ContextKeys>,
-    dress_cache: &mut RenoteDressCache,
-) -> Option<Pattern> {
-    let layers = folded(pattern)?;
-    without_query_signals(|| {
-        if let [layer] = layers {
-            return node_of_one(layer.renoted_cached(map, note, known_keys, dress_cache)?);
-        }
-        if layers.len() <= 8 {
-            let mut arr: [Option<Layer>; 8] = Default::default();
-            for (slot, layer) in arr.iter_mut().zip(layers.iter()) {
-                *slot = Some(layer.renoted_cached(map, note, known_keys, dress_cache)?);
-            }
-            let arc: Arc<[Layer]> = arr
-                .into_iter()
-                .take(layers.len())
-                .map(|layer| layer.expect("layer built"))
-                .collect();
-            return Some(Pattern::of(Node::Sequence(arc)));
-        }
-        let mut out = Vec::with_capacity(layers.len());
-        for layer in layers {
-            out.push(layer.renoted_cached(map, note, known_keys, dress_cache)?);
-        }
-        Some(node_of_sound(out))
-    })
-}
-
-/// `pattern` with each hap changed by `map`, a map that reads no span, when
-/// `pattern` is a sequence or a constant of data values. The map can set
-/// the keys of the context, as `scale` does: the haps of a layer then hold
-/// the same keys.
-///
-/// `None` when the map drops a hap, moves it, gives it more than a value
-/// and keys, or gives two haps of one layer other keys.
-pub(crate) fn mapped_haps(pattern: &Pattern, map: &HapMapFn) -> Option<Pattern> {
-    let layers = layers(pattern)?.into_owned();
-    let cycle = TimeSpan::new(Fraction::ZERO, Fraction::ONE);
-    without_query_signals(|| {
-        let layers = layers
-            .into_iter()
-            .map(|layer| {
-                let mut keys: Option<ContextKeys> = None;
-                // One hap for each value in turn: the map reads it and
-                // makes its own.
-                let mut read = cycle_hap(Value::Undefined);
-                read.keys = layer.dress().keys().clone();
-                let values = layer
-                    .each_value()
-                    .map(|value| {
-                        // A value of the script is read through its host,
-                        // at each query.
-                        if !value.is_data(0) {
-                            return None;
-                        }
-                        // A handle of the value, which the layer holds.
-                        read.value = value;
-                        let hap = map(&read)?;
-                        let keys = keys.get_or_insert_with(|| hap.keys.clone());
-                        ((hap.whole, hap.part) == (Some(cycle), cycle)
-                            && holds_a_value_and_keys(&hap)
-                            && hap.context.is_empty()
-                            && keys.same(&hap.keys))
-                        .then(|| {
-                            let mut value = hap.value;
-                            if let Value::Object(map) = &mut value {
-                                map.undress_patched();
-                            }
-                            value
-                        })
-                    })
-                    .collect::<Option<Vec<Value>>>()?;
-                let mut layer = layer.valued(values.into());
-                if let Some(keys) = keys {
-                    layer.change_dress(|dress| dress.set_keys(keys));
-                }
-                Some(layer)
-            })
-            .collect::<Option<Vec<_>>>()?;
-        Some(node_of_sound(layers))
-    })
-}
-
-/// Whether a fold may run `apply` when a pattern is built: it is a compose
-/// op, a function of its two values and nothing more.
-fn runs_at_the_build(apply: &Combine) -> bool {
-    match apply {
-        Combine::Composed(_) | Combine::SetMerged => true,
-        Combine::With(closure) => is_op_closure(closure),
-    }
-}
-
-/// What `function` and `value` make by `apply`, as the hap of a step makes
-/// it where the two meet, when they make a value and nothing more.
-fn made(function: &Value, value: &Value, apply: &Combine, flow: LookupFlow) -> Option<Value> {
-    if let Some(op) = apply.in_place_op()
-        && Meeting::values_meet_in_place(function, value, apply, flow)
-    {
-        let mut out = function.clone();
-        crate::compose::compose_data_flat(op, &mut out, value);
-        return Some(out);
-    }
-    let mut hap = cycle_hap(function.clone());
-    let meets = cycle_hap(value.clone());
-    let part = hap.part;
-    // A meeting that is not made in place is made as its node makes it.
-    if !Meeting::in_place(&mut hap, &meets, part, apply, flow) {
-        hap = applied_hap(&hap, &meets, hap.whole, part, apply, flow);
-    }
-    is_plain(&hap).then(|| {
-        let mut value = hap.value;
-        if let Value::Object(map) = &mut value {
-            map.undress_patched();
-        }
-        value
-    })
-}
-
-/// The `appLeft` of `functions` and `values` by `apply`, when `functions`
-/// is a sequence or a constant and `values` is one layer of plain values,
-/// or a constant of one: each step meets the values where the step is, and
-/// is cut to each that it meets, as the meeting cuts its hap. A constant is
-/// another hap in each cycle, so it cuts a step that crosses a bound of a
-/// cycle there.
-///
-/// `None` for values of more layers than one, which answer each step layer
-/// by layer, for a value that is not data, for a function that is no
-/// compose op, for a meeting that makes more than a value, and for cut
-/// steps that are not in the order of time.
-/// Owned variant of [`applied`] that mutates a uniquely-owned single-layer
-/// `Node::Sequence` in place, avoiding `Arc<[Layer]>` and `Arc<NodeCell>` allocs.
-pub(crate) fn applied_owned(
-    mut functions: Pattern,
-    values: &Pattern,
-    apply: &Combine,
-    flow: LookupFlow,
-) -> Result<Pattern, Pattern> {
-    if !runs_at_the_build(apply) || builds_each_node() {
-        return Err(functions);
-    }
-    let can_in_place = matches!(
-        functions.node_kind(),
-        Node::Sequence(layers) if layers.len() == 1 && Arc::strong_count(layers) == 1
-    ) && Arc::strong_count(&functions.node) == 1;
-    if can_in_place {
-        if let Some(next_layer) = applied_single_layer(&functions, values, apply, flow)
-            && let Some(cell) = functions.own_node()
-            && let Node::Sequence(layers) = &mut cell.kind
-            && let Some(slice) = Arc::get_mut(layers)
-        {
-            slice[0] = next_layer;
-            return Ok(functions);
-        }
-        return Err(functions);
-    }
-    match applied(&functions, values, apply, flow) {
-        Some(done) => Ok(done),
-        None => Err(functions),
-    }
-}
-
-fn apply_constant_to_layer(
-    layer: &Layer,
-    val: &Value,
-    op: ComposeOp,
-    flow: LookupFlow,
-) -> Option<Layer> {
-    let apply = Combine::Composed(op);
-    if let Some(set) = layer.set_constant(val, Locations::new, &apply, flow) {
-        return Some(set);
-    }
-    // Composing a control-object layer with a non-object, non-undefined scalar
-    // (`compose_op`: `(Value::Object(kept), value) => Value::Object(kept)`)
-    // keeps every control map unchanged without materializing `BuiltinMap`s.
-    if op != ComposeOp::KeepIf
-        && (flow != LookupFlow::Set || (op == ComposeOp::Set && !matches!(val, Value::Str(_))))
-        && layer.is_direct_keyed()
-        && !matches!(val, Value::Object(_) | Value::Undefined)
-    {
-        if layer.in_cycles() {
-            return Some(layer.clone());
-        }
-        static EMPTY_VALUES: std::sync::LazyLock<Arc<[Value]>> =
-            std::sync::LazyLock::new(|| Arc::from([]));
-        let raw = Raw {
-            whole: TimeSpan::new(Fraction::ZERO, Fraction::ONE),
-            part: None,
-            value: 0,
-            locations: Locations::new(),
-        };
-        let rhs = Layer::of_single(Fraction::ONE, raw, Arc::clone(&EMPTY_VALUES));
-        let (mut met, pairs) = layer.met(&rhs, Side::Functions)?;
-        let pairs_slice = pairs.as_slice();
-        let identity = pairs_slice.len() == layer.values.len()
-            && pairs_slice
-                .iter()
-                .enumerate()
-                .all(|(i, &(f, _))| f as usize == i);
-        if !identity {
-            met.values = pairs_slice
-                .iter()
-                .map(|&(f, _)| layer.values[f as usize].clone())
-                .collect();
-            met.refresh_direct();
-        }
-        return Some(met);
-    }
-    static EMPTY_VALUES: std::sync::LazyLock<Arc<[Value]>> =
-        std::sync::LazyLock::new(|| Arc::from([]));
-    let raw = Raw {
-        whole: TimeSpan::new(Fraction::ZERO, Fraction::ONE),
-        part: None,
-        value: 0,
-        locations: Locations::new(),
-    };
-    let rhs = Layer::of_single(Fraction::ONE, raw, Arc::clone(&EMPTY_VALUES));
-    let (met, pairs) = layer.met(&rhs, Side::Functions)?;
-    let fn_reader = layer.reader(None);
-    let pairs_slice = pairs.as_slice();
-    if pairs_slice.len() == 1 {
-        let (function, _) = pairs_slice[0];
-        let v = made(&fn_reader.get(function as usize)?, val, &apply, flow)?;
-        return Some(met.valued(crate::value::arc_single_value(v)));
-    }
-    if pairs_slice.len() <= 16 {
-        let mut stack_vals: [Value; 16] = std::array::from_fn(|_| Value::Undefined);
-        for (slot, &(function, _)) in stack_vals.iter_mut().zip(pairs_slice) {
-            *slot = made(&fn_reader.get(function as usize)?, val, &apply, flow)?;
-        }
-        let met_values: Arc<[Value]> = stack_vals[..pairs_slice.len()]
-            .iter_mut()
-            .map(|v| std::mem::replace(v, Value::Undefined))
-            .collect();
-        return Some(met.valued(met_values));
-    }
-    let values = pairs_slice
-        .iter()
-        .map(|&(function, _)| made(&fn_reader.get(function as usize)?, val, &apply, flow))
-        .collect::<Option<Vec<Value>>>()?;
-    Some(met.valued(values.into()))
-}
-
-/// Owned constant-RHS compose onto a folded `Node::Sequence`, avoiding any
-/// temporary `Node::Pure`, `Layer`, or `Arc<[Value]>` allocation for the RHS.
-pub(crate) fn applied_constant_owned(
-    mut functions: Pattern,
-    val: Value,
-    op: ComposeOp,
-    flow: LookupFlow,
-) -> Result<Pattern, Pattern> {
-    let apply = Combine::Composed(op);
-    if !runs_at_the_build(&apply) || builds_each_node() {
-        return Err(functions);
-    }
-    if !val.is_data(0) {
-        return Err(functions);
-    }
-    if let Node::Pure(v) = functions.node_kind()
-        && v.is_data(0)
-        && folds(&functions)
-        && let Some(out) = without_query_signals(|| made(v, &val, &apply, flow))
-    {
-        let steps = functions.steps();
-        if let Some(cell) = functions.own_node()
-            && let Node::Pure(slot) = &mut cell.kind
-        {
-            *slot = out;
-            return Ok(functions.with_steps(steps));
-        }
-        return Ok(crate::pure(out).with_steps(steps));
-    }
-    let Some(layers) = folded(&functions) else {
-        return Err(functions);
-    };
-    if !holds_data(layers) {
-        return Err(functions);
-    }
-    let steps = functions.steps();
-    let result = without_query_signals(|| {
-        if layers.len() <= 8 {
-            let mut buf: [Option<Layer>; 8] = Default::default();
-            for (slot, layer) in buf.iter_mut().zip(layers.iter()) {
-                *slot = Some(apply_constant_to_layer(layer, &val, op, flow)?);
-            }
-            return Some((Some(buf), None, layers.len()));
-        }
-        let met = layers
-            .iter()
-            .map(|layer| apply_constant_to_layer(layer, &val, op, flow))
-            .collect::<Option<Vec<_>>>()?;
-        let len = met.len();
-        Some((None, Some(met), len))
-    });
-    let Some((mut stack_buf, vec_buf, len)) = result else {
-        return Err(functions);
-    };
-    if let Some(cell) = functions.own_node()
-        && let Node::Sequence(target) = &mut cell.kind
-        && let Some(dst) = Arc::get_mut(target)
-        && dst.len() == len
-    {
-        if let Some(buf) = &mut stack_buf {
-            for (d, s) in dst.iter_mut().zip(buf[..len].iter_mut()) {
-                *d = s.take().expect("layer present");
-            }
-        } else if let Some(vec) = vec_buf {
-            for (d, s) in dst.iter_mut().zip(vec) {
-                *d = s;
-            }
-        }
-        return Ok(functions.with_steps(steps));
-    }
-    let out = if let Some(mut buf) = stack_buf {
-        node_of_sound_stack(&mut buf, len)
-    } else {
-        node_of_sound(vec_buf.expect("vec present"))
-    };
-    Ok(out.with_steps(steps))
-}
-
-fn applied_single_layer(
-    functions: &Pattern,
-    values: &Pattern,
-    apply: &Combine,
-    flow: LookupFlow,
-) -> Option<Layer> {
-    let Node::Sequence(layers) = functions.node_kind() else {
-        return None;
-    };
-    let [layer] = &**layers else {
-        return None;
-    };
-    let values = self::layers(values)?;
-    let [values] = &*values else {
-        return None;
-    };
-    if !(values.is_data() && layer.is_data()) {
-        return None;
-    }
-    without_query_signals(|| apply_layer_with(layer, values, apply, flow))
-}
-
-pub(crate) fn applied(
-    functions: &Pattern,
-    values: &Pattern,
-    apply: &Combine,
-    flow: LookupFlow,
-) -> Option<Pattern> {
-    if !runs_at_the_build(apply) {
-        return None;
-    }
-    let layers = layers(functions)?;
-    let values = self::layers(values)?;
-    let [values] = &*values else {
-        return None;
-    };
-    // A value of the script is read through its host, at each query.
-    if !(values.is_data() && holds_data(&layers)) {
-        return None;
-    }
-    without_query_signals(|| {
-        if layers.len() <= 8 {
-            let mut buf: [Option<Layer>; 8] = Default::default();
-            for (slot, layer) in buf.iter_mut().zip(layers.iter()) {
-                *slot = Some(apply_layer_with(layer, values, apply, flow)?);
-            }
-            return Some(node_of_sound_stack(&mut buf, layers.len()));
-        }
-        let met = layers
-            .iter()
-            .map(|layer| apply_layer_with(layer, values, apply, flow))
-            .collect::<Option<Vec<_>>>()?;
-        Some(node_of_sound(met))
-    })
-}
-
-fn apply_layer_with(
-    layer: &Layer,
-    values: &Layer,
-    apply: &Combine,
-    flow: LookupFlow,
-) -> Option<Layer> {
-    if let Some(set) = layer.set(values, apply, flow) {
-        return Some(set);
-    }
-    let (mut met, pairs) = layer.met(values, Side::Functions)?;
-    // Fast path: single-value constant built-in control applied by Set
-    // folds into `met.dress` directly without materializing per-step
-    // `BuiltinMap` objects or copying `layer.values` when 1-to-1.
-    if apply.in_place_op() == Some(crate::compose::ComposeOp::Set)
-        && flow == LookupFlow::Set
-        && values.values.len() == 1
-        && layer.is_direct_keyed()
-        && layer.dress().tail.is_none()
-    {
-        let rhs_packed: Option<(u16, &Value)> = if values.is_direct_keyed()
-            && values.dress.as_deref().is_none_or(|d| !d.has_set_map())
-        {
-            Some((values.seq_packed_key(), &values.values[0]))
-        } else if values.named_id == 0
-            && values
-                .dress
-                .as_deref()
-                .is_none_or(|d| !d.has_set_map() && d.tail.is_none())
-            && let Value::Object(map) = &values.values[0]
-            && let Some(entries) = map.as_builtin()
-            && let crate::value::Slice::Builtin(keys, vals) = entries.as_slice()
-            && keys.len() == 1
-        {
-            Some((keys[0], &vals[0]))
-        } else {
-            None
-        };
-        if let Some((k1, v1)) = rhs_packed {
-            let id1 = k1 & 0x03ff;
-            if id1 != 0
-                && id1 != layer.named_id
-                && crate::controls::builtin_name_str_by_id(id1) != Some("value")
-                && v1.is_data(0)
-            {
-                let pairs_slice = pairs.as_slice();
-                let identity = pairs_slice.len() == layer.values.len()
-                    && pairs_slice
-                        .iter()
-                        .enumerate()
-                        .all(|(i, &(f, _))| f as usize == i);
-                if !identity {
-                    met.values = pairs_slice
-                        .iter()
-                        .map(|&(f, _)| layer.values[f as usize].clone())
-                        .collect();
-                }
-                met.change_dress(|dress| {
-                    let mut shared = None;
-                    dress.set_packed_here(
-                        &[k1],
-                        std::slice::from_ref(v1),
-                        Locations::new(),
-                        &mut shared,
-                    );
-                });
-                met.refresh_direct();
-                return Some(met);
-            }
-        }
-    }
-    // Fast path: two direct-keyed built-in layers combined by Set
-    // build each exact-sized BuiltinMap directly without temporary
-    // 1-key maps or intermediate Vec<Value>.
-    if apply.in_place_op() == Some(crate::compose::ComposeOp::Set)
-        && flow == LookupFlow::Set
-        && layer.is_direct_keyed()
-        && values.is_direct_keyed()
-        && values.dress.as_deref().is_none_or(|d| !d.has_set_map())
-        && layer.named_id != values.named_id
-        && crate::controls::builtin_name_str_by_id(values.named_id) != Some("value")
-    {
-        let k0 = layer.seq_packed_key();
-        let k1 = values.seq_packed_key();
-        let tail_dress = layer.dress.as_deref().filter(|d| d.has_set_map());
-        match tail_dress {
-            None => {
-                let met_values: Arc<[Value]> = pairs
-                    .as_slice()
-                    .iter()
-                    .map(|&(f, v)| {
-                        Value::Object(crate::OrderedMap::from_two_packed(
-                            k0,
-                            layer.values[f as usize].clone(),
-                            k1,
-                            values.values[v as usize].clone(),
-                        ))
-                    })
-                    .collect();
-                return Some(met.valued(met_values));
-            }
-            Some(dress)
-                if !dress.set_packed_keys().contains(&k1)
-                    && dress.set_len() + 2 <= crate::value::MAX_BUILTIN_MAP_LEN =>
-            {
-                let tail_slice = dress.set_slice();
-                let met_values: Arc<[Value]> = pairs
-                    .as_slice()
-                    .iter()
-                    .map(|&(f, v)| {
-                        Value::Object(crate::OrderedMap::from_keyed_tail_and_packed(
-                            k0,
-                            layer.values[f as usize].clone(),
-                            tail_slice,
-                            k1,
-                            values.values[v as usize].clone(),
-                        ))
-                    })
-                    .collect();
-                return Some(met.valued(met_values));
-            }
-            Some(_) => {}
-        }
-    }
-    // Fast path: two direct-keyed built-in layers with the SAME key
-    // combined by any scalar compose op (e.g. `note("c3 e3").add(note(7))`,
-    // `n("0 2").add(n(7))`): apply `op.apply_scalar` directly on the
-    // raw values and keep `met` direct-keyed without materializing any
-    // `BuiltinMap<1>` objects on inputs or outputs.
-    if let Some(op) = apply.in_place_op()
-        && op != crate::compose::ComposeOp::KeepIf
-        && (flow != LookupFlow::Set || op == crate::compose::ComposeOp::Set)
-        && layer.is_direct_keyed()
-        && layer.dress().tail.is_none()
-        && values.is_direct_keyed()
-        && layer.named_id == values.named_id
-        && values
-            .dress
-            .as_deref()
-            .is_none_or(|d| !d.has_set_map() && d.tail.is_none())
-        && crate::controls::builtin_name_str_by_id(layer.named_id) != Some("value")
-    {
-        let pairs_slice = pairs.as_slice();
-        let mut ok = true;
-        let map_pair = |f: u32, v: u32| -> Option<Value> {
-            let a = &layer.values[f as usize];
-            let b = &values.values[v as usize];
-            if matches!(a, Value::Object(_) | Value::Undefined)
-                || matches!(b, Value::Object(_) | Value::Undefined)
-            {
-                return None;
-            }
-            let res = op.apply_scalar(a, b);
-            if matches!(res, Value::Object(_) | Value::Undefined) || !res.is_data(0) {
-                return None;
-            }
-            Some(res)
-        };
-        if pairs_slice.len() == 1 {
-            let (f, v) = pairs_slice[0];
-            if let Some(res) = map_pair(f, v) {
-                met.values = crate::value::arc_single_value(res);
-                met.refresh_direct();
-                return Some(met);
-            }
-        } else if pairs_slice.len() <= 16 {
-            let mut stack_vals: [Value; 16] = std::array::from_fn(|_| Value::Undefined);
-            for (slot, &(f, v)) in stack_vals.iter_mut().zip(pairs_slice) {
-                if let Some(res) = map_pair(f, v) {
-                    *slot = res;
-                } else {
-                    ok = false;
-                    break;
-                }
-            }
-            if ok {
-                met.values = stack_vals[..pairs_slice.len()]
-                    .iter_mut()
-                    .map(|v| std::mem::replace(v, Value::Undefined))
-                    .collect();
-                met.refresh_direct();
-                return Some(met);
-            }
-        } else {
-            let mut vec_vals = Vec::with_capacity(pairs_slice.len());
-            for &(f, v) in pairs_slice {
-                if let Some(res) = map_pair(f, v) {
-                    vec_vals.push(res);
-                } else {
-                    ok = false;
-                    break;
-                }
-            }
-            if ok {
-                met.values = vec_vals.into();
-                met.refresh_direct();
-                return Some(met);
-            }
-        }
-    }
-    // Fast path: composing a direct-keyed control-object layer with a
-    // non-object, non-undefined scalar layer keeps every control map unchanged
-    // (`compose_op`: `(Value::Object(kept), value) => Value::Object(kept)`)
-    // without materializing `BuiltinMap`s (matching `apply_constant_to_layer`).
-    if let Some(op) = apply.in_place_op()
-        && op != crate::compose::ComposeOp::KeepIf
-        && layer.is_direct_keyed()
-        && values.named_id == 0
-        && values
-            .dress
-            .as_deref()
-            .is_none_or(|d| !d.has_set_map() && d.tail.is_none())
-        && values.values.iter().all(|v| {
-            !matches!(v, Value::Object(_) | Value::Undefined)
-                && (flow != LookupFlow::Set
-                    || (op == crate::compose::ComposeOp::Set && !matches!(v, Value::Str(_))))
-        })
-    {
-        let pairs_slice = pairs.as_slice();
-        let identity = pairs_slice.len() == layer.values.len()
-            && pairs_slice
-                .iter()
-                .enumerate()
-                .all(|(i, &(f, _))| f as usize == i);
-        if !identity {
-            met.values = pairs_slice
-                .iter()
-                .map(|&(f, _)| layer.values[f as usize].clone())
-                .collect();
-            met.refresh_direct();
-        }
-        return Some(met);
-    }
-    // What each pair of values makes, with no location: the
-    // locations of both sides are those of the steps.
-    let fn_reader = layer.reader(None);
-    let val_reader = values.reader(None);
-    let pairs_slice = pairs.as_slice();
-    if pairs_slice.len() == 1 {
-        let (function, value) = pairs_slice[0];
-        let v = made(
-            &fn_reader.get(function as usize)?,
-            &val_reader.get(value as usize)?,
-            apply,
-            flow,
-        )?;
-        return Some(met.valued(crate::value::arc_single_value(v)));
-    }
-    if pairs_slice.len() <= 16 {
-        let mut stack_vals: [Value; 16] = std::array::from_fn(|_| Value::Undefined);
-        for (slot, &(function, value)) in stack_vals.iter_mut().zip(pairs_slice) {
-            *slot = made(
-                &fn_reader.get(function as usize)?,
-                &val_reader.get(value as usize)?,
-                apply,
-                flow,
-            )?;
-        }
-        let met_values: Arc<[Value]> = stack_vals[..pairs_slice.len()]
-            .iter_mut()
-            .map(|v| std::mem::replace(v, Value::Undefined))
-            .collect();
-        return Some(met.valued(met_values));
-    }
-    let values = pairs_slice
-        .iter()
-        .map(|&(function, value)| {
-            made(
-                &fn_reader.get(function as usize)?,
-                &val_reader.get(value as usize)?,
-                apply,
-                flow,
-            )
-        })
-        .collect::<Option<Vec<Value>>>()?;
-    Some(met.valued(values.into()))
-}
-
-/// Direct `Set` of a packed row of built-in constant controls onto a
-/// cross-cycle folded sequence: cuts each layer against cycle boundaries with
-/// `first_locs`, prepends `rest_locs` onto `dress.before`, and writes all
-/// `(keys, vals)` in a single `BuiltinMap<N>` allocation.
-pub(crate) fn applied_packed_row(
-    mut functions: Pattern,
-    keys: &[u16],
-    vals: &[Value],
-    first_locs: Locations,
-    rest_locs: Locations,
-) -> Result<Pattern, Pattern> {
-    if keys.is_empty() {
-        return Err(functions);
-    }
-    let Some(layers) = folded(&functions) else {
-        return Err(functions);
-    };
-    if !holds_data(layers)
-        || !layers.iter().all(|layer| {
-            layer.is_direct_keyed()
-                && layer.dress().tail.is_none()
-                && !keys.iter().any(|&k| (k & 0x03ff) == layer.named_id)
-        })
-    {
-        return Err(functions);
-    }
-    static EMPTY_VALUES: std::sync::LazyLock<Arc<[Value]>> =
-        std::sync::LazyLock::new(|| Arc::from([]));
-    let raw = Raw {
-        whole: TimeSpan::new(Fraction::ZERO, Fraction::ONE),
-        part: None,
-        value: 0,
-        locations: first_locs,
-    };
-    let mut rhs = Layer::of_single(Fraction::ONE, raw, Arc::clone(&EMPTY_VALUES));
-    rhs.named_id = keys[0] & 0x03ff;
-    let steps = functions.steps();
-    let result = without_query_signals(|| {
-        let mut shared = None;
-        let mut apply_layer = |layer: &Layer| -> Option<Layer> {
-            let (mut met, pairs) = layer.met(&rhs, Side::Functions)?;
-            let pairs_slice = pairs.as_slice();
-            let identity = pairs_slice.len() == layer.values.len()
-                && pairs_slice
-                    .iter()
-                    .enumerate()
-                    .all(|(i, &(f, _))| f as usize == i);
-            if !identity {
-                met.values = pairs_slice
-                    .iter()
-                    .map(|&(f, _)| layer.values[f as usize].clone())
-                    .collect();
-            }
-            met.change_dress(|dress| {
-                dress.set_packed_here(keys, vals, rest_locs.clone(), &mut shared);
-            });
-            met.refresh_direct();
-            Some(met)
-        };
-        if layers.len() <= 8 {
-            let mut buf: [Option<Layer>; 8] = Default::default();
-            for (slot, layer) in buf.iter_mut().zip(layers.iter()) {
-                *slot = Some(apply_layer(layer)?);
-            }
-            return Some((Some(buf), None, layers.len()));
-        }
-        let met = layers.iter().map(apply_layer).collect::<Option<Vec<_>>>()?;
-        let len = met.len();
-        Some((None, Some(met), len))
-    });
-    let Some((mut stack_buf, vec_buf, len)) = result else {
-        return Err(functions);
-    };
-    if let Some(cell) = functions.own_node()
-        && let Node::Sequence(target) = &mut cell.kind
-        && let Some(dst) = Arc::get_mut(target)
-        && dst.len() == len
-    {
-        if let Some(buf) = &mut stack_buf {
-            for (d, s) in dst.iter_mut().zip(buf[..len].iter_mut()) {
-                *d = s.take().expect("met layer present");
-            }
-        } else if let Some(met) = vec_buf {
-            for (d, s) in dst.iter_mut().zip(met) {
-                *d = s;
-            }
-        }
-        return Ok(functions.with_steps(steps));
-    }
-    let out = match (stack_buf.as_mut(), vec_buf) {
-        (Some(buf), _) => node_of_sound_stack(buf, len),
-        (None, Some(met)) => node_of_sound(met),
-        (None, None) => unreachable!("either stack or vec buffer present"),
-    };
-    Ok(out.with_steps(steps))
-}
-
-/// Direct `Set` of a single-value built-in constant with source `locations`
-/// onto a folded sequence, avoiding temporary `PureAt`, `NodeCell`,
-/// `Arc<[Layer; 1]>`, and `Arc<[Value; 1]>` allocations and updating uniquely
-/// owned layer slices in place.
-pub(crate) fn applied_constant(
-    mut functions: Pattern,
-    spec: &crate::controls::ControlSpec,
-    value: Value,
-    locations: Locations,
-) -> Result<Pattern, (Pattern, Value, Locations)> {
-    if spec.id == 0
-        || spec.name() == "value"
-        || !matches!(value, Value::F64(_) | Value::Str(_) | Value::Bool(_))
-        || !value.is_data(0)
-    {
-        return Err((functions, value, locations));
-    }
-    let Some(layers) = folded(&functions) else {
-        return Err((functions, value, locations));
-    };
-    if !holds_data(layers)
-        || !layers.iter().all(|layer| {
-            layer.is_direct_keyed() && layer.dress().tail.is_none() && layer.named_id != spec.id
-        })
-    {
-        return Err((functions, value, locations));
-    }
-    static EMPTY_VALUES: std::sync::LazyLock<Arc<[Value]>> =
-        std::sync::LazyLock::new(|| Arc::from([]));
-    let k1 = crate::controls::builtin_packed_key(spec.id);
-    let raw = Raw {
-        whole: TimeSpan::new(Fraction::ZERO, Fraction::ONE),
-        part: None,
-        value: 0,
-        locations: locations.clone(),
-    };
-    let mut rhs = Layer::of_single(Fraction::ONE, raw, Arc::clone(&EMPTY_VALUES));
-    rhs.named_id = spec.id;
-    let steps = functions.steps();
-    let result = without_query_signals(|| {
-        let mut shared = None;
-        let mut apply_layer = |layer: &Layer| -> Option<Layer> {
-            let (mut met, pairs) = layer.met(&rhs, Side::Functions)?;
-            let pairs_slice = pairs.as_slice();
-            let identity = pairs_slice.len() == layer.values.len()
-                && pairs_slice
-                    .iter()
-                    .enumerate()
-                    .all(|(i, &(f, _))| f as usize == i);
-            if !identity {
-                met.values = pairs_slice
-                    .iter()
-                    .map(|&(f, _)| layer.values[f as usize].clone())
-                    .collect();
-            }
-            met.change_dress(|dress| {
-                dress.set_packed_here(
-                    &[k1],
-                    std::slice::from_ref(&value),
-                    Locations::new(),
-                    &mut shared,
+    /// A walked handle answers from the layers, and any other handle from
+    /// their tables.
+    fn assert_same_haps(name: &str, one_node: &Pattern, nodes: &Pattern) {
+        for (walk, one_node) in [(false, one_node.clone()), (true, one_node.mark_walked())] {
+            for (begin, end) in spans() {
+                assert_eq!(
+                    answers(&one_node, begin, end),
+                    answers(nodes, begin, end),
+                    "{name} over {begin:?}..{end:?}, walked: {walk}"
                 );
-            });
-            met.refresh_direct();
-            Some(met)
-        };
-        if layers.len() <= 8 {
-            let mut buf: [Option<Layer>; 8] = Default::default();
-            for (slot, layer) in buf.iter_mut().zip(layers.iter()) {
-                *slot = Some(apply_layer(layer)?);
-            }
-            return Some((Some(buf), None, layers.len()));
-        }
-        let met = layers.iter().map(apply_layer).collect::<Option<Vec<_>>>()?;
-        let len = met.len();
-        Some((None, Some(met), len))
-    });
-    let Some((mut stack_buf, vec_buf, len)) = result else {
-        return Err((functions, value, locations));
-    };
-    if let Some(cell) = functions.own_node()
-        && let Node::Sequence(target) = &mut cell.kind
-        && let Some(dst) = Arc::get_mut(target)
-        && dst.len() == len
-    {
-        if let Some(buf) = &mut stack_buf {
-            for (d, s) in dst.iter_mut().zip(buf[..len].iter_mut()) {
-                *d = s.take().expect("met layer present");
-            }
-        } else if let Some(met) = vec_buf {
-            for (d, s) in dst.iter_mut().zip(met) {
-                *d = s;
             }
         }
-        return Ok(functions.with_steps(steps));
     }
-    let out = match (stack_buf.as_mut(), vec_buf) {
-        (Some(buf), _) => node_of_sound_stack(buf, len),
-        (None, Some(met)) => node_of_sound(met),
-        (None, None) => unreachable!("either stack or vec buffer present"),
-    };
-    Ok(out.with_steps(steps))
-}
 
-/// Whether each step of the sequence `functions` takes the data value
-/// `control` in place by a `set` of a constant of it, as [`applied`] folds
-/// that `set`. See [`Layer::takes_set`].
-/// Whether `layers` takes a single plain non-`"value"` data control without
-/// needing a temporary `OrderedMap` wrapper.
-pub(crate) fn takes_plain_set_layers(layers: &[Layer]) -> bool {
-    holds_data(layers)
-        && layers.iter().all(|layer| {
-            layer.in_cycles() && layer.maps() && layer.is_data() && !layer.values.is_empty()
-        })
-}
-
-/// Whether `functions` takes a single plain non-`"value"` data control without
-/// needing a temporary `OrderedMap` wrapper.
-pub(crate) fn takes_plain_set(functions: &Pattern) -> bool {
-    folded(functions).is_some_and(takes_plain_set_layers)
-}
-
-/// Set one plain `(key, value)` control directly on each step of `layers`.
-pub(crate) fn set_single_here(layers: &mut Arc<[Layer]>, key: &crate::Key, value: Value) {
-    if Arc::get_mut(layers).is_none() {
-        *layers = layers.iter().map(|layer| layer.with(|_| {})).collect();
+    /// Sequences of numbers: steps, a rest, a chord, a slow layer with a
+    /// step of three cycles, a layer of one cycle and a half, a value that
+    /// fills each cycle, and layers with time before and after their steps.
+    fn sequences() -> Vec<(&'static str, Vec<SequenceLayer>)> {
+        vec![
+            (
+                "steps",
+                vec![layer(
+                    (1, 1),
+                    vec![
+                        step((0, 1), (1, 4), 1.0),
+                        step((1, 4), (1, 2), 2.0),
+                        step((3, 4), (1, 1), 3.0),
+                    ],
+                )],
+            ),
+            (
+                "a chord and fast steps",
+                vec![
+                    layer(
+                        (1, 1),
+                        vec![step((0, 1), (1, 2), 4.0), step((0, 1), (1, 2), 5.0)],
+                    ),
+                    layer((1, 3), vec![step((0, 1), (1, 1), 6.0)]),
+                ],
+            ),
+            (
+                "steps of several cycles",
+                vec![layer(
+                    (4, 1),
+                    vec![step((0, 1), (3, 4), 7.0), step((3, 4), (1, 1), 8.0)],
+                )],
+            ),
+            (
+                "a period of a cycle and a half",
+                vec![layer(
+                    (3, 2),
+                    vec![step((0, 1), (1, 2), 9.0), step((1, 2), (1, 1), 10.0)],
+                )],
+            ),
+            (
+                "one value a cycle",
+                vec![layer((1, 1), vec![step((0, 1), (1, 1), 11.0)])],
+            ),
+            (
+                "layers with time around their steps",
+                vec![
+                    layer(
+                        (1, 1),
+                        vec![step((1, 2), (5, 8), 12.0), step((5, 8), (7, 8), 13.0)],
+                    ),
+                    layer((2, 1), vec![step((1, 8), (1, 4), 14.0)]),
+                    layer((2, 1), vec![step((3, 4), (7, 8), 15.0)]),
+                ],
+            ),
+        ]
     }
-    let layers = Arc::get_mut(layers).expect("layers that no other sequence holds");
-    if let [layer] = layers
-        && let Some(dress) = layer.dress.as_mut().and_then(Arc::get_mut)
-    {
-        dress.set_single_here(key, value);
-        layer.refresh_direct_after_set();
-        return;
-    }
-    let mut last: Option<(*const Dress, Arc<Dress>)> = None;
-    for layer in layers {
-        if let Some(dress) = layer.dress.as_mut().and_then(Arc::get_mut) {
-            dress.set_single_here(key, value.clone());
-            layer.refresh_direct_after_set();
-            continue;
-        }
-        let from = layer.dress.as_ref().map_or(std::ptr::null(), Arc::as_ptr);
-        let dress = match &last {
-            Some((seen, dress)) if *seen == from => Arc::clone(dress),
-            _ => {
-                let mut dress = layer.dress().clone();
-                dress.set_single_here(key, value.clone());
-                let dress = dress.into_arc();
-                last = Some((from, Arc::clone(&dress)));
-                dress
+
+    /// A step is found by the float of where it begins, and by the time
+    /// itself where two floats are the same and where no float orders a
+    /// time.
+    #[test]
+    fn a_place_orders_by_its_time_where_its_float_does_not() {
+        let place = |begin: Fraction| {
+            let whole = TimeSpan::new(begin, begin + Fraction::ONE);
+            Place::at(whole, None, 0, Locations::new())
+        };
+        let third = Fraction::new(1, 3);
+        // The same float of 32 bits as a third, and a time past the
+        // numbers that a float holds.
+        let near = third + Fraction::new(1, 1 << 40);
+        let fine = Fraction::new(1, (1 << 60) + 1);
+        assert_eq!(time_key(third), time_key(near));
+        assert!(time_key(fine).is_nan());
+        let times = [Fraction::ZERO, fine, third, near, Fraction::ONE];
+        for begin in times {
+            for time in times {
+                let (step, key) = (place(begin), time_key(time));
+                assert_eq!(
+                    step.begins_before(time, key),
+                    begin < time,
+                    "{begin:?} {time:?}"
+                );
+                assert_eq!(
+                    step.begins_by(time, key),
+                    begin <= time,
+                    "{begin:?} {time:?}"
+                );
             }
-        };
-        layer.dress = Some(dress);
-        layer.refresh_direct_after_set();
-    }
-}
-
-pub(crate) fn takes_set_layers(layers: &[Layer], control: &Value) -> bool {
-    holds_data(layers)
-        && control.is_data(0)
-        && layers
-            .iter()
-            .all(|layer| layer.takes_set(control, LookupFlow::Set))
-}
-
-pub(crate) fn takes_set(functions: &Pattern, control: &Value) -> bool {
-    folded(functions).is_some_and(|layers| takes_set_layers(layers, control))
-}
-
-/// Owned fast path of [`set_packed_here`] for a top-level `Node::Sequence`,
-/// moving values out of `vals` with zero clones for single-layer sequences and
-/// bare multi-layer sequences.
-pub(crate) fn set_packed_layers_owned(
-    layers: &mut Arc<[Layer]>,
-    keys: &[u16],
-    vals: &mut [Value],
-    context: Locations,
-) {
-    if layers.len() == 1 {
-        set_packed_single_layer_owned(layers, keys, vals, context);
-        return;
-    }
-    if layers.iter().all(|layer| layer.dress.is_none()) {
-        if Arc::get_mut(layers).is_none() {
-            *layers = layers.iter().map(|layer| layer.with(|_| {})).collect();
         }
-        let layers = Arc::get_mut(layers).expect("layers that no other sequence holds");
-        let mut dress = Dress::default();
-        dress.set_packed_here_owned(keys, vals, context);
-        let shared = dress.into_arc();
-        for layer in layers {
-            layer.dress = Some(Arc::clone(&shared));
-            layer.refresh_direct_after_set();
-        }
-        return;
     }
-    let mut shared_entries = None;
-    let mut shared_bare_dress = None;
-    let mut shared_last_dress = None;
-    set_packed_here(
-        layers,
-        keys,
-        vals,
-        context,
-        &mut shared_entries,
-        &mut shared_bare_dress,
-        &mut shared_last_dress,
-    );
-}
 
-/// Single-layer owned fast path of [`set_packed_here`], moving values out of
-/// `vals` straight into the layer's built-in control map with zero clones.
-pub(crate) fn set_packed_single_layer_owned(
-    layers: &mut Arc<[Layer]>,
-    keys: &[u16],
-    vals: &mut [Value],
-    context: Locations,
-) {
-    if Arc::get_mut(layers).is_none() {
-        *layers = layers.iter().map(|layer| layer.with(|_| {})).collect();
+    fn built(layers: &[SequenceLayer]) -> Pattern {
+        sequence(layers.to_vec()).expect("sound layers")
     }
-    let layers = Arc::get_mut(layers).expect("layers that no other sequence holds");
-    let [layer] = layers else {
-        unreachable!("caller verified single layer");
-    };
-    if let Some(dress) = layer.dress.as_mut().and_then(Arc::get_mut) {
-        dress.set_packed_here_owned(keys, vals, context);
-        layer.refresh_direct_after_set();
-        return;
-    }
-    let mut dress = match layer.dress.as_ref() {
-        Some(existing) => (**existing).clone(),
-        None => Dress::default(),
-    };
-    dress.set_packed_here_owned(keys, vals, context);
-    layer.dress = Some(dress.into_arc());
-    layer.refresh_direct_after_set();
-}
 
-/// Set stack-packed built-in controls `(keys, vals)` at `context` on each step
-/// of `layers`, avoiding a temporary `BuiltinMap` allocation when merging into
-/// an existing `Dress::set_map` and sharing `shared_entries` / `shared_bare_dress`
-/// across sibling sequences in stacks and picks.
-pub(crate) fn set_packed_here(
-    layers: &mut Arc<[Layer]>,
-    keys: &[u16],
-    vals: &[Value],
-    context: Locations,
-    shared_entries: &mut Option<Arc<dyn crate::value::BuiltinEntries>>,
-    shared_bare_dress: &mut Option<Arc<Dress>>,
-    shared_last_dress: &mut Option<(Arc<Dress>, Arc<Dress>)>,
-) {
-    if Arc::get_mut(layers).is_none() {
-        *layers = layers.iter().map(|layer| layer.with(|_| {})).collect();
-    }
-    let layers = Arc::get_mut(layers).expect("layers that no other sequence holds");
-    if let [layer] = layers {
-        if let Some(dress) = layer.dress.as_mut().and_then(Arc::get_mut) {
-            dress.set_packed_here(keys, vals, context, shared_entries);
-            layer.refresh_direct_after_set();
-            return;
-        }
-        let Some(existing) = layer.dress.as_ref() else {
-            let dress = shared_bare_dress.get_or_insert_with(|| {
-                let mut dress = Dress::default();
-                dress.set_packed_here(keys, vals, context, shared_entries);
-                dress.into_arc()
-            });
-            layer.dress = Some(Arc::clone(dress));
-            layer.refresh_direct_after_set();
-            return;
-        };
-        let next = match shared_last_dress {
-            Some((seen, dress)) if Arc::ptr_eq(seen, existing) => Arc::clone(dress),
-            _ => {
-                let mut dress = (**existing).clone();
-                dress.set_packed_here(keys, vals, context, shared_entries);
-                let dress = dress.into_arc();
-                *shared_last_dress = Some((Arc::clone(existing), Arc::clone(&dress)));
-                dress
-            }
-        };
-        layer.dress = Some(next);
-        layer.refresh_direct_after_set();
-        return;
-    }
-    for layer in layers {
-        if let Some(dress) = layer.dress.as_mut().and_then(Arc::get_mut) {
-            dress.set_packed_here(keys, vals, context.clone(), shared_entries);
-            layer.refresh_direct_after_set();
-            continue;
-        }
-        let Some(existing) = layer.dress.as_ref() else {
-            let dress = shared_bare_dress.get_or_insert_with(|| {
-                let mut dress = Dress::default();
-                dress.set_packed_here(keys, vals, context.clone(), shared_entries);
-                dress.into_arc()
-            });
-            layer.dress = Some(Arc::clone(dress));
-            layer.refresh_direct_after_set();
-            continue;
-        };
-        let next = match shared_last_dress {
-            Some((seen, dress)) if Arc::ptr_eq(seen, existing) => Arc::clone(dress),
-            _ => {
-                let mut dress = (**existing).clone();
-                dress.set_packed_here(keys, vals, context.clone(), shared_entries);
-                let dress = dress.into_arc();
-                *shared_last_dress = Some((Arc::clone(existing), Arc::clone(&dress)));
-                dress
-            }
-        };
-        layer.dress = Some(next);
-        layer.refresh_direct_after_set();
-    }
-}
-
-/// Set `control` at `context` on each step of `layers`, which
-/// [take it](takes_set). The layers are written where no other sequence
-/// holds them, and a copy of them otherwise.
-pub(crate) fn set_here(layers: &mut Arc<[Layer]>, control: &Value, context: Locations) {
-    let mut cache = RenoteDressCache::default();
-    set_here_cached(layers, control, context, &mut cache);
-}
-
-/// [`set_here`] sharing newly constructed dresses across multiple sequences
-/// (such as branches of a `Node::Pick`) via `cache`. Only immutable source
-/// dresses (`None` or shared `Arc`) are inserted into `cache`.
-pub(crate) fn set_here_cached(
-    layers: &mut Arc<[Layer]>,
-    control: &Value,
-    context: Locations,
-    cache: &mut RenoteDressCache,
-) {
-    if Arc::get_mut(layers).is_none() {
-        *layers = layers.iter().map(|layer| layer.with(|_| {})).collect();
-    }
-    let layers = Arc::get_mut(layers).expect("layers that no other sequence holds");
-    if let [layer] = layers {
-        let from = layer.dress.as_ref().map_or(std::ptr::null(), Arc::as_ptr);
-        if let Some(cached) = cache.get(from) {
-            layer.dress = cached;
-            layer.refresh_direct();
-            return;
-        }
-        if let Some(dress) = layer.dress.as_mut().and_then(Arc::get_mut) {
-            dress.set_here(control, context);
-            layer.refresh_direct();
-            return;
-        }
-        let mut dress = layer.dress().clone();
-        dress.set_here(control, context);
-        let dress = dress.into_arc();
-        cache.put(from, Some(Arc::clone(&dress)));
-        layer.dress = Some(dress);
-        layer.refresh_direct();
-        return;
-    }
-    for layer in layers {
-        let from = layer.dress.as_ref().map_or(std::ptr::null(), Arc::as_ptr);
-        if let Some(cached) = cache.get(from) {
-            layer.dress = cached;
-            layer.refresh_direct();
-            continue;
-        }
-        if let Some(dress) = layer.dress.as_mut().and_then(Arc::get_mut) {
-            dress.set_here(control, context.clone());
-            layer.refresh_direct();
-            continue;
-        }
-        let mut dress = layer.dress().clone();
-        dress.set_here(control, context.clone());
-        let dress = dress.into_arc();
-        cache.put(from, Some(Arc::clone(&dress)));
-        layer.dress = Some(dress);
-        layer.refresh_direct();
-    }
-}
-
-/// The `appRight` of `functions` and `values` by `apply`, when `values` is
-/// a sequence and `functions` is one layer of data values, or a constant
-/// of one, as the `struct` of a sequence is: each step of `values` keeps
-/// its whole, and is cut to each step of `functions` that it meets.
-///
-/// `None` for functions of more layers than one, which answer each step
-/// layer by layer, for a value that is not data, for a function that is no
-/// compose op, for a meeting that makes more than a value, and for cut
-/// steps that are not in the order of time.
-pub(crate) fn applied_out(
-    functions: &Pattern,
-    values: &Pattern,
-    apply: &Combine,
-    flow: LookupFlow,
-) -> Option<Pattern> {
-    if !runs_at_the_build(apply) {
-        return None;
-    }
-    let functions = layers(functions)?;
-    let [functions] = &*functions else {
-        return None;
-    };
-    let values = layers(values)?;
-    // A value of the script is read through its host, at each query.
-    if !(functions.is_data() && holds_data(&values)) {
-        return None;
-    }
-    without_query_signals(|| {
-        let met = values
-            .iter()
-            .map(|layer| {
-                let (met, pairs) = layer.met(functions, Side::Values)?;
-                // What each pair of values makes, with no location: the
-                // locations of both sides are those of the steps.
-                let values = pairs
-                    .as_slice()
-                    .iter()
-                    .map(|&(value, function)| {
-                        let hf = cycle_hap(functions.value(function as usize)?);
-                        let hv = cycle_hap(layer.value(value as usize)?);
-                        let hap = applied_hap(&hf, &hv, hv.whole, hv.part, apply, flow);
-                        is_plain(&hap).then(|| {
-                            let mut value = hap.value;
-                            if let Value::Object(map) = &mut value {
-                                map.undress_patched();
-                            }
-                            value
-                        })
-                    })
-                    .collect::<Option<Vec<Value>>>()?;
-                Some(met.valued(values.into()))
-            })
-            .collect::<Option<Vec<_>>>()?;
-        Some(node_of_sound(met))
-    })
-}
-
-/// `pattern` with no step whose value `keep` refuses, when `pattern` is a
-/// sequence of data values: what a filter of the values answers.
-pub(crate) fn filtered(pattern: &Pattern, keep: &ValuePredicate) -> Option<Pattern> {
-    let layers = folded(pattern)?;
-    if !holds_data(layers) {
-        return None;
-    }
-    without_query_signals(|| {
-        let layers = layers
-            .iter()
-            .map(|layer| {
-                let kept: Vec<bool> = layer.each_value().map(|value| keep(&value)).collect();
-                if kept.iter().all(|kept| *kept) {
-                    return layer.clone();
+    /// The layers that a fold dresses alike wear one dress, and layers of
+    /// two dresses keep two: a name, a set of a control and locations
+    /// make one dress for all the layers of a sequence.
+    #[test]
+    fn the_layers_that_a_fold_dresses_alike_share_one_dress() {
+        let dresses = |pattern: &Pattern| -> usize {
+            let Node::Sequence(layers) = pattern.node_kind() else {
+                panic!("a sequence");
+            };
+            let mut seen: Vec<*const Dress> = Vec::new();
+            for layer in layers.iter() {
+                let at = layer.dress.as_ref().map_or(std::ptr::null(), Arc::as_ptr);
+                if !seen.contains(&at) {
+                    seen.push(at);
                 }
-                let listing = layer.listing();
-                let raws: Vec<Raw> = (0..listing.len())
-                    .filter(|index| {
-                        kept.get(listing.value(*index) as usize)
-                            .copied()
-                            .unwrap_or(false)
-                    })
-                    .map(|index| listing.raw(index))
-                    .collect();
-                layer.with(|layer| {
-                    layer.set_in_cycles(lie_in_spans(layer.period(), raws.iter().map(Raw::part)));
-                    layer.set_steps(Steps::Listed(Listing::of(raws)));
-                })
-            })
-            .collect();
-        Some(node_of_sound(layers))
-    })
-}
-
-/// The stack of `patterns`, when each is a sequence, a constant or silence:
-/// the layers of each, one after the other.
-pub(crate) fn stacked(patterns: &[Pattern]) -> Option<Pattern> {
-    stacked_iter(patterns.iter())
-}
-
-pub(crate) fn stacked_opt(patterns: &[Option<Pattern>]) -> Option<Pattern> {
-    stacked_iter(patterns.iter().filter_map(Option::as_ref))
-}
-
-fn stacked_iter<'a>(patterns: impl Iterator<Item = &'a Pattern> + Clone) -> Option<Pattern> {
-    let mut total = 0usize;
-    for pattern in patterns.clone() {
-        if pattern.is_rest() && folds(pattern) {
-            continue;
-        }
-        total += layers(pattern)?.len();
+            }
+            seen.len()
+        };
+        let (_, layers) = sequences().swap_remove(5);
+        let spec = crate::controls::ControlSpec::new(["note"]);
+        let pattern = named(&built(&layers), &spec, false).expect("a named sequence");
+        assert_eq!(dresses(&pattern), 1);
+        let control = Value::object([("gain".to_string(), Value::F64(0.5))]);
+        let set = compose(&pattern, &pure(control), ComposeOp::Set, Alignment::In);
+        assert!(matches!(set.node_kind(), Node::Sequence(_)));
+        assert_eq!(dresses(&set), 1);
+        let located = located(&set, &[(3, 5)]).expect("a located sequence");
+        assert_eq!(dresses(&located), 1);
+        // Two sequences of two dresses, one after the other in a stack.
+        let other = named(&built(&sequences()[0].1), &spec, false).expect("a named sequence");
+        let both = stack(vec![located, other]);
+        assert_eq!(dresses(&both), 2);
     }
-    if total <= 8 {
-        let mut buf: [Option<Layer>; 8] = Default::default();
-        let mut len = 0usize;
-        for pattern in patterns {
-            if pattern.is_rest() && folds(pattern) {
+
+    /// A ply of a sequence by a whole count is one sequence, which answers
+    /// as the join of a pattern for each step. A count that is not whole,
+    /// a step that is cut, and more steps than a fold lists keep the join.
+    #[test]
+    fn a_ply_of_a_sequence_answers_as_the_join_of_each_step() {
+        use crate::combinators::ply;
+        let is_sequence = |pattern: &Pattern| matches!(pattern.node_kind(), Node::Sequence(_));
+        let stepped = |layers: &[SequenceLayer]| built(layers).with_steps(Some(frac((4, 1))));
+        for (name, layers) in sequences() {
+            // The steps of a chord sound at one time.
+            let chord = name == "a chord and fast steps";
+            for count in [1, 2, 3, 7] {
+                let plied = || ply(&stepped(&layers), frac((count, 1)));
+                let folded = plied();
+                let name = format!("{name}, each step {count} times");
+                assert_eq!(is_sequence(&folded), !chord || count == 1, "{name}");
+                assert_same_answers(&name, &folded, &unfolded(plied));
+            }
+            assert!(!is_sequence(&ply(&built(&layers), frac((3, 2)))), "{name}");
+            assert!(
+                !is_sequence(&ply(&built(&layers), frac((300, 1)))),
+                "{name}"
+            );
+        }
+        let whole = (frac((0, 1)), frac((3, 4)));
+        let cut = step((0, 1), (3, 4), 1.0).placed(whole, (frac((1, 4)), frac((1, 2))));
+        let cut = built(&[layer((2, 1), vec![cut])]);
+        assert!(!is_sequence(&ply(&cut, frac((2, 1)))));
+    }
+
+    /// A lane whose second application raises a query error at each query.
+    #[test]
+    fn a_fold_leaves_an_application_that_fails_to_its_node() {
+        let steps = || built(&sequences()[0].1);
+        let failing = |pattern: Pattern| {
+            let text = pure(Value::Str("no number".into()));
+            compose(&pattern, &text, ComposeOp::Add, Alignment::In)
+        };
+        let folded = failing(steps());
+        assert!(!matches!(folded.node_kind(), Node::Sequence(_)));
+        assert!(!crate::query_error_pending());
+        for (begin, end) in spans() {
+            assert_eq!(
+                format!("{:?}", folded.try_query_arc_sorted(begin, end)),
+                format!(
+                    "{:?}",
+                    unfolded(|| failing(steps())).try_query_arc_sorted(begin, end)
+                ),
+            );
+        }
+    }
+
+    #[test]
+    fn a_sequence_answers_as_the_concatenation_of_its_values() {
+        let one_node = sequence(vec![layer(
+            (1, 1),
+            vec![
+                step((0, 1), (1, 2), 1.0),
+                step((1, 2), (1, 1), 2.0),
+                step((1, 2), (1, 1), 3.0),
+            ],
+        )])
+        .expect("ordered steps inside the cycle");
+        let nodes = fastcat(vec![
+            located_value(1.0),
+            unfolded(|| stack(vec![located_value(2.0), located_value(3.0)])),
+        ]);
+        assert_same_haps("a concatenation", &one_node, &nodes);
+    }
+
+    #[test]
+    fn layers_answer_as_a_stack_of_concatenations_at_their_speeds() {
+        let one_node = sequence(vec![
+            layer(
+                (1, 2),
+                vec![step((0, 1), (1, 2), 1.0), step((1, 2), (1, 1), 2.0)],
+            ),
+            // A layer with a rest in it, slower than the cycle.
+            layer((3, 1), vec![step((1, 2), (1, 1), 3.0)]),
+            layer(
+                (3, 2),
+                vec![
+                    step((0, 1), (1, 3), 4.0),
+                    step((1, 3), (2, 3), 5.0),
+                    step((2, 3), (1, 1), 6.0),
+                ],
+            ),
+        ])
+        .expect("ordered steps inside each period");
+        let nodes = unfolded(|| {
+            stack(vec![
+                fastcat(vec![located_value(1.0), located_value(2.0)]).fast(frac((2, 1))),
+                fastcat(vec![silence(), located_value(3.0)]).slow(frac((3, 1))),
+                fastcat(vec![
+                    located_value(4.0),
+                    located_value(5.0),
+                    located_value(6.0),
+                ])
+                .slow(frac((3, 2))),
+            ])
+        });
+        assert_same_haps("layers", &one_node, &nodes);
+    }
+
+    #[test]
+    fn steps_out_of_order_or_outside_the_period_make_no_sequence() {
+        for steps in [
+            vec![step((1, 2), (1, 1), 1.0), step((0, 1), (1, 2), 2.0)],
+            vec![step((0, 1), (3, 2), 1.0)],
+            vec![step((1, 2), (1, 2), 1.0)],
+            vec![step((-1, 2), (1, 2), 1.0)],
+        ] {
+            assert!(sequence(vec![layer((1, 1), steps)]).is_none());
+        }
+        let whole = || vec![step((0, 1), (1, 1), 1.0)];
+        assert!(sequence(vec![layer((0, 1), whole())]).is_none());
+        assert!(sequence(vec![layer((-1, 2), whole())]).is_none());
+        assert!(sequence(Vec::new()).is_some());
+    }
+
+    #[test]
+    fn a_control_of_a_sequence_answers_as_the_map_of_each_hap() {
+        for (name, layers) in sequences() {
+            let control = |pattern: Pattern| pattern.map_control(&ControlSpec::new(["n"]), false);
+            let folded = control(built(&layers));
+            assert!(matches!(folded.node_kind(), Node::Sequence(_)), "{name}");
+            assert_same_answers(name, &folded, &unfolded(|| control(built(&layers))));
+            // Steps that hold a control already, with a constant set on
+            // them: the name takes each map with that constant in it.
+            let again = |pattern: Pattern| {
+                let named = pattern.map_control(&ControlSpec::new(["n"]), true);
+                let quiet = ControlSpec::new(["gain"]).apply_to(named, Some(located_value(0.25)));
+                quiet.map_control(&ControlSpec::new(["note"]), false)
+            };
+            assert_same_answers(
+                name,
+                &again(built(&layers)),
+                &unfolded(|| again(built(&layers))),
+            );
+        }
+    }
+
+    #[test]
+    fn steps_that_another_control_names_are_another_construction() {
+        let (_, layers) = &sequences()[0];
+        let named = |name: &str| built(layers).map_control(&ControlSpec::new([name]), false);
+        assert!(named("n").same_construction(&named("n")));
+        assert!(!named("n").same_construction(&named("note")));
+    }
+
+    /// A scale over steps that `note` or `n` names gives each step its
+    /// note where it is, and answers as the scale of each hap: steps,
+    /// notes, steps with accidentals, a step that is none, and a name that
+    /// is no scale.
+    #[test]
+    fn a_scale_of_named_steps_answers_as_the_scale_of_each_hap() {
+        let text = |text: &str| Value::Str(text.into());
+        let melodies = [
+            (
+                "steps",
+                vec![
+                    Value::F64(0.0),
+                    Value::F64(2.0),
+                    Value::F64(-3.0),
+                    Value::F64(7.5),
+                ],
+            ),
+            (
+                "notes",
+                vec![text("c3"), text("eb4"), text("f#2"), text("a")],
+            ),
+            (
+                "steps with accidentals",
+                vec![text("0"), text("2#"), text("4b"), text("-1")],
+            ),
+            (
+                "a step that is none",
+                vec![Value::F64(1.0), text("x"), Value::Bool(true)],
+            ),
+            // A hap of no note stays as it is, with no tag of the scale.
+            ("no note", vec![Value::F64(1.0), Value::Null]),
+            (
+                "a map of a value",
+                vec![Value::object([("value".into(), Value::F64(2.0))])],
+            ),
+        ];
+        for (name, values) in melodies {
+            let steps = || {
+                let count = values.len() as i128;
+                let steps = values.iter().zip(0..).map(|(value, at)| {
+                    let (begin, end) = (frac((at, count)), frac((at + 1, count)));
+                    SequenceStep::new(begin, end, value.clone(), Locations::new())
+                });
+                built(&[layer((1, 1), steps.collect())])
+            };
+            for control in ["note", "n", "s"] {
+                for scale in ["C:minor", "F#:major", "no such scale"] {
+                    let scaled = || {
+                        let named = steps().map_control(&ControlSpec::new([control]), false);
+                        crate::combinators::scale(&named, text(scale))
+                    };
+                    let name = format!("{name} under {control} in {scale}");
+                    assert_same_haps(&name, &scaled(), &unfolded(scaled));
+                    // A control that is set before the scale stays.
+                    let quiet = || {
+                        let named = steps().map_control(&ControlSpec::new([control]), false);
+                        let gain = ControlSpec::new(["gain"]);
+                        let quiet = gain.apply_to(named, Some(located_value(0.25)));
+                        crate::combinators::scale(&quiet, text(scale))
+                    };
+                    assert_same_haps(&name, &quiet(), &unfolded(quiet));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn locations_of_a_sequence_answer_as_their_own_node() {
+        for (name, layers) in sequences() {
+            let located = |pattern: Pattern| pattern.with_added_context(vec![(70, 72), (80, 81)]);
+            let folded = located(built(&layers));
+            assert!(matches!(folded.node_kind(), Node::Sequence(_)), "{name}");
+            assert_same_answers(name, &folded, &unfolded(|| located(built(&layers))));
+        }
+    }
+
+    #[test]
+    fn a_constant_applied_to_a_sequence_answers_as_the_application() {
+        let controls = |key: &str, value: f64| {
+            pure(Value::F64(value))
+                .with_added_context(vec![(90, 93)])
+                .map_control(&ControlSpec::new([key]), false)
+        };
+        for (name, layers) in sequences() {
+            // Numbers under arithmetic, and control objects that a
+            // constant sets, adds to and sets again.
+            let chains: [(&str, &dyn Fn(Pattern) -> Pattern); 3] = [
+                // A chain of constants that each set a control: a key that
+                // is new, and a key that an earlier constant set.
+                ("set controls", &|pattern: Pattern| {
+                    let notes = pattern.map_control(&ControlSpec::new(["n"]), false);
+                    [("gain", 0.8), ("room", 0.3), ("gain", 0.25), ("n", 7.0)]
+                        .into_iter()
+                        .fold(notes, |so_far, (key, value)| {
+                            compose(
+                                &so_far,
+                                &controls(key, value),
+                                ComposeOp::Set,
+                                Alignment::In,
+                            )
+                        })
+                }),
+                ("arithmetic", &|pattern: Pattern| {
+                    let scaled = compose(
+                        &pattern,
+                        &pure(Value::F64(3.0)),
+                        ComposeOp::Mul,
+                        Alignment::In,
+                    );
+                    compose(&scaled, &located_value(0.5), ComposeOp::Add, Alignment::In)
+                }),
+                ("controls", &|pattern: Pattern| {
+                    let notes = pattern.map_control(&ControlSpec::new(["n"]), false);
+                    let set = compose(
+                        &notes,
+                        &controls("gain", 0.8),
+                        ComposeOp::Set,
+                        Alignment::In,
+                    );
+                    let added = compose(&set, &controls("n", 12.0), ComposeOp::Add, Alignment::In);
+                    compose(
+                        &added,
+                        &controls("gain", 0.25),
+                        ComposeOp::Set,
+                        Alignment::In,
+                    )
+                }),
+            ];
+            for (chain_name, chain) in chains {
+                let folded = chain(built(&layers));
+                assert!(
+                    matches!(folded.node_kind(), Node::Sequence(_)),
+                    "{chain_name} of {name}"
+                );
+                assert_same_answers(
+                    &format!("{chain_name} of {name}"),
+                    &folded,
+                    &unfolded(|| chain(built(&layers))),
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn values_applied_to_a_sequence_answer_as_the_application() {
+        let controls =
+            |pattern: Pattern, key: &str| pattern.map_control(&ControlSpec::new([key]), false);
+        let mut folds = Vec::new();
+        for (name, layers) in sequences() {
+            for (value_name, value_layers) in sequences() {
+                let name = format!("{name} with {value_name}");
+                // Numbers under arithmetic, and control objects that the
+                // values set.
+                let added = |pattern: Pattern| {
+                    compose(
+                        &pattern,
+                        &built(&value_layers),
+                        ComposeOp::Add,
+                        Alignment::In,
+                    )
+                };
+                let set = |pattern: Pattern| {
+                    compose(
+                        &controls(pattern, "n"),
+                        &controls(built(&value_layers), "gain"),
+                        ComposeOp::Set,
+                        Alignment::In,
+                    )
+                };
+                let chains: [&dyn Fn(Pattern) -> Pattern; 2] = [&added, &set];
+                for chain in chains {
+                    let folded = chain(built(&layers));
+                    if matches!(folded.node_kind(), Node::Sequence(_)) {
+                        folds.push(name.clone());
+                    }
+                    assert_same_answers(&name, &folded, &unfolded(|| chain(built(&layers))));
+                }
+            }
+        }
+        // Steps meet steps of another period, and steps that they cut.
+        for name in [
+            "steps with steps of several cycles",
+            "steps of several cycles with steps",
+            "steps with a period of a cycle and a half",
+            "a period of a cycle and a half with steps of several cycles",
+            "a chord and fast steps with one value a cycle",
+        ] {
+            assert_eq!(
+                folds.iter().filter(|fold| *fold == name).count(),
+                2,
+                "{name}"
+            );
+        }
+        // Values of two layers answer each step layer by layer.
+        assert!(
+            !folds
+                .iter()
+                .any(|fold| fold.ends_with("with a chord and fast steps"))
+        );
+    }
+
+    #[test]
+    fn a_structure_of_a_sequence_answers_as_the_application() {
+        // Steps that keep and steps that drop, in one cycle and in a period
+        // of a cycle and a half.
+        let structures = || {
+            vec![
+                (
+                    "a structure of one cycle",
+                    vec![layer(
+                        (1, 1),
+                        vec![
+                            step((0, 1), (1, 4), 1.0),
+                            step((1, 4), (1, 2), 0.0),
+                            step((1, 2), (1, 1), 1.0),
+                        ],
+                    )],
+                ),
+                (
+                    "a structure of two layers",
+                    vec![
+                        layer(
+                            (3, 2),
+                            vec![step((0, 1), (1, 3), 0.0), step((1, 3), (1, 1), 1.0)],
+                        ),
+                        layer((1, 2), vec![step((1, 4), (3, 4), 1.0)]),
+                    ],
+                ),
+            ]
+        };
+        // The steps as they are, and with a number that fills each cycle
+        // added: a step of several cycles then has a part in each of them.
+        let receiver = |layers: &[SequenceLayer], cut: bool| {
+            let steps = built(layers);
+            if !cut {
+                return steps;
+            }
+            let each_cycle = built(&[layer((1, 1), vec![step((0, 1), (1, 1), 16.0)])]);
+            compose(&steps, &each_cycle, ComposeOp::Add, Alignment::In)
+        };
+        let mut folds = Vec::new();
+        for (name, layers) in sequences() {
+            for (structure_name, structure) in structures() {
+                // `struct` and `mask`, and numbers that the values add to.
+                let chains: [(&str, ComposeOp, Alignment); 3] = [
+                    ("struct", ComposeOp::KeepIf, Alignment::Out),
+                    ("mask", ComposeOp::KeepIf, Alignment::In),
+                    ("add out", ComposeOp::Add, Alignment::Out),
+                ];
+                for ((chain_name, op, how), cut) in chains
+                    .into_iter()
+                    .flat_map(|chain| [(chain, false), (chain, true)])
+                {
+                    let cut_name = if cut { " cut at each cycle" } else { "" };
+                    let name = format!("{chain_name} of {name}{cut_name} with {structure_name}");
+                    let chain = || compose(&receiver(&layers, cut), &built(&structure), op, how);
+                    let folded = chain();
+                    if matches!(folded.node_kind(), Node::Sequence(_) | Node::Silence) {
+                        folds.push(name.clone());
+                    }
+                    assert_same_answers(&name, &folded, &unfolded(chain));
+                }
+            }
+        }
+        // Values of two layers answer each step layer by layer, and so do
+        // functions of two layers: any other pair is one node.
+        assert!(folds.len() >= 42, "{}: {folds:#?}", folds.len());
+    }
+
+    #[test]
+    fn a_scale_of_a_sequence_answers_as_the_map_of_each_hap() {
+        let scaled = |pattern: Pattern, name: &str| {
+            let degrees = pattern.map_control(&ControlSpec::new(["n"]), false);
+            crate::combinators::scale(&degrees, Value::Str(name.into()))
+        };
+        for (name, layers) in sequences() {
+            // The scale names each note and its own key of the context,
+            // and controls and another scale come after it.
+            let chains: [(&str, &dyn Fn(Pattern) -> Pattern); 3] = [
+                ("a scale", &|pattern: Pattern| scaled(pattern, "C:minor")),
+                ("controls after a scale", &|pattern: Pattern| {
+                    let gain =
+                        pure(Value::F64(0.5)).map_control(&ControlSpec::new(["gain"]), false);
+                    compose(
+                        &scaled(pattern, "D:dorian"),
+                        &gain,
+                        ComposeOp::Set,
+                        Alignment::In,
+                    )
+                }),
+                ("a scale of numbers", &|pattern: Pattern| {
+                    crate::combinators::scale(&pattern, Value::Str("E:major".into()))
+                }),
+            ];
+            for (chain_name, chain) in chains {
+                let folded = chain(built(&layers));
+                assert!(
+                    matches!(folded.node_kind(), Node::Sequence(_)),
+                    "{chain_name} of {name}"
+                );
+                assert_same_answers(
+                    &format!("{chain_name} of {name}"),
+                    &folded,
+                    &unfolded(|| chain(built(&layers))),
+                );
+            }
+        }
+        // A step that is no degree drops its hap at each query: the map
+        // keeps its node.
+        let text = |pattern: Pattern| {
+            let words = pattern.fmap(|_| Value::Str("no degree".into()));
+            crate::combinators::scale(&words, Value::Str("C:minor".into()))
+        };
+        let dropped = text(built(&sequences()[0].1));
+        assert!(!matches!(dropped.node_kind(), Node::Sequence(_)));
+        assert_same_answers(
+            "a step that is no degree",
+            &dropped,
+            &unfolded(|| text(built(&sequences()[0].1))),
+        );
+    }
+
+    /// A control of a constant takes the short way to its fold. The fold is
+    /// the one that the composition of the control's pattern gives, and it
+    /// answers as the nodes it stands for.
+    #[test]
+    fn a_control_of_a_constant_folds_as_its_composition_folds() {
+        let gain = ControlSpec::new(["gain"]);
+        let sound = ControlSpec::new(["s"]);
+        let constants: [(&str, &dyn Fn() -> Pattern); 3] = [
+            ("a number", &|| pure(Value::F64(0.5))),
+            ("a number at a place", &|| located_value(0.25)),
+            ("one step", &|| {
+                built(&[layer((1, 1), vec![step((0, 1), (1, 1), 3.0)])])
+            }),
+        ];
+        for (name, layers) in sequences() {
+            let notes = || built(&layers).map_control(&ControlSpec::new(["n"]), false);
+            for (constant_name, constant) in constants {
+                let name = format!("{constant_name} on {name}");
+                let set = gain.apply(&notes(), Some(constant()));
+                let composed = compose(
+                    &notes(),
+                    &gain.pattern(&constant()),
+                    ComposeOp::Set,
+                    Alignment::In,
+                );
+                assert_eq!(
+                    matches!(set.node_kind(), Node::Sequence(_)),
+                    matches!(composed.node_kind(), Node::Sequence(_)),
+                    "{name}"
+                );
+                assert_same_haps(&name, &set, &composed);
+                // Each control has a place of its own, so their order shows.
+                let chain = |pattern: Pattern| {
+                    let quiet = gain.apply(&pattern, Some(constant()));
+                    sound.apply(&quiet, Some(located_value(7.0)))
+                };
+                assert_same_answers(&name, &chain(notes()), &unfolded(|| chain(notes())));
+            }
+        }
+    }
+
+    /// A part lies in one cycle in every turn of a period when each turn,
+    /// read on its own, holds the part in one cycle.
+    #[test]
+    fn a_part_lies_in_cycles_when_each_turn_holds_it_in_one() {
+        for period in [
+            (1, 1),
+            (3, 1),
+            (1, 2),
+            (3, 2),
+            (2, 3),
+            (5, 3),
+            (7, 4),
+            (5, 6),
+        ] {
+            let period = frac(period);
+            let twelfths = (period * frac((12, 1))).floor().numer();
+            for (begin, end) in
+                (0..twelfths).flat_map(|begin| (begin + 1..=twelfths).map(move |end| (begin, end)))
+            {
+                let part = TimeSpan::new(frac((begin, 12)), frac((end, 12)));
+                let in_each_turn = (0..period.denom()).all(|turn| {
+                    let start = period * frac((turn, 1));
+                    part.end + start <= (part.begin + start).floor() + Fraction::ONE
+                });
+                let place = Place::at(part, None, 0, Locations::new());
+                assert_eq!(
+                    lie_in_cycles(period, &[place]),
+                    in_each_turn,
+                    "{part:?} of a period of {period:?}"
+                );
+            }
+        }
+    }
+
+    /// A step whose time in cycles leaves the native range is no sequence.
+    #[test]
+    fn a_time_outside_the_native_range_is_no_sequence() {
+        let far = layer((i128::MAX, 1), vec![step((2, 3), (1, 1), 0.0)]);
+        assert!(sequence(vec![far]).is_none());
+    }
+
+    /// The four equal steps of a cycle, at a source that reads no span
+    /// of a time finer than a part in a thousand.
+    struct Quarters;
+
+    impl StepSource for Quarters {
+        fn count(&self) -> usize {
+            4
+        }
+
+        fn steps(
+            &self,
+            begin: Fraction,
+            end: Fraction,
+            each: &mut dyn FnMut(SourceStep),
+        ) -> Option<()> {
+            for quarter in 0..4 {
+                if begin.denom() > 1000 && quarter == 1 {
+                    return None;
+                }
+                let (from, to) = (frac((quarter, 4)), frac((quarter + 1, 4)));
+                let holds = from <= begin && begin < to;
+                if holds || (begin < from && from < end) {
+                    let mut locations = Locations::new();
+                    locations.push((quarter as usize, quarter as usize + 1));
+                    each(SourceStep {
+                        begin: from,
+                        end: to,
+                        value: quarter as u32,
+                        locations,
+                    });
+                }
+            }
+            Some(())
+        }
+    }
+
+    /// A layer that reads its steps from a source answers as a layer that
+    /// lists the same steps: for a query that walks it, for a table of it,
+    /// and for a fold of it, which both list the steps.
+    #[test]
+    fn steps_at_a_source_answer_as_the_same_steps_in_a_list() {
+        let values = (0..4).map(|value| Value::F64(f64::from(value)));
+        let sourced = SourcedLayer {
+            period: Fraction::ONE,
+            values: values.collect(),
+            in_cycles: true,
+            steps: Arc::new(Quarters),
+        };
+        let read = sequence_of(vec![GivenLayer::Sourced(sourced)]).expect("a sound layer");
+        let steps = (0..4).map(|at| step((at, 4), (at + 1, 4), at as f64));
+        let listed = built(&[layer((1, 1), steps.collect())]);
+        let twice = |pattern: &Pattern| faster(pattern, frac((2, 1))).expect("a sequence");
+        let instant = (frac((1, 4)), frac((1, 4)));
+        // The source reads no span of a time this fine: the layer lists
+        // its steps for it.
+        let fine = (frac((1, 1024)), frac((3, 4)));
+        // Folds that move no step leave the steps at their source: a
+        // name, a scale, which tags each hap, and a location.
+        let noted = |pattern: &Pattern| {
+            let steps = pattern.map_control(&ControlSpec::new(["n"]), false);
+            let notes = crate::combinators::scale(&steps, Value::Str("C:minor".into()));
+            notes.with_added_context(vec![(7, 8)])
+        };
+        // A walked handle reads the source at each query, with no table.
+        let (walked, noted_walk) = (read.mark_walked(), noted(&read).mark_walked());
+        for (begin, end) in spans().into_iter().chain([instant, fine]) {
+            assert_eq!(
+                answers(&walked, begin, end),
+                answers(&listed, begin, end),
+                "a walk over {begin:?}..{end:?}"
+            );
+            assert_eq!(
+                answers(&noted_walk, begin, end),
+                answers(&noted(&listed), begin, end),
+                "a walk of notes over {begin:?}..{end:?}"
+            );
+        }
+        for (begin, end) in spans().into_iter().chain([instant]) {
+            assert_eq!(
+                answers(&read, begin, end),
+                answers(&listed, begin, end),
+                "over {begin:?}..{end:?}"
+            );
+            assert_eq!(
+                answers(&twice(&read), begin, end),
+                answers(&twice(&listed), begin, end),
+                "twice as fast, over {begin:?}..{end:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_short_source_in_a_long_period_keeps_its_rests_and_locations() {
+        let period = Fraction::int(8);
+        let read = sequence_of(vec![GivenLayer::Sourced(SourcedLayer {
+            period,
+            values: (0..4).map(|at| Value::F64(f64::from(at))).collect(),
+            in_cycles: true,
+            steps: Arc::new(Quarters),
+        })])
+        .unwrap();
+        let steps = (0..4)
+            .map(|at| step((at, 32), (at + 1, 32), at as f64))
+            .collect();
+        let listed = built(&[SequenceLayer { period, steps }]);
+        let located = |pattern: Pattern| pattern.with_added_context(vec![(70, 72)]).mark_walked();
+        let (read, listed) = (located(read), located(listed));
+        for eighth in -67..=67 {
+            let begin = Fraction::new(eighth, 8);
+            for width in [Fraction::ZERO, frac((1, 7)), frac((17, 2))] {
+                let end = begin + width;
+                assert_eq!(
+                    answers(&read, begin, end),
+                    answers(&listed, begin, end),
+                    "{begin:?}..{end:?}"
+                );
+            }
+        }
+    }
+
+    /// Equal data values of a layer are one value, which its steps share.
+    #[test]
+    fn equal_values_of_a_layer_are_one_value() {
+        let steps = [0.0, 1.0, 0.0, 1.0, 2.0].iter().enumerate();
+        let steps = steps.map(|(at, value)| {
+            let at = at as i128;
+            step((at, 5), (at + 1, 5), *value)
+        });
+        let pattern = built(&[layer((1, 1), steps.collect())]);
+        let Node::Sequence(layers) = pattern.node_kind() else {
+            panic!("the steps are no sequence");
+        };
+        let shared: Vec<u32> = layers[0].places().iter().map(|place| place.value).collect();
+        assert_eq!(shared, [0, 1, 0, 1, 2]);
+        assert_eq!(layers[0].held_values().len(), 3);
+    }
+
+    /// Sets of constant controls in a row on a pattern that is no sequence
+    /// are one meeting of one node, and it answers as the applications one
+    /// by one:
+    /// for maps of controls under a control of a signal, for numbers, and
+    /// for strings and a function of the script, which no meeting takes in
+    /// place. The last control of the chain sets the key of the function,
+    /// so the lookup of each hap shows whether the controls met it in turn.
+    #[test]
+    fn sets_of_constants_in_a_row_are_one_meeting() {
+        use crate::controls::{ChainArgument, apply_chain};
+        let control = |name: &str| ControlSpec::new([name]);
+        // A filter keeps its node, so no control folds into the steps.
+        let kept = |layers: &[SequenceLayer]| built(layers).filter_haps(|_| true);
+        let function = Value::Function(std::sync::Arc::new(crate::value::FunctionRef::js(7)));
+        let bases: [Base<'_>; 4] = [
+            ("controls under a signal", &|layers| {
+                let notes = built(layers).map_control(&control("n"), false);
+                // A map of a signal is no wave, which a control goes under.
+                let cutoff = crate::signal::sine().fmap(Value::clone);
+                control("lpf").apply(&notes, Some(cutoff))
+            }),
+            ("numbers", &kept),
+            ("strings", &|layers| {
+                kept(layers).fmap(|value| Value::Str(value.show().into()))
+            }),
+            ("a function of the script", &|layers| {
+                // A handle of the function for each hap.
+                let function = function.clone();
+                kept(layers).fmap(move |value| {
+                    Value::object([
+                        ("n".to_owned(), value.clone()),
+                        ("room".to_owned(), function.clone()),
+                    ])
+                })
+            }),
+        ];
+        // The second gain takes the place of the first, and each control
+        // has a place of its own, so their order shows.
+        let chain = |pattern: Pattern| {
+            ["gain", "pan", "gain", "room"].iter().enumerate().fold(
+                pattern,
+                |pattern, (index, name)| {
+                    control(name).apply(&pattern, Some(located_value(index as f64 + 0.5)))
+                },
+            )
+        };
+        let specs = ["gain", "pan", "gain", "room"].map(control);
+        let row = |pattern: Pattern| {
+            let numbers = (0..).map(|index| ChainArgument::Number(f64::from(index) + 0.5));
+            let calls: Vec<_> = specs.iter().zip(numbers).collect();
+            apply_chain(pattern, &calls)
+        };
+        for (name, layers) in sequences() {
+            for (base_name, base) in bases {
+                let name = format!("{base_name} of {name}");
+                let joined = chain(base(&layers));
+                let Node::Constants(node) = joined.node_kind() else {
+                    panic!("{name} is no run of constants");
+                };
+                let (under, run) = (&node.0, &node.1);
+                assert_eq!(run.len(), 1, "{name}");
+                assert!(!matches!(under.node_kind(), Node::Constants(..)), "{name}");
+                assert_same_answers(&name, &joined, &unfolded(|| chain(base(&layers))));
+                // A row on a stack is one such meeting on the pattern of
+                // the stack that takes no control.
+                let stacked = || {
+                    let notes = built(&layers).map_control(&control("n"), false);
+                    crate::stack(vec![notes, base(&layers)])
+                };
+                let name = format!("a row on a stack of {name}");
+                assert_same_answers(&name, &row(stacked()), &unfolded(|| row(stacked())));
+            }
+        }
+    }
+
+    /// A chain of controls answers as its controls applied in turn, with
+    /// no fold: for constants in a row, for a pattern between them, for a
+    /// control that a union keeps out, and for the name of a wave over the
+    /// steps. The steps of a sequence, of a pick and under a wave hold the
+    /// constants, and a pattern that keeps its node holds none.
+    #[test]
+    fn a_chain_of_controls_answers_as_each_control_in_turn() {
+        use crate::controls::{ChainArgument, apply_chain};
+        let number = |name: &'static str, n: f64| (name, ChainArgument::Number(n));
+        let pattern = |name: &'static str, values: Pattern| (name, ChainArgument::Pattern(values));
+        let two_steps = || {
+            built(&[layer(
+                (1, 1),
+                vec![step((0, 1), (1, 2), 20.0), step((1, 2), (1, 1), 21.0)],
+            )])
+        };
+        type Chain = Vec<(&'static str, ChainArgument)>;
+        let chains: [(&str, &dyn Fn() -> Chain); 4] = [
+            ("constants in a row", &|| {
+                vec![
+                    number("gain", 0.5),
+                    pattern("s", located_value(7.0)),
+                    number("pan", 0.25),
+                    number("gain", 0.75),
+                    pattern("room", located_value(3.0)),
+                ]
+            }),
+            ("a pattern between constants", &|| {
+                vec![
+                    number("gain", 0.5),
+                    number("pan", 0.25),
+                    pattern("cutoff", two_steps()),
+                    pattern("room", located_value(3.0)),
+                    number("gain", 1.5),
+                ]
+            }),
+            ("a control named value", &|| {
+                vec![
+                    number("gain", 0.5),
+                    number("value", 2.0),
+                    number("pan", 0.25),
+                ]
+            }),
+            ("the name of the wave", &|| {
+                vec![
+                    number("gain", 0.5),
+                    number("lpf", 300.0),
+                    number("pan", 0.25),
+                ]
+            }),
+        ];
+        let control = |name: &str| ControlSpec::new([name]);
+        let notes = |layers: &[SequenceLayer]| built(layers).map_control(&control("n"), false);
+        let kept = |layers: &[SequenceLayer]| notes(layers).filter_haps(|_| true);
+        let waved = |layers: &[SequenceLayer]| {
+            control("lpf").apply(&notes(layers), Some(crate::signal::sine()))
+        };
+        let picked = |layers: &[SequenceLayer]| {
+            let selector = built(&[layer(
+                (2, 1),
+                vec![step((0, 1), (1, 2), 0.0), step((1, 2), (1, 1), 1.0)],
+            )]);
+            let lookup = crate::PickLookup::Array {
+                enumerable_len: 2,
+                length: 2,
+                entries: vec![(0, notes(layers)), (1, waved(layers))],
+            };
+            let (index, join) = (crate::PickIndexMode::Clamp, crate::JoinMode::Restart);
+            crate::pick(selector, lookup, index, join)
+        };
+        // A run of sets holds each control apart, also those of a chain.
+        let run = |layers: &[SequenceLayer]| {
+            control("gain").apply(&kept(layers), Some(located_value(0.125)))
+        };
+        // A pattern of the stack that takes no control meets each row as
+        // one meeting, which strings meet control by control.
+        let stacked = |layers: &[SequenceLayer]| {
+            crate::stack(vec![
+                notes(layers),
+                waved(layers),
+                picked(layers),
+                kept(layers).fmap(|value| Value::Str(value.show().into())),
+            ])
+        };
+        let segmented =
+            |layers: &[SequenceLayer]| crate::combinators::segment(&stacked(layers), frac((4, 1)));
+        // Strings meet each control of a run one by one, with the name of
+        // the wave over the run at its place.
+        let strings = |layers: &[SequenceLayer]| {
+            let named = kept(layers).fmap(|value| Value::Str(value.show().into()));
+            let quiet = control("gain").apply(&named, Some(located_value(0.125)));
+            control("lpf").apply(&quiet, Some(crate::signal::sine()))
+        };
+        let bases: [Base<'_>; 8] = [
+            ("a sequence", &notes),
+            ("steps under a wave", &waved),
+            ("a pick", &picked),
+            ("a stack", &stacked),
+            ("a segment of a stack", &segmented),
+            ("a pattern that keeps its node", &kept),
+            ("a wave over a run of sets on strings", &strings),
+            ("a run of sets", &run),
+        ];
+        for (name, layers) in sequences() {
+            let (_, row) = chains[0];
+            let specs: Vec<ControlSpec> = row().iter().map(|(name, _)| control(name)).collect();
+            let calls: Vec<_> = specs
+                .iter()
+                .zip(row())
+                .map(|(spec, call)| (spec, call.1))
+                .collect();
+            let set = apply_chain(run(&layers), &calls);
+            let Node::Constants(set_node) = set.node_kind() else {
+                panic!("{name} is no run of constants");
+            };
+            assert_eq!(set_node.1.len(), 1, "{name}");
+            for (base_name, base) in bases {
+                for (chain_name, chain) in chains {
+                    let name = format!("{chain_name} on {base_name} of {name}");
+                    let specs: Vec<ControlSpec> =
+                        chain().iter().map(|(name, _)| control(name)).collect();
+                    let calls = || {
+                        specs
+                            .iter()
+                            .zip(chain())
+                            .map(|(spec, (_, value))| (spec, value))
+                    };
+                    let set = apply_chain(base(&layers), &calls().collect::<Vec<_>>());
+                    let in_turn = || {
+                        calls().fold(base(&layers), |pattern, (spec, value)| match value {
+                            ChainArgument::Number(n) => spec.apply_value(pattern, Value::F64(n)),
+                            ChainArgument::Constant(value, locations) => {
+                                if locations.is_empty() {
+                                    spec.apply_value(pattern, value)
+                                } else {
+                                    let values = crate::pure(value)
+                                        .with_added_context(locations.to_vec())
+                                        .with_steps(Some(Fraction::ONE));
+                                    spec.apply_to(pattern, Some(values))
+                                }
+                            }
+                            ChainArgument::ConstantPair(a, b, locations) => {
+                                let value = Value::List(Arc::from([a, b]));
+                                if locations.is_empty() {
+                                    spec.apply_value(pattern, value)
+                                } else {
+                                    let values = crate::pure(value)
+                                        .with_added_context(locations.to_vec())
+                                        .with_steps(Some(Fraction::ONE));
+                                    spec.apply_to(pattern, Some(values))
+                                }
+                            }
+                            ChainArgument::Wave(wave, steps, math_inside, op_flags) => spec
+                                .apply_to(
+                                    pattern,
+                                    Some(wave.to_pattern(math_inside, steps, op_flags)),
+                                ),
+                            ChainArgument::Pattern(values) => spec.apply_to(pattern, Some(values)),
+                        })
+                    };
+                    assert_same_answers(&name, &set, &unfolded(in_turn));
+                }
+            }
+        }
+    }
+
+    /// A receiver that no other handle holds takes a constant control where
+    /// it is, and answers as a copy that took it. A query before the control
+    /// leaves tables and a reading of the constant on the node, which answer
+    /// no query after it. A receiver that another handle holds stays as it
+    /// was.
+    #[test]
+    fn a_receiver_held_alone_takes_a_control_where_it_is() {
+        let control = |name: &str| ControlSpec::new([name]);
+        let notes = |layers: &[SequenceLayer]| built(layers).map_control(&control("n"), false);
+        let bases: [Base<'_>; 3] = [
+            ("a sequence", &notes),
+            ("one set", &|layers| {
+                let swept = control("lpf").apply(&notes(layers), Some(crate::signal::sine()));
+                control("gain").apply(&swept, Some(located_value(0.25)))
+            }),
+            ("a run of sets", &|layers| {
+                let swept = control("lpf").apply(&notes(layers), Some(crate::signal::sine()));
+                let quiet = control("gain").apply(&swept, Some(located_value(0.25)));
+                control("room").apply(&quiet, Some(located_value(0.75)))
+            }),
+        ];
+        // The control goes to the steps of each picked pattern.
+        let picked = |layers: &[SequenceLayer], mode| {
+            // A restart takes a selector whose steps begin on whole cycles.
+            let period = match mode {
+                crate::JoinMode::Restart => (2, 1),
+                _ => (1, 1),
+            };
+            let selector = built(&[layer(
+                period,
+                vec![step((0, 1), (1, 2), 0.0), step((1, 2), (1, 1), 1.0)],
+            )]);
+            let lookup = crate::PickLookup::Array {
+                enumerable_len: 2,
+                length: 2,
+                entries: vec![
+                    (0, notes(layers)),
+                    (
+                        1,
+                        control("gain").apply(&notes(layers), Some(located_value(0.25))),
+                    ),
+                ],
+            };
+            crate::pick(selector, lookup, crate::PickIndexMode::Clamp, mode)
+        };
+        let inner = |layers: &[SequenceLayer]| picked(layers, crate::JoinMode::Inner);
+        let restart = |layers: &[SequenceLayer]| picked(layers, crate::JoinMode::Restart);
+        // The control goes to each pattern of a stack: steps, steps under a
+        // wave, a pick and silence.
+        let stacked = |layers: &[SequenceLayer]| {
+            let swept = control("lpf").apply(&notes(layers), Some(crate::signal::sine()));
+            let quiet = control("gain").apply(&notes(layers), Some(located_value(0.25)));
+            crate::stack(vec![quiet, swept, restart(layers), crate::silence()])
+        };
+        // A pattern of a stack that takes no control meets a constant of
+        // it, and each other pattern takes the control.
+        let kept = |layers: &[SequenceLayer]| {
+            crate::stack(vec![notes(layers), notes(layers).filter_haps(|_| true)])
+        };
+        // The control goes to the steps under a structure that gives its
+        // haps nothing more: the pulses of a segment, in each cycle.
+        let segmented = |layers: &[SequenceLayer]| {
+            let swept = control("lpf").apply(&notes(layers), Some(crate::signal::sine()));
+            crate::combinators::segment(&crate::stack(vec![swept, notes(layers)]), frac((4, 1)))
+        };
+        // A structure with places in the text keeps the control over it.
+        // Pulses that cross the cycles cut each hap of the steps to a part
+        // in its cycle, so the control goes to the steps.
+        let struck = |layers: &[SequenceLayer]| {
+            let structure = built(&[layer(
+                (1, 1),
+                vec![step((0, 1), (1, 2), 1.0), step((1, 2), (1, 1), 0.0)],
+            )]);
+            crate::compose::compose(
+                &notes(layers),
+                &structure,
+                crate::compose::ComposeOp::KeepIf,
+                crate::compose::Alignment::Out,
+            )
+        };
+        let crossed = |layers: &[SequenceLayer]| {
+            let pulse = SequenceStep::new(
+                Fraction::ZERO,
+                Fraction::ONE,
+                Value::Bool(true),
+                Locations::new(),
+            );
+            let structure = built(&[layer((3, 2), vec![pulse])]);
+            let swept = control("lpf").apply(&notes(layers), Some(crate::signal::sine()));
+            crate::compose::compose(
+                &crate::stack(vec![swept, notes(layers)]),
+                &structure,
+                crate::compose::ComposeOp::KeepIf,
+                crate::compose::Alignment::Out,
+            )
+        };
+        let bases = bases.into_iter().chain([
+            ("a pick", &inner as _),
+            ("a pick that restarts", &restart as _),
+            ("a stack", &stacked as _),
+            ("a stack that keeps a node", &kept as _),
+            ("a segment", &segmented as _),
+            ("a structure with places", &struck as _),
+            ("pulses that cross cycles", &crossed as _),
+        ]);
+        let pan = |pattern: Pattern| control("pan").apply_to(pattern, Some(located_value(0.5)));
+        let ask = |pattern: &Pattern| {
+            for (begin, end) in spans() {
+                pattern.query_arc(begin, end);
+            }
+        };
+        let mut written = 0;
+        for (name, layers) in sequences() {
+            for (base_name, base) in bases.clone() {
+                let name = format!("{base_name} of {name}");
+                let alone = base(&layers);
+                let node = Arc::as_ptr(&alone.node);
+                ask(&alone);
+                let alone = pan(alone);
+                written += usize::from(Arc::as_ptr(&alone.node) == node);
+
+                let held = base(&layers);
+                ask(&held);
+                // A handle of the receiver, which `held` keeps.
+                let copied = pan(held.clone());
+                assert_same_answers(&name, &alone, &copied);
+                assert_same_answers(&name, &held, &base(&layers));
+                assert_same_answers(&name, &alone, &unfolded(|| pan(base(&layers))));
+            }
+        }
+        // Each base of each sequence whose steps lie in one cycle.
+        assert!(written >= 7 * 4, "written where it is: {written}");
+    }
+
+    /// A control of a number, with no pattern of the number, answers as the
+    /// control of a `pure` of it: on a sequence, on a set of a constant, and
+    /// on a pattern that takes no control where it is.
+    #[test]
+    fn a_control_of_a_number_answers_as_the_control_of_its_pure() {
+        let control = |name: &str| ControlSpec::new([name]);
+        let notes = |layers: &[SequenceLayer]| built(layers).map_control(&control("n"), false);
+        let bases: [Base<'_>; 3] = [
+            ("a sequence", &notes),
+            ("a set", &|layers| {
+                let swept = control("lpf").apply(&notes(layers), Some(crate::signal::sine()));
+                control("room").apply(&swept, Some(located_value(0.25)))
+            }),
+            ("a filter", &|layers| notes(layers).filter_haps(|_| true)),
+        ];
+        for (name, layers) in sequences() {
+            for (base_name, base) in bases {
+                let name = format!("{base_name} of {name}");
+                let number = control("gain").apply_value(base(&layers), Value::F64(0.5));
+                let reified = control("gain").apply(&base(&layers), Some(pure(Value::F64(0.5))));
+                assert_eq!(
+                    std::mem::discriminant(number.node_kind()),
+                    std::mem::discriminant(reified.node_kind()),
+                    "{name}"
+                );
+                assert_same_answers(&name, &number, &reified);
+            }
+        }
+    }
+
+    /// A control of a pattern of many steps, on a pattern that is no
+    /// sequence, asks the steps one time for all the haps of a query. The
+    /// haps that it then makes are those that each hap makes when it asks
+    /// the steps over its own part.
+    #[test]
+    fn a_control_of_many_steps_asks_them_one_time() {
+        let control = |name: &str| ControlSpec::new([name]);
+        let kept = |layers: &[SequenceLayer]| {
+            built(layers)
+                .map_control(&control("n"), false)
+                .filter_haps(|_| true)
+        };
+        let steps = |period: (i128, i128), count: i128| {
+            let step = |at: i128| step((at, count), (at + 1, count), at as f64);
+            built(&[layer(period, (0..count).map(step).collect())])
+        };
+        let values: [(&str, &dyn Fn() -> Pattern); 3] = [
+            ("eight steps a cycle", &|| steps((1, 1), 8)),
+            ("five steps in a cycle and a half", &|| steps((3, 2), 5)),
+            ("a chord of steps", &|| {
+                stack(vec![steps((1, 1), 8), steps((1, 2), 3)]).filter_haps(|_| true)
+            }),
+        ];
+        let said = |haps: &[Hap]| {
+            haps.iter()
+                .map(|hap| format!("{hap:?}"))
+                .collect::<Vec<_>>()
+        };
+        let mut asked_one_time = 0;
+        for (name, layers) in sequences() {
+            for (values_name, values) in values {
+                let name = format!("{values_name} on {name}");
+                let applied = control("gain").apply(&kept(&layers), Some(values()));
+                let side = crate::ValueSide::of(applied.node_kind()).expect("an application");
+                for (begin, end) in spans() {
+                    let state = State::new(TimeSpan::new(begin, end));
+                    let functions = side.functions.query(&state);
+                    let mut one_query = Vec::new();
+                    if !side.met_in_one_query(&mut functions.clone(), &state, &mut one_query) {
+                        continue;
+                    }
+                    asked_one_time += 1;
+                    let mut each = Vec::new();
+                    let mut meetings = crate::Meetings::default();
+                    for hf in functions {
+                        assert!(side.meet(hf, &mut meetings, &state, 0, &mut each));
+                    }
+                    assert_eq!(said(&one_query), said(&each), "{name}: {begin:?}..{end:?}");
+                }
+            }
+        }
+        assert!(asked_one_time >= 30, "asked one time: {asked_one_time}");
+    }
+
+    /// A union with a map of `value` alone keeps the other side as it is, so
+    /// a set of such a map joins no run.
+    #[test]
+    fn a_set_that_a_union_drops_joins_no_run() {
+        let gain = ControlSpec::new(["gain"]);
+        let value_alone = ControlSpec::new(["value"]);
+        for (name, layers) in sequences() {
+            let base = || {
+                built(&layers)
+                    .map_control(&ControlSpec::new(["n"]), false)
+                    .filter_haps(|_| true)
+            };
+            let chains: [(&str, [&ControlSpec; 2]); 2] = [
+                ("dropped first", [&value_alone, &gain]),
+                ("dropped last", [&gain, &value_alone]),
+            ];
+            for (chain_name, controls) in chains {
+                let name = format!("{chain_name} on {name}");
+                let chain = || {
+                    controls.iter().fold(base(), |pattern, control| {
+                        control.apply(&pattern, Some(located_value(0.5)))
+                    })
+                };
+                assert_same_answers(&name, &chain(), &unfolded(chain));
+            }
+        }
+    }
+
+    /// A row with the name of a wave, on a stack with a pattern under that
+    /// wave: the control of that name meets the pattern after the wave, and
+    /// the other control goes under the wave, into the steps.
+    #[test]
+    fn a_row_with_the_name_of_a_wave_sets_the_others_under_it() {
+        use crate::controls::{ChainArgument, apply_chain};
+        let (gain, lpf) = (ControlSpec::new(["gain"]), ControlSpec::new(["lpf"]));
+        for (name, layers) in sequences() {
+            let stacked = || {
+                let notes = || built(&layers).map_control(&ControlSpec::new(["n"]), false);
+                let waved = lpf.apply(&notes(), Some(crate::signal::sine()));
+                crate::stack(vec![notes(), waved])
+            };
+            let row = [
+                (&gain, ChainArgument::Number(0.5)),
+                (&lpf, ChainArgument::Number(800.0)),
+            ];
+            let set = apply_chain(stacked(), &row);
+            assert_same_answers(name, &set, &unfolded(|| apply_chain(stacked(), &row)));
+            // Steps that lie in one cycle take a row where they are.
+            if !lies_in_cycles(&built(&layers)) {
                 continue;
             }
-            for layer in layers(pattern)?.iter() {
-                buf[len] = Some(layer.clone());
-                len += 1;
+            let second_kind = match set.node_kind() {
+                Node::Stack(patterns) => patterns[1].node_kind(),
+                Node::StackPure(cells) => &cells[1].kind,
+                _ => panic!("{name} is no stack"),
+            };
+            let Node::Constants(node) = second_kind else {
+                panic!("the wave of {name} meets no constant");
+            };
+            let run = &node.1;
+            assert_eq!(run.len(), 1, "{name}");
+        }
+    }
+
+    /// A `set` that gives its hap another lookup than a `set` of controls
+    /// does joins no run, and no control joins it.
+    #[test]
+    fn a_set_of_another_lookup_joins_no_run() {
+        let gain = ControlSpec::new(["gain"]);
+        for (name, layers) in sequences() {
+            let chain = || {
+                let notes = built(&layers)
+                    .map_control(&ControlSpec::new(["n"]), false)
+                    .filter_haps(|_| true);
+                let quiet = gain.pattern(&located_value(0.5));
+                let set = notes.app_left_composed(quiet, ComposeOp::Set, LookupFlow::Left);
+                ControlSpec::new(["pan"]).apply(&set, Some(located_value(1.5)))
+            };
+            let set = chain();
+            let Node::Constants(node) = set.node_kind() else {
+                panic!("{name} is no run of constants");
+            };
+            let run = &node.1;
+            assert_eq!(run.len(), 2, "{name}");
+            assert_same_answers(name, &set, &unfolded(chain));
+        }
+    }
+
+    /// A pick whose patterns take no control where they are folds a
+    /// constant control into the steps of each, when the steps lie in one
+    /// cycle: no run of constants is made over the pick.
+    #[test]
+    fn a_pick_folds_a_control_that_its_steps_do_not_take() {
+        for (name, layers) in sequences() {
+            let chain = || {
+                let selector = built(&[layer((1, 1), vec![step((0, 1), (1, 1), 0.0)])]);
+                let lookup = crate::PickLookup::Array {
+                    enumerable_len: 1,
+                    length: 1,
+                    // Steps of numbers hold no map for a control to go in.
+                    entries: vec![(0, built(&layers))],
+                };
+                let (index, join) = (crate::PickIndexMode::Clamp, crate::JoinMode::Restart);
+                let picked = crate::pick(selector, lookup, index, join);
+                ControlSpec::new(["gain"]).apply(&picked, Some(located_value(0.5)))
+            };
+            let folded = matches!(chain().node_kind(), Node::Pick(..));
+            assert_eq!(folded, lies_in_cycles(&built(&layers)), "{name}");
+            assert_same_answers(name, &chain(), &unfolded(chain));
+        }
+    }
+
+    /// A function call gives a handle that binds the runtime of the call.
+    #[test]
+    fn a_fold_reads_data_through_the_runtime_that_a_handle_binds() {
+        let bound = |pattern: Pattern| {
+            pattern.with_runtime_settings(crate::settings::RuntimeSettings::default())
+        };
+        let changed = |pattern: Pattern| {
+            stack(vec![
+                pattern,
+                bound(located_value(2.0)),
+                bound(crate::silence()),
+            ])
+            .map_control(&ControlSpec::new(["n"]), false)
+            .fast(frac((3, 2)))
+        };
+        for (name, layers) in sequences() {
+            let folded = changed(bound(built(&layers)));
+            assert!(matches!(folded.node_kind(), Node::Sequence(_)), "{name}");
+            assert_same_answers(name, &folded, &unfolded(|| changed(bound(built(&layers)))));
+        }
+        // A list of haps is no data: a query reads it under the runtime.
+        let haps = bound(pure(Value::Haps(crate::value::HapList::new(Vec::new()))));
+        let kept = stack(vec![built(&sequences()[0].1), haps]);
+        assert!(matches!(
+            kept.node_kind(),
+            Node::Stack(_) | Node::StackPure(_)
+        ));
+    }
+
+    #[test]
+    fn a_stack_and_a_speed_of_sequences_answer_as_their_own_nodes() {
+        let all = || sequences().into_iter().map(|(_, layers)| built(&layers));
+        let stacked = || stack(all().collect());
+        let folded = stacked();
+        assert!(matches!(folded.node_kind(), Node::Sequence(_)));
+        assert_same_answers("a stack", &folded, &unfolded(stacked));
+        for (name, layers) in sequences() {
+            for factor in [(2, 1), (1, 3), (3, 2), (5, 7)] {
+                let sped = |pattern: Pattern| pattern.fast(frac(factor)).slow(frac((2, 1)));
+                let folded = sped(built(&layers));
+                assert!(matches!(folded.node_kind(), Node::Sequence(_)), "{name}");
+                assert_same_answers(
+                    &format!("{name} at {factor:?}"),
+                    &folded,
+                    &unfolded(|| sped(built(&layers))),
+                );
             }
         }
-        return Some(node_of_sound_stack(&mut buf, len));
     }
-    let mut stacked = Vec::with_capacity(total);
-    for pattern in patterns {
-        if pattern.is_rest() && folds(pattern) {
-            continue;
-        }
-        stacked.extend(layers(pattern)?.iter().cloned());
-    }
-    Some(node_of_sound(stacked))
-}
 
-/// Try to rescale an owned `Node::Sequence` by `factor` in place when unshared,
-/// updating unshared `CompactGrid`s in place with zero heap allocations.
-pub(crate) fn faster_in_place(layers: &mut Arc<[Layer]>, factor: Fraction) -> bool {
-    if factor <= Fraction::ZERO {
-        return false;
-    }
-    let small =
-        |period: &Fraction| period.numer() <= MAX_PERIOD_TERM && period.denom() <= MAX_PERIOD_TERM;
-    let Some(slice) = Arc::get_mut(layers) else {
-        return false;
-    };
-    // Validate every layer's new period fits before mutating any layer.
-    for layer in slice.iter() {
-        if layer.period().checked_div(factor).filter(small).is_none() {
-            return false;
+    #[test]
+    fn a_fold_leaves_what_it_does_not_know_to_its_node() {
+        let steps = || built(&sequences()[0].1);
+        // Values of two layers, a factor that is not above zero, a handle
+        // that is marked volatile, and a stack with a signal in it.
+        let layered = built(&sequences()[1].1);
+        let unknown = [
+            compose(&steps(), &layered, ComposeOp::Add, Alignment::In),
+            steps().fast(frac((-2, 1))),
+            compose(
+                &steps().mark_volatile(),
+                &pure(Value::F64(1.0)),
+                ComposeOp::Add,
+                Alignment::In,
+            ),
+            stack(vec![steps(), crate::signal::saw()]),
+        ];
+        for pattern in unknown {
+            assert!(!matches!(pattern.node_kind(), Node::Sequence(_)));
         }
     }
-    // Fast path: when every layer has a listed CompactGrid, try in-place first,
-    // falling back per-layer to `GridView::faster` (which never mutates until
-    // all layers are validated).
-    if slice.len() == 1 {
-        let layer = &mut slice[0];
-        let period = layer.period().checked_div(factor).expect("validated");
-        if (layer.period_denom_flags & LAYER_DENOM_MASK) != 0
-            && let Steps::Listed(Listing::CompactGrid(grid)) = &mut layer.steps
-            && grid.try_faster_in_place(factor).is_some()
-        {
-            let in_cycles = match &layer.steps {
-                Steps::Listed(listing) => listing
-                    .with_grid_view(|view| view.in_cycles_for(period))
-                    .unwrap_or(false),
-                _ => false,
-            };
-            let steps = std::mem::replace(
-                &mut layer.steps,
-                Steps::Listed(Listing::CompactGrid(CompactGrid::OneStep([0; 12]))),
-            );
-            layer.set_in_cycles(in_cycles);
-            layer.set_period_and_steps(period, steps);
-            return true;
-        }
-        let listing = layer.listing();
-        if let Some(Some((new_listing, in_cycles))) =
-            listing.with_grid_view(|grid| grid.faster(factor, period))
-        {
-            layer.set_in_cycles(in_cycles);
-            layer.set_period_and_steps(period, Steps::Listed(new_listing));
-            return true;
-        }
-        return false;
+
+    fn text(value: &str) -> Value {
+        Value::Str(value.into())
     }
-    // Multi-layer owned sequence: ensure every layer can rescale via GridView
-    // before mutating any layer so partial mutation cannot happen.
-    let can_grid = slice.iter().all(|layer| {
-        let period = layer.period().checked_div(factor).expect("validated");
-        // Verify factor fits u32 and period fits; actual rescaling is infallible
-        // when grid.faster would succeed, so check via dry-run for non-inline or
-        // only proceed when all layers are listed CompactGrid/Grid with small ticks.
-        let _ = period;
-        matches!(
-            &layer.steps,
-            Steps::Listed(Listing::CompactGrid(_)) if (layer.period_denom_flags & LAYER_DENOM_MASK) != 0
+
+    fn map_of(entries: &[(&str, Value)]) -> Value {
+        Value::object(
+            entries
+                .iter()
+                .map(|(key, value)| (key.to_string(), value.clone())),
         )
-    });
-    if !can_grid {
-        return false;
     }
-    // Check that every layer's ticks won't overflow `GridView::faster` before mutating.
-    let f_num = match u32::try_from(factor.numer()) {
-        Ok(v) if v != 0 => v,
-        _ => return false,
-    };
-    let f_den = match u32::try_from(factor.denom()) {
-        Ok(v) if v != 0 => v,
-        _ => return false,
-    };
-    let all_fit = slice.iter().all(|layer| {
-        let Steps::Listed(listing) = &layer.steps else {
-            return false;
-        };
-        listing
-            .with_grid_view(|view| {
-                let g0 = gcd(u64::from(view.ticks.get()), u64::from(f_den)) as u32;
-                let ticks_1 = view.ticks.get() / g0;
-                let mul = f_den / g0;
-                let Some(ticks_2) = u64::from(ticks_1).checked_mul(u64::from(f_num)) else {
-                    return false;
-                };
-                if u32::try_from(ticks_2)
-                    .ok()
-                    .and_then(|v| i32::try_from(v).ok())
-                    .is_none()
-                {
-                    return false;
+
+    /// A layer of `values` that `names` and `set` dress.
+    fn dressed_layer(values: Vec<Value>, names: Option<&[&str]>, set: Option<Value>) -> Layer {
+        let raws: Vec<Raw> = (0..values.len())
+            .map(|at| {
+                let at = at as i128;
+                let whole = TimeSpan::new(frac((at, 4)), frac((at + 1, 4)));
+                Raw {
+                    whole,
+                    part: None,
+                    value: at as u32,
+                    locations: Locations::new(),
                 }
-                if mul > 1 {
-                    for i in 0..view.steps.len() {
-                        let (b, e) = view.steps.times_of(i);
-                        if u64::from(b)
-                            .checked_mul(u64::from(mul))
-                            .and_then(|v| u32::try_from(v).ok())
-                            .is_none()
-                            || u64::from(e)
-                                .checked_mul(u64::from(mul))
-                                .and_then(|v| u32::try_from(v).ok())
-                                .is_none()
-                        {
-                            return false;
-                        }
-                    }
-                }
-                true
             })
-            .unwrap_or(false)
-    });
-    if !all_fit {
-        return false;
-    }
-    for layer in slice.iter_mut() {
-        let period = layer.period().checked_div(factor).expect("validated");
-        if let Steps::Listed(Listing::CompactGrid(grid)) = &mut layer.steps
-            && grid.try_faster_in_place(factor).is_some()
-        {
-            let in_cycles = match &layer.steps {
-                Steps::Listed(listing) => listing
-                    .with_grid_view(|view| view.in_cycles_for(period))
-                    .unwrap_or(false),
-                _ => false,
-            };
-            let steps = std::mem::replace(
-                &mut layer.steps,
-                Steps::Listed(Listing::CompactGrid(CompactGrid::OneStep([0; 12]))),
-            );
-            layer.set_in_cycles(in_cycles);
-            layer.set_period_and_steps(period, steps);
-            continue;
-        }
-        let listing = layer.listing();
-        let (new_listing, in_cycles) = listing
-            .with_grid_view(|grid| grid.faster(factor, period))
-            .flatten()
-            .expect("validated grid faster");
-        layer.set_in_cycles(in_cycles);
-        layer.set_period_and_steps(period, Steps::Listed(new_listing));
-    }
-    true
-}
-
-/// `pattern`, `factor` times as fast, when it is a sequence or a constant
-/// and the factor is above zero.
-pub(crate) fn faster(pattern: &Pattern, factor: Fraction) -> Option<Pattern> {
-    let layers = layers(pattern)?;
-    if factor <= Fraction::ZERO {
-        return None;
-    }
-    let small =
-        |period: &Fraction| period.numer() <= MAX_PERIOD_TERM && period.denom() <= MAX_PERIOD_TERM;
-    let faster = |span: TimeSpan| {
-        Some(TimeSpan::new(
-            span.begin.checked_div(factor)?,
-            span.end.checked_div(factor)?,
-        ))
-    };
-    let rescale_layer = |layer: &Layer| -> Option<Layer> {
-        let period = layer.period().checked_div(factor).filter(small)?;
-        // The times of the steps are in cycles, so they change with
-        // the speed.
-        let listing = layer.listing();
-        if let Some(Some((new_listing, in_cycles))) =
-            listing.with_grid_view(|grid| grid.faster(factor, period))
-        {
-            return Some(layer.with(|layer| {
-                layer.set_in_cycles(in_cycles);
-                layer.set_period_and_steps(period, Steps::Listed(new_listing));
-            }));
-        }
-        let raws = (0..listing.len())
-            .map(|index| {
-                let (whole, part) = listing.times(index);
-                let part = match part {
-                    Some(part) => Some(faster(part)?),
-                    None => None,
-                };
-                Some(Raw {
-                    whole: faster(whole)?,
-                    part,
-                    value: listing.value(index),
-                    locations: listing.locations(index),
-                })
-            })
-            .collect::<Option<Vec<_>>>()?;
-        Some(layer.with(|layer| {
-            layer.set_in_cycles(lie_in_spans(period, raws.iter().map(Raw::part)));
-            layer.set_period_and_steps(period, Steps::Listed(Listing::of(raws)));
-        }))
-    };
-    if layers.len() <= 8 {
-        let mut buf: [Option<Layer>; 8] = Default::default();
-        for (slot, layer) in buf.iter_mut().zip(layers.iter()) {
-            *slot = Some(rescale_layer(layer)?);
-        }
-        return Some(node_of_sound_stack(&mut buf, layers.len()));
-    }
-    let layers = layers
-        .iter()
-        .map(rescale_layer)
-        .collect::<Option<Vec<_>>>()?;
-    Some(node_of_sound(layers))
-}
-
-/// `pattern` with each step `count` times in the time of the step, one
-/// after the other: what a `ply` makes of a sequence of whole steps of
-/// data, with no join at each query. `None` for any other pattern, for a
-/// step that is cut or has no width, for more than [`MAX_FOLDED_STEPS`]
-/// steps in a layer, and for a step that begins before the step before it
-/// ends: the join answers each of the one step and then each of the
-/// other, which is not the order of time that a layer has.
-pub(crate) fn plied(pattern: &Pattern, count: usize) -> Option<Pattern> {
-    let layers = layers(pattern)?;
-    let share = Fraction::int(i128::try_from(count).ok().filter(|count| *count > 0)?);
-    let layers = layers
-        .iter()
-        .map(|layer| {
-            let steps = layer.listing();
-            let listed = steps.len().checked_mul(count)?;
-            if !layer.is_data() || listed > MAX_FOLDED_STEPS {
-                return None;
-            }
-            let mut raws = Vec::with_capacity(listed);
-            let mut before = None;
-            for index in 0..steps.len() {
-                let whole = steps.whole(index);
-                let (begin, end) = (whole.begin, whole.end);
-                let sounds_on = count > 1 && before.is_some_and(|before| begin < before);
-                if steps.is_cut(index) || begin >= end || sounds_on {
-                    return None;
+            .collect();
+        let mut layer = Layer::new(frac((1, 1)), raws, values.into());
+        if let Some(names) = names {
+            let names: Arc<[Arc<str>]> = names.iter().map(|name| Arc::from(*name)).collect();
+            let id = crate::controls::builtin_id_of_names(&names);
+            layer.named_id = id;
+            layer.change_dress(|dress| {
+                if id == 0 {
+                    dress.set_custom_named(&names);
+                } else {
+                    dress.clear_custom_named();
                 }
-                before = Some(end);
-                let width = end.checked_sub(begin)?.checked_div(share)?;
-                let mut from = begin;
-                for at in 1..=count {
-                    // The last one ends where the step ends.
-                    let to = match at == count {
-                        true => end,
-                        false => {
-                            let at = Fraction::int(i128::try_from(at).ok()?);
-                            begin.checked_add(width.checked_mul(at)?)?
-                        }
-                    };
-                    raws.push(Raw {
-                        whole: TimeSpan::new(from, to),
-                        part: None,
-                        value: steps.value(index),
-                        locations: steps.locations(index),
-                    });
-                    from = to;
-                }
-            }
-            Some(layer.with(|layer| {
-                layer.set_in_cycles(lie_in_spans(layer.period(), raws.iter().map(Raw::part)));
-                layer.set_steps(Steps::Listed(Listing::of(raws)));
-            }))
-        })
-        .collect::<Option<Vec<_>>>()?;
-    Some(node_of_sound(layers))
-}
-
-fn clone_packed_runs(packed: PackedRunsRef<'_>) -> PackedRunsInput {
-    match packed {
-        PackedRunsRef::None => PackedRunsInput::None,
-        PackedRunsRef::Small(runs) => PackedRunsInput::Small(SmallPackedRuns::from_slice(runs)),
-        PackedRunsRef::Wide(runs) => PackedRunsInput::Wide(Box::from(runs)),
+                dress.assign_set(set);
+            });
+        } else {
+            layer.named_id = 0;
+            layer.change_dress(|dress| {
+                dress.clear_custom_named();
+                dress.assign_set(set);
+            });
+        }
+        layer
     }
-}
 
-fn pack_small_steps(steps: Vec<SmallGridStep>) -> GridSteps {
-    if steps.len() <= MAX_INLINE_GRID_LEN {
-        let mut arr = [GridSteps::ZERO_SMALL; MAX_INLINE_GRID_LEN];
-        arr[..steps.len()].copy_from_slice(&steps);
-        GridSteps::Inline(steps.len() as u8, arr)
-    } else {
-        GridSteps::Small(steps.into_boxed_slice())
-    }
-}
-
-/// Fold `rev()` onto a `Node::Sequence` whose layers are uncut, disjoint
-/// small grids with `period = 1/k` (`k >= 1`, `ticks % k == 0`).
-pub(crate) fn reversed(pattern: &Pattern) -> Option<Pattern> {
-    let layers = layers(pattern)?;
-    let rev_layer = |layer: &Layer| -> Option<Layer> {
-        if layer.source().is_some() || !layer.in_cycles() {
-            return None;
-        }
-        let period = layer.period();
-        if period.numer() != 1 {
-            return None;
-        }
-        let k = u32::try_from(period.denom()).ok()?;
-        if k == 0 {
-            return None;
-        }
-        let listing = layer.listing();
-        let new_listing = listing.with_grid_view(|grid| {
-            if grid.rare.is_some() || grid.ticks.get() % k != 0 {
-                return None;
-            }
-            let period_ticks = u16::try_from(grid.ticks.get() / k).ok()?;
-            let GridStepsRef::Small(steps) = grid.steps else {
-                return None;
-            };
-            if !steps.is_empty()
-                && (steps[steps.len() - 1].part_end > period_ticks
-                    || !steps.windows(2).all(|w| w[0].part_end <= w[1].part_begin))
-            {
-                return None;
-            }
-            let grid_steps = if steps.len() <= MAX_INLINE_GRID_LEN {
-                let mut arr = [GridSteps::ZERO_SMALL; MAX_INLINE_GRID_LEN];
-                for (dst, &s) in arr.iter_mut().zip(steps.iter().rev()) {
-                    *dst = SmallGridStep {
-                        part_begin: period_ticks - s.part_end,
-                        part_end: period_ticks - s.part_begin,
-                        value: s.value,
-                        loc: s.loc,
-                    };
-                }
-                GridSteps::Inline(steps.len() as u8, arr)
-            } else {
-                let mut rev_steps = Vec::with_capacity(steps.len());
-                for &s in steps.iter().rev() {
-                    rev_steps.push(SmallGridStep {
-                        part_begin: period_ticks - s.part_end,
-                        part_end: period_ticks - s.part_begin,
-                        value: s.value,
-                        loc: s.loc,
-                    });
-                }
-                GridSteps::Small(rev_steps.into_boxed_slice())
-            };
-            Some(Listing::from_parts(
-                grid.ticks,
-                grid.base | Grid::SMALL,
-                grid_steps,
-                clone_packed_runs(grid.packed),
-                None,
-            ))
-        })??;
-        Some(layer.with(|l| {
-            l.set_period_and_steps(period, Steps::Listed(new_listing));
-        }))
-    };
-    if layers.len() <= 8 {
-        let mut buf: [Option<Layer>; 8] = Default::default();
-        for (slot, layer) in buf.iter_mut().zip(layers.iter()) {
-            *slot = Some(rev_layer(layer)?);
-        }
-        return Some(node_of_sound_stack(&mut buf, layers.len()));
-    }
-    let out = layers.iter().map(rev_layer).collect::<Option<Vec<_>>>()?;
-    Some(node_of_sound(out))
-}
-
-/// Shift one uncut `period == 1` small-grid layer by `by` when `by * ticks` is
-/// an integer and no step straddles the wrap boundary.
-fn shift_one_layer(layer: &Layer, by: Fraction) -> Option<Layer> {
-    if layer.source().is_some() || !layer.in_cycles() || layer.period() != Fraction::ONE {
-        return None;
-    }
-    let listing = layer.listing();
-    let new_listing = listing.with_grid_view(|grid| {
-        if grid.rare.is_some() {
-            return None;
-        }
-        let GridStepsRef::Small(steps) = grid.steps else {
-            return None;
-        };
-        let ticks_i = i128::from(grid.ticks.get());
-        let prod = by.checked_mul(Fraction::int(ticks_i))?;
-        if prod.denom() != 1 {
-            return None;
-        }
-        let shift_mod = prod.numer().rem_euclid(ticks_i) as u16;
-        if shift_mod == 0 {
-            return Some(None);
-        }
-        let ticks_u16 = u16::try_from(ticks_i).ok()?;
-        let cut = ticks_u16 - shift_mod;
-        if !steps
+    /// The value of each step as one map of its own: the way a layer made
+    /// each value before the steps shared a table.
+    fn made_plain(layer: &Layer) -> Vec<Value> {
+        let dress = layer.dress();
+        let named = layer.named_names();
+        layer
+            .values
             .iter()
-            .all(|s| s.part_end <= ticks_u16 && (s.part_end <= cut || s.part_begin >= cut))
-        {
-            return None;
-        }
-        let split = steps.partition_point(|s| s.part_begin < cut);
-        if !steps[..split].iter().all(|s| s.part_end <= cut)
-            || !steps[split..].iter().all(|s| s.part_begin >= cut)
-        {
-            return None;
-        }
-        let grid_steps = if steps.len() <= MAX_INLINE_GRID_LEN {
-            let mut arr = [GridSteps::ZERO_SMALL; MAX_INLINE_GRID_LEN];
-            let mut idx = 0usize;
-            for &s in &steps[split..] {
-                arr[idx] = SmallGridStep {
-                    part_begin: s.part_begin - cut,
-                    part_end: s.part_end - cut,
-                    value: s.value,
-                    loc: s.loc,
+            .map(|value| {
+                let mut value = match named {
+                    Some(names) => crate::controls::named_value(names, value.clone()),
+                    None => value.clone(),
                 };
-                idx += 1;
-            }
-            for &s in &steps[..split] {
-                arr[idx] = SmallGridStep {
-                    part_begin: s.part_begin + shift_mod,
-                    part_end: s.part_end + shift_mod,
-                    value: s.value,
-                    loc: s.loc,
+                dress.compose_set_into(&mut value);
+                value
+            })
+            .collect()
+    }
+
+    /// Every way to read the two maps agrees.
+    fn assert_one_map(shared: &crate::OrderedMap, plain: &crate::OrderedMap, what: &str) {
+        assert_eq!(shared, plain, "{what}: ==");
+        assert_eq!(format!("{shared:?}"), format!("{plain:?}"), "{what}: Debug");
+        assert_eq!(
+            format!("{shared:#?}"),
+            format!("{plain:#?}"),
+            "{what}: Debug#"
+        );
+        assert_eq!(shared.len(), plain.len(), "{what}: len");
+        assert_eq!(shared.is_empty(), plain.is_empty(), "{what}: is_empty");
+        assert_eq!(shared.data_hash(), plain.data_hash(), "{what}: data_hash");
+        assert!(
+            shared.same_data(plain) && plain.same_data(shared),
+            "{what}: same_data"
+        );
+        assert_eq!(
+            shared.holds_only_data(),
+            plain.holds_only_data(),
+            "{what}: data"
+        );
+        if plain.is_empty() {
+            assert!(shared.owns_no_heap(), "{what}: heap");
+        }
+        assert_eq!(
+            shared.js_entries(),
+            plain.js_entries(),
+            "{what}: js_entries"
+        );
+        assert_eq!(
+            shared.iter().collect::<Vec<_>>(),
+            plain.iter().collect::<Vec<_>>(),
+            "{what}: iter"
+        );
+        assert_eq!(
+            shared.into_iter().collect::<Vec<_>>(),
+            plain.into_iter().collect::<Vec<_>>(),
+            "{what}: into_iter"
+        );
+        for key in ["note", "s", "n", "gain", "release", "value", "new", "none"] {
+            assert_eq!(shared.get(key), plain.get(key), "{what}: get {key}");
+            assert_eq!(
+                shared.contains_key(key),
+                plain.contains_key(key),
+                "{what}: has {key}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_shared_table_reads_as_the_plain_maps() {
+        let set = map_of(&[
+            ("s", text("gm_piano")),
+            ("release", Value::F64(0.28)),
+            ("gain", Value::F64(0.78)),
+        ]);
+        let notes = || vec![text("d#3"), text("a2"), Value::F64(7.0), text("d#3")];
+        let raw = || {
+            vec![
+                map_of(&[("note", text("c3")), ("n", Value::F64(1.0))]),
+                map_of(&[("n", Value::F64(2.0))]),
+                map_of(&[]),
+            ]
+        };
+        let object = |object: Value| Some(object);
+        // The name, the layer's values, its set, and whether the table
+        // reads them.
+        type Case<'a> = (
+            &'a str,
+            Vec<Value>,
+            Option<&'a [&'a str]>,
+            Option<Value>,
+            bool,
+        );
+        let cases: Vec<Case> = vec![
+            (
+                "one name and a set",
+                notes(),
+                Some(&["note"]),
+                object(set.clone()),
+                true,
+            ),
+            ("one name, no set", notes(), Some(&["note"]), None, true),
+            (
+                "two names, no list",
+                notes(),
+                Some(&["note", "s"]),
+                object(set.clone()),
+                true,
+            ),
+            (
+                "a raw map and a set",
+                raw(),
+                None,
+                object(set.clone()),
+                true,
+            ),
+            (
+                "a name that the set holds",
+                notes(),
+                Some(&["s"]),
+                object(set.clone()),
+                false,
+            ),
+            (
+                "a raw map with a key that the set holds",
+                vec![map_of(&[("gain", Value::F64(1.0)), ("n", Value::F64(2.0))])],
+                None,
+                object(set.clone()),
+                false,
+            ),
+            (
+                "a list under two names",
+                vec![Value::list(vec![text("c3"), text("gm_piano")])],
+                Some(&["note", "s"]),
+                object(set.clone()),
+                false,
+            ),
+            (
+                "a list under one name",
+                vec![Value::list(vec![text("c3"), text("e3")])],
+                Some(&["note"]),
+                object(set.clone()),
+                true,
+            ),
+            (
+                "an object with a value key",
+                vec![map_of(&[("value", text("c3")), ("n", Value::F64(2.0))])],
+                Some(&["note"]),
+                object(set.clone()),
+                false,
+            ),
+            (
+                "a value that is no data",
+                vec![Value::Haps(crate::value::HapList::new(Vec::new()))],
+                Some(&["note"]),
+                None,
+                false,
+            ),
+            (
+                "a set that a union drops",
+                notes(),
+                Some(&["note"]),
+                object(map_of(&[("value", Value::F64(1.0))])),
+                false,
+            ),
+            (
+                "an object under a name",
+                vec![map_of(&[("n", Value::F64(1.0))]), text("x")],
+                Some(&["dict"]),
+                object(set.clone()),
+                true,
+            ),
+        ];
+        for (what, values, names, set, shared) in cases {
+            let layer = dressed_layer(values, names, set);
+            let owner: Arc<[Layer]> = Arc::new([layer]);
+            let layer = &owner[0];
+            let plain = made_plain(layer);
+            assert_eq!(layer.each_value().count(), plain.len(), "{what}: count");
+            assert!(layer.value(plain.len()).is_none(), "{what}: past the end");
+            let is_shared = layer.is_direct()
+                || layer
+                    .steps
+                    .cache_cell()
+                    .and_then(OnceLock::get)
+                    .is_some_and(|read| {
+                        matches!(read.as_layer_read(), (LayerReadView::Shared(_), None))
+                    });
+            assert_eq!(is_shared, shared, "{what}: the form");
+            let reader = layer.reader(Some((&owner, 0)));
+            for (index, plain) in plain.iter().enumerate() {
+                let Some(Value::Object(shared)) = reader.get(index) else {
+                    panic!("{what}: step {index} is no map");
                 };
-                idx += 1;
-            }
-            GridSteps::Inline(steps.len() as u8, arr)
-        } else {
-            let mut rotated = Vec::with_capacity(steps.len());
-            for &s in &steps[split..] {
-                rotated.push(SmallGridStep {
-                    part_begin: s.part_begin - cut,
-                    part_end: s.part_end - cut,
-                    value: s.value,
-                    loc: s.loc,
-                });
-            }
-            for &s in &steps[..split] {
-                rotated.push(SmallGridStep {
-                    part_begin: s.part_begin + shift_mod,
-                    part_end: s.part_end + shift_mod,
-                    value: s.value,
-                    loc: s.loc,
-                });
-            }
-            GridSteps::Small(rotated.into_boxed_slice())
-        };
-        Some(Some(Listing::from_parts(
-            grid.ticks,
-            grid.base | Grid::SMALL,
-            grid_steps,
-            clone_packed_runs(grid.packed),
-            None,
-        )))
-    })??;
-    Some(match new_listing {
-        Some(listing) => layer.with(|l| {
-            l.set_period_and_steps(Fraction::ONE, Steps::Listed(listing));
-        }),
-        None => layer.clone(),
-    })
-}
-
-/// Fold `late(by)` / `early(-by)` onto a `Node::Sequence` whose layers have
-/// `period == 1`, uncut small grids, integer tick shift `by * ticks`, and no
-/// step straddling the wrap boundary.
-pub(crate) fn shifted(pattern: &Pattern, by: Fraction) -> Option<Pattern> {
-    let layers = layers(pattern)?;
-    if by == Fraction::ZERO {
-        return Some(pattern.clone());
-    }
-    if by.numer().abs() > MAX_PERIOD_TERM || by.denom() > MAX_PERIOD_TERM {
-        return None;
-    }
-    if layers.len() <= 8 {
-        let mut buf: [Option<Layer>; 8] = Default::default();
-        for (slot, layer) in buf.iter_mut().zip(layers.iter()) {
-            *slot = Some(shift_one_layer(layer, by)?);
-        }
-        return Some(node_of_sound_stack(&mut buf, layers.len()));
-    }
-    let out = layers
-        .iter()
-        .map(|layer| shift_one_layer(layer, by))
-        .collect::<Option<Vec<_>>>()?;
-    Some(node_of_sound(out))
-}
-
-/// Fold `off(by, f)` directly onto a `Node::Sequence` without allocating an
-/// intermediate shifted `Arc<[Layer]>` or `Arc<NodeCell>`.
-pub(crate) fn off_shifted(
-    pattern: &Pattern,
-    by: Fraction,
-    f: Option<&crate::value::FunctionRef>,
-) -> Option<Pattern> {
-    use crate::compose::{Alignment, ComposeOp, default_alignment};
-    use crate::value::OffLayerOp;
-    if !folds(pattern)
-        || pattern.pure_loc_raw().is_some()
-        || by.numer().abs() > MAX_PERIOD_TERM
-        || by.denom() > MAX_PERIOD_TERM
-    {
-        return None;
-    }
-    let Node::Sequence(layers) = pattern.node_kind() else {
-        return None;
-    };
-    if layers.is_empty() || layers.len() > 4 || !holds_data(layers) {
-        return None;
-    }
-    let op = match f {
-        None => None,
-        Some(func) => Some(func.as_off_layer_op()?),
-    };
-    // Pre-extract RHS layer for `OffLayerOp::Compose` so we only check once.
-    let compose_rhs = match op {
-        Some(OffLayerOp::Compose {
-            other, op, align, ..
-        }) => {
-            if op == ComposeOp::KeepIf || align.unwrap_or_else(default_alignment) != Alignment::In {
-                return None;
-            }
-            let rhs_layers = self::layers(other)?;
-            if rhs_layers.len() != 1 || !rhs_layers[0].is_data() {
-                return None;
-            }
-            Some((rhs_layers, op))
-        }
-        Some(OffLayerOp::ComposeNumber { op, align, .. }) => {
-            if op == ComposeOp::KeepIf || align.unwrap_or_else(default_alignment) != Alignment::In {
-                return None;
-            }
-            None
-        }
-        Some(OffLayerOp::ControlNumber { spec, .. }) => {
-            if spec.names.len() != 1 || spec.packed_key == 0 {
-                return None;
-            }
-            None
-        }
-        None => None,
-    };
-    let n = layers.len();
-    let mut buf: [Option<Layer>; 8] = Default::default();
-    for (i, layer) in layers.iter().enumerate() {
-        let mut shifted = if by == Fraction::ZERO {
-            layer.clone()
-        } else {
-            shift_one_layer(layer, by)?
-        };
-        match op {
-            None => {}
-            Some(OffLayerOp::Compose { op, .. }) => {
-                let (rhs_layers, _) = compose_rhs.as_ref()?;
-                let apply = Combine::Composed(op);
-                let flow = op.lookup_flow();
-                shifted = without_query_signals(|| {
-                    apply_layer_with(&shifted, &rhs_layers[0], &apply, flow)
-                })?;
-            }
-            Some(OffLayerOp::ComposeNumber { op, value, .. }) => {
-                let val = Value::F64(value);
-                let flow = op.lookup_flow();
-                shifted =
-                    without_query_signals(|| apply_constant_to_layer(&shifted, &val, op, flow))?;
-            }
-            Some(OffLayerOp::ControlNumber { spec, value }) => {
-                let k = spec.packed_key;
-                if !shifted.is_direct_keyed()
-                    || shifted.dress().tail.is_some()
-                    || (k & 0x03ff) == shifted.named_id
-                {
-                    return None;
+                let Value::Object(plain) = plain else {
+                    panic!("{what}: plain step {index} is no map");
+                };
+                let name = format!("{what}, step {index}");
+                assert_one_map(&shared, plain, &name);
+                // A compose reads data only.
+                if !Value::Object(plain.clone()).is_data(0) {
+                    continue;
                 }
-                let mut shared = None;
-                let v = Value::F64(value);
-                shifted.change_dress(|dress| {
-                    dress.set_packed_here(
-                        &[k],
-                        std::slice::from_ref(&v),
-                        Locations::new(),
-                        &mut shared,
-                    );
-                });
-                shifted.refresh_direct();
-            }
-        }
-        buf[i] = Some(layer.clone());
-        buf[n + i] = Some(shifted);
-    }
-    Some(node_of_sound_stack(&mut buf, n * 2).with_steps(pattern.steps()))
-}
-
-/// Fold `slowcat_prime` (`every` / `firstOf` / `lastOf`) of `2..=16`
-/// single-layer sequences sharing values/dress/ticks and integer-divisor
-/// periods (`period = 1/k`) into one multi-cycle `Node::Sequence`.
-pub(crate) fn slowcat_primed(pats: &[Pattern]) -> Option<Pattern> {
-    let n = pats.len();
-    if !(2..=16).contains(&n) {
-        return None;
-    }
-    let first_layers = layers(&pats[0])?;
-    if first_layers.len() != 1 {
-        return None;
-    }
-    let first = &first_layers[0];
-    if first.source().is_some() || !first.in_cycles() {
-        return None;
-    }
-    let (ticks, base, packed_in) = first.listing().with_grid_view(|grid| {
-        if grid.rare.is_some() {
-            return None;
-        }
-        Some((grid.ticks, grid.base, clone_packed_runs(grid.packed)))
-    })??;
-    let ticks_u32 = ticks.get();
-    if n.checked_mul(ticks_u32 as usize)? > usize::from(u16::MAX) {
-        return None;
-    }
-    let mut total_steps = 0usize;
-    let mut inline_steps = [GridSteps::ZERO_SMALL; MAX_INLINE_GRID_LEN];
-    let mut all_steps: Option<Vec<SmallGridStep>> = None;
-    for (cycle_idx, pat) in pats.iter().enumerate() {
-        let ls = layers(pat)?;
-        if ls.len() != 1 {
-            return None;
-        }
-        let layer = &ls[0];
-        if layer.source().is_some()
-            || !layer.in_cycles()
-            || layer.named_id != first.named_id
-            || !Arc::ptr_eq(&layer.values, &first.values)
-        {
-            return None;
-        }
-        let same_dress = match (&layer.dress, &first.dress) {
-            (None, None) => true,
-            (Some(a), Some(b)) => Arc::ptr_eq(a, b),
-            _ => false,
-        };
-        if !same_dress {
-            return None;
-        }
-        let period = layer.period();
-        if period.numer() != 1 {
-            return None;
-        }
-        let k = u32::try_from(period.denom()).ok()?;
-        if k == 0 || ticks_u32 % k != 0 {
-            return None;
-        }
-        let sub_ticks = ticks_u32 / k;
-        let ok = layer.listing().with_grid_view(|grid| {
-            if grid.rare.is_some() || grid.ticks != ticks || grid.base != base {
-                return false;
-            }
-            let same_packed = match (&packed_in, grid.packed) {
-                (PackedRunsInput::None, PackedRunsRef::None) => true,
-                (PackedRunsInput::Small(a), PackedRunsRef::Small(b)) => a.as_slice() == b,
-                (PackedRunsInput::Wide(a), PackedRunsRef::Wide(b)) => a.as_ref() == b,
-                _ => false,
-            };
-            if !same_packed {
-                return false;
-            }
-            let GridStepsRef::Small(steps) = grid.steps else {
-                return false;
-            };
-            if !steps.is_empty() && u32::from(steps[steps.len() - 1].part_end) > sub_ticks {
-                return false;
-            }
-            let add = match steps.len().checked_mul(k as usize) {
-                Some(a) => a,
-                None => return false,
-            };
-            let prev_len = total_steps;
-            total_steps = total_steps.saturating_add(add);
-            if total_steps > 256 {
-                return false;
-            }
-            if all_steps.is_none() && total_steps > MAX_INLINE_GRID_LEN {
-                let mut vec = Vec::with_capacity(total_steps);
-                vec.extend_from_slice(&inline_steps[..prev_len]);
-                all_steps = Some(vec);
-            } else if let Some(vec) = &mut all_steps {
-                vec.reserve(add);
-            }
-            let mut cursor = prev_len;
-            for copy in 0..k {
-                let offset = (cycle_idx as u32) * ticks_u32 + copy * sub_ticks;
-                let offset_u16 = offset as u16;
-                for &s in steps {
-                    let step = SmallGridStep {
-                        part_begin: s.part_begin + offset_u16,
-                        part_end: s.part_end + offset_u16,
-                        value: s.value,
-                        loc: s.loc,
+                // A write copies the entries into a plain map first.
+                for write in 0..5 {
+                    let (mut shared, mut plain) = (shared.clone(), plain.clone());
+                    let change = |map: &mut crate::OrderedMap| match write {
+                        0 => {
+                            map.insert("gain".into(), Value::F64(9.0));
+                        }
+                        1 => {
+                            map.insert("new".into(), Value::F64(9.0));
+                        }
+                        2 => {
+                            map.remove("s");
+                            map.remove("note");
+                        }
+                        3 => {
+                            if let Some(value) = map.get_mut("release") {
+                                *value = Value::F64(9.0);
+                            }
+                        }
+                        _ => {
+                            let mut over = Value::Object(map.clone());
+                            let by = map_of(&[("n", Value::F64(5.0)), ("fresh", text("f"))]);
+                            compose_data_in_place(ComposeOp::Set, &mut over, &by);
+                            *map = match over {
+                                Value::Object(over) => over,
+                                _ => unreachable!("a map composed with a map"),
+                            };
+                        }
                     };
-                    if let Some(vec) = &mut all_steps {
-                        vec.push(step);
-                    } else {
-                        inline_steps[cursor] = step;
-                        cursor += 1;
-                    }
+                    change(&mut shared);
+                    change(&mut plain);
+                    assert_one_map(&shared, &plain, &format!("{name}, write {write}"));
                 }
+                // A map that a dressed map is set onto reads the same.
+                let (mut onto, mut onto_plain) = (
+                    map_of(&[("n", Value::F64(0.0)), ("gain", Value::F64(1.0))]),
+                    map_of(&[("n", Value::F64(0.0)), ("gain", Value::F64(1.0))]),
+                );
+                compose_data_in_place(ComposeOp::Set, &mut onto, &Value::Object(shared.clone()));
+                compose_data_in_place(
+                    ComposeOp::Set,
+                    &mut onto_plain,
+                    &Value::Object(plain.clone()),
+                );
+                let (Value::Object(onto), Value::Object(onto_plain)) = (onto, onto_plain) else {
+                    panic!("{what}: a union is no map");
+                };
+                assert_one_map(&onto, &onto_plain, &format!("{name}, set onto"));
+                // An empty map of data set onto it leaves it data.
+                let (mut empty, mut empty_plain) =
+                    (Value::Object(shared.clone()), Value::Object(plain.clone()));
+                compose_data_in_place(ComposeOp::Set, &mut empty, &map_of(&[]));
+                compose_data_in_place(ComposeOp::Set, &mut empty_plain, &map_of(&[]));
+                let (Value::Object(empty), Value::Object(empty_plain)) = (empty, empty_plain)
+                else {
+                    panic!("{what}: a union is no map");
+                };
+                assert_one_map(&empty, &empty_plain, &format!("{name}, empty set onto"));
             }
-            true
-        })?;
-        if !ok {
-            return None;
         }
     }
-    let grid_steps = match all_steps {
-        Some(vec) => pack_small_steps(vec),
-        None => GridSteps::Inline(total_steps as u8, inline_steps),
-    };
-    let listing = Listing::from_parts(ticks, base | Grid::SMALL, grid_steps, packed_in, None);
-    node_of_one(first.with(|l| {
-        l.set_in_cycles(true);
-        l.set_period_and_steps(Fraction::int(n as i128), Steps::Listed(listing));
-    }))
-}
 
-#[cfg(test)]
-#[path = "sequence_tests.rs"]
-mod tests;
+    /// The order of the entries is the order of the compose of the set
+    /// onto the value: the entries of the step, then those of the set.
+    #[test]
+    fn a_shared_map_holds_the_entries_of_its_step_before_the_set() {
+        let set = map_of(&[("s", text("gm_piano")), ("gain", Value::F64(0.5))]);
+        let layer = dressed_layer(vec![text("c3")], Some(&["note"]), Some(set));
+        let Some(Value::Object(map)) = layer.value(0) else {
+            panic!("a step is a map");
+        };
+        assert_eq!(
+            map.iter().map(|(key, _)| key).collect::<Vec<_>>(),
+            ["note", "s", "gain"]
+        );
+    }
+
+    /// A map that reads a table is the raw map of another layer, or the
+    /// set of one, and reads the same as the plain map.
+    #[test]
+    fn a_dressed_map_dresses_another_layer() {
+        let inner_set = map_of(&[("s", text("gm_piano")), ("gain", Value::F64(0.5))]);
+        let inner = dressed_layer(
+            vec![text("c3"), text("e3")],
+            Some(&["note"]),
+            Some(inner_set),
+        );
+        let maps: Vec<Value> = inner.each_value().collect();
+        let outer_set = map_of(&[("release", Value::F64(0.2))]);
+        // The dressed maps as raw values, then as the set.
+        for (values, set) in [
+            (maps.clone(), outer_set.clone()),
+            (vec![text("a2")], maps[0].clone()),
+        ] {
+            let names: Option<&[&str]> = match values[0] {
+                Value::Object(_) => None,
+                _ => Some(&["n"]),
+            };
+            let layer = dressed_layer(values, names, Some(set));
+            let owner: Arc<[Layer]> = Arc::new([layer]);
+            let layer = &owner[0];
+            assert!(matches!(
+                layer.reader(Some((&owner, 0))),
+                Values::Table(_) | Values::SeqLayer(_, _)
+            ));
+            for (shared, plain) in layer.each_value().zip(made_plain(layer)) {
+                let (Value::Object(shared), Value::Object(plain)) = (shared, plain) else {
+                    panic!("a step is no map");
+                };
+                assert_one_map(&shared, &plain, "a dressed map under a dress");
+            }
+        }
+    }
+
+    /// A layer of `cells` steps that fill `[0, 1)` of the period, some cut
+    /// by a wider whole, with the locations that `variant` picks.
+    fn grid_layer(period: (i128, i128), cells: i128, variant: usize) -> SequenceLayer {
+        let steps = (0..cells)
+            .map(|cell| {
+                let at = |n: i128| frac((n, cells));
+                let mut locations = Locations::new();
+                let (begin, end) = match (variant + cell as usize) % 6 {
+                    0 => (0, 0),
+                    1 => (cell as usize * 7, cell as usize * 7 + 3),
+                    // A range of no length is not no range.
+                    2 => (cell as usize, cell as usize),
+                    3 => (cell as usize, cell as usize + 1),
+                    4 => ((1 << 22) + cell as usize, (1 << 22) + cell as usize + 5000),
+                    _ => (0, 1),
+                };
+                match (variant + cell as usize) % 6 {
+                    0 => {}
+                    3 => locations.extend_from_slice(&[(begin, end), (begin + 9, end + 9)]),
+                    _ => locations.push((begin, end)),
+                }
+                let mut step =
+                    SequenceStep::new(at(cell), at(cell + 1), Value::F64(cell as f64), locations);
+                if cell % 3 == 1 {
+                    // The whole reaches into the cells around the part.
+                    let whole = (at((cell - 1).max(0)), at((cell + 2).min(cells)));
+                    step = step.placed(whole, (at(cell), at(cell + 1)));
+                }
+                step
+            })
+            .collect();
+        layer(period, steps)
+    }
+
+    fn haps_of(layer: &Layer, span: (Fraction, Fraction)) -> Vec<String> {
+        let mut out = Vec::new();
+        let owner: Arc<[Layer]> = Arc::new([layer.clone()]);
+        crate::QUERY_THREAD.with(|thread| {
+            query_sequence_onto(
+                thread,
+                &owner,
+                &State::new(TimeSpan::new(span.0, span.1)),
+                &mut out,
+            );
+        });
+        out.iter()
+            .map(|hap| format!("{hap:?} {:?}", hap.context.to_vec()))
+            .collect()
+    }
+
+    /// The same layer with its steps as places.
+    fn as_places(layer: &Layer) -> Layer {
+        let places: Box<[Place]> = layer.places().into();
+        layer.with(|layer| {
+            layer.set_steps(Steps::Listed(Listing::Places(Arc::new(Listed {
+                places,
+                small_denominators: true,
+            }))));
+        })
+    }
+
+    fn with_grid_of<R>(layer: &Layer, f: impl FnOnce(GridView<'_>) -> R) -> R {
+        layer
+            .listing()
+            .with_grid_view(f)
+            .expect("the steps are not on a grid")
+    }
+
+    fn assert_on_grid(layer: &Layer) {
+        with_grid_of(layer, |_| ());
+    }
+
+    /// The grid of a layer answers as its places do, over spans that are
+    /// negative, of no width, on a tick or between two, and at the ends of
+    /// a period.
+    #[test]
+    fn a_layer_on_a_grid_answers_as_its_places_do() {
+        let mut seen = 0;
+        for period in [(1, 1), (3, 2), (2, 1), (1, 3)] {
+            for cells in [1, 2, 3, 4, 5, 8, 12] {
+                for variant in 0..6 {
+                    let grid = Layer::of(grid_layer(period, cells, variant)).unwrap();
+                    assert_on_grid(&grid);
+                    let places = as_places(&grid);
+                    for begin in -40..40i128 {
+                        for width in [0, 1, 3, 7, 24] {
+                            let begin = frac((begin, 8));
+                            let span = (begin, begin.add(frac((width, 8))));
+                            assert_eq!(
+                                haps_of(&grid, span),
+                                haps_of(&places, span),
+                                "{period:?} {cells} {variant} {span:?}"
+                            );
+                        }
+                    }
+                    // A span between two ticks.
+                    for span in [(frac((1, 7)), frac((22, 7))), (frac((-5, 3)), frac((2, 9)))] {
+                        assert_eq!(haps_of(&grid, span), haps_of(&places, span));
+                    }
+                    seen += 1;
+                }
+            }
+        }
+        assert_eq!(seen, 168);
+    }
+
+    /// A grid gives back each time, cut and location that made it.
+    #[test]
+    fn a_grid_gives_back_its_steps() {
+        for cells in [1, 3, 5, 12] {
+            for variant in 0..6 {
+                let raws = |layer: SequenceLayer| {
+                    layer
+                        .steps
+                        .iter()
+                        .map(|step| (step.whole(), step.part.is_some(), step.locations().clone()))
+                        .collect::<Vec<_>>()
+                };
+                let made = grid_layer((1, 1), cells, variant);
+                let layer = Layer::of(made.clone()).unwrap();
+                let listing = layer.listing();
+                for (index, (whole, part, locations)) in raws(made).into_iter().enumerate() {
+                    assert_eq!(listing.whole(index), TimeSpan::new(whole.0, whole.1));
+                    assert_eq!(listing.is_cut(index), part);
+                    assert_eq!(listing.locations(index), locations);
+                }
+            }
+        }
+    }
+
+    /// A tick that is zero is the canonical zero, and the tick size is the
+    /// least common multiple of the denominators.
+    #[test]
+    fn a_grid_is_as_fine_as_its_denominators() {
+        let layer = Layer::of(grid_layer((1, 1), 4, 0)).unwrap();
+        with_grid_of(&layer, |grid| {
+            assert_eq!(grid.ticks.get(), 4);
+            assert_eq!(grid.time(0), Fraction::ZERO);
+            assert_eq!(grid.time(0).denom(), 1);
+        });
+        let layer = Layer::of(grid_layer((1, 3), 4, 0)).unwrap();
+        with_grid_of(&layer, |grid| assert_eq!(grid.ticks.get(), 12));
+    }
+
+    /// A layer whose times do not fit 32 bits of ticks keeps its places,
+    /// and a denominator past 32 bits refuses before the tick size is made.
+    #[test]
+    fn a_layer_off_the_grid_keeps_its_places() {
+        let huge = Fraction::new(1, (1 << 40) + 1);
+        let none = Locations::new;
+        let steps = vec![
+            SequenceStep::new(Fraction::ZERO, huge, Value::F64(0.0), none()),
+            SequenceStep::new(huge, Fraction::ONE, Value::F64(1.0), none()),
+        ];
+        let layer = Layer::of(layer((1, 1), steps)).unwrap();
+        assert!(matches!(layer.listing(), Listing::Places(_)));
+        // The product of the two denominators does not fit 64 bits.
+        let wide = Fraction::new((1 << 62) + 1, (1 << 63) + 1);
+        let steps = vec![
+            SequenceStep::new(Fraction::ZERO, frac((1, 2)), Value::F64(0.0), none()),
+            SequenceStep::new(frac((1, 2)), wide, Value::F64(1.0), none()),
+        ];
+        let layer = Layer::of(self::layer((1, 1), steps)).unwrap();
+        assert!(matches!(layer.listing(), Listing::Places(_)));
+        // A negative time does not fit unsigned ticks either.
+        let steps = vec![SequenceStep::new(
+            frac((-1, 2)),
+            frac((1, 2)),
+            Value::F64(0.0),
+            none(),
+        )];
+        let layer = Layer::of(self::layer((1, 1), steps)).unwrap();
+        assert!(matches!(layer.listing(), Listing::Places(_)));
+        // The places of a layer off the grid answer.
+        assert_eq!(haps_of(&layer, (Fraction::ZERO, Fraction::ONE)).len(), 1);
+    }
+
+    /// A range of locations that is too long for a packed one does not push
+    /// the short ranges of other steps into the spare list.
+    #[test]
+    fn a_long_range_leaves_the_short_ones_packed() {
+        let mut long = Locations::new();
+        long.push((0, 100_000));
+        let mut short = Locations::new();
+        short.push((5_000_000, 5_000_003));
+        let steps = vec![
+            SequenceStep::new(Fraction::ZERO, frac((1, 2)), Value::F64(0.0), long),
+            SequenceStep::new(frac((1, 2)), Fraction::ONE, Value::F64(1.0), short),
+        ];
+        let layer = Layer::of(self::layer((1, 1), steps)).unwrap();
+        with_grid_of(&layer, |grid| {
+            assert_eq!(grid.steps.get(1).loc.0 & PackedLoc::SPARE, 0);
+            assert_eq!(grid.locations(1).to_vec(), [(5_000_000, 5_000_003)]);
+            assert_eq!(grid.locations(0).to_vec(), [(0, 100_000)]);
+        });
+    }
+
+    /// `same` leaves a source that nobody read unread, and answers the same
+    /// each time it is asked.
+    #[test]
+    fn same_reads_no_source() {
+        struct Rest;
+        impl StepSource for Rest {
+            fn count(&self) -> usize {
+                1
+            }
+            fn steps(
+                &self,
+                _: Fraction,
+                end: Fraction,
+                each: &mut dyn FnMut(SourceStep),
+            ) -> Option<()> {
+                each(SourceStep {
+                    begin: Fraction::ZERO,
+                    end,
+                    value: 0,
+                    locations: Locations::new(),
+                });
+                Some(())
+            }
+        }
+        let sourced = |source: &Arc<dyn StepSource>| {
+            Layer::of_source(SourcedLayer {
+                period: Fraction::ONE,
+                values: Arc::new([Value::F64(1.0)]),
+                in_cycles: true,
+                steps: Arc::clone(source),
+            })
+        };
+        let one: Arc<dyn StepSource> = Arc::new(Rest);
+        let (a, b) = (sourced(&one), sourced(&one));
+        let other = sourced(&(Arc::new(Rest) as Arc<dyn StepSource>));
+        let listed = Layer::of(layer((1, 1), vec![step((0, 1), (1, 1), 1.0)])).unwrap();
+        let same = |a: &Layer, b: &Layer| a.same(b, |a, b| a.same_data(b));
+        for _ in 0..2 {
+            assert!(same(&a, &b));
+            assert!(!same(&a, &other));
+            assert!(!same(&a, &listed));
+            assert!(!same(&listed, &a));
+        }
+        for layer in [&a, &b, &other] {
+            assert!(layer.source().is_some(), "a source was read");
+        }
+    }
+
+    /// Two layers of the same steps are the same layer, and two grids with
+    /// other steps are not.
+    #[test]
+    fn grids_of_the_same_steps_are_the_same_layer() {
+        let first = Layer::of(grid_layer((1, 1), 5, 2)).unwrap();
+        let second = Layer::of(grid_layer((1, 1), 5, 2)).unwrap();
+        let other = Layer::of(grid_layer((1, 1), 5, 3)).unwrap();
+        let same = |a: &Layer, b: &Layer| a.same(b, |a, b| a.same_data(b));
+        assert!(same(&first, &second));
+        assert!(same(&first, &as_places(&second)));
+        assert!(!same(&first, &other));
+    }
+
+    /// A grid says a layer is in order as its places do: a step past the
+    /// period, out of order, empty, or with a whole inside its part is not.
+    #[test]
+    fn a_grid_checks_the_order_as_its_places_do() {
+        let at = |a: i128, b: i128, whole: (i128, i128)| {
+            let step = step((a, 4), (b, 4), 1.0);
+            step.placed(
+                (frac((whole.0, 4)), frac((whole.1, 4))),
+                (frac((a, 4)), frac((b, 4))),
+            )
+        };
+        let cases = [
+            vec![at(0, 2, (0, 2)), at(2, 4, (2, 4))],
+            vec![at(0, 2, (0, 2)), at(2, 5, (2, 5))],
+            vec![at(2, 4, (2, 4)), at(0, 2, (0, 2))],
+            vec![at(0, 0, (0, 0))],
+            vec![at(1, 3, (0, 4)), at(2, 4, (1, 4))],
+            vec![at(1, 3, (2, 4))],
+            vec![at(0, 3, (0, 3)), at(1, 2, (1, 2))],
+            vec![at(0, 2, (0, 2)), at(1, 4, (1, 4)), at(1, 4, (0, 4))],
+        ];
+        for period in [(1, 1), (1, 2), (3, 2)] {
+            for steps in &cases {
+                let grid = Layer::of(layer(period, steps.clone())).unwrap();
+                assert_on_grid(&grid);
+                assert_eq!(
+                    grid.is_in_order(),
+                    as_places(&grid).is_in_order(),
+                    "{period:?}"
+                );
+            }
+        }
+    }
+
+    /// A grid makes the reduced time of a tick as exact division does,
+    /// with a table of reductions or with a shift, for a tick of either
+    /// sign.
+    #[test]
+    fn a_grid_makes_the_reduced_time_of_a_tick() {
+        for ticks in [1, 3, 6, 12, 64, 100, 1000, 1024, 1025, 4096, 65_537] {
+            let step = |end: i128| {
+                SequenceStep::new(
+                    Fraction::ZERO,
+                    Fraction::new(1, end),
+                    Value::F64(0.0),
+                    Locations::new(),
+                )
+            };
+            let layer = Layer::of(layer((1, 1), vec![step(ticks)])).unwrap();
+            with_grid_of(&layer, |grid| {
+                assert_eq!(grid.ticks.get() as i128, ticks);
+                for tick in (-5000..5000).chain([i128::from(i64::MAX), i128::from(i64::MIN)]) {
+                    assert_eq!(
+                        grid.made(tick),
+                        Fraction::new(tick, ticks),
+                        "{tick}/{ticks}"
+                    );
+                }
+            });
+        }
+    }
+
+    /// The floor and the ceiling of a time in ticks are those of exact
+    /// division, for a time on a tick, between two, and negative.
+    #[test]
+    fn a_time_has_its_floor_and_ceiling_in_ticks() {
+        let layer = Layer::of(grid_layer((1, 1), 12, 0)).unwrap();
+        with_grid_of(&layer, |grid| {
+            for denom in [1, 2, 3, 5, 7, 8, 12, 16, 24, 1 << 20] {
+                for numer in -300..300 {
+                    let time = Fraction::new(numer, denom);
+                    let exact = time * Fraction::int(12);
+                    let (floor, ceil) = grid.ticks_at(time).unwrap();
+                    assert_eq!(Fraction::int(i128::from(floor)), exact.floor(), "{time:?}");
+                    assert_eq!(Fraction::int(i128::from(ceil)), exact.ceil(), "{time:?}");
+                }
+            }
+            assert!(grid.ticks_at(Fraction::int(i128::MAX / 2)).is_none());
+        });
+    }
+
+    /// A source that holds one step in each period.
+    struct OneStep;
+    impl StepSource for OneStep {
+        fn count(&self) -> usize {
+            1
+        }
+        fn steps(
+            &self,
+            _: Fraction,
+            end: Fraction,
+            each: &mut dyn FnMut(SourceStep),
+        ) -> Option<()> {
+            each(SourceStep {
+                begin: Fraction::ZERO,
+                end,
+                value: 0,
+                locations: Locations::new(),
+            });
+            Some(())
+        }
+    }
+
+    fn one_step_layer(source: &Arc<dyn StepSource>, value: f64) -> Layer {
+        Layer::of_source(SourcedLayer {
+            period: Fraction::ONE,
+            values: Arc::new([Value::F64(value)]),
+            in_cycles: true,
+            steps: Arc::clone(source),
+        })
+    }
+
+    /// The answer of `same` for two layers of one source does not change
+    /// when a query reads the source of one of them.
+    #[test]
+    fn same_answers_alike_after_a_source_is_read() {
+        let source: Arc<dyn StepSource> = Arc::new(OneStep);
+        let (a, b) = (one_step_layer(&source, 1.0), one_step_layer(&source, 1.0));
+        let listed = Layer::of(layer((1, 1), vec![step((0, 1), (1, 1), 1.0)])).unwrap();
+        let same = |a: &Layer, b: &Layer| a.same(b, |a, b| a.same_data(b));
+        let before = (
+            same(&a, &b),
+            same(&b, &a),
+            same(&a, &listed),
+            same(&listed, &a),
+        );
+        assert_eq!(before, (true, true, false, false));
+        // A query reads the steps of `a` into a list.
+        assert_eq!(a.listing().len(), 1);
+        assert!(a.source().is_none(), "the source of a was read");
+        let after = (
+            same(&a, &b),
+            same(&b, &a),
+            same(&a, &listed),
+            same(&listed, &a),
+        );
+        assert_eq!(after, before);
+    }
+
+    /// Two layers of one source with other values are not the same.
+    #[test]
+    fn same_tells_two_layers_of_one_source_with_other_values() {
+        let source: Arc<dyn StepSource> = Arc::new(OneStep);
+        let a = one_step_layer(&source, 1.0);
+        let other = a.clone().valued(Arc::new([Value::F64(2.0)]));
+        let alike = a.clone().valued(Arc::new([Value::F64(1.0)]));
+        let same = |a: &Layer, b: &Layer| a.same(b, |a, b| a.same_data(b));
+        assert!(!same(&a, &other));
+        assert!(!same(&other, &a));
+        assert!(same(&a, &alike));
+    }
+
+    /// A raw map with a `value` key under no name reads as the compose of a
+    /// set onto it, which keeps every key of the map.
+    #[test]
+    fn a_raw_map_with_a_value_key_reads_as_the_plain_map() {
+        let set = map_of(&[("s", text("piano")), ("gain", Value::F64(0.5))]);
+        let raw = vec![map_of(&[("value", text("c3")), ("n", Value::F64(1.0))])];
+        let layer = dressed_layer(raw, None, Some(set));
+        let plain = made_plain(&layer);
+        for (index, plain) in plain.iter().enumerate() {
+            let (Some(Value::Object(shared)), Value::Object(plain)) = (layer.value(index), plain)
+            else {
+                panic!("step {index} is no map");
+            };
+            assert_one_map(&shared, plain, "a raw map with a value key");
+            assert_eq!(shared.get("value"), Some(&text("c3")));
+        }
+    }
+}
