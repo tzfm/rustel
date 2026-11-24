@@ -522,7 +522,7 @@ fn emit_single_layer_static_int_contiguous(
         .is_power_of_two()
         .then(|| grid.ticks.trailing_zeros())
         .filter(|&shift| shift < 24);
-    let mut pairs = [(Fraction::ZERO, 0u64, 0i8); MAX_STEPS];
+    let mut pairs = [(Fraction::ZERO, 0i64, 0i8); MAX_STEPS];
     if let Some(shift) = ticks_pow2 {
         for (dst, &s) in pairs[..len].iter_mut().zip(steps.iter()) {
             let Some(iv) = values
@@ -890,7 +890,7 @@ fn emit_single_layer_general(
             if let Some(packed_loc) = dressed.as_packed_copy() {
                 out.reserve_exact(total_haps);
                 if contiguous {
-                    let mut pairs = [(Fraction::ZERO, 0u64, 0i8); MAX_STEPS];
+                    let mut pairs = [(Fraction::ZERO, 0i64, 0i8); MAX_STEPS];
                     for i in 0..len {
                         let cur_e = if first_shift == 0 {
                             base_e[i]

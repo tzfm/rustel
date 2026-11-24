@@ -707,7 +707,7 @@ pub struct Hap {
 }
 
 #[cfg(target_pointer_width = "64")]
-const _: () = assert!(std::mem::size_of::<Hap>() == 96);
+const _: () = assert!(std::mem::size_of::<Hap>() == 192);
 
 /// Read a `tags` key off a JS context object: an array of strings, anything
 /// else ignored. A score that somehow writes a non-array there loses the tag,

@@ -2802,15 +2802,27 @@ mod restart_tests {
 
     #[test]
     fn shift_does_not_truncate_ticks_above_u16_max() {
-        let base = fastcat(vec![note(1.0), silence()]).fast(Fraction::int(65_536));
-        let shifted = base.late(Fraction::new(1, 131_072));
-        let orig = base.query_arc(Fraction::ZERO, Fraction::new(1, 65_536));
-        let moved = shifted.query_arc(Fraction::ZERO, Fraction::new(1, 65_536));
+        // Build a period-1 sequence with ticks == 131_072 (> u16::MAX) so
+        // `shift_one_layer` enters its tick validation path (`folds.rs:2549`).
+        let base = crate::sequence::sequence(vec![crate::sequence::SequenceLayer {
+            period: Fraction::ONE,
+            steps: vec![crate::sequence::SequenceStep::new(
+                Fraction::ZERO,
+                Fraction::new(1, 131_072),
+                Value::object([("note".into(), Value::F64(1.0))]),
+                Locations::new(),
+            )],
+        }])
+        .expect("single-step 1/131072 sequence");
+        let shifted = base.late(Fraction::new(1, 2));
+        let orig = base.query_arc(Fraction::ZERO, Fraction::ONE);
+        let moved = shifted.query_arc(Fraction::ZERO, Fraction::ONE);
         assert_eq!(orig.len(), 1);
         assert_eq!(moved.len(), 1);
-        assert_ne!(
-            orig[0].part, moved[0].part,
-            "shift by 1/131072 must not wrap to 0"
+        assert_eq!(
+            moved[0].part,
+            TimeSpan::new(Fraction::new(1, 2), Fraction::new(65_537, 131_072)),
+            "shift by 1/2 on 131_072 ticks must not truncate to 0"
         );
     }
 
@@ -2833,16 +2845,17 @@ mod restart_tests {
         let single = fastcat(vec![note(1.0), note(2.0)]);
         let stacked = stack(vec![note(1.0), note(2.0)]);
         let wide = MAX_QUERY_SPAN_CYCLES + 5;
-        let (_, limit_single) = with_hap_budget(u64::MAX, || {
-            single.query_arc(Fraction::ZERO, Fraction::int(wide))
-        });
+        let state = State::new(TimeSpan::new(Fraction::ZERO, Fraction::int(wide)));
+        let limit_single = single
+            .query_arc_outcome_sorted_with_budget(&state, u64::MAX)
+            .err();
         assert!(
             matches!(limit_single, Some(QueryLimit::QuerySpan { .. })),
             "single-layer sorted query must enforce MAX_QUERY_SPAN_CYCLES: {limit_single:?}"
         );
-        let (_, limit_stack) = with_hap_budget(u64::MAX, || {
-            stacked.query_arc(Fraction::ZERO, Fraction::int(wide))
-        });
+        let limit_stack = stacked
+            .query_arc_outcome_sorted_with_budget(&state, u64::MAX)
+            .err();
         assert!(
             matches!(limit_stack, Some(QueryLimit::QuerySpan { .. })),
             "multi-layer sorted query must enforce MAX_QUERY_SPAN_CYCLES: {limit_stack:?}"
