@@ -175,6 +175,19 @@ pub(super) struct ReplayBlock {
 const EVALUATING: &str = "evaluating on the native engine…";
 /// The footer once the engine refuses that update.
 pub(super) const UPDATE_REFUSED: &str = "update refused - the last good score keeps playing";
+/// The footer while an installed update waits for its cutover.
+pub(super) const UPDATE_SWAPS_IN: &str = "updated - swaps in on the next cycle";
+/// The footer once that update is the one playing.
+const UPDATE_PLAYING: &str = "updated - playing";
+/// How the producer begins the line for a replacement it refused.
+const REPLACEMENT_REFUSED: &str = "the new score could not be played";
+
+/// An installed update the device has not played yet.
+#[derive(Clone, Copy, Debug)]
+pub(super) struct AwaitedSwap {
+    generation: u64,
+    text: Option<(SceneId, Revision)>,
+}
 
 impl App {
     /// Keep the evaluated revision mappable in the audible editor however
@@ -650,6 +663,7 @@ impl App {
             rewind,
             record,
         });
+        self.refused_swap = None;
         self.status = EVALUATING.into();
         self.flush_pending_evaluation();
     }
@@ -926,6 +940,13 @@ impl App {
                             player_facing_error(&diagnostic.message),
                         );
                         self.update_failure = owner;
+                        // It can arrive before the install's own answer,
+                        // which then clears the footer: see `settle_swap`.
+                        if diagnostic.kind == "live-error"
+                            && diagnostic.message.starts_with(REPLACEMENT_REFUSED)
+                        {
+                            self.refused_swap = Some(player_facing_error(&diagnostic.message));
+                        }
                     }
                     (StudioDiagnosticLevel::Error, false) => {
                         // Not `set_error`: that logs the same text it shows,
@@ -1140,8 +1161,12 @@ impl App {
                 // arranged: "prefetched" and "cuts over atomically" describe a
                 // guarantee the engine owes itself, and the log below keeps
                 // that wording for anyone debugging.
+                self.awaited_swap = install.pending_cutover.then(|| AwaitedSwap {
+                    generation: install.generation,
+                    text: sent.as_ref().map(|sent| (sent.scene, sent.editor_revision)),
+                });
                 let stage = if install.pending_cutover {
-                    "updated - swaps in on the next cycle"
+                    UPDATE_SWAPS_IN
                 } else {
                     "playing from the top"
                 };
@@ -1203,6 +1228,36 @@ impl App {
                     }
                 }
             }
+        }
+        self.dirty_frame = true;
+    }
+
+    /// End the line that promised a swap: the update plays, or the engine
+    /// refused it and the last score keeps playing. A refused generation
+    /// never publishes, so one that plays was not the one refused.
+    pub(super) fn settle_swap(&mut self) {
+        let Some(awaited) = self.awaited_swap else {
+            return;
+        };
+        let audible = self
+            .snapshot
+            .as_ref()
+            .and_then(|snapshot| snapshot.audible_generation);
+        let refused = self.refused_swap.take();
+        let line = if audible == Some(awaited.generation) {
+            UPDATE_PLAYING
+        } else if let Some(footer) = refused {
+            self.errors.set(ErrorOwner::Evaluation, footer);
+            self.update_failure = awaited.text;
+            UPDATE_REFUSED
+        } else if audible.is_some_and(|audible| audible > awaited.generation) {
+            UPDATE_PLAYING
+        } else {
+            return;
+        };
+        self.awaited_swap = None;
+        if self.status == UPDATE_SWAPS_IN {
+            self.status = line.to_owned();
         }
         self.dirty_frame = true;
     }
@@ -2748,6 +2803,78 @@ mod tests {
                 }),
             });
             owner
+        }
+
+        fn refused_replacement() -> StudioControlEvent {
+            StudioControlEvent::Diagnostic(crate::StudioDiagnostic {
+                kind: "live-error".into(),
+                message: "the new score could not be played (Csound is not permitted); \
+                          the last audible score keeps playing"
+                    .into(),
+                recoverable: true,
+                level: StudioDiagnosticLevel::Error,
+                alert: None,
+            })
+        }
+
+        fn swap_install(generation: u64) -> crate::StudioInstall {
+            crate::StudioInstall {
+                generation,
+                pending_cutover: true,
+                ..alert_install(false)
+            }
+        }
+
+        /// The refusal can reach the app before the install's answer. The
+        /// footer says the refusal, not that the update is on its way, and
+        /// a permission can still run the update again.
+        #[test]
+        fn a_replacement_refused_before_its_answer_is_not_said_to_swap_in() {
+            let directory = tempfile::tempdir().expect("temp dir");
+            let mut app = app_over(directory.path());
+            let owner = pending_alert_update(&mut app, 7);
+            app.handle_control(refused_replacement());
+            app.handle_evaluation(EvaluationOutcome {
+                request_id: 7,
+                editor_revision: owner.1.0,
+                result: Ok(swap_install(9)),
+            });
+            assert_eq!(app.status, UPDATE_SWAPS_IN);
+
+            app.settle_swap();
+            assert_eq!(app.status, UPDATE_REFUSED);
+            assert!(
+                app.errors
+                    .get(ErrorOwner::Evaluation)
+                    .is_some_and(|footer| footer.contains("Csound is not permitted")),
+                "{:?}",
+                app.errors.get(ErrorOwner::Evaluation)
+            );
+            assert_eq!(app.update_failure, Some(owner));
+        }
+
+        /// The line that promised a swap ends when the update plays.
+        #[test]
+        fn the_footer_stops_promising_a_swap_once_the_update_plays() {
+            let directory = tempfile::tempdir().expect("temp dir");
+            let mut app = app_over(directory.path());
+            let owner = pending_alert_update(&mut app, 7);
+            app.handle_evaluation(EvaluationOutcome {
+                request_id: 7,
+                editor_revision: owner.1.0,
+                result: Ok(swap_install(9)),
+            });
+            let mut snapshot = sounding(true, false);
+            snapshot.audible_generation = Some(8);
+            app.snapshot = Some(snapshot.clone());
+            app.settle_swap();
+            assert_eq!(app.status, UPDATE_SWAPS_IN, "the old score still plays");
+
+            snapshot.audible_generation = Some(9);
+            app.snapshot = Some(snapshot);
+            app.settle_swap();
+            assert_eq!(app.status, UPDATE_PLAYING);
+            assert_eq!(app.update_failure, None);
         }
 
         fn alert_install(answered_repeat: bool) -> crate::StudioInstall {
