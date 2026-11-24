@@ -3222,7 +3222,7 @@ fn live_producer_repeated_edit_soak_keeps_one_heap_and_exact_generations() {
 
     fn source(identity: usize, callback: bool) -> String {
         let transform = if callback {
-            ".every(fastcat(1, 1), pattern => pattern.fast(2))"
+            ".every(fastcat(1, 1), pattern => { globalThis.__soakCallback = 1; return pattern.fast(2); })"
         } else {
             ""
         };
@@ -3439,7 +3439,7 @@ fn assembled_live_route_survives_two_valid_saves_one_invalid_and_backpressure() 
 
     let source = |label: &str, callback: bool| {
         let transform = if callback {
-            ".every(fastcat(1, 1), pattern => pattern.fast(16))"
+            ".every(fastcat(1, 1), pattern => { globalThis.__assembledCallback = 1; return pattern.fast(16); })"
         } else {
             ".fast(16)"
         };
