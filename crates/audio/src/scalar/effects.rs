@@ -163,6 +163,54 @@ pub(super) fn inline_reverb(
     }
 }
 
+/// How much an offline render keeps of the responses no reverb uses, as
+/// the live producer does.
+const INLINE_UNUSED_RESPONSE_BYTES: usize = 64 << 20;
+
+/// The reverb responses an offline render has made, by the params asked for,
+/// so an orbit whose room changes back to a size it had takes that response
+/// again instead of making it anew: a stack of three sizes made one each
+/// note. The oldest unused go past the budget.
+#[derive(Default)]
+pub(super) struct InlineResponses(
+    Vec<(crate::reverb::ReverbParams, crate::reverb::ReverbResponse)>,
+);
+
+impl InlineResponses {
+    /// A new reverb for `wanted`, from a response made before when there is
+    /// one: see [`inline_reverb`].
+    pub(super) fn reverb(
+        &mut self,
+        sample_rate: u32,
+        wanted: crate::reverb::ReverbParams,
+        bank: &SampleBank,
+        dispatch: DspDispatch,
+    ) -> crate::reverb::OrbitReverb {
+        if let Some(at) = self.0.iter().position(|(params, _)| *params == wanted) {
+            let known = self.0.remove(at);
+            let reverb = known.1.reverb();
+            self.0.push(known);
+            return reverb;
+        }
+        let reverb = inline_reverb(sample_rate, wanted, bank, dispatch);
+        self.0.push((wanted, reverb.response()));
+        let mut unused: usize = self
+            .0
+            .iter()
+            .filter(|(_, known)| !known.in_use())
+            .map(|(_, known)| known.approx_bytes())
+            .sum();
+        self.0.retain(|(_, known)| {
+            if unused <= INLINE_UNUSED_RESPONSE_BYTES || known.in_use() {
+                return true;
+            }
+            unused -= known.approx_bytes();
+            false
+        });
+        reverb
+    }
+}
+
 impl FxDelayLine {
     pub(super) fn new(sample_rate: u32) -> Self {
         // The line is fixed at a 1-second maximum, and `delaytime` is
@@ -1309,5 +1357,27 @@ mod tests {
             let want = (crush - 1.0).exp2();
             assert_eq!(crush_levels(crush).to_bits(), want.to_bits(), "{crush}");
         }
+    }
+
+    /// A size an orbit had before comes back from its response, not a new
+    /// one: two sizes in turn make two responses however many notes ask.
+    #[test]
+    fn an_offline_render_makes_each_room_size_once() {
+        let bank = SampleBank::empty();
+        let params = |size_secs| crate::reverb::ReverbParams {
+            ir: None,
+            size_secs,
+            fade_secs: 0.1,
+            lp_start_hz: 15_000.0,
+            lp_end_hz: 1_000.0,
+        };
+        let mut responses = InlineResponses::default();
+        let mut reverbs = Vec::new();
+        for size in [0.05, 0.1, 0.05, 0.1, 0.05] {
+            reverbs.push(responses.reverb(8_000, params(size), &bank, DspDispatch::portable()));
+        }
+        assert_eq!(responses.0.len(), 2);
+        assert!(responses.0.iter().all(|(_, known)| known.in_use()));
+        assert_eq!(reverbs[2].params(), params(0.05));
     }
 }

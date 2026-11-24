@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Fixed: an export where a voice's `roomsize` changes from note to note, such as `roomsize("<4, 1, 2>")` on stacked tracks, reuses the reverb it made for each size instead of making it again: 8 such tracks render in about a sixth of the time.
+
 ## v0.1.8
 
 - Fixed: a live orbit that changes its `roomsize` back, or takes the `roomsize` of another orbit, reuses that reverb instead of making it again, so frequent room changes no longer cause audio underruns.
