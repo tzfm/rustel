@@ -22,6 +22,8 @@
 - Fixed: a sample source turned off and on again on the Permissions page brings its sounds back, and the update it refused while off runs again.
 - Fixed: in an export, an infinite `note` or `freq`, such as the log2 of 0, is a refused voice, and so is NaN on a sample, as on strudel.cc, instead of a note at the default pitch. A synth still reads a NaN note as absent.
 - Fixed: the update a permission re-runs waits for the engine to start fetching the source, instead of sometimes being refused again with an unknown sound.
+- Fixed: a playing score with a cycle past a native limit, such as `euclid(3, "<8 1000000>")`, loses only that cycle, as on strudel.cc, instead of a longer gap and a "fell behind" warning.
+- Fixed: a sample source turned off while its map was loading, then allowed again, brings its sounds back instead of leaving them unknown.
 - Fixed: an Alt key over the mixer or another panel holding the keyboard no longer types into or edits the score.
 - Fixed: an export of a score with an unknown chord, from the command line or the Studio sheet, says which chord, instead of writing a silent file with no message. The chord stays silent, as on strudel.cc.
 - `rustel check` queries the first 8 cycles, so a patterned value that is refused in a later one, such as `euclid(3, "<8 1000000>")`, is found and its cycle named.
@@ -63,27 +65,30 @@
 - Fixed: `rustel check` queries the score's first cycle, so a score that evaluates but refuses when it plays, such as a Euclid step past its limit or a KabelSalat `out(16)`, fails the check as query and export do.
 - Fixed: one sample source in Settings that will not read fails only its own row; the other remote sources still load.
 - Fixed: allowing a source or native orchestras on the Permissions page runs the refused update again by itself whatever refused it, as the docs say, not only for a refusal named on the footer.
-
 - Fixed: talkit speaks C7, the top of its documented range, which was refused a hair above the range's limit in whole hertz.
+- Fixed: a scale name that will not read, such as `scale("C3:kafi raga")`, says why its notes are dropped in export, query and Studio, instead of a silent lane with nothing said.
+- Fixed: a Hydra animated array with an entry that is not a number, such as `osc([10, "x", 30])`, refuses the new score as the docs say, instead of installing it with a warning.
+- Fixed: `rustel vst -j` gives each plugin its `status`, and a `reason` for one that failed its scan, as the readable list shows `off`.
+- Fixed: allowing a sample source on the Permissions page fetches the score's `samples()` import it had refused and re-runs the update with it, instead of the check still finding the sounds unknown.
+- Fixed: the slider form in quick action says on the footer why it did not write the fader, such as a min above the max, instead of an Enter that seems to do nothing.
+- Fixed: a `limit` above 0 dBFS is refused and says why, since a ceiling above full scale holds nothing back.
+- Fixed: a Hydra file with a hidden name, one that starts with `.`, is refused for being hidden, instead of a message about `..`.
+- Fixed: Studio's footer says an update was refused, and that the last good score keeps playing, instead of still evaluating.
+
 ## v0.1.7
 
-- Fixed: a scale name that will not read, such as `scale("C3:kafi raga")`, says why its notes are dropped in export, query and Studio, instead of a silent lane with nothing said.
 - Release archives and installers include signed build provenance for independent verification with GitHub CLI.
 - A video file plays as a sample: `mp4`, `m4v`, `mov`, `mkv` and `webm` play their audio track.
-- Fixed: a Hydra animated array with an entry that is not a number, such as `osc([10, "x", 30])`, refuses the new score as the docs say, instead of installing it with a warning.
 - `_video()` and `video()` draw a video sample's picture in sync with its sound. H.264, HEVC, AV1, VP9, VP8 and Motion JPEG decode natively.
 - The visuals docks show the clips of `_video()` and `video()` lanes. Enter opens a clip in a desktop window.
 - Settings ▸ General ▸ biggest video sets the largest video file that loads. The default is 256 MiB.
 - `s0.initVideo()` plays WebM or MKV video and animated GIF, PNG or WebP. `initImage()` and `initVideo()` read files from the set folder.
-- Fixed: `rustel vst -j` gives each plugin its `status`, and a `reason` for one that failed its scan, as the readable list shows `off`.
 - Hydra sketches read the mouse, `width` and `height`, and set `speed`, `bpm`, `fps` and `time`. Patterns read the mouse as `mousex` and `mousey`.
 - The reference knows the Hydra names, and a shared sketch with calls Rustel does not support still runs.
 - Picking a plugin from the reference opens its presets and closes the call.
-- Fixed: allowing a sample source on the Permissions page fetches the score's `samples()` import it had refused and re-runs the update with it, instead of the check still finding the sounds unknown.
 - Each open scene keeps its plugins loaded, and a scene you close frees them.
 - Plugins stay loaded when the output device or buffer size changes, and an undo within 5 seconds reuses the previous plugin copy.
 - A plugin chain with up to 1 second of latency plays in time, also in exports, and edits reach it that much later.
-- Fixed: the slider form in quick action says on the footer why it did not write the fader, such as a min above the max, instead of an Enter that seems to do nothing.
 - A plugin that fails or sends invalid audio goes silent with one warning, and the next evaluation loads it again.
 - A Studio export names a plugin that does not load, and Ctrl+C stops `rustel export` to MP3.
 - Samples, images and videos load only from allowed sources. `--allow-sample-origin` adds a source, and Settings ▸ Permissions allows a refused folder.

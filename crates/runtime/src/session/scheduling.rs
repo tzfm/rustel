@@ -885,14 +885,21 @@ impl Session {
         continuation_reserve: Duration,
         mode: LiveQueryBudgetMode,
     ) -> Result<LiveAudioBatch, LiveAudioScheduleError> {
-        self.schedule_audio_live_with_cover_at(
+        // A score already playing loses only the cycle it cannot query. A
+        // replacement still unpublished is refused whole, so the old score
+        // keeps playing.
+        self.scheduler
+            .set_moves_past_fixed_refusals(mode == LiveQueryBudgetMode::Steady);
+        let scheduled = self.schedule_audio_live_with_cover_at(
             now,
             sample_rate,
             continuation_reserve,
             mode,
             self.live_producer_schedule_cover(),
             true,
-        )
+        );
+        self.scheduler.set_moves_past_fixed_refusals(false);
+        scheduled
     }
 
     #[cfg(feature = "device-audio")]

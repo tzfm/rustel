@@ -1954,6 +1954,21 @@ pub enum QueryLimit {
     Cancelled,
 }
 
+impl QueryLimit {
+    /// Whether the same query would be refused again whatever the machine
+    /// is doing: the pattern itself asks past a native limit.
+    pub fn is_fixed(&self) -> bool {
+        matches!(
+            self,
+            Self::EuclidSteps { .. }
+                | Self::MiniRange { .. }
+                | Self::EchoCopies { .. }
+                | Self::IterParts { .. }
+                | Self::StepwiseExpansion { .. }
+        )
+    }
+}
+
 impl std::fmt::Display for QueryLimit {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {

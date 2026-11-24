@@ -54,19 +54,12 @@ const FTRANS: crate::reference::ReferenceEntry = crate::reference::ReferenceEntr
     name: "ftranspose",
     synonyms: &["ftrans", "fTrans", "ftranspose", "fTranspose"],
     summary: "Frequency transpose.",
-    description: "Frequency transpose. Assumes pattern either has `freq` set, or has values that can be interpreted as frequencies\namt has optional `edoSize` param, defaults to 12.\nIf haps have edoSize param set, such as from the output of `xen(\"31edo\")`,\n`ftrans` will fallback to that instead of 12 as the default.\n\nTransposes the frequency by `amt` edoSteps",
-    params: &[
-        crate::reference::ReferenceParam {
-            name: "amt",
-            r#type: "number",
-            description: "",
-        },
-        crate::reference::ReferenceParam {
-            name: "edoSize",
-            r#type: "number",
-            description: "(optional)",
-        },
-    ],
+    description: "Frequency transpose. Assumes pattern either has `freq` set, or has values that can be interpreted as frequencies\nWrite the edo size with the amount, as `ftrans(\"1:31\")`; it defaults to 12.\nA second argument is not the edo size: as on any one-argument method, the arguments play in sequence.\nIf haps have edoSize param set, such as from the output of `xen(\"31edo\")`,\n`ftrans` will fallback to that instead of 12 as the default.\n\nTransposes the frequency by `amt` edoSteps",
+    params: &[crate::reference::ReferenceParam {
+        name: "amt",
+        r#type: "number",
+        description: "steps, or \"step:edo\"",
+    }],
     examples: &[
         "i(\"0 1 2\").xen(\"12edo\").ftrans(\"7\")\n// n(\"0 1 2\").scale(\"A:chromatic\").trans(\"7\")",
         "i(\"0 8 18\").xen(\"31edo\").ftrans(\"<8 -8>\")",

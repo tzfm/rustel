@@ -176,6 +176,12 @@ jobs:
           if-no-files-found: ignore
           retention-days: 14
 
+  # The studio's end-to-end suite paints a real `App` into a test backend, so
+  # a TUI regression fails on the screen that it changes. CI runs the suite
+  # only here; the check job excludes it. The suite uses the default feature
+  # sets of the studio and the runtime, and `pty_smoke` drives the
+  # default-features binary. It has its own job because it is serial and slow,
+  # and so that a failure here does not hide the check job's result.
   bench:
     name: Engine benchmark (Linux x64)
     runs-on: ubuntu-24.04
@@ -232,7 +238,7 @@ jobs:
       - name: Measure this revision
         run: |
           cargo build --release -p rustel-bench
-          target/release/rustel-bench run crates/runtime/examples/songs --out "$RUNNER_TEMP/new.json"
+          target/release/rustel-bench run --out "$RUNNER_TEMP/new.json"
 
       # A shared runner's time moves with its neighbours, so the gate is on
       # allocations and kept bytes. Both reports keep the times.
@@ -257,12 +263,6 @@ jobs:
           if-no-files-found: ignore
           retention-days: 30
 
-  # The studio's end-to-end suite paints a real `App` into a test backend, so
-  # a TUI regression fails on the screen that it changes. CI runs the suite
-  # only here; the check job excludes it. The suite uses the default feature
-  # sets of the studio and the runtime, and `pty_smoke` drives the
-  # default-features binary. It has its own job because it is serial and slow,
-  # and so that a failure here does not hide the check job's result.
   studio:
     name: Studio (${{ matrix.name }})
     strategy:

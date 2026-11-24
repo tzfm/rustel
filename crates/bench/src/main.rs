@@ -24,7 +24,9 @@ use std::process::ExitCode;
 #[global_allocator]
 static ALLOCATOR: measure::Counting = measure::Counting;
 
-/// The scores a run measures when it names none: the tracked songs.
+/// Relative default score path when run from the repository root.
+const RELATIVE_DEFAULT_SCORES: &str = "crates/runtime/examples/songs";
+/// Fallback default score path when run from another working directory.
 const DEFAULT_SCORES: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../runtime/examples/songs");
 
 fn main() -> ExitCode {
@@ -61,7 +63,12 @@ fn run(args: &[String]) -> ExitCode {
         }
     }
     if targets.is_empty() {
-        targets.push(PathBuf::from(DEFAULT_SCORES));
+        let rel = Path::new(RELATIVE_DEFAULT_SCORES);
+        if rel.exists() {
+            targets.push(rel.to_path_buf());
+        } else {
+            targets.push(PathBuf::from(DEFAULT_SCORES));
+        }
     }
     let scores = scores_in(&targets);
     let plan = if quick {
