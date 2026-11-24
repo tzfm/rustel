@@ -69,7 +69,19 @@ impl App {
         }
         let baseline_cps = (self.options.session.cps != SessionConfig::default().cps)
             .then_some(self.options.session.cps);
-        SessionRecorder::create_unique(path, options.mode, baseline_cps)
+        let mut recorder = SessionRecorder::create_unique(path, options.mode, baseline_cps)?;
+        // Every tape opens on the fader the set plays at, the one the first
+        // save makes too: a replay export starts from it.
+        if let Err(error) = recorder.try_record_control(
+            0.0,
+            serde_json::json!({ "fader_db": f64::from(self.master.gain_db()) }),
+        ) {
+            let path = recorder.path().to_path_buf();
+            drop(recorder);
+            let _ = std::fs::remove_file(path);
+            return Err(error);
+        }
+        Ok(recorder)
     }
 
     pub(super) fn new_session(&mut self) {
@@ -99,10 +111,7 @@ impl App {
                         Some("session"),
                     )?;
                 }
-                recorder.try_record_control(
-                    0.0,
-                    serde_json::json!({ "fader_db": f64::from(self.master.gain_db()) }),
-                )
+                Ok::<(), String>(())
             })();
             if let Err(error) = seeded {
                 let path = recorder.path().to_path_buf();
@@ -493,6 +502,26 @@ mod tests {
         fn press(app: &mut App, code: KeyCode, modifiers: KeyModifiers) {
             app.handle_terminal_event(Event::Key(KeyEvent::new(code, modifiers)))
                 .unwrap();
+        }
+
+        /// A tape the first save opens starts on the fader the set plays at,
+        /// so a replay export of its first seconds is at the take's level.
+        #[test]
+        fn a_tape_opened_by_the_first_save_starts_on_the_fader() {
+            let directory = tempfile::tempdir().unwrap();
+            let mut app = session_app(directory.path());
+            app.master.set_gain_db(-3.0);
+            app.record_save(SaveStatus::Installed, "s(\"bd\")", None, None);
+            let tape = std::fs::read_to_string(app.recording_path().unwrap()).unwrap();
+            let opening = tape
+                .lines()
+                .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+                .find(|record| record["kind"] == "control")
+                .expect("a control record");
+            assert_eq!(
+                (opening["t"].as_f64(), opening["fader_db"].as_f64()),
+                (Some(0.0), Some(-3.0))
+            );
         }
 
         #[test]

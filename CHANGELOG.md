@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Fixed: a session tape that the first save opens records the master fader at its start, so a replay export plays its first seconds at the level of the take.
+
 - Fixed: `rustel replay --export` plays the master fader the take was played at, ahead of the limiter as live, so it sounds at the level of the take.
 
 ## v0.1.8
