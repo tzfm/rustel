@@ -56,7 +56,7 @@ default-members = [
 ]
 
 [workspace.package]
-version = "0.1.7"
+version = "0.1.8"
 edition = "2024"
 license = "AGPL-3.0-or-later"
 # The toolchain rust-toolchain.toml pins, the only one tested.
