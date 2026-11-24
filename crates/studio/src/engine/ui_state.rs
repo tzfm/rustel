@@ -147,13 +147,13 @@ impl LayoutDelivery {
             return false;
         };
         let generation = layout.ui_layout.generation;
-        match emit(StudioUpdate::Layout(layout)) {
+        match emit(StudioUpdate::Layout(Box::new(layout))) {
             Ok(()) => {
                 self.delivered_generation = Some(generation);
                 true
             }
             Err((_, StudioUpdate::Layout(layout))) => {
-                self.pending = Some(layout);
+                self.pending = Some(*layout);
                 false
             }
             Err(_) => unreachable!("layout handoff returned a different update kind"),
