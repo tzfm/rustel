@@ -173,7 +173,7 @@ fn aligned_stacks_reify_strings_and_keep_short_lane_placement() {
             let short = haps
                 .iter()
                 .filter(
-                    |hap| matches!(&hap.value, Value::Str(value) if value == "x" || value == "y"),
+                    |hap| matches!(&hap.value, Value::Str(value) if &**value == "x" || &**value == "y"),
                 )
                 .map(|hap| {
                     let whole = hap.whole.expect("stack event");
@@ -204,7 +204,7 @@ fn repeat_stack_keeps_each_lanes_step_rate_across_cycles() {
         .expect("repeated lanes");
     let short = haps
         .into_iter()
-        .filter(|hap| matches!(&hap.value, Value::Str(value) if value == "x" || value == "y"))
+        .filter(|hap| matches!(&hap.value, Value::Str(value) if &**value == "x" || &**value == "y"))
         .map(|hap| (hap.whole.expect("stack event").begin, hap.value))
         .collect::<Vec<_>>();
     assert_eq!(
@@ -279,13 +279,13 @@ fn numeric_generators_keep_their_values_and_timing() {
     );
     assert_eq!(
         values(&runtime, "binaryNL(5, 4)"),
-        [Value::List(
+        [Value::list(
             [0.0, 1.0, 0.0, 1.0].into_iter().map(Value::F64).collect(),
         )]
     );
     assert_eq!(
         values(&runtime, "binaryL(5)"),
-        [Value::List(
+        [Value::list(
             [1.0, 0.0, 1.0].into_iter().map(Value::F64).collect(),
         )]
     );
@@ -558,7 +558,7 @@ fn rand_list_uses_the_same_seed_as_rand() {
     for count in ["0", "-1", "NaN", "Infinity"] {
         assert_eq!(
             values(&runtime, &format!("randL({count}).seed(42)")),
-            [Value::List(Vec::new())]
+            [Value::list(Vec::new())]
         );
     }
 }

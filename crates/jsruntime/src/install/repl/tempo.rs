@@ -19,7 +19,7 @@ struct NativeTempoSetter<'js> {
     #[qjs(skip_trace)]
     lane: bool,
     #[qjs(skip_trace)]
-    transaction: Rc<RefCell<Option<ScoreEffects>>>,
+    transaction: Rc<RefCell<EffectTransaction>>,
     #[qjs(skip_trace)]
     policy: Rc<Cell<EffectPolicy>>,
     #[qjs(skip_trace)]
@@ -228,9 +228,9 @@ fn setter<'js>(
             silence,
             unit,
             lane,
-            transaction: runtime.effect_transaction.clone(),
-            policy: runtime.effect_policy.clone(),
-            refusal: runtime.effect_policy_refusal.clone(),
+            transaction: runtime.bridge().effect_transaction.clone(),
+            policy: runtime.bridge().effect_policy.clone(),
+            refusal: runtime.bridge().effect_policy_refusal.clone(),
         },
     )
     .map_err(|error| error.to_string())?
@@ -286,6 +286,14 @@ pub(super) fn install<'js>(
         globals
             .set(name, function.clone())
             .map_err(|error| error.to_string())?;
+        let per_minute = name.ends_with("pm");
+        record_builtin_global(
+            ctx,
+            name,
+            function.clone().into_value(),
+            BuiltinGlobal::Tempo { per_minute },
+        )
+        .map_err(|error| error.to_string())?;
         scope
             .set(name, function)
             .map_err(|error| error.to_string())?;
@@ -299,18 +307,26 @@ pub(super) fn install<'js>(
     globals
         .set("cps", lane.clone())
         .map_err(|error| error.to_string())?;
+    record_builtin_global(
+        ctx,
+        "cps",
+        lane.clone().into_value(),
+        BuiltinGlobal::Tempo { per_minute: false },
+    )
+    .map_err(|error| error.to_string())?;
     scope
         .set("cps", lane.clone())
         .map_err(|error| error.to_string())?;
     canonical.set(6, lane).map_err(|error| error.to_string())?;
     // `getCps()` reads the tempo that `setCps` staged in this evaluation,
     // or else the tempo that plays.
-    let staged = runtime.effect_transaction.clone();
-    let playing = runtime.cps.clone();
+    let bridge = runtime.bridge();
+    let staged = bridge.effect_transaction.clone();
+    let playing = bridge.cps.clone();
     let get_cps = Function::new(ctx.clone(), move || {
         staged
             .borrow()
-            .as_ref()
+            .written()
             .and_then(|effects| effects.cps)
             .unwrap_or_else(|| playing.get())
     })

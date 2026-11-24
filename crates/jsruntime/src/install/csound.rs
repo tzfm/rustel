@@ -108,9 +108,10 @@ pub(super) fn install<'js>(
     globals: &rquickjs::Object<'js>,
 ) -> Result<(), String> {
     for (name, remote) in [("loadCSound", false), ("loadOrc", true)] {
-        let policy = runtime.effect_policy.clone();
-        let transaction = runtime.effect_transaction.clone();
-        let refusal = runtime.effect_policy_refusal.clone();
+        let bridge = runtime.bridge();
+        let policy = bridge.effect_policy.clone();
+        let transaction = bridge.effect_transaction.clone();
+        let refusal = bridge.effect_policy_refusal.clone();
         let function = Function::new(
             ctx.clone(),
             hr_effect(move |ctx, args| {

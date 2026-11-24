@@ -1273,6 +1273,10 @@ struct App {
     /// checker finds it fine, the message comes down without waiting for
     /// the next update to say the same.
     update_failure: Option<(SceneId, Revision)>,
+    /// The installed update the footer says is on its way.
+    awaited_swap: Option<evaluation::AwaitedSwap>,
+    /// The footer for a replacement the engine refused, until `settle_swap`.
+    refused_swap: Option<String>,
     /// The origins whose script imports the engine refused in this studio,
     /// newest last. The permissions page offers them, so nobody types an origin.
     blocked_imports: Vec<String>,
@@ -1894,6 +1898,8 @@ impl App {
             layout_generation: None,
             inflight: HashMap::new(),
             update_failure: None,
+            awaited_swap: None,
+            refused_swap: None,
             blocked_imports: Vec::new(),
             csound_allowed: csound_at_start,
             csound_refused: false,
@@ -3074,9 +3080,15 @@ mod tests {
             app.devices
                 .pin(crate::devices::DeviceInventory::no_hardware());
             // Nor its plugins: with no standard plugin folder, a vst tab
-            // lists and loads no plugin of the machine.
+            // lists and loads no plugin of the machine. The pin replaces the
+            // folder list of the one host of the process, so it waits for a
+            // fixture test that holds it: an empty list under a fixture's
+            // feet makes its plugin vanish mid-test.
             #[cfg(feature = "vst")]
-            rustel_runtime::vst::pin_standard_folders(Vec::new());
+            {
+                let _one = crate::engine::load_mode_tests::fixture_test_lock();
+                rustel_runtime::vst::pin_standard_folders(Vec::new());
+            }
             // A folder of its own, as the real one has: the config folder is
             // never the set's folder, and a prebake.strudel among the scores
             // would be read as one.

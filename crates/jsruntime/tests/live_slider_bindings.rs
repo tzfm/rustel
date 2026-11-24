@@ -50,14 +50,14 @@ fn direct_gain_lpf_and_lpq_follow_distinct_native_cells() {
         assert_ne!(gain, cutoff);
         assert_ne!(cutoff, q);
         assert_eq!(
-            query(&runtime)[0].live_controls,
+            query(&runtime)[0].live_controls(),
             [gain, cutoff, q, 0],
             "{lane}{plugin}"
         );
         assert!(runtime.set_slider_value("gain", 0.75).unwrap());
         assert_eq!(runtime.slider_binding("gain"), Some(gain));
         assert_eq!(
-            query(&runtime)[0].live_controls,
+            query(&runtime)[0].live_controls(),
             [gain, cutoff, q, 0],
             "{lane}{plugin}"
         );
@@ -84,7 +84,7 @@ fn graph_sources_and_effects_keep_existing_slider_bindings_through_gc_and_update
         assert!(
             query(&runtime)
                 .iter()
-                .all(|hap| hap.live_controls == bindings),
+                .all(|hap| hap.live_controls() == bindings),
             "{expression}"
         );
         assert!(runtime.set_slider_value("graphGain", 0.75).unwrap());
@@ -93,7 +93,7 @@ fn graph_sources_and_effects_keep_existing_slider_bindings_through_gc_and_update
         assert!(!haps.is_empty(), "{expression}");
         assert!(
             haps.iter().all(|hap| {
-                hap.live_controls == bindings
+                hap.live_controls() == bindings
                     && hap.value.get("gain").and_then(rustel_core::Value::as_f64) == Some(0.75)
                     && hap.value.get("cutoff").and_then(rustel_core::Value::as_f64) == Some(1600.0)
             }),
@@ -121,13 +121,13 @@ fn pitch_combinators_after_sliders_keep_their_bound_controls_on_every_voice() {
         let haps = query(&runtime);
         assert!(!haps.is_empty(), "{expression}");
         assert!(
-            haps.iter().all(|hap| hap.live_controls == bindings),
+            haps.iter().all(|hap| hap.live_controls() == bindings),
             "{expression}"
         );
         assert!(runtime.set_slider_value("gain", 0.75).unwrap());
         assert!(
             query(&runtime).iter().all(|hap| {
-                hap.live_controls == bindings
+                hap.live_controls() == bindings
                     && hap.value.get("gain").and_then(rustel_core::Value::as_f64) == Some(0.75)
             }),
             "{expression}"
@@ -146,13 +146,13 @@ fn sharing_slider_with_timing_does_not_bind_the_timing_only_branch() {
     let haps = query(&runtime);
     assert_eq!(
         haps.iter()
-            .filter(|hap| hap.live_controls == [token, 0, 0, 0])
+            .filter(|hap| hap.live_controls() == [token, 0, 0, 0])
             .count(),
         2
     );
     assert_eq!(
         haps.iter()
-            .filter(|hap| hap.live_controls == [0; 4])
+            .filter(|hap| hap.live_controls() == [0; 4])
             .count(),
         2
     );
@@ -175,7 +175,7 @@ fn transformed_and_overwritten_values_cannot_retarget_sustained_voices() {
         assert!(
             query(&runtime)
                 .iter()
-                .all(|hap| hap.live_controls == [0; 4]),
+                .all(|hap| hap.live_controls() == [0; 4]),
             "{expression}"
         );
     }
@@ -200,10 +200,10 @@ fn tokens_survive_failed_candidates_and_refresh_on_successful_evaluation() {
     evaluate(&runtime, score);
     let second = runtime.slider_binding("same").unwrap();
     assert!(second > first + 1, "failed candidate token was reused");
-    assert_eq!(query(&runtime)[0].live_controls, [second, 0, 0, 0]);
+    assert_eq!(query(&runtime)[0].live_controls(), [second, 0, 0, 0]);
     runtime.restore_last_good_active().unwrap();
     assert_eq!(runtime.slider_binding("same"), Some(first));
-    assert_eq!(query(&runtime)[0].live_controls, [first, 0, 0, 0]);
+    assert_eq!(query(&runtime)[0].live_controls(), [first, 0, 0, 0]);
 }
 
 #[test]

@@ -26,6 +26,7 @@
 - Fixed: a playing score with a cycle past a native limit, such as `euclid(3, "<8 1000000>")`, loses only that cycle, as on strudel.cc, instead of a longer gap and a "fell behind" warning.
 - Fixed: a sample source turned off while its map was loading, then allowed again, brings its sounds back instead of leaving them unknown.
 - Changed: stem files are named by their orbit number. The default orbit's stem is now `1.wav` (it was `2.wav`), and `o(0)` writes `0.wav` (it was `1.wav`).
+- Fixed: the Studio footer stops saying an update "swaps in on the next cycle" once it plays, and says why when the engine refused it.
 - Fixed: an Alt key over the mixer or another panel holding the keyboard no longer types into or edits the score.
 - Fixed: an export of a score with an unknown chord, from the command line or the Studio sheet, says which chord, instead of writing a silent file with no message. The chord stays silent, as on strudel.cc.
 - `rustel check` queries the first 8 cycles, so a patterned value that is refused in a later one, such as `euclid(3, "<8 1000000>")`, is found and its cycle named.
@@ -41,6 +42,9 @@
 - The theme picker shows its Ctrl+N new, Ctrl+E edit and Ctrl+D delete keys.
 - Fixed: an export, query or check whose every note an error dropped, such as a scale name that will not read, exits 1 with the reason instead of passing as silence; a partial drop still plays what it can.
 - Fixed: the theme editor opened from the theme picker shows on top of the reference.
+- A score made of patterns, controls, functions, arrows and lanes is evaluated without JavaScript, 15 to 60 times faster on a new session, and an edit builds only the calls it changed. The script engine starts only for a score that needs it: the memory breakdown and `rustel play` name the line that needs it.
+- A score evaluated again keeps the answers of what it did not change, and a restarted section is asked only where it plays: the first query after an edit of a large score runs up to 170 times faster, and the first query of a score in sections about 17 times faster.
+- A dense score edited while it plays keeps all its scheduled notes: a live window now enters the ring before the backlog cap drops anything, and only a genuinely full pipeline drops the newest events.
 - The knobs column moves a plain number live while the set plays, as a slider does: the number of an audio control such as `lpf(4000)`, or of a function such as `pg(0.8)`, `fast(2)`, an `FX` stage's `soft(4.5)`, or a plugin option such as `vsti("Diva", { output: 0.111 })`. It needs no update, and edits not yet evaluated stay out of the sound. A plugin key turned on goes in as an update of its own. A rail that waits for an update is muted, dashed and marked "not live". A live move is written to the session tape.
 - Hold Shift or Alt while you drag any slider for a fine drag, a tenth as far. f in the knobs column or the expanded slider locks it on.
 - Fixed: the documented prebake helper `window.bpm = b => setcpm(b/4)` works after a score has run `initHydra()`, and a prebake that throws after an `await` reports its own line.

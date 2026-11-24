@@ -1207,7 +1207,7 @@ fn the_orchestra_switch_starts_on_and_space_takes_it_back_for_a_run() {
     match studio.errors() {
         None => assert!(
             studio.status().contains("playing from the top")
-                || studio.status().contains("swaps in on the next cycle"),
+                || studio.status().starts_with("updated"),
             "the re-run installed: {}",
             studio.status()
         ),

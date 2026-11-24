@@ -14,6 +14,19 @@ Press Ctrl+C to stop. With `--watch`, each saved change updates playback.
 If evaluation or the first scheduling window fails, the last valid score
 continues.
 
+A score of patterns, controls, functions, arrows and lanes is native: rustel
+builds it with no script engine. A form that only JavaScript has, such as a
+loop or an index, moves the score to the script engine, which costs more
+time and memory. The start line and each update line then say so, with the
+line of the score that needs the engine:
+
+```text
+Updated song.strudel · script engine, line 12 needs it
+```
+
+With `--json`, the `live` start event and each `reload` event hold `engine`
+(`native` or `script`) and `script_line`.
+
 Add `--prebake setup.js` to load helpers before the score. Put shared functions
 on `globalThis`. A prebake cannot set tempo, select MIDI input, or open visuals.
 Studio has its own prebakes in Settings.

@@ -345,7 +345,7 @@ fn raw_range_pair_keep_scalar_timing_steps_and_tag_loss() {
             "{label}: register fast-path tags survived"
         );
         let pattern = runtime.active_pattern().expect("active raw range result");
-        assert_eq!(pattern.steps, Some(Fraction::int(3)), "{label}: steps");
+        assert_eq!(pattern.steps(), Some(Fraction::int(3)), "{label}: steps");
         assert!(pattern.is_pure(), "{label}: native purity");
         assert!(
             pattern.as_pure().is_none(),

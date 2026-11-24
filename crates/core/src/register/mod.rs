@@ -15,7 +15,8 @@ use crate::ops::PatOps;
 use crate::purity::PurePattern;
 use crate::{Hap, Pattern, Value};
 use rustel_fraction::Fraction;
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::sync::{Arc, OnceLock};
 
 // The registered surface, split by family: each file owns its calls.
 // Entry order inside default_registry follows the original table.
@@ -114,6 +115,10 @@ pub enum CombinatorFn {
     /// which generates both typed views from a single body expression, so the
     /// `PurePattern`-typed view cannot disagree with the `Pattern`-typed one.
     Native(NativeCombinator),
+    /// Native combinator taking a trailing pattern transformer directly by
+    /// reference (`Option<&FunctionRef>`), avoiding `Arc<FunctionRef>` boxing
+    /// on unpatternified native calls.
+    NativeTransformer(DirectTransformer),
     /// A native body whose leading arguments remain patterns instead of being
     /// sampled into scalar values. Extensions use this for structural
     /// application; the generic host still installs it like any registration.
@@ -121,6 +126,30 @@ pub enum CombinatorFn {
     /// May materialise anything, including JS. Always classified impure.
     Dynamic(AnyBody),
 }
+
+/// Direct function-pointer pair for built-in transformer combinators,
+/// generated from a single body expression via `native_transformer!`.
+#[derive(Clone, Copy)]
+pub struct DirectTransformer {
+    pub(crate) fn_idx: usize,
+    pub(crate) pure: fn(&[Value], Option<&crate::value::FunctionRef>, PurePattern) -> PurePattern,
+    pub(crate) any: fn(&[Value], Option<&crate::value::FunctionRef>, Pattern) -> Pattern,
+}
+
+macro_rules! native_transformer {
+    ($fn_idx:expr, |$args:ident, $func:ident, $pat:ident| $body:expr) => {
+        $crate::register::CombinatorFn::NativeTransformer($crate::register::DirectTransformer {
+            fn_idx: $fn_idx,
+            pure: |$args: &[$crate::Value],
+                   $func: ::std::option::Option<&$crate::value::FunctionRef>,
+                   $pat: $crate::purity::PurePattern| $body,
+            any: |$args: &[$crate::Value],
+                  $func: ::std::option::Option<&$crate::value::FunctionRef>,
+                  $pat: $crate::Pattern| $body,
+        })
+    };
+}
+pub(super) use native_transformer;
 
 /// Two views of one body. The `pure` view's signature is the proof: a
 /// `PurePattern` can only be built from a pattern already classified pure, so
@@ -196,14 +225,15 @@ impl NativePatternedCombinator {
     }
 
     fn apply(&self, args: &[Pattern], pat: Pattern) -> Pattern {
-        let pure_args = args
-            .iter()
-            .map(Pattern::as_pure_pattern)
-            .collect::<Option<Vec<_>>>();
-        match (pure_args, pat.as_pure_pattern()) {
-            (Some(args), Some(pat)) => (self.pure)(&args, pat).pattern().clone(),
-            _ => (self.any)(args, pat),
+        if pat.is_pure()
+            && let Some(pure_args) = args
+                .iter()
+                .map(Pattern::as_pure_pattern)
+                .collect::<Option<Vec<_>>>()
+        {
+            return (self.pure)(&pure_args, crate::purity::PurePattern::assert_pure(pat)).0;
         }
+        (self.any)(args, pat)
     }
 }
 
@@ -219,19 +249,49 @@ impl CombinatorFn {
     fn apply(&self, args: &[Value], pat: Pattern, pure_view: bool) -> Pattern {
         match self {
             // Use the pure view when the operand is pure and the arguments
-            // admit it. Binds through the `Pattern` view use the opaque dynamic
-            // constructor and mark their results impure. The `PurePattern` return
-            // type preserves the proof needed for tight-lookahead scheduling.
-            CombinatorFn::Native(n) => match pat.as_pure_pattern() {
-                Some(pure) if pure_view => (n.pure)(args, pure)
-                    .pattern()
-                    .clone()
-                    .retaining_callbacks(args.iter().filter_map(|value| match value {
-                        Value::Function(function) => function.callback_kept_by_pure_view(),
-                        _ => None,
-                    })),
-                _ => (n.any)(args, pat),
-            },
+            // admit it. Move `pat` directly so `Arc::get_mut` succeeds for
+            // uniquely-owned combinator receivers, and skip callback retention
+            // allocation when no argument is a `Value::Function`.
+            CombinatorFn::Native(n) => {
+                if pure_view && pat.is_pure() {
+                    let out = (n.pure)(args, crate::purity::PurePattern::assert_pure(pat)).0;
+                    if args
+                        .iter()
+                        .any(|v| matches!(v, Value::Function(f) if f.has_retained_callbacks()))
+                    {
+                        let callbacks = args
+                            .iter()
+                            .filter_map(|value| match value {
+                                Value::Function(function) if function.has_retained_callbacks() => {
+                                    Some(function.retained_callbacks())
+                                }
+                                _ => None,
+                            })
+                            .collect::<Vec<_>>()
+                            .concat();
+                        out.retaining_callbacks(callbacks)
+                    } else {
+                        out
+                    }
+                } else {
+                    (n.any)(args, pat)
+                }
+            }
+            CombinatorFn::NativeTransformer(d) => {
+                let func = arg_function(args, d.fn_idx);
+                if pure_view && pat.is_pure() {
+                    let out = (d.pure)(args, func, crate::purity::PurePattern::assert_pure(pat)).0;
+                    if let Some(f) = func
+                        && f.has_retained_callbacks()
+                    {
+                        out.retaining_callbacks(f.retained_callbacks())
+                    } else {
+                        out
+                    }
+                } else {
+                    (d.any)(args, func, pat)
+                }
+            }
             CombinatorFn::NativePatterned(n) => {
                 let args = args.iter().cloned().map(crate::pure).collect::<Vec<_>>();
                 n.apply(&args, pat)
@@ -298,10 +358,66 @@ fn admits_pure_view(function_argument: FunctionArgument, value: &Value) -> bool 
     }
 }
 
+/// The argument values of one application of a patterned call, each at its
+/// position. `riding` holds the values of the chain, `chain` of them, and
+/// `constants` holds each constant at its position, with `None` where the
+/// next value of the chain goes. With no constants, every argument rides.
+pub(crate) fn argument_values(
+    riding: &Value,
+    chain: usize,
+    constants: &[Option<Value>],
+) -> Vec<Value> {
+    let riding = match riding {
+        Value::List(values) => values.to_vec(),
+        single => vec![single.clone()],
+    };
+    debug_assert_eq!(riding.len(), chain);
+    if constants.is_empty() {
+        return riding;
+    }
+    let mut riding = riding.into_iter();
+    constants
+        .iter()
+        .map(|constant| match constant {
+            Some(value) => value.clone(),
+            None => riding.next().unwrap_or(Value::Null),
+        })
+        .collect()
+}
+
 impl Registration {
     /// Whether a leading argument is a function, in any role.
     pub fn takes_function(&self) -> bool {
         self.function_argument != FunctionArgument::None
+    }
+
+    /// Whether two registrations are the same record: the same names, shape
+    /// and body. Two clones of one registration are the same definition; two
+    /// registrations registered apart are not, whatever their names say. The
+    /// reference entry documents the record and takes no part.
+    pub fn same_definition(&self, other: &Self) -> bool {
+        self.names == other.names
+            && self.declared_in == other.declared_in
+            && self.function_argument == other.function_argument
+            && self.arity == other.arity
+            && self.patternify == other.patternify
+            && self.preserve_steps == other.preserve_steps
+            && self.join == other.join
+            && match (&self.func, &other.func) {
+                (CombinatorFn::Native(a), CombinatorFn::Native(b)) => {
+                    Arc::ptr_eq(&a.pure, &b.pure) && Arc::ptr_eq(&a.any, &b.any)
+                }
+                (CombinatorFn::NativeTransformer(a), CombinatorFn::NativeTransformer(b)) => {
+                    a.fn_idx == b.fn_idx
+                        && std::ptr::fn_addr_eq(a.pure, b.pure)
+                        && std::ptr::fn_addr_eq(a.any, b.any)
+                }
+                (CombinatorFn::NativePatterned(a), CombinatorFn::NativePatterned(b)) => {
+                    Arc::ptr_eq(&a.pure, &b.pure) && Arc::ptr_eq(&a.any, &b.any)
+                }
+                (CombinatorFn::Dynamic(a), CombinatorFn::Dynamic(b)) => Arc::ptr_eq(a, b),
+                _ => false,
+            }
     }
 
     /// Whether these argument values may enter the body's pure view. Only a
@@ -320,37 +436,94 @@ impl Registration {
     /// argument chooses the function per hap, through the opaque dynamic
     /// constructor.
     pub fn preserves_purity_with(&self, args: &[Pattern]) -> bool {
-        matches!(self.func, CombinatorFn::Native(_))
-            && args.iter().all(Pattern::is_pure)
+        matches!(
+            self.func,
+            CombinatorFn::Native(_) | CombinatorFn::NativeTransformer(_)
+        ) && args.iter().all(Pattern::is_pure)
             && (!self.takes_function() || args.iter().all(|arg| arg.as_pure().is_some()))
+    }
+
+    /// Whether [`Self::call_unpatternified`] with these plain values keeps a
+    /// pure operand pure (matching [`Self::preserves_purity_with`] on `pure(v)`).
+    pub fn preserves_purity_with_values(&self, args: &[Value]) -> bool {
+        matches!(
+            self.func,
+            CombinatorFn::Native(_) | CombinatorFn::NativeTransformer(_)
+        ) && args.iter().all(|v| match v {
+            Value::Function(f) => f.is_native(),
+            other => other.is_data(0),
+        })
     }
 
     /// The patternified entry point.
     ///
     /// `args` are the leading arguments as *patterns* (already `reify`d).
     pub fn call(&self, args: &[Pattern], pat: Pattern) -> Pattern {
+        let preserved_steps = self.preserve_steps.then(|| pat.steps()).flatten();
         let result = if let CombinatorFn::NativePatterned(body) = &self.func {
-            body.apply(args, pat.clone())
+            body.apply(args, pat)
         } else if self.arity == 1 || args.is_empty() {
-            self.func.apply(&[], pat.clone(), true)
+            self.func.apply(&[], pat, true)
         } else if !self.patternify {
             // Non-patternified: leading args must be pure values. A non-pure
             // one keeps its position as Null. Dropping it would shift every
             // later argument one place left, and the body could not tell "no
             // argument" from "an argument that is not a literal".
-            let vals: Vec<Value> = args
-                .iter()
-                .map(|p| p.as_pure().unwrap_or(Value::Null))
-                .collect();
-            let pure_view = self.admits_pure_view(&vals);
-            self.func.apply(&vals, pat.clone(), pure_view)
-        } else if args.len() > self.arity.saturating_sub(1) && all_pure(args).is_none() {
+            if args.len() <= 4 {
+                let mut vals: [Value; 4] = std::array::from_fn(|_| Value::Null);
+                for (slot, p) in vals[..args.len()].iter_mut().zip(args) {
+                    if let Some(v) = p.as_pure() {
+                        *slot = v;
+                    }
+                }
+                let slice = &vals[..args.len()];
+                let pure_view = self.admits_pure_view(slice);
+                self.func.apply(slice, pat, pure_view)
+            } else {
+                let vals: Vec<Value> = args
+                    .iter()
+                    .map(|p| p.as_pure().unwrap_or(Value::Null))
+                    .collect();
+                let pure_view = self.admits_pure_view(&vals);
+                self.func.apply(&vals, pat, pure_view)
+            }
+        } else if args.len() > self.arity.saturating_sub(1) {
             // Over-applied call: with more leading arguments than the arity
             // allows, the curry chain ends up applying a Pattern as if it
             // were a function, and the query fails with this exact error.
             // `echoWith(..., fast(2))` reaches it; absorbing the extra
             // argument instead would produce plausible-but-wrong haps.
             crate::query_error_pattern("hap_func.value is not a function")
+        } else if args.len() <= 4 {
+            // ---- stack fast path for 1..=4 pure leading args --------------
+            let mut pures: [Value; 4] = std::array::from_fn(|_| Value::Undefined);
+            let mut locs: [(usize, usize); 4] = [(0, 0); 4];
+            let mut locs_len = 0usize;
+            let mut all_pure_small = true;
+            for (i, a) in args.iter().enumerate() {
+                if let Some(v) = a.as_pure() {
+                    pures[i] = v;
+                    if let Some(loc) = a.pure_loc() {
+                        locs[locs_len] = loc;
+                        locs_len += 1;
+                    }
+                } else {
+                    all_pure_small = false;
+                    break;
+                }
+            }
+            if all_pure_small {
+                let pures_slice = &pures[..args.len()];
+                let pure_view = self.admits_pure_view(pures_slice);
+                let out = self.func.apply(pures_slice, pat, pure_view);
+                if locs_len == 0 {
+                    out
+                } else {
+                    out.with_added_context_owned(&locs[..locs_len])
+                }
+            } else {
+                self.call_patternified_general(args, pat)
+            }
         } else if let Some(pures) = all_pure(args) {
             // ---- fast path ---------------------------------------------
             // All leading args pure. Not merely an optimisation: it also
@@ -359,89 +532,214 @@ impl Registration {
             let locs: Vec<(usize, usize)> =
                 args.iter().flat_map(|p| p.pure_loc().into_iter()).collect();
             let pure_view = self.admits_pure_view(&pures);
-            let out = self.func.apply(&pures, pat.clone(), pure_view);
+            let out = self.func.apply(&pures, pat, pure_view);
             if locs.is_empty() {
                 out
             } else {
-                out.with_added_context(locs)
+                out.with_added_context_owned(&locs)
             }
         } else {
-            // ---- general path ------------------------------------------
-            // Build up a partial-application chain: `left.fmap` produces a
-            // pattern of "functions", each subsequent `appLeft` supplies the
-            // next argument, and the join flattens the resulting
-            // pattern-of-patterns. This is where the combinator body runs *at
-            // query time* - the reason querying can never be real-time
-            // itself.
-            let func = self.func.clone();
-            let pat_for_fn = pat.clone();
-            let n_args = args.len();
-            let function_argument = self.function_argument;
-
-            // Accumulate argument values positionally.
-            let mut acc: Pattern = args[0].fmap_collect();
-            for a in &args[1..] {
-                acc = acc.app_left_collect(a.clone());
-            }
-
-            // Which constructor is used is decided by the combinator's TYPE,
-            // not by a flag. A `Native` body applied to a pure operand is
-            // provably pure, so purity can be inherited soundly; anything else
-            // goes through the dynamic constructor and is impure.
-            let unpack = move |v: &Value| -> Vec<Value> {
-                let vals = match v {
-                    Value::List(xs) => xs.clone(),
-                    single => vec![single.clone()],
-                };
-                debug_assert_eq!(vals.len(), n_args);
-                vals
-            };
-            let apply = move |v: &Value| {
-                let values = unpack(v);
-                let pure_view = values
-                    .iter()
-                    .all(|value| admits_pure_view(function_argument, value));
-                func.apply(&values, pat_for_fn.clone(), pure_view)
-            };
-            let inner = match (&self.func, pat.as_pure_pattern()) {
-                // A body that consumes a transformer cannot take the pure
-                // route: the argument values are only known at query time, so
-                // there is no way to know the transformer is native.
-                _ if self.takes_function() => acc.fmap_to_pattern(apply),
-                // Native body + pure operand: the closure's return type proves
-                // no JavaScript can appear, so purity is inherited SOUNDLY.
-                (CombinatorFn::Native(n), Some(pure_operand)) => {
-                    let pf = n.pure.clone();
-                    acc.fmap_to_pure_pattern(move |v| pf(&unpack(v), pure_operand.clone()))
-                }
-                // Anything else is an opaque closure -> always impure.
-                _ => acc.fmap_to_pattern(apply),
-            };
-            match self.join {
-                JoinKind::Inner => inner.inner_join(),
-                JoinKind::Outer => inner.outer_join(),
-                JoinKind::Mix => inner.mix_join(),
-                JoinKind::Step => inner.step_join(),
-            }
+            self.call_patternified_general(args, pat)
         };
 
         if self.preserve_steps {
-            result.with_steps(pat.steps)
+            result.with_steps(preserved_steps)
         } else {
             result
         }
     }
 
+    fn call_patternified_general(&self, args: &[Pattern], pat: Pattern) -> Pattern {
+        // ---- general path ------------------------------------------
+        // Build up a partial-application chain: `left.fmap` produces a
+        // pattern of "functions", each subsequent `appLeft` supplies the
+        // next argument, and the join flattens the resulting
+        // pattern-of-patterns. This is where the combinator body runs *at
+        // query time* - the reason querying can never be real-time
+        // itself.
+        let func = self.func.clone();
+        let pat_for_fn = pat.clone();
+        let function_argument = self.function_argument;
+
+        // A constant function argument rides outside the chain:
+        // collecting it per whole only duplicates one value, and the
+        // collected node carries the function's per-bridge identity into
+        // the graph, where two builds of one score cannot agree. The
+        // closure splices each constant back into its argument position.
+        let mut constants: Vec<Option<Value>> = if self.takes_function() {
+            args.iter()
+                .map(|arg| match arg.as_pure() {
+                    Some(value @ Value::Function(_)) => Some(value),
+                    _ => None,
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
+        let mut chain: Vec<Pattern> = args
+            .iter()
+            .zip(constants.iter())
+            .filter(|(_, constant)| constant.is_none())
+            .map(|(arg, _)| arg.clone())
+            .collect();
+        if chain.is_empty() {
+            // An all-constant call cannot reach the general path; keep
+            // the whole chain all the same.
+            constants.clear();
+            chain = args.to_vec();
+        }
+
+        let n_chain = chain.len();
+        let retained = if constants
+            .iter()
+            .any(|c| matches!(c, Some(Value::Function(f)) if f.has_retained_callbacks()))
+        {
+            constants
+                .iter()
+                .filter_map(|constant| match constant {
+                    Some(Value::Function(function)) if function.has_retained_callbacks() => {
+                        Some(function.retained_callbacks())
+                    }
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+                .concat()
+        } else {
+            Vec::new()
+        };
+
+        // Which constructor is used is decided by the combinator's TYPE,
+        // not by a flag. A `Native` body applied to a pure operand is
+        // provably pure, so purity can be inherited soundly; anything else
+        // goes through the dynamic constructor and is impure.
+        let pure_view = !self.takes_function()
+            || (constants
+                .iter()
+                .flatten()
+                .all(|constant| admits_pure_view(function_argument, constant))
+                && chain.iter().all(crate::sequence::is_data));
+        let build_collected = || {
+            let mut acc: Pattern = chain[0].fmap_collect();
+            for a in &chain[1..] {
+                acc = acc.app_left_collect(a.clone());
+            }
+            acc
+        };
+        let inner = match (&self.func, pat.as_pure_pattern()) {
+            // Native body + pure operand: a single dynamic argument rides
+            // directly without wrapping every hap value in a one-element
+            // `Value::List`.
+            (CombinatorFn::Native(n), Some(pure_operand)) if pure_view => {
+                let acc = if n_chain == 1 {
+                    chain[0].clone()
+                } else {
+                    build_collected()
+                };
+                acc.fmap_to_pure_pattern_with_operand(
+                    &pure_operand,
+                    n.pure.clone(),
+                    n_chain,
+                    constants,
+                )
+            }
+            (CombinatorFn::NativeTransformer(d), Some(pure_operand)) if pure_view => {
+                let d = *d;
+                let acc = if n_chain == 1 {
+                    chain[0].clone()
+                } else {
+                    build_collected()
+                };
+                acc.fmap_to_pure_pattern_with_operand(
+                    &pure_operand,
+                    Arc::new(move |args: &[Value], pat: PurePattern| {
+                        (d.pure)(args, arg_function(args, d.fn_idx), pat)
+                    }),
+                    n_chain,
+                    constants,
+                )
+            }
+            // Anything else is an opaque closure -> always impure.
+            _ => build_collected().fmap_to_pattern(move |riding: &Value| {
+                let values = argument_values(riding, n_chain, &constants);
+                let pure_view = values
+                    .iter()
+                    .all(|value| admits_pure_view(function_argument, value));
+                func.apply(&values, pat_for_fn.clone(), pure_view)
+            }),
+        };
+        let inner = inner.retaining_callbacks(retained);
+        match self.join {
+            JoinKind::Inner => inner.inner_join(),
+            JoinKind::Outer => inner.outer_join(),
+            JoinKind::Mix => inner.mix_join(),
+            JoinKind::Step => inner.step_join(),
+        }
+    }
+
     /// The unpatternified `_name` form, calling `func` directly.
     pub fn call_unpatternified(&self, args: &[Value], pat: Pattern) -> Pattern {
-        let result = self
-            .func
-            .apply(args, pat.clone(), self.admits_pure_view(args));
+        let preserved_steps = self.preserve_steps.then(|| pat.steps()).flatten();
+        let result = self.func.apply(args, pat, self.admits_pure_view(args));
         if self.preserve_steps {
-            result.with_steps(pat.steps)
+            result.with_steps(preserved_steps)
         } else {
             result
         }
+    }
+
+    /// Unpatternified call passing a trailing transformer by reference,
+    /// skipping `Arc<FunctionRef>` boxing for built-in `NativeTransformer`
+    /// combinators.
+    pub fn call_with_transformer(
+        &self,
+        leading: &[Value],
+        func: &crate::value::FunctionRef,
+        pat: Pattern,
+    ) -> Pattern {
+        if let CombinatorFn::NativeTransformer(d) = self.func {
+            let preserved_steps = self.preserve_steps.then(|| pat.steps()).flatten();
+            let pure_view = func.is_native() && leading.iter().all(|v| !v.has_js_function());
+            let result = if pure_view && pat.is_pure() {
+                let out = (d.pure)(
+                    leading,
+                    Some(func),
+                    crate::purity::PurePattern::assert_pure(pat),
+                )
+                .0;
+                if func.has_retained_callbacks() {
+                    out.retaining_callbacks(func.retained_callbacks())
+                } else {
+                    out
+                }
+            } else {
+                (d.any)(leading, Some(func), pat)
+            };
+            return if self.preserve_steps {
+                result.with_steps(preserved_steps)
+            } else {
+                result
+            };
+        }
+        if leading.len() < 4 {
+            let mut args = [const { Value::Undefined }; 4];
+            for (slot, val) in args.iter_mut().zip(leading) {
+                *slot = val.clone();
+            }
+            args[leading.len()] = Value::function(func.clone());
+            self.call_unpatternified(&args[..leading.len() + 1], pat)
+        } else {
+            let mut vec = Vec::with_capacity(leading.len() + 1);
+            vec.extend_from_slice(leading);
+            vec.push(Value::function(func.clone()));
+            self.call_unpatternified(&vec, pat)
+        }
+    }
+
+    /// Whether this registration dispatches through a pattern-level native
+    /// combinator that inspects its argument patterns directly.
+    #[inline]
+    pub fn is_native_patterned(&self) -> bool {
+        matches!(self.func, CombinatorFn::NativePatterned(_))
     }
 }
 
@@ -457,6 +755,9 @@ fn all_pure(args: &[Pattern]) -> Option<Vec<Value>> {
 #[derive(Default, Clone)]
 pub struct Registry {
     entries: Vec<Registration>,
+    /// The first entry that holds each name, made at the first lookup after
+    /// a registration.
+    first: OnceLock<HashMap<Arc<str>, usize>>,
 }
 
 impl Registry {
@@ -474,12 +775,21 @@ impl Registry {
             });
         }
         self.entries.push(reg);
+        self.first.take();
     }
 
     pub fn get(&self, name: &str) -> Option<&Registration> {
-        self.entries
-            .iter()
-            .find(|r| r.names.iter().any(|n| &**n == name))
+        let first = self.first.get_or_init(|| {
+            let mut first = HashMap::new();
+            for (index, entry) in self.entries.iter().enumerate() {
+                for name in &entry.names {
+                    // The key shares the allocation of the name.
+                    first.entry(Arc::clone(name)).or_insert(index);
+                }
+            }
+            first
+        });
+        first.get(name).map(|index| &self.entries[*index])
     }
 
     /// Every registered name, aliases included - the acceptance checklist.
@@ -584,7 +894,7 @@ pub fn register_fast(reg: &mut Registry) {
             match args.first() {
                 None => pat,
                 Some(value) => match value_to_fraction(value) {
-                    Some(factor) => pat.fast(factor),
+                    Some(factor) => pat.fast_owned(factor),
                     None => PatOps::pat_silence(),
                 },
             }
@@ -838,7 +1148,7 @@ pub(super) fn stepwise_input_refusal<P: PatOps>(operation: &'static str) -> P {
 /// Numbers stringify, so a port index reaches the same place a port name does.
 pub(super) fn arg_text(args: &[Value], index: usize) -> String {
     match args.get(index) {
-        Some(Value::Str(text)) => text.clone(),
+        Some(Value::Str(text)) => text.to_string(),
         Some(Value::F64(number)) => {
             if number.fract() == 0.0 && number.is_finite() {
                 format!("{}", *number as i64)
@@ -944,7 +1254,9 @@ mod numeric_string_tests {
         );
         assert_eq!(value_to_fraction(&Value::Str(" 3/4".into())), None);
         assert_eq!(
-            value_to_fraction(&Value::Str("9".repeat(MAX_FRACTION_SOURCE_BYTES + 1))),
+            value_to_fraction(&Value::Str(
+                "9".repeat(MAX_FRACTION_SOURCE_BYTES + 1).into()
+            )),
             None
         );
     }
@@ -962,7 +1274,7 @@ mod numeric_string_tests {
             }),
             true,
         );
-        let callback = pure(Value::Function(Box::new(transformer)));
+        let callback = pure(Value::Function(std::sync::Arc::new(transformer)));
         let count = pure(Value::F64((MAX_ITER_PARTS + 1) as f64));
         let receiver = pure(Value::Str("a".into()));
         let cases = [
@@ -1024,7 +1336,7 @@ mod numeric_string_tests {
             ("euclidRot", vec![value(3.0), value(16_385.0), value(0.0)]),
             (
                 "bjork",
-                vec![pure(Value::List(vec![
+                vec![pure(Value::list(vec![
                     Value::F64(3.0),
                     Value::F64(16_385.0),
                 ]))],
@@ -1067,7 +1379,7 @@ mod numeric_string_tests {
             }),
             true,
         );
-        let callback = pure(Value::Function(Box::new(transformer)));
+        let callback = pure(Value::Function(std::sync::Arc::new(transformer)));
         let receiver = pure(Value::Str("a".into()));
         let echo_with = registry.get("echoWith").expect("registered echoWith");
 
@@ -1119,7 +1431,7 @@ mod numeric_string_tests {
             &[
                 pure(Value::F64(MAX_ECHO_COPIES as f64)),
                 pure(Value::F64(0.0)),
-                pure(Value::Function(Box::new(transformer))),
+                pure(Value::Function(std::sync::Arc::new(transformer))),
             ],
             pure(Value::Str("a".into())),
         );
@@ -1147,7 +1459,7 @@ mod purity_rule_tests {
     use std::sync::Arc;
 
     fn lowered() -> Value {
-        Value::Function(Box::new(FunctionRef::lowered_js(
+        Value::Function(std::sync::Arc::new(FunctionRef::lowered_js(
             1,
             PatternTransformProgram::new([]).unwrap(),
         )))
@@ -1160,8 +1472,11 @@ mod purity_rule_tests {
         let fast = registry.get("fast").expect("registered fast");
         assert!(sometimes.admits_pure_view(&[lowered()]));
         assert!(sometimes.admits_pure_view(&[Value::F64(0.5), lowered()]));
-        assert!(!sometimes.admits_pure_view(&[Value::Function(Box::new(FunctionRef::js(1)))]));
-        assert!(!sometimes.admits_pure_view(&[Value::List(vec![lowered()])]));
+        assert!(
+            !sometimes
+                .admits_pure_view(&[Value::Function(std::sync::Arc::new(FunctionRef::js(1)))])
+        );
+        assert!(!sometimes.admits_pure_view(&[Value::list(vec![lowered()])]));
         assert!(!fast.admits_pure_view(&[lowered()]));
         assert!(fast.admits_pure_view(&[Value::F64(2.0)]));
     }
@@ -1191,11 +1506,9 @@ mod purity_rule_tests {
         let registry = default_registry();
         let fast = registry.get("fast").expect("registered fast");
         let every = registry.get("every").expect("registered every");
-        let rev = pure(Value::Function(Box::new(FunctionRef::registered(
-            "rev",
-            Arc::new(|pattern| pattern.rev()),
-            true,
-        ))));
+        let rev = pure(Value::Function(std::sync::Arc::new(
+            FunctionRef::registered("rev", Arc::new(|pattern| pattern.rev()), true),
+        )));
         let patterned = crate::fastcat(vec![pure(Value::F64(2.0)), pure(Value::F64(4.0))]);
         assert!(fast.preserves_purity_with(&[pure(Value::F64(2.0))]));
         assert!(fast.preserves_purity_with(std::slice::from_ref(&patterned)));
@@ -1206,15 +1519,65 @@ mod purity_rule_tests {
         let every_two = every.call(
             &[
                 pure(Value::F64(2.0)),
-                pure(Value::Function(Box::new(FunctionRef::registered(
-                    "rev",
-                    Arc::new(|pattern| pattern.rev()),
-                    true,
-                )))),
+                pure(Value::Function(std::sync::Arc::new(
+                    FunctionRef::registered("rev", Arc::new(|pattern| pattern.rev()), true),
+                ))),
             ],
             receiver,
         );
         assert!(every_two.is_pure());
+    }
+
+    #[test]
+    fn a_patterned_call_with_a_constant_native_transformer_keeps_a_pure_operand_pure() {
+        use rustel_fraction::Fraction;
+        let registry = default_registry();
+        let every = registry.get("every").expect("registered every");
+        let rev = || {
+            pure(Value::Function(std::sync::Arc::new(
+                FunctionRef::registered("rev", Arc::new(|pattern| pattern.rev()), true),
+            )))
+        };
+        // Two counts, one a cycle: data that the graph holds.
+        let counts = || {
+            let step = |index: i128, count: f64| {
+                crate::SequenceStep::new(
+                    Fraction::new(index, 2),
+                    Fraction::new(index + 1, 2),
+                    Value::F64(count),
+                    crate::Locations::new(),
+                )
+            };
+            crate::sequence(vec![crate::SequenceLayer {
+                period: Fraction::int(2),
+                steps: vec![step(0, 2.0), step(1, 3.0)],
+            }])
+            .expect("steps in order")
+        };
+        let receiver = || {
+            crate::fastcat(
+                ["a", "b", "c"]
+                    .map(|name| pure(Value::Str(name.into())))
+                    .to_vec(),
+            )
+        };
+        let kept = every.call(&[counts(), rev()], receiver());
+        assert!(kept.is_pure() && kept.is_cacheable());
+        // Counts behind a time map are not data that the graph holds, and a
+        // function of the script has no pure view: each call takes the
+        // dynamic constructor.
+        let behind_a_map = every.call(&[counts().with_query_time(|time| time), rev()], receiver());
+        assert!(!behind_a_map.is_pure());
+        let script = pure(Value::Function(std::sync::Arc::new(FunctionRef::js(1))));
+        assert!(!every.call(&[counts(), script], receiver()).is_pure());
+        // Both constructors build the same patterns.
+        for (begin, end) in [(0, 6), (1, 2), (-3, 5), (2, 2)] {
+            let (begin, end) = (Fraction::int(begin), Fraction::int(end));
+            assert_eq!(
+                format!("{:?}", kept.query_arc(begin, end)),
+                format!("{:?}", behind_a_map.query_arc(begin, end)),
+            );
+        }
     }
 }
 
@@ -1311,5 +1674,39 @@ mod reference_honesty_tests {
                 "`{name}` must explain that keyboard input is unsupported"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod lookup_tests {
+    use super::{Registration, default_registry};
+    use std::sync::Arc;
+
+    /// `registration` under `name` alone.
+    fn named(registration: &Registration, name: &str) -> Registration {
+        Registration {
+            names: vec![Arc::from(name)],
+            ..registration.clone()
+        }
+    }
+
+    #[test]
+    fn a_name_registered_after_a_lookup_is_found() {
+        let mut registry = default_registry();
+        let fast = registry.get("fast").expect("fast").clone();
+        registry.register(named(&fast, "quick"));
+        let quick = registry.get("quick").expect("the name registered last");
+        assert_eq!(quick.names, [Arc::from("quick")]);
+        assert!(registry.get("fast").is_some());
+    }
+
+    #[test]
+    fn the_first_registration_of_a_name_answers() {
+        let mut registry = default_registry();
+        let fast = registry.get("fast").expect("fast").clone();
+        let slow = registry.get("slow").expect("slow").clone();
+        registry.register(named(&slow, "fast"));
+        let held = registry.get("fast").expect("fast");
+        assert!(held.same_definition(&fast));
     }
 }

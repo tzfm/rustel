@@ -13,21 +13,63 @@ later version.
 */
 
 use crate::ops::PatOps;
-use crate::{Key, OrderedMap, Pattern, Value};
+use crate::{Hap, Key, OrderedMap, Pattern, Value};
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone)]
 pub struct ControlSpec {
     /// Compound controls use each name positionally. The first name is the
-    /// canonical control name and method name.
-    pub names: Vec<Arc<str>>,
+    /// canonical control name and method name. Each copy of the spec, and
+    /// each sequence that the control names, shares the one list.
+    pub names: Arc<[Arc<str>]>,
+    /// One-based index in [`default_control_registry`], or `0` for a custom
+    /// control created outside the built-in registry.
+    pub(crate) id: u16,
+    /// Precomputed packed `(mark_bit << 10) | id` key for `names[0]`, or `0`
+    /// when custom or `"value"` (which must never be packed into a builtin map).
+    pub(crate) packed_key: u16,
+    /// Precomputed packed key for `names[1]` on compound controls, or `0`.
+    pub(crate) second_packed_key: u16,
+    /// The map of this control over the haps of a pattern, for each value
+    /// and for unnamed values alone. Each is the interned map of the names,
+    /// kept at its first use, so a later call takes no lock. A copy of the
+    /// spec shares the maps it has.
+    maps: [std::sync::OnceLock<crate::OwnedHapMapFn>; 2],
+}
+
+/// A spec is its names: the maps it keeps follow from them.
+impl PartialEq for ControlSpec {
+    fn eq(&self, other: &Self) -> bool {
+        self.names == other.names
+    }
+}
+
+impl Eq for ControlSpec {}
+
+impl std::hash::Hash for ControlSpec {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.names.hash(state);
+    }
+}
+
+impl std::fmt::Debug for ControlSpec {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ControlSpec")
+            .field("names", &self.names)
+            .finish_non_exhaustive()
+    }
 }
 
 impl ControlSpec {
     pub fn new(names: impl IntoIterator<Item = impl Into<Arc<str>>>) -> Self {
         Self {
             names: names.into_iter().map(Into::into).collect(),
+            id: 0,
+            packed_key: 0,
+            second_packed_key: 0,
+            maps: Default::default(),
         }
     }
 
@@ -36,53 +78,18 @@ impl ControlSpec {
     }
 
     /// Wraps a raw value into this control's named form.
-    pub fn with_value(&self, mut value: Value) -> Value {
-        // Compound controls inspect array elements positionally (`s`, `n`,
-        // `gain`), so a script-owned array must be opened at that boundary;
-        // otherwise it is stored wholesale under `s`. A single-name control
-        // preserves an ordinary array as its value, identity included, for
-        // a following callback to observe.
-        let single_js_array = self.names.len() == 1
-            && matches!(&value, Value::JsValue(reference) if reference.is_array());
-        if !single_js_array {
-            value = crate::materialize_js_value(&value);
-        }
-        let mut bag = match &value {
-            Value::Object(object) if object.contains_key("value") => {
-                let mut object = object.clone();
-                value = object.remove("value").expect("the key was just checked");
-                Some(object)
-            }
-            _ => None,
-        };
-
-        if self.names.len() > 1
-            && let Value::List(values) = value
-        {
-            let result = bag.get_or_insert_with(OrderedMap::new);
-            for (name, value) in self.names.iter().zip(values) {
-                result.insert_key(Key::from(Arc::clone(name)), value);
-            }
-            return Value::Object(result.clone());
-        }
-
-        // An object is a value like any other here: `.dict({…})` hands a
-        // chord dictionary that `voicing()` reads back under `dict`.
-        let mut named = bag.unwrap_or_default();
-        named.insert_key(self.key(), value);
-        Value::Object(named)
+    pub fn with_value(&self, value: Value) -> Value {
+        named_value(&self.names, value)
     }
 
     /// The canonical name as a map key, which every map this control makes
     /// shares.
-    fn key(&self) -> Key {
-        self.names
-            .first()
-            .map_or_else(|| Key::from(""), |name| Key::from(Arc::clone(name)))
+    pub(crate) fn key(&self) -> Key {
+        key_of(&self.names)
     }
 
     fn pattern_for<P: PatOps>(&self, values: &P) -> P {
-        values.map_control(self.clone(), false)
+        values.map_control(self, false)
     }
 
     /// The receiver's own values, named: `"c e g".note()`. A value that is
@@ -90,7 +97,7 @@ impl ControlSpec {
     /// leaves it unchanged. With the whole event stored under `gain`, no
     /// voice resolves and the track is silent.
     fn pattern_for_unnamed<P: PatOps>(&self, values: &P) -> P {
-        values.map_control(self.clone(), true)
+        values.map_control(self, true)
     }
 
     pub fn pattern(&self, values: &Pattern) -> Pattern {
@@ -104,22 +111,107 @@ impl ControlSpec {
     /// `pat.set(x)` is the COMPOSERS `set` at the DEFAULT alignment (`in`),
     /// so it goes through the same matrix as `add`/`keep` - object promotion
     /// included.
-    fn apply_for<P: PatOps>(&self, pattern: &P, value: Option<P>) -> P {
-        match value {
-            None => self.pattern_for_unnamed(pattern),
-            Some(value) => crate::compose::compose(
-                pattern,
-                &self.pattern_for(&value),
-                crate::compose::ComposeOp::Set,
-                // Controls route through the DEFAULT `set` wrapper, so
-                // setDefaultJoin('mix') restructures them.
-                crate::compose::default_alignment(),
-            ),
+    ///
+    /// The receiver moves in: the result of one call of a chain is the
+    /// receiver of the next, and no other handle holds it, so a constant
+    /// control is set on it where it is.
+    fn apply_for<P: PatOps>(&self, mut pattern: P, value: Option<&P>) -> P {
+        let Some(value) = value else {
+            return self.pattern_for_unnamed(&pattern);
+        };
+        // Controls route through the DEFAULT `set` wrapper, so
+        // setDefaultJoin('mix') restructures them.
+        let alignment = crate::compose::default_alignment();
+        // A constant on a sequence joins each step where the step is. That
+        // is the node the composition below folds to, built here with no
+        // pattern of the constant between.
+        if alignment == crate::compose::Alignment::In {
+            pattern = match pattern.set_constant_control(self, value) {
+                Ok(set) => return set,
+                Err(back) => back,
+            };
         }
+        crate::compose::compose(
+            &pattern,
+            &self.pattern_for(value),
+            crate::compose::ComposeOp::Set,
+            alignment,
+        )
     }
 
     pub fn apply(&self, pattern: &Pattern, value: Option<Pattern>) -> Pattern {
-        self.apply_for(pattern, value)
+        // A handle of the receiver, which its owner keeps as it is.
+        self.apply_for(pattern.clone(), value.as_ref())
+    }
+
+    /// [`Self::apply`] for a receiver that the caller gives away, as the
+    /// next call of a chain takes the result of the call before it.
+    pub fn apply_to(&self, mut pattern: Pattern, value: Option<Pattern>) -> Pattern {
+        let Some(value) = value else {
+            return pattern.map_control_owned(self, true);
+        };
+        let alignment = crate::compose::default_alignment();
+        if alignment == crate::compose::Alignment::In {
+            pattern = match pattern.set_constant_control(self, &value) {
+                Ok(set) => return set,
+                Err(back) => back,
+            };
+        }
+        let named = value.map_control_owned(self, false);
+        crate::compose::compose(&pattern, &named, crate::compose::ComposeOp::Set, alignment)
+    }
+
+    /// [`Self::apply_to`] of a `pure` of `value`, as a score writes a
+    /// number. A receiver that takes the control where it is takes it with
+    /// no pattern of the value.
+    pub fn apply_value(&self, mut pattern: Pattern, value: Value) -> Pattern {
+        let alignment = crate::compose::default_alignment();
+        if alignment == crate::compose::Alignment::In {
+            pattern = match pattern.set_control_value(self, &value) {
+                Ok(set) => return set,
+                Err(back) => back,
+            };
+        }
+        crate::compose::compose(
+            &pattern,
+            &self.pattern_for(&crate::pure(value)),
+            crate::compose::ComposeOp::Set,
+            alignment,
+        )
+    }
+
+    /// [`Self::apply_value`] carrying source `locations` (for single-word mini
+    /// literals), avoiding an intermediate `Node::PureAt` allocation when the
+    /// receiver folds the control directly.
+    pub fn apply_constant(
+        &self,
+        mut pattern: Pattern,
+        mut value: Value,
+        mut locations: crate::Locations,
+    ) -> Pattern {
+        if locations.is_empty() {
+            return self.apply_value(pattern, value);
+        }
+        let alignment = crate::compose::default_alignment();
+        if alignment == crate::compose::Alignment::In {
+            match pattern.set_control_value_at(self, &value, locations) {
+                Ok(set) => return set,
+                Err((back, back_locs)) => {
+                    pattern = back;
+                    locations = back_locs;
+                }
+            }
+            match crate::sequence::applied_constant(pattern, self, value, locations) {
+                Ok(set) => return set,
+                Err((back, back_val, back_locs)) => {
+                    pattern = back;
+                    value = back_val;
+                    locations = back_locs;
+                }
+            }
+        }
+        let named = self.standalone_word(value, locations);
+        crate::compose::compose(&pattern, &named, crate::compose::ComposeOp::Set, alignment)
     }
 
     /// A compound control called with one argument per positional name:
@@ -141,13 +233,815 @@ impl ControlSpec {
             .iter()
             .zip(parts)
             .fold(pattern.clone(), |so_far, (name, part)| {
-                Self::new([name.clone()]).apply(&so_far, Some(part.clone()))
+                Self::new([name.clone()]).apply_to(so_far, Some(part.clone()))
             })
+    }
+
+    /// Built-in control id (`0` for non-built-in controls).
+    #[inline]
+    pub fn builtin_id(&self) -> u16 {
+        self.id
     }
 
     /// Free-function form: `gain(0.5)` with no receiver.
     pub fn standalone(&self, value: &Pattern) -> Pattern {
         self.pattern(value)
+    }
+
+    /// Owned free-function form: names an unshared sequence in place.
+    pub fn standalone_owned(&self, value: Pattern) -> Pattern {
+        value.map_control_owned(self, false)
+    }
+
+    /// Direct free-function form for a single-word constant value and source
+    /// locations, building the named single-step sequence without an
+    /// intermediate `Node::PureAt` allocation.
+    pub fn standalone_word(&self, value: Value, locations: crate::Locations) -> Pattern {
+        crate::sequence::of_single_named(value, locations, self)
+    }
+
+    pub fn standalone_word_pair(&self, a: Value, b: Value, locations: crate::Locations) -> Pattern {
+        crate::sequence::of_single_named_pair(a, b, locations, self)
+    }
+}
+
+/// The names of the control `note`, which a rewrite of pitch names each
+/// note by.
+pub(crate) fn note_names() -> Arc<[Arc<str>]> {
+    static NAMES: std::sync::LazyLock<Arc<[Arc<str>]>> =
+        std::sync::LazyLock::new(|| Arc::from([Arc::from("note")]));
+    Arc::clone(&NAMES)
+}
+
+/// The first of `names`, the canonical name of their control, as a map key.
+pub(crate) fn key_of(names: &[Arc<str>]) -> Key {
+    names
+        .first()
+        .map_or_else(|| Key::from(""), |name| Key::from(Arc::clone(name)))
+}
+
+/// Whether a map holds its value under `value`, apart from its controls.
+fn has_value_key(object: &OrderedMap) -> bool {
+    object.contains_key("value")
+}
+
+/// Whether a list of values is one value for each of `names`.
+fn opens_list(names: &[Arc<str>], value: &Value) -> bool {
+    names.len() > 1 && matches!(value, Value::List(_))
+}
+
+/// Whether [`named_value`] makes the map of one entry of `value`: the key
+/// of the control, and `value` as it is. A data value that holds a `value`
+/// key or opens as a list under more than one name makes another map.
+pub(crate) fn names_as_one_entry(names: &[Arc<str>], value: &Value) -> bool {
+    !opens_list(names, value) && !matches!(value, Value::Object(object) if has_value_key(object))
+}
+
+/// `value` in the named form of the control of `names`: see
+/// [`ControlSpec::with_value`].
+pub(crate) fn named_value(names: &[Arc<str>], mut value: Value) -> Value {
+    // Compound controls inspect array elements positionally (`s`, `n`,
+    // `gain`), so a script-owned array must be opened at that boundary;
+    // otherwise it is stored wholesale under `s`. A single-name control
+    // preserves an ordinary array as its value, identity included, for
+    // a following callback to observe.
+    let single_js_array =
+        names.len() == 1 && matches!(&value, Value::JsValue(reference) if reference.is_array());
+    // A value of data holds nothing of the script to open.
+    if !single_js_array && value.contains_js_value() {
+        value = crate::materialize_js_value(&value);
+    }
+    let bag = match &value {
+        Value::Object(object) if has_value_key(object) => {
+            let mut object = object.clone();
+            value = object.remove("value").expect("the key was just checked");
+            Some(object)
+        }
+        _ => None,
+    };
+
+    if opens_list(names, &value)
+        && let Value::List(values) = value
+    {
+        if let Some(mut result) = bag {
+            for (name, value) in names.iter().zip(values.iter()) {
+                result.insert_key(Key::from(Arc::clone(name)), value.clone());
+            }
+            return Value::Object(result);
+        }
+        return Value::Object(OrderedMap::of_keys(
+            names
+                .iter()
+                .zip(values.iter())
+                .map(|(name, value)| (Key::from(Arc::clone(name)), value.clone())),
+        ));
+    }
+
+    // An object is a value like any other here: `.dict({…})` hands a
+    // chord dictionary that `voicing()` reads back under `dict`.
+    let Some(mut named) = bag else {
+        return Value::Object(OrderedMap::of_one(key_of(names), value));
+    };
+    named.insert_key(key_of(names), value);
+    Value::Object(named)
+}
+
+/// The argument of one control call of a chain: a number as a score writes
+/// it, a constant value with inline locations, a validated inline wave, or a pattern.
+#[derive(Clone)]
+pub enum ChainArgument {
+    Number(f64),
+    Constant(Value, crate::Locations),
+    ConstantPair(Value, Value, crate::Locations),
+    Wave(crate::fused::Wave, u32, bool, u8),
+    Pattern(Pattern),
+}
+
+impl ChainArgument {
+    /// Whether this argument is a constant of one plain value.
+    fn is_constant(&self) -> bool {
+        match self {
+            Self::Number(_) => true,
+            Self::Constant(value, _) => value.is_data(0),
+            Self::ConstantPair(a, b, _) => a.is_data(0) && b.is_data(0),
+            Self::Wave(..) => false,
+            Self::Pattern(values) => crate::sequence::is_constant_value(values),
+        }
+    }
+
+    /// The value that this argument is a constant of, with the place of
+    /// the value in the text. `None` for a pattern that is no constant of
+    /// one plain value.
+    fn constant(&self) -> Option<(Value, crate::Locations)> {
+        match self {
+            Self::Number(number) => Some((Value::F64(*number), crate::Locations::new())),
+            Self::Constant(value, locations) => Some((value.clone(), locations.clone())),
+            Self::ConstantPair(a, b, locations) => Some((
+                Value::List(Arc::from([a.clone(), b.clone()])),
+                locations.clone(),
+            )),
+            Self::Wave(..) => None,
+            Self::Pattern(values) => crate::sequence::constant_value_at(values),
+        }
+    }
+
+    /// Only the locations of a constant argument without cloning its value.
+    fn constant_locations(&self) -> Option<crate::Locations> {
+        match self {
+            Self::Number(_) => Some(crate::Locations::new()),
+            Self::Constant(_, locations) | Self::ConstantPair(_, _, locations) => {
+                Some(locations.clone())
+            }
+            Self::Wave(..) => None,
+            Self::Pattern(values) => crate::sequence::constant_value_at(values).map(|(_, l)| l),
+        }
+    }
+}
+
+/// One control call of a chain: its control and its argument.
+pub type ChainCall<'a> = (&'a ControlSpec, ChainArgument);
+
+/// `pattern` with each control of `chain` applied in turn: a number as
+/// [`ControlSpec::apply_value`] applies it, and a pattern as
+/// [`ControlSpec::apply_to`] does.
+///
+/// A chain of controls is mostly constants in a row, such as
+/// `.s("saw").lpf(800).room(0.3)`. A receiver that takes constants takes
+/// such a row in one step: the union of the controls, set one time, where
+/// each control alone visits every node and step under the receiver.
+pub fn apply_chain(mut pattern: Pattern, chain: &[ChainCall<'_>]) -> Pattern {
+    let folds = crate::compose::default_alignment() == crate::compose::Alignment::In;
+    // Where the constants in a row so far begin.
+    let mut row = 0;
+    for (index, (spec, argument)) in chain.iter().enumerate() {
+        // Check `is_constant()` first so pattern/wave arguments skip walking
+        // `takes_constants()` / `meets_each_control()`.
+        if folds
+            && argument.is_constant()
+            && (row < index || pattern.takes_constants() || pattern.meets_each_control())
+        {
+            continue;
+        }
+        pattern = apply_row(pattern, &chain[row..index]);
+        pattern = apply_argument(spec, pattern, argument);
+        row = index + 1;
+    }
+    apply_row(pattern, &chain[row..])
+}
+
+/// Owned version of [`apply_chain`] that moves pattern arguments out of
+/// `chain`, allowing `map_control_owned` to name unshared sequences in place.
+pub fn apply_chain_owned(mut pattern: Pattern, chain: &mut [ChainCall<'_>]) -> Pattern {
+    let folds = crate::compose::default_alignment() == crate::compose::Alignment::In;
+    let mut row = 0;
+    let mut can_fold: Option<bool> = None;
+    for index in 0..chain.len() {
+        if folds
+            && chain[index].1.is_constant()
+            && (row < index
+                || *can_fold.get_or_insert_with(|| {
+                    pattern.takes_constants() || pattern.meets_each_control()
+                }))
+        {
+            continue;
+        }
+        if row < index {
+            pattern = apply_row_owned(pattern, &mut chain[row..index]);
+        }
+        let spec = chain[index].0;
+        let argument = std::mem::replace(&mut chain[index].1, ChainArgument::Number(0.0));
+        pattern = apply_argument_owned(spec, pattern, argument);
+        row = index + 1;
+        can_fold = None;
+    }
+    if row < chain.len() {
+        pattern = apply_row_owned(pattern, &mut chain[row..]);
+    }
+    pattern
+}
+
+/// The transformer that applies `chain` to each pattern as [`apply_chain`]
+/// does, under `name`. It keeps a pure pattern pure when each pattern of
+/// the chain is pure: a control composes pure operands into a pure result.
+pub fn chain_transformer(
+    name: &str,
+    chain: impl IntoIterator<Item = ChainCall<'static>>,
+) -> crate::value::FunctionRef {
+    let mut iter = chain.into_iter();
+    let hint = iter.size_hint().0;
+    let mut inline: [Option<ChainCall<'static>>; 4] = [const { None }; 4];
+    let mut count = 0usize;
+    let mut spilled: Option<Vec<ChainCall<'static>>> =
+        (hint > inline.len()).then(|| Vec::with_capacity(hint));
+    let mut pure = true;
+    let is_pure = |call: &ChainCall<'static>| match &call.1 {
+        ChainArgument::Number(_)
+        | ChainArgument::Constant(..)
+        | ChainArgument::ConstantPair(..)
+        | ChainArgument::Wave(..) => true,
+        ChainArgument::Pattern(values) => values.is_pure(),
+    };
+    while let Some(item) = iter.next() {
+        pure &= is_pure(&item);
+        if let Some(vec) = &mut spilled {
+            vec.push(item);
+        } else if count < inline.len() {
+            inline[count] = Some(item);
+            count += 1;
+        } else {
+            let mut vec = Vec::with_capacity(count + 1 + iter.size_hint().0);
+            for slot in &mut inline {
+                if let Some(prev) = slot.take() {
+                    vec.push(prev);
+                }
+            }
+            vec.push(item);
+            spilled = Some(vec);
+        }
+    }
+    let body: Arc<dyn Fn(Pattern) -> Pattern + Send + Sync> = if let Some(vec) = spilled {
+        let chain: Box<[ChainCall<'static>]> = vec.into_boxed_slice();
+        Arc::new(move |pattern| apply_chain(pattern, &chain))
+    } else {
+        let all_numbers = count > 0
+            && inline[..count]
+                .iter()
+                .all(|c| matches!(c, Some((_, ChainArgument::Number(_)))));
+        if all_numbers {
+            match count {
+                1 => {
+                    let Some((spec, ChainArgument::Number(n))) = inline[0].take() else {
+                        unreachable!()
+                    };
+                    return crate::value::FunctionRef::control_number(name, spec, n);
+                }
+                2 => {
+                    let Some((s0, ChainArgument::Number(n0))) = inline[0].take() else {
+                        unreachable!()
+                    };
+                    let Some((s1, ChainArgument::Number(n1))) = inline[1].take() else {
+                        unreachable!()
+                    };
+                    return crate::value::FunctionRef::control_two_numbers(name, s0, n0, s1, n1);
+                }
+                3 => {
+                    let Some((s0, ChainArgument::Number(n0))) = inline[0].take() else {
+                        unreachable!()
+                    };
+                    let Some((s1, ChainArgument::Number(n1))) = inline[1].take() else {
+                        unreachable!()
+                    };
+                    let Some((s2, ChainArgument::Number(n2))) = inline[2].take() else {
+                        unreachable!()
+                    };
+                    Arc::new(move |pattern| {
+                        let calls = [
+                            (s0, ChainArgument::Number(n0)),
+                            (s1, ChainArgument::Number(n1)),
+                            (s2, ChainArgument::Number(n2)),
+                        ];
+                        apply_chain(pattern, &calls)
+                    })
+                }
+                4 => {
+                    let Some((s0, ChainArgument::Number(n0))) = inline[0].take() else {
+                        unreachable!()
+                    };
+                    let Some((s1, ChainArgument::Number(n1))) = inline[1].take() else {
+                        unreachable!()
+                    };
+                    let Some((s2, ChainArgument::Number(n2))) = inline[2].take() else {
+                        unreachable!()
+                    };
+                    let Some((s3, ChainArgument::Number(n3))) = inline[3].take() else {
+                        unreachable!()
+                    };
+                    Arc::new(move |pattern| {
+                        let calls = [
+                            (s0, ChainArgument::Number(n0)),
+                            (s1, ChainArgument::Number(n1)),
+                            (s2, ChainArgument::Number(n2)),
+                            (s3, ChainArgument::Number(n3)),
+                        ];
+                        apply_chain(pattern, &calls)
+                    })
+                }
+                _ => unreachable!("inline count exceeds 4"),
+            }
+        } else {
+            match count {
+                0 => Arc::new(|pattern| pattern),
+                1 => {
+                    let one = inline[0].take().expect("one call present");
+                    Arc::new(move |pattern| apply_chain(pattern, std::slice::from_ref(&one)))
+                }
+                2 => {
+                    let two = [
+                        inline[0].take().expect("call 0"),
+                        inline[1].take().expect("call 1"),
+                    ];
+                    Arc::new(move |pattern| apply_chain(pattern, &two))
+                }
+                3 => {
+                    let three = [
+                        inline[0].take().expect("call 0"),
+                        inline[1].take().expect("call 1"),
+                        inline[2].take().expect("call 2"),
+                    ];
+                    Arc::new(move |pattern| apply_chain(pattern, &three))
+                }
+                4 => {
+                    let four = [
+                        inline[0].take().expect("call 0"),
+                        inline[1].take().expect("call 1"),
+                        inline[2].take().expect("call 2"),
+                        inline[3].take().expect("call 3"),
+                    ];
+                    Arc::new(move |pattern| apply_chain(pattern, &four))
+                }
+                _ => unreachable!("inline count exceeds 4"),
+            }
+        }
+    };
+    crate::value::FunctionRef::registered(name, body, pure)
+}
+
+/// `pattern` with the constants of `row` applied: in one step when the
+/// pattern takes them so, and in turn otherwise.
+///
+/// A step that is longer than a cycle takes no row: a constant is another
+/// hap in each cycle, which cuts the step. The first control in turn makes
+/// the cut, and the steps then take the others as one row.
+fn apply_row(pattern: Pattern, row: &[ChainCall<'_>]) -> Pattern {
+    let Some(((spec, argument), rest)) = row.split_first() else {
+        return pattern;
+    };
+    let in_turn =
+        |pattern, (spec, argument): &ChainCall<'_>| apply_argument(spec, pattern, argument);
+    let back = match set_row(pattern, row) {
+        Ok(set) => return set,
+        Err(back) => back,
+    };
+    let cut = apply_argument(spec, back, argument);
+    if rest.is_empty() {
+        return cut;
+    }
+    match set_row(cut, rest) {
+        Ok(set) => set,
+        Err(back) => rest.iter().fold(back, in_turn),
+    }
+}
+
+fn apply_row_owned(pattern: Pattern, row: &mut [ChainCall<'_>]) -> Pattern {
+    if row.is_empty() {
+        return pattern;
+    }
+    let back = if row.len() >= 2 {
+        let each = || {
+            let apart = row.iter().filter_map(|(spec, argument)| {
+                let (value, at) = argument.constant()?;
+                Some((spec.with_value(value), at))
+            });
+            apart.collect()
+        };
+        let try_packed =
+            |pattern: Pattern, keys: &mut [u16], vals: &mut [Value]| -> Result<Pattern, Pattern> {
+                let Some((len, context)) = packed_union_into(row, keys, vals) else {
+                    return if let Some((union, context)) = union_of(row) {
+                        pattern.with_row(&union, context, &crate::Apart::new(row.len(), &each))
+                    } else {
+                        Err(pattern)
+                    };
+                };
+                match pattern.with_packed_row(
+                    &keys[..len],
+                    &mut vals[..len],
+                    context,
+                    &crate::Apart::new(row.len(), &each),
+                ) {
+                    Ok(set) => Ok(set),
+                    Err(back) => {
+                        if let Some(first_locs) = row[0].1.constant_locations() {
+                            let mut rest_locs = crate::Locations::new();
+                            for (_, arg) in &row[1..] {
+                                if let Some(mut at) = arg.constant_locations()
+                                    && !at.is_empty()
+                                {
+                                    at.append(&rest_locs);
+                                    rest_locs = at;
+                                }
+                            }
+                            crate::sequence::applied_packed_row(
+                                back,
+                                &keys[..len],
+                                &vals[..len],
+                                first_locs,
+                                rest_locs,
+                            )
+                        } else {
+                            Err(back)
+                        }
+                    }
+                }
+            };
+        let result = if row.len() <= 4
+            && !row
+                .iter()
+                .any(|(_, arg)| matches!(arg, ChainArgument::ConstantPair(..)))
+        {
+            let mut keys = [0u16; 4];
+            let mut vals = [const { Value::Undefined }; 4];
+            try_packed(pattern, &mut keys, &mut vals)
+        } else {
+            let mut keys = [0u16; 16];
+            let mut vals = [const { Value::Undefined }; 16];
+            try_packed(pattern, &mut keys, &mut vals)
+        };
+        match result {
+            Ok(set) => return set,
+            Err(back) => back,
+        }
+    } else {
+        if let [(spec, ChainArgument::Constant(value, locations))] = row
+            && !locations.is_empty()
+            && !opens_list(&spec.names, value)
+        {
+            match pattern.set_control_value_at(spec, value, locations.clone()) {
+                Ok(set) => return set,
+                Err((back, _)) => back,
+            }
+        } else {
+            match set_row(pattern, row) {
+                Ok(set) => return set,
+                Err(back) => back,
+            }
+        }
+    };
+    let (first, rest) = row.split_first_mut().expect("non-empty row");
+    let first_arg = std::mem::replace(&mut first.1, ChainArgument::Number(0.0));
+    let cut = apply_argument_owned(first.0, back, first_arg);
+    if rest.is_empty() {
+        return cut;
+    }
+    match set_row(cut, rest) {
+        Ok(set) => set,
+        Err(mut back) => {
+            for (spec, argument) in rest.iter_mut() {
+                let arg = std::mem::replace(argument, ChainArgument::Number(0.0));
+                back = apply_argument_owned(spec, back, arg);
+            }
+            back
+        }
+    }
+}
+
+/// `pattern` with the constants of `row` set in one step. `Err` gives the
+/// pattern back as it was, when it does not take the row so.
+fn set_row(pattern: Pattern, row: &[ChainCall<'_>]) -> Result<Pattern, Pattern> {
+    if let [(spec, argument)] = row {
+        // One control, as its method sets it: a number through its method,
+        // and a constant with locations directly through `union_of` + `with_row`.
+        match argument {
+            ChainArgument::Pattern(values) => return pattern.set_constant_control(spec, values),
+            ChainArgument::Number(_) | ChainArgument::Wave(..) => return Err(pattern),
+            ChainArgument::Constant(_, locations)
+            | ChainArgument::ConstantPair(_, _, locations)
+                if locations.is_empty() =>
+            {
+                return Err(pattern);
+            }
+            ChainArgument::Constant(..) | ChainArgument::ConstantPair(..) => {}
+        }
+    }
+    // The control of each call, and its locations.
+    let each = || {
+        let apart = row.iter().filter_map(|(spec, argument)| {
+            let (value, at) = argument.constant()?;
+            Some((spec.with_value(value), at))
+        });
+        apart.collect()
+    };
+    if row.len() <= 4
+        && !row
+            .iter()
+            .any(|(_, arg)| matches!(arg, ChainArgument::ConstantPair(..)))
+    {
+        let mut keys = [0u16; 4];
+        let mut vals = [const { Value::Undefined }; 4];
+        if let Some((len, context)) = packed_union_into(row, &mut keys, &mut vals) {
+            return pattern.with_packed_row(
+                &keys[..len],
+                &mut vals[..len],
+                context,
+                &crate::Apart::new(row.len(), &each),
+            );
+        }
+    } else {
+        let mut keys = [0u16; 16];
+        let mut vals = [const { Value::Undefined }; 16];
+        if let Some((len, context)) = packed_union_into(row, &mut keys, &mut vals) {
+            return pattern.with_packed_row(
+                &keys[..len],
+                &mut vals[..len],
+                context,
+                &crate::Apart::new(row.len(), &each),
+            );
+        }
+    }
+    let Some((union, context)) = union_of(row) else {
+        return Err(pattern);
+    };
+    pattern.with_row(&union, context, &crate::Apart::new(row.len(), &each))
+}
+
+/// Fast stack-packed union for rows where every entry is a plain scalar
+/// canonical built-in control (not `"value"`) and count fits in `keys`/`vals`.
+fn packed_union_into(
+    row: &[ChainCall<'_>],
+    keys: &mut [u16],
+    vals: &mut [Value],
+) -> Option<(usize, crate::Locations)> {
+    if row.is_empty() {
+        return None;
+    }
+    let cap = keys.len().min(vals.len());
+    let mut len = 0usize;
+    let mut seen_marks = 0u64;
+    let mut context = crate::Locations::new();
+    let mut push_packed = |packed: u16, value: Value| -> bool {
+        let bit = 1u64 << ((packed >> 10) & 63);
+        if (seen_marks & bit) != 0
+            && let Some(pos) = keys[..len].iter().position(|&k| k == packed)
+        {
+            vals[pos] = value;
+            true
+        } else if len < cap {
+            seen_marks |= bit;
+            keys[len] = packed;
+            vals[len] = value;
+            len += 1;
+            true
+        } else {
+            false
+        }
+    };
+    for (spec, argument) in row {
+        if let ChainArgument::Number(n) = *argument {
+            let packed = spec.packed_key;
+            if packed == 0 {
+                return None;
+            }
+            if !push_packed(packed, Value::F64(n)) {
+                return None;
+            }
+            continue;
+        }
+        if let ChainArgument::ConstantPair(a, b, at) = argument
+            && spec.names.len() >= 2
+        {
+            if !at.is_empty() {
+                let mut locs = at.clone();
+                locs.append(&context);
+                context = locs;
+            }
+            let p0 = spec.packed_key;
+            let p1 = spec.second_packed_key;
+            if p0 == 0
+                || p1 == 0
+                || !matches!(a, Value::F64(_) | Value::Str(_) | Value::Bool(_))
+                || !matches!(b, Value::F64(_) | Value::Str(_) | Value::Bool(_))
+            {
+                return None;
+            }
+            if !push_packed(p0, a.clone()) || !push_packed(p1, b.clone()) {
+                return None;
+            }
+            continue;
+        }
+        let (value, mut at) = argument.constant()?;
+        if !at.is_empty() {
+            at.append(&context);
+            context = at;
+        }
+        if opens_list(&spec.names, &value)
+            && let Value::List(items) = &value
+        {
+            for (idx, (name, item)) in spec.names.iter().zip(items.iter()).enumerate() {
+                if !matches!(item, Value::F64(_) | Value::Str(_) | Value::Bool(_)) {
+                    return None;
+                }
+                let packed = match idx {
+                    0 => spec.packed_key,
+                    1 => spec.second_packed_key,
+                    _ if name.as_ref() == "value" => 0,
+                    _ => pack_builtin_key_str(name),
+                };
+                if packed == 0 {
+                    return None;
+                }
+                if !push_packed(packed, item.clone()) {
+                    return None;
+                }
+            }
+            continue;
+        }
+        let packed = spec.packed_key;
+        if packed == 0 || !matches!(value, Value::F64(_) | Value::Str(_) | Value::Bool(_)) {
+            return None;
+        }
+        if !push_packed(packed, value) {
+            return None;
+        }
+    }
+    (len > 0).then_some((len, context))
+}
+
+/// The union of the controls of a row, as a `set` of each control in turn
+/// makes it: the keys in their order, with the later value of a key that
+/// comes again. With it, the locations of each control, the last one
+/// first. `None` when a control is no map of data that a union takes, so
+/// that the caller sets each control in turn.
+fn union_of(row: &[ChainCall<'_>]) -> Option<(Value, crate::Locations)> {
+    const INLINE_CAP: usize = 16;
+    let mut context = crate::Locations::new();
+    let mut inline: [Option<(Key, Value)>; INLINE_CAP] = [const { None }; INLINE_CAP];
+    let mut inline_len = 0usize;
+    let mut spilled: Option<Vec<(Key, Value)>> = None;
+    let mut set = |key: Key, value: Value| {
+        if let Some(vec) = &mut spilled {
+            match vec.iter_mut().find(|(name, _)| *name == key) {
+                Some((_, current)) => *current = value,
+                None => vec.push((key, value)),
+            }
+            return;
+        }
+        for slot in &mut inline[..inline_len] {
+            if let Some((name, current)) = slot
+                && *name == key
+            {
+                *current = value;
+                return;
+            }
+        }
+        if inline_len < INLINE_CAP {
+            inline[inline_len] = Some((key, value));
+            inline_len += 1;
+        } else {
+            let mut vec = Vec::with_capacity(INLINE_CAP * 2);
+            for slot in &mut inline[..inline_len] {
+                if let Some(pair) = slot.take() {
+                    vec.push(pair);
+                }
+            }
+            vec.push((key, value));
+            spilled = Some(vec);
+        }
+    };
+    for (spec, argument) in row {
+        if let ChainArgument::ConstantPair(a, b, at) = argument
+            && spec.names.len() >= 2
+        {
+            if !at.is_empty() {
+                let mut locs = at.clone();
+                locs.append(&context);
+                context = locs;
+            }
+            for (name, item) in [(&spec.names[0], a), (&spec.names[1], b)] {
+                if name.as_ref() == "value" || !item.is_data(0) {
+                    return None;
+                }
+                set(Key::from(Arc::clone(name)), item.clone());
+            }
+            continue;
+        }
+        let (value, mut at) = argument.constant()?;
+        // The locations of a later control come first.
+        if !at.is_empty() {
+            at.append(&context);
+            context = at;
+        }
+        // A number, a text or a flag is the one entry of its control, with
+        // no map of that entry. A map of `value` alone leaves the other
+        // side of a union as it is.
+        let plain = matches!(value, Value::F64(_) | Value::Str(_) | Value::Bool(_));
+        if plain && spec.name() != "value" {
+            set(spec.key(), value);
+            continue;
+        }
+        let named = spec.with_value(value);
+        let controls = named.as_object().filter(|_| named.is_data(0))?;
+        if crate::compose::union_drops(controls) {
+            return None;
+        }
+        for (key, value) in controls {
+            // A handle of the key and of the value.
+            set(key.clone(), value.clone());
+        }
+    }
+    let mut union = match spilled {
+        Some(entries) => OrderedMap::of_keys(entries),
+        None => OrderedMap::of_keys(
+            inline[..inline_len]
+                .iter_mut()
+                .map(|slot| slot.take().expect("inline entry present")),
+        ),
+    };
+    union.mark_made_of_data();
+    Some((Value::Object(union), context))
+}
+
+/// One control of a chain, applied as its method applies it.
+fn apply_argument(spec: &ControlSpec, pattern: Pattern, argument: &ChainArgument) -> Pattern {
+    match argument {
+        ChainArgument::Number(number) => spec.apply_value(pattern, Value::F64(*number)),
+        ChainArgument::Constant(value, locations) => {
+            spec.apply_constant(pattern, value.clone(), locations.clone())
+        }
+        ChainArgument::ConstantPair(a, b, locations) => spec.apply_constant(
+            pattern,
+            Value::List(Arc::from([a.clone(), b.clone()])),
+            locations.clone(),
+        ),
+        ChainArgument::Wave(wave, steps, math_inside, op_flags) => {
+            if crate::compose::default_alignment() == crate::compose::Alignment::In
+                && spec.id != 0
+                && !crate::sequence::builds_each_node()
+                && !pattern.is_volatile()
+                && (*steps == 0 || (!crate::fused::is_unfused() && spec.name() != "value"))
+            {
+                pattern.apply_inline_wave(spec.id, wave.clone(), *steps, *math_inside)
+            } else {
+                let pat = wave.to_pattern(*math_inside, *steps, *op_flags);
+                spec.apply_for(pattern, Some(&pat))
+            }
+        }
+        ChainArgument::Pattern(values) => spec.apply_for(pattern, Some(values)),
+    }
+}
+
+/// Owned version of [`apply_argument`] that moves `ChainArgument::Pattern` into
+/// [`ControlSpec::apply_to`] so unshared sequences are named in place.
+fn apply_argument_owned(spec: &ControlSpec, pattern: Pattern, argument: ChainArgument) -> Pattern {
+    match argument {
+        ChainArgument::Number(number) => spec.apply_value(pattern, Value::F64(number)),
+        ChainArgument::Constant(value, locations) => spec.apply_constant(pattern, value, locations),
+        ChainArgument::ConstantPair(a, b, locations) => {
+            spec.apply_constant(pattern, Value::List(Arc::from([a, b])), locations)
+        }
+        ChainArgument::Wave(wave, steps, math_inside, op_flags) => {
+            if crate::compose::default_alignment() == crate::compose::Alignment::In
+                && spec.id != 0
+                && !crate::sequence::builds_each_node()
+                && !pattern.is_volatile()
+                && (steps == 0 || (!crate::fused::is_unfused() && spec.name() != "value"))
+            {
+                pattern.apply_inline_wave(spec.id, wave, steps, math_inside)
+            } else {
+                let pat = wave.to_pattern(math_inside, steps, op_flags);
+                spec.apply_to(pattern, Some(pat))
+            }
+        }
+        ChainArgument::Pattern(values) => spec.apply_to(pattern, Some(values)),
     }
 }
 
@@ -161,7 +1055,7 @@ pub fn apply_pattern<P: PatOps>(name: &str, pattern: &P, value: &P) -> P {
     default_control_registry()
         .get(name)
         .unwrap_or_else(|| panic!("generated control registry is missing {name}"))
-        .apply_for(pattern, Some(value.clone()))
+        .apply_for(pattern.clone(), Some(value))
 }
 
 /// The compose `set` applied to two values, object promotion included.
@@ -190,6 +1084,8 @@ pub fn set_value(left: &Value, right: &Value) -> Value {
 #[derive(Clone, Debug, Default)]
 pub struct ControlRegistry {
     specs: Vec<ControlSpec>,
+    keys: Vec<Key>,
+    mark_bits: Vec<u8>,
     aliases: BTreeMap<Arc<str>, usize>,
 }
 
@@ -205,6 +1101,8 @@ impl ControlRegistry {
     ) {
         let spec = ControlSpec::new(names);
         let index = self.specs.len();
+        let key = spec.key();
+        let mark_bit = crate::value::Table::mark_bit(key.as_str());
         // Only `names[0]` becomes an accessor. The SECONDARY positional names
         // of a compound control are output keys, not entry points - `s` writes
         // `n` and `gain`, but `pat.n(…)` is the separately registered `n`
@@ -218,6 +1116,8 @@ impl ControlRegistry {
             self.aliases.insert(alias.into(), index);
         }
         self.specs.push(spec);
+        self.keys.push(key);
+        self.mark_bits.push(mark_bit);
     }
 
     pub fn get(&self, name: &str) -> Option<&ControlSpec> {
@@ -270,10 +1170,294 @@ pub fn default_control_registry() -> &'static ControlRegistry {
                 control.names.iter().copied(),
                 control.aliases.iter().copied(),
             );
+            let index = registry.specs.len();
+            if let Some(id) = u16::try_from(index).ok().filter(|&n| n != 0)
+                && let Some(spec) = registry.specs.last_mut()
+            {
+                spec.id = id;
+                if let Some(first) = control.names.first().copied()
+                    && first != "value"
+                {
+                    spec.packed_key = pack_builtin_key_str(first);
+                }
+                if let Some(second) = control.names.get(1).copied()
+                    && second != "value"
+                {
+                    spec.second_packed_key = pack_builtin_key_str(second);
+                }
+            }
         }
         registry
     });
     &REGISTRY
+}
+
+const _: () = assert!(crate::controls_generated::CONTROL_NAMES.len() < 1024);
+
+/// Built-in [`ControlSpec`] for a non-zero 1-based registry id.
+#[inline]
+pub(crate) fn builtin_spec_by_id(id: u16) -> Option<&'static ControlSpec> {
+    let index = usize::from(id.checked_sub(1)?);
+    default_control_registry().specs.get(index)
+}
+
+/// Built-in canonical control name `&'static str` for a non-zero 1-based id,
+/// reading the compile-time catalog table directly with zero `LazyLock` overhead.
+#[inline(always)]
+pub(crate) fn builtin_name_str_by_id(id: u16) -> Option<&'static str> {
+    let index = usize::from(id.checked_sub(1)?);
+    crate::controls_generated::CONTROL_NAMES
+        .get(index)
+        .and_then(|c| c.names.first().copied())
+}
+
+const PACKED_TABLE_LEN: usize = 1024;
+
+#[inline(always)]
+const fn control_name_hash(bytes: &[u8]) -> usize {
+    let mut h: u32 = 0x811c_9dc5;
+    let mut i = 0;
+    while i < bytes.len() {
+        h ^= bytes[i] as u32;
+        h = h.wrapping_mul(0x0100_0193);
+        i += 1;
+    }
+    h as usize
+}
+
+/// Compile-time open-addressed lookup table from canonical built-in control
+/// name to packed `u16` (`id | (mark_bit << 10)`). Zero runtime initialization
+/// and zero `BTreeMap` traversal.
+static PACKED_KEY_TABLE: [(&str, u16); PACKED_TABLE_LEN] = {
+    let mut table = [("", 0u16); PACKED_TABLE_LEN];
+    let controls = crate::controls_generated::CONTROL_NAMES;
+    let mut i = 0;
+    while i < controls.len() {
+        let names = controls[i].names;
+        if !names.is_empty() {
+            let name = names[0];
+            let id = (i + 1) as u16;
+            let bit = crate::value::Table::mark_bit(name);
+            let packed = id | ((bit as u16) << 10);
+            let mut slot = control_name_hash(name.as_bytes()) & (PACKED_TABLE_LEN - 1);
+            while table[slot].1 != 0 {
+                slot = (slot + 1) & (PACKED_TABLE_LEN - 1);
+            }
+            table[slot] = (name, packed);
+        }
+        i += 1;
+    }
+    table
+};
+
+/// Pack a built-in canonical key name into a non-zero `u16`: low 10 bits hold
+/// the 1-based control id (`1..1024`) and high 6 bits hold `Table::mark_bit`.
+/// Returns `0` for non-built-in or alias names.
+#[inline]
+pub(crate) fn pack_builtin_key_str(name: &str) -> u16 {
+    let mut slot = control_name_hash(name.as_bytes()) & (PACKED_TABLE_LEN - 1);
+    loop {
+        let (slot_name, packed) = PACKED_KEY_TABLE[slot];
+        if packed == 0 {
+            return 0;
+        }
+        if slot_name == name {
+            return packed;
+        }
+        slot = (slot + 1) & (PACKED_TABLE_LEN - 1);
+    }
+}
+
+/// Built-in canonical [`Key`] table for 1-based registry ids (`id - 1`).
+#[inline]
+pub(crate) fn builtin_key_slice() -> &'static [Key] {
+    &default_control_registry().keys
+}
+
+/// Built-in canonical [`Key`] reference for a non-zero 1-based registry id.
+#[inline]
+pub(crate) fn builtin_key_ref_by_id(id: u16) -> Option<&'static Key> {
+    let index = usize::from(id.checked_sub(1)?);
+    default_control_registry().keys.get(index)
+}
+
+/// Precomputed key bloom bit index (`0..63`) for a non-zero 1-based registry id.
+#[inline]
+pub(crate) fn builtin_mark_bit_by_id(id: u16) -> u8 {
+    let Some(index) = id.checked_sub(1).map(usize::from) else {
+        return 0;
+    };
+    default_control_registry()
+        .mark_bits
+        .get(index)
+        .copied()
+        .unwrap_or(0)
+}
+
+/// Packed `(mark_bit << 10) | id` key for a non-zero 1-based built-in registry id.
+#[inline]
+pub(crate) fn builtin_packed_key(id: u16) -> u16 {
+    id | (u16::from(builtin_mark_bit_by_id(id)) << 10)
+}
+
+/// Built-in control names for a non-zero 1-based registry id.
+#[inline]
+pub(crate) fn builtin_names_by_id(id: u16) -> Option<&'static Arc<[Arc<str>]>> {
+    builtin_spec_by_id(id).map(|spec| &spec.names)
+}
+
+/// Built-in 1-based control id whose canonical name matches `name`, or `0`.
+pub(crate) fn builtin_id_of_name(name: &str) -> u16 {
+    default_control_registry()
+        .get(name)
+        .filter(|spec| spec.name() == name)
+        .map_or(0, |spec| spec.id)
+}
+
+/// Built-in 1-based control id matching `names`, or `0` for custom controls.
+pub(crate) fn builtin_id_of_names(names: &[Arc<str>]) -> u16 {
+    let Some(first) = names.first() else {
+        return 0;
+    };
+    default_control_registry()
+        .get(first)
+        .filter(|spec| spec.names.as_ref() == names)
+        .map_or(0, |spec| spec.id)
+}
+
+/// Cached 1-based control id for `"note"`.
+#[inline]
+pub(crate) fn note_control_id() -> u16 {
+    static ID: std::sync::OnceLock<u16> = std::sync::OnceLock::new();
+    *ID.get_or_init(|| {
+        default_control_registry()
+            .get("note")
+            .map_or(0, |spec| spec.id)
+    })
+}
+
+/// The per-hap maps of the control applications, interned by what each
+/// reads.
+///
+/// A map is a pure function of its spec and its unnamed-only flag, so the
+/// same control built by a later evaluation is the same closure object. The
+/// node that holds it then agrees with its counterpart by pointer, and the
+/// answers of the unchanged subtree carry across evaluations and edits
+/// instead of rebuilding. See [`crate::interned_closure`].
+type WeakOwnedHapMapFn = std::sync::Weak<dyn Fn(Hap) -> Option<Hap> + Send + Sync>;
+
+#[derive(Default)]
+struct ControlMaps {
+    maps: std::collections::HashMap<(ControlSpec, bool), (WeakOwnedHapMapFn, usize)>,
+    /// The name of each live interned map of every value, keyed by the address
+    /// of the map and verified against its weak handle.
+    names: std::collections::HashMap<usize, (WeakOwnedHapMapFn, Key)>,
+}
+
+static INTERNED_CONTROL_MAPS: std::sync::OnceLock<std::sync::Mutex<ControlMaps>> =
+    std::sync::OnceLock::new();
+
+/// The address of `map`, which tells one interned map from another.
+fn address(map: &crate::OwnedHapMapFn) -> usize {
+    Arc::as_ptr(map).cast::<()>() as usize
+}
+
+pub(crate) fn interned_control_map(spec: &ControlSpec, unnamed_only: bool) -> crate::OwnedHapMapFn {
+    let kept = spec.maps[usize::from(unnamed_only)].get_or_init(|| {
+        // The pool and the map hold the names alone: a spec with its maps
+        // would hold the maps that hold it.
+        let names = || ControlSpec::new(spec.names.iter().cloned());
+        let make = || -> crate::OwnedHapMapFn { Arc::new(control_map(names(), unnamed_only)) };
+        let Ok(mut pool) = INTERNED_CONTROL_MAPS.get_or_init(Default::default).lock() else {
+            return make();
+        };
+        if let Some((weak, _)) = pool.maps.get(&(names(), unnamed_only))
+            && let Some(found) = weak.upgrade()
+        {
+            return found;
+        }
+        let made = make();
+        if pool.maps.len() >= 32 || pool.names.len() >= 32 {
+            let ControlMaps {
+                maps,
+                names: name_map,
+            } = &mut *pool;
+            maps.retain(|_, (weak, addr)| {
+                if weak.strong_count() > 0 {
+                    true
+                } else {
+                    name_map.remove(addr);
+                    false
+                }
+            });
+            name_map.retain(|_, (weak, _)| weak.strong_count() > 0);
+        }
+        // A full pool takes no map: a fresh one only loses the carry.
+        if pool.maps.len() < crate::MAX_INTERNED_CLOSURES {
+            let addr = address(&made);
+            let weak = Arc::downgrade(&made);
+            if !unnamed_only {
+                pool.names.insert(addr, (weak.clone(), spec.key()));
+            }
+            pool.maps.insert((names(), unnamed_only), (weak, addr));
+        }
+        made
+    });
+    Arc::clone(kept)
+}
+
+/// The name of the control whose map of each value `map` is: that map
+/// names a number `{name: number}`, also for a control of several names,
+/// which reads the other names from a list. `None` for any other map of
+/// haps.
+pub(crate) fn named_by(map: &crate::OwnedHapMapFn) -> Option<Key> {
+    let pool = INTERNED_CONTROL_MAPS.get()?.lock().ok()?;
+    let (weak, key) = pool.names.get(&address(map))?;
+    (std::ptr::addr_eq(weak.as_ptr(), Arc::as_ptr(map)) && weak.strong_count() > 0)
+        .then(|| key.clone())
+}
+
+/// The place of the live binding of the control `name` in
+/// [`crate::Hap::live_controls`], for a control that a slider can drive.
+pub(crate) fn live_slot(name: &str) -> Option<usize> {
+    match name {
+        "gain" => Some(0),
+        "cutoff" => Some(1),
+        "resonance" => Some(2),
+        "fmi" => Some(3),
+        _ => None,
+    }
+}
+
+/// Apply a control's naming map directly to one hap without closure indirection.
+pub(crate) fn apply_control_hap(spec: &ControlSpec, unnamed_only: bool, hap: Hap) -> Option<Hap> {
+    let already_controls = unnamed_only
+        && match &hap.value {
+            Value::Object(object) => !object.contains_key("value"),
+            Value::JsValue(reference) if !reference.is_array() => matches!(
+                crate::materialize_js_value(&hap.value),
+                Value::Object(object) if !object.contains_key("value")
+            ),
+            _ => false,
+        };
+    if already_controls {
+        return Some(hap);
+    }
+    let slider_binding = hap.slider_binding();
+    let scalar = matches!(hap.value, Value::F64(_));
+    let mut mapped = hap.map_value(|value| spec.with_value(value.clone()));
+    if slider_binding != 0
+        && scalar
+        && let Some(slot) = live_slot(spec.name())
+    {
+        mapped.set_live_control(slot, slider_binding);
+    }
+    Some(mapped)
+}
+
+/// The body of one interned control map. See [`interned_control_map`].
+fn control_map(spec: ControlSpec, unnamed_only: bool) -> impl Fn(Hap) -> Option<Hap> + Send + Sync {
+    move |hap| apply_control_hap(&spec, unnamed_only, hap)
 }
 
 #[cfg(test)]
@@ -302,10 +1486,36 @@ mod tests {
     }
 
     #[test]
+    fn a_chain_transformer_is_native_for_pure_patterns_alone() {
+        let gain: &'static ControlSpec = Box::leak(Box::new(ControlSpec::new(["gain"])));
+        let script = pure(Value::Function(std::sync::Arc::new(
+            crate::value::FunctionRef::js(9),
+        )));
+        assert!(!script.is_pure());
+        let chains = [
+            (vec![(gain, ChainArgument::Number(0.5))], true),
+            (
+                vec![(gain, ChainArgument::Pattern(pure(Value::F64(0.5))))],
+                true,
+            ),
+            (
+                vec![
+                    (gain, ChainArgument::Number(0.5)),
+                    (gain, ChainArgument::Pattern(script)),
+                ],
+                false,
+            ),
+        ];
+        for (chain, native) in chains {
+            assert_eq!(chain_transformer("gain", chain).is_native(), native);
+        }
+    }
+
+    #[test]
     fn compound_control_ignores_extra_values() {
         let sound = ControlSpec::new(["s", "n", "gain"]);
         assert_eq!(
-            sound.with_value(Value::List(vec![
+            sound.with_value(Value::list(vec![
                 Value::Str("bd".into()),
                 Value::F64(2.0),
                 Value::F64(0.5),
@@ -341,7 +1551,7 @@ mod tests {
     fn an_object_argument_is_named_like_any_other_value() {
         let dict = ControlSpec::new(["dict"]);
         let dictionary =
-            Value::object([("".into(), Value::List(vec![Value::Str("0 7 12 16".into())]))]);
+            Value::object([("".into(), Value::list(vec![Value::Str("0 7 12 16".into())]))]);
         assert_eq!(
             dict.with_value(dictionary.clone()),
             Value::object([("dict".into(), dictionary)])

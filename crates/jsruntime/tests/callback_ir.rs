@@ -8,7 +8,7 @@
 
 use std::fmt::Write;
 
-use rustel_core::{Hap, PickLookup, TimeSpan, Value};
+use rustel_core::{Hap, PickLookup, Value};
 use rustel_fraction::Fraction;
 use rustel_jsruntime::{JsRuntime, PatternTransformIrMode, PatternTransformIrStats, Slot};
 use rustel_transpiler::TranspileOptions;
@@ -90,7 +90,10 @@ fn describe(hap: &Hap) -> String {
             entries,
         } => format!(
             "object {enumerable_len} {:?}",
-            entries.iter().map(|(key, _)| key).collect::<Vec<_>>()
+            entries
+                .iter()
+                .map(|(key, _)| key.as_str())
+                .collect::<Vec<_>>()
         ),
     });
     format!(
@@ -104,7 +107,7 @@ fn describe(hap: &Hap) -> String {
         hap.scale_definition_context(),
         hap.tags_context(),
         hap.log_line(),
-        hap.live_controls,
+        hap.live_controls(),
         hap.ui_visuals_context(),
     )
 }
@@ -124,7 +127,7 @@ fn observe(runtime: &JsRuntime) -> String {
             Err(error) => writeln!(out, "{begin}..{end}: {error}").expect("write to a string"),
         }
     }
-    let steps = runtime.active_pattern().map(|pattern| pattern.steps);
+    let steps = runtime.active_pattern().map(|pattern| pattern.steps());
     writeln!(out, "steps: {steps:?}").expect("write to a string");
     out
 }
@@ -237,6 +240,7 @@ const CALLBACKS: &[&str] = &[
     r#"x => x.mask("1 0 1 1")"#,
     r#"x => x.squeeze("0 1")"#,
     r#"x => x.clip(0.75).ply("<2 2 2 4>")"#,
+    r#"y => y.when("< 0 [0!3 1]>", x => x.ply(2))"#,
     r#"x => x.s("square:1").add(16)"#,
     "x => x.crush(4).speed(2)",
     "x => x.hurry(2).early(0.25)",
@@ -317,6 +321,67 @@ fn compiled_callbacks_build_what_their_javascript_builds() {
     assert_eq!(dual.stale, 0, "{dual:?}");
 }
 
+/// A combinator method whose function slot a nested arrow fills: the gated
+/// shape a benchmark song uses. The registration is the instruction, so the
+/// program applies the argument patterns as the method call does, and the
+/// nested arrow compiles as its own chain.
+#[test]
+fn a_nested_transform_arrow_plays_what_its_javascript_plays() {
+    let runtimes = [runtime(AUTO), runtime(COMPATIBILITY), runtime(DUAL_RUN)];
+    for source in [
+        r#"s("bd*4").when("< 0 [0!3 1]>", x => x.ply(2))"#,
+        r#"s("bd*4").sometimesBy(1, y => y.when("< 0 [0!3 1]>", x => x.ply(2)))"#,
+        r#"n("0 1 2 3").every(2, y => y.when("< 0 [0!3 1]>", x => x.ply(2)))"#,
+        r#"s("bd*4").sometimesBy(1, y => y.when("< 0 [0!3 1]>", x => x.clip(0.75).ply("<2 2 2 4>")))"#,
+    ] {
+        assert_modes_agree(&runtimes, source);
+    }
+
+    // The outer chain and the nested arrow each compile, and sixteen cycles
+    // answer without one host call: a current program applies its chain
+    // natively, and the table the first query builds answers the rest.
+    let gated = r#"s("bd*4").sometimesBy(1, y => y.when("< 0 [0!3 1]>", x => x.ply(2)))"#;
+    let (auto, stats) = stats_after(AUTO, gated);
+    assert_eq!(stats.lowered, 2, "{stats:?}");
+    for _ in 0..2 {
+        auto.query(Slot::Active, 0, Fraction::ZERO, Fraction::int(16))
+            .expect("query");
+    }
+    let stats = auto.pattern_transform_ir_stats();
+    assert_eq!(stats.calls, 0, "{stats:?}");
+    assert_eq!(stats.compatibility_executions, 0, "{stats:?}");
+
+    // The first cycle's condition is false everywhere: its four quarters pass
+    // through. The second cycle's condition is true on its last whole: that
+    // quarter plys into two eighths.
+    let of_cycle = |cycle: i128| {
+        auto.query(
+            Slot::Active,
+            0,
+            Fraction::int(cycle),
+            Fraction::int(cycle + 1),
+        )
+        .expect("query")
+    };
+    let first = of_cycle(0);
+    assert_eq!(
+        first.len(),
+        4,
+        "{:?}",
+        first.iter().map(|hap| hap.whole).collect::<Vec<_>>()
+    );
+    let second = of_cycle(1);
+    assert_eq!(second.len(), 5);
+    // Three quarters pass through; the truthy quarter plys into two eighths.
+    assert_eq!(
+        second
+            .iter()
+            .filter(|hap| hap.part.end - hap.part.begin == Fraction::new(1, 8))
+            .count(),
+        2
+    );
+}
+
 #[test]
 fn a_setup_helper_compiles_with_its_location_free_mini_notation() {
     let setup = TranspileOptions {
@@ -375,16 +440,19 @@ fn lazily_applied_compiled_callbacks_leave_a_pure_graph() {
 }
 
 #[test]
-fn a_compiled_chunk_callback_answers_from_tables() {
+fn a_compiled_chunk_callback_stays_pure_and_cacheable() {
     let (auto, _) = stats_after(AUTO, r#"n("0 1 2 3").chunk(4, x => x.fast(2))"#);
     let graph = auto.active_pattern().expect("active graph");
     assert!(graph.is_pure());
-    // The first query of a node answers from the graph and a later one
-    // builds its tables.
-    for _ in 0..2 {
-        let _ = auto.query(Slot::Active, 0, Fraction::ZERO, Fraction::int(16));
-    }
-    assert!(graph.answers_from_tables(TimeSpan::new(Fraction::ZERO, Fraction::int(16))));
+    assert!(graph.is_cacheable());
+    let first = auto
+        .query(Slot::Active, 0, Fraction::ZERO, Fraction::int(16))
+        .expect("first query");
+    let second = auto
+        .query(Slot::Active, 0, Fraction::ZERO, Fraction::int(16))
+        .expect("second query");
+    assert!(!first.is_empty());
+    assert_eq!(first.len(), second.len());
 }
 
 #[test]
@@ -673,6 +741,56 @@ fn a_later_replacement_reaches_graphs_built_before_it() {
     }
 }
 
+/// Each arrow keeps its own standings: a replacement reaches the chain that
+/// reads it, through the host, while the other chain's program still stands.
+#[test]
+fn a_nested_arrow_goes_stale_for_its_own_chain_alone() {
+    let gated = r#"s("bd*4").sometimesBy(1, y => y.when("< 0 [0!3 1]>", x => x.ply(2)))"#;
+    for texts in [
+        vec![
+            Text::Score(gated),
+            Text::Eval("Pattern.prototype.ply = function () { return this.fast(2) }"),
+        ],
+        vec![
+            Text::Score(gated),
+            Text::Eval("Pattern.prototype.when = function (c, f) { return this.fast(2) }"),
+        ],
+        vec![
+            Text::Score(gated),
+            Text::Score("register('ply', (n, pat) => pat.fast(n))"),
+        ],
+    ] {
+        let [auto, ..] = assert_sessions_agree(&texts);
+        assert_eq!(auto.2.lowered, 2, "{texts:?}: {:?}", auto.2);
+    }
+}
+
+/// A stale nested arrow with no host plays only the parts that need no
+/// callback: the cycle whose condition is false passes through, and a query
+/// that reaches the stale whole answers nothing at all - a pending query
+/// error empties the whole query, not only the part that erred.
+#[test]
+fn a_stale_nested_arrow_without_a_host_plays_what_needs_no_callback() {
+    let runtime = runtime(AUTO);
+    evaluate(
+        &runtime,
+        r#"s("bd*4").sometimesBy(1, y => y.when("< 0 [0!3 1]>", x => x.ply(2)))"#,
+    );
+    assert_eq!(runtime.pattern_transform_ir_stats().lowered, 2);
+    let graph = runtime.active_pattern().expect("active graph");
+    runtime
+        .eval("Pattern.prototype.ply = function () { return this.fast(2) }")
+        .expect("replace ply");
+    assert!(runtime.compiled_callbacks_need_host());
+    let count = |begin: i128, end: i128| {
+        graph
+            .query_arc(Fraction::int(begin), Fraction::int(end))
+            .len()
+    };
+    assert_eq!(count(0, 1), 4);
+    assert_eq!(count(1, 2), 0);
+}
+
 #[test]
 fn a_stale_compiled_callback_routes_queries_through_the_host_while_it_lives() {
     let runtime = runtime(AUTO);
@@ -860,6 +978,35 @@ fn nearby_dynamic_arrows_remain_on_the_complete_quickjs_tier() {
             "{callback}: unsupported source entered callback IR"
         );
     }
+}
+
+/// A nested arrow recognition cannot prove keeps the whole callback's
+/// JavaScript: a free name, a statement body, an asynchronous arrow, a
+/// function in the slot of a method that takes none, or more nesting than a
+/// program holds.
+#[test]
+fn an_unprovable_nested_arrow_keeps_the_whole_callback() {
+    for callback in [
+        r#"y => y.when("< 0 [0!3 1]>", x => x.ply(k))"#,
+        r#"y => y.when(k, x => x.ply(2))"#,
+        r#"y => y.when("< 0 [0!3 1]>", x => { return x.ply(2) })"#,
+        r#"y => y.when("< 0 [0!3 1]>", async x => x.ply(2))"#,
+        r#"y => y.fast((x) => x)"#,
+        r#"y => y.when(1, z1 => z1.when(1, z2 => z2.when(1, z3 => z3.when(1, z4 => z4))))"#,
+    ] {
+        let source = format!(r#"globalThis.k = 2; s("bd*4").sometimesBy(1, {callback})"#);
+        assert_sessions_agree(&[Text::Score(&source)]);
+        // A snapshot taken before any query: recognition declined, so the
+        // evaluation compiled nothing. Queries afterwards run the kept
+        // JavaScript, which bridges its nested arrows again per run.
+        let (_, stats) = stats_after(AUTO, &source);
+        assert_eq!(stats.lowered, 0, "{callback}: {stats:?}");
+    }
+    // Up to the nesting cap, each arrow compiles as its own chain.
+    let source =
+        r#"s("bd*4").sometimesBy(1, y => y.when(1, z1 => z1.when(1, z2 => z2.when(1, z3 => z3))))"#;
+    let (_, stats) = stats_after(AUTO, source);
+    assert_eq!(stats.lowered, 4, "{stats:?}");
 }
 
 #[test]

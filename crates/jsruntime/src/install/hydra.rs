@@ -631,7 +631,7 @@ fn bare_object<'js>(ctx: &Ctx<'js>) -> rquickjs::Result<rquickjs::Object<'js>> {
 fn install_surface<'js>(
     ctx: &Ctx<'js>,
     chains: &Rc<RefCell<HydraChains>>,
-    transaction: &Rc<RefCell<Option<ScoreEffects>>>,
+    transaction: &Rc<RefCell<EffectTransaction>>,
     policy: &Rc<Cell<EffectPolicy>>,
     refusal: &Rc<RefCell<Option<String>>>,
 ) -> rquickjs::Result<()> {
@@ -845,7 +845,7 @@ pub(crate) fn restore_surface<'js>(
 fn new_chain<'js>(
     ctx: &Ctx<'js>,
     chains: &Rc<RefCell<HydraChains>>,
-    transaction: &Rc<RefCell<Option<ScoreEffects>>>,
+    transaction: &Rc<RefCell<EffectTransaction>>,
     policy: &Rc<Cell<EffectPolicy>>,
     refusal: &Rc<RefCell<Option<String>>>,
     chain: Chain,
@@ -919,7 +919,7 @@ fn chain_at<'js>(
 fn chain_apply<'js>(
     ctx: &Ctx<'js>,
     chains: &Rc<RefCell<HydraChains>>,
-    transaction: &Rc<RefCell<Option<ScoreEffects>>>,
+    transaction: &Rc<RefCell<EffectTransaction>>,
     policy: &Rc<Cell<EffectPolicy>>,
     refusal: &Rc<RefCell<Option<String>>>,
     args: &[rquickjs::Value<'js>],
@@ -978,7 +978,7 @@ const RESERVED: &[&str] = &[
 fn chain_get<'js>(
     ctx: &Ctx<'js>,
     chains: &Rc<RefCell<HydraChains>>,
-    transaction: &Rc<RefCell<Option<ScoreEffects>>>,
+    transaction: &Rc<RefCell<EffectTransaction>>,
     policy: &Rc<Cell<EffectPolicy>>,
     refusal: &Rc<RefCell<Option<String>>>,
     args: &[rquickjs::Value<'js>],
@@ -1082,7 +1082,7 @@ fn chain_get<'js>(
 
 fn push_statement<'js>(
     ctx: &Ctx<'js>,
-    transaction: &Rc<RefCell<Option<ScoreEffects>>>,
+    transaction: &Rc<RefCell<EffectTransaction>>,
     policy: &Rc<Cell<EffectPolicy>>,
     refusal: &Rc<RefCell<Option<String>>>,
     statement: serde_json::Value,
@@ -1114,7 +1114,7 @@ fn push_statement<'js>(
 fn action_function<'js>(
     ctx: &Ctx<'js>,
     chains: &Rc<RefCell<HydraChains>>,
-    transaction: &Rc<RefCell<Option<ScoreEffects>>>,
+    transaction: &Rc<RefCell<EffectTransaction>>,
     policy: &Rc<Cell<EffectPolicy>>,
     refusal: &Rc<RefCell<Option<String>>>,
     name: &'static str,
@@ -1171,7 +1171,7 @@ fn action_function<'js>(
 fn set_function<'js>(
     ctx: &Ctx<'js>,
     chains: &Rc<RefCell<HydraChains>>,
-    transaction: &Rc<RefCell<Option<ScoreEffects>>>,
+    transaction: &Rc<RefCell<EffectTransaction>>,
     policy: &Rc<Cell<EffectPolicy>>,
     refusal: &Rc<RefCell<Option<String>>>,
     args: &[rquickjs::Value<'js>],
@@ -1259,7 +1259,7 @@ fn set_function<'js>(
 fn install_setting<'js>(
     ctx: &Ctx<'js>,
     _chains: &Rc<RefCell<HydraChains>>,
-    transaction: &Rc<RefCell<Option<ScoreEffects>>>,
+    transaction: &Rc<RefCell<EffectTransaction>>,
     policy: &Rc<Cell<EffectPolicy>>,
     refusal: &Rc<RefCell<Option<String>>>,
     name: &'static str,
@@ -1454,10 +1454,14 @@ pub(super) fn install<'js>(
         .set(HYDRA_STATE, state)
         .map_err(|error| error.to_string())?;
 
-    let chains = runtime.hydra_chains.clone();
-    let transaction = runtime.effect_transaction.clone();
-    let policy = runtime.effect_policy.clone();
-    let refusal = runtime.effect_policy_refusal.clone();
+    let chains = runtime
+        .hydra_chains
+        .get_or_init(|| Rc::new(RefCell::new(crate::install::HydraChains::default())))
+        .clone();
+    let bridge = runtime.bridge();
+    let transaction = bridge.effect_transaction.clone();
+    let policy = bridge.effect_policy.clone();
+    let refusal = bridge.effect_policy_refusal.clone();
 
     let open = Function::new(ctx.clone(), {
         let chains = chains.clone();

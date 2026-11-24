@@ -57,6 +57,10 @@ pub struct MemoryFigures {
     pub samples: Option<SampleMemory>,
     /// The script engine's heap; `None` until the engine's first snapshot.
     pub script_heap: Option<usize>,
+    /// What evaluated the score, when the engine says: a native score
+    /// needs no script engine, and the breakdown says which line of a
+    /// score needs it.
+    pub score_engine: Option<rustel_runtime::ScoreEngine>,
     /// What the audio side holds, only while an output or input is open.
     pub audio: Option<AudioMemory>,
     /// What Hydra holds, only while it has a renderer open or a camera or
@@ -192,6 +196,9 @@ pub struct PluginMemory {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Detail {
     Sounds,
+    /// What the script engine does for the score. This line stays on a
+    /// short terminal: it says when an edit moved the score to the engine.
+    Script,
     Audio,
     Visuals,
     Interface,
@@ -322,6 +329,21 @@ pub fn rows(figures: &MemoryFigures) -> Vec<Row> {
             rows.push(Row::figure(Part, "script engine", heap as u64));
         }
         None => rows.push(Row::unknown(Part, "script engine")),
+    }
+    if let Some(engine) = figures.score_engine {
+        use rustel_runtime::ScoreEngine;
+        let label = match engine {
+            // The engine starts at the first score that needs it.
+            ScoreEngine::Native if figures.script_heap.unwrap_or(0) == 0 => {
+                "off · the score is native".to_owned()
+            }
+            ScoreEngine::Native => "idle · the score is native".to_owned(),
+            ScoreEngine::Script { line: Some(line) } => {
+                format!("runs the score · line {line} needs it")
+            }
+            ScoreEngine::Script { line: None } => "runs the score".to_owned(),
+        };
+        rows.push(Row::text(Of(Detail::Script), label));
     }
     // Only while something is open: the audio side is nothing otherwise.
     // Its parts are what has been written, not what was set aside, so the
@@ -477,7 +499,7 @@ fn drop_rank(kind: RowKind) -> Option<u8> {
             Some(2)
         }
         RowKind::Detail(Detail::Sounds) => Some(3),
-        RowKind::Title | RowKind::Part | RowKind::Excess => None,
+        RowKind::Title | RowKind::Part | RowKind::Excess | RowKind::Detail(Detail::Script) => None,
     }
 }
 
@@ -512,6 +534,8 @@ pub fn sidecar_rows(figures: &MemoryFigures, room: usize) -> Vec<Row> {
                 "interface" => 4,
                 _ => 5,
             },
+            // With its part.
+            RowKind::Detail(Detail::Script) => 2,
             RowKind::Detail(Detail::Plugins) => 5,
             RowKind::Outside => 6,
             RowKind::Detail(_) => 7,
@@ -976,6 +1000,7 @@ mod tests {
                 recent_limit_bytes: 256 * MIB,
             }),
             script_heap: Some(5 * MIB),
+            score_engine: None,
             audio: Some(AudioMemory {
                 event_ring: 8 * MIB,
                 backend: 17 * MIB,
@@ -1221,6 +1246,56 @@ mod tests {
     /// discrete card's and, on Linux and Windows, an integrated one's: they
     /// are said beside the visuals and never added to the figure, which
     /// only the readback buffers count toward.
+    /// The breakdown says what the script engine does for the score, under
+    /// the engine's part, and keeps that line on a short terminal.
+    #[test]
+    fn the_script_engine_part_says_what_evaluated_the_score() {
+        use rustel_runtime::ScoreEngine;
+        let said = |score_engine, script_heap| {
+            let rows = rows(&MemoryFigures {
+                score_engine,
+                script_heap: Some(script_heap),
+                ..figures()
+            });
+            let part = rows
+                .iter()
+                .position(|row| row.label == "script engine")
+                .expect("the part");
+            let detail = rows.get(part + 1);
+            detail
+                .filter(|row| row.kind == RowKind::Detail(Detail::Script))
+                .map(|row| row.label.clone())
+        };
+        assert_eq!(said(None, 0), None);
+        assert_eq!(
+            said(Some(ScoreEngine::Native), 0).as_deref(),
+            Some("off · the score is native")
+        );
+        assert_eq!(
+            said(Some(ScoreEngine::Native), MIB).as_deref(),
+            Some("idle · the score is native")
+        );
+        assert_eq!(
+            said(Some(ScoreEngine::Script { line: Some(12) }), MIB).as_deref(),
+            Some("runs the score · line 12 needs it")
+        );
+        assert_eq!(
+            said(Some(ScoreEngine::Script { line: None }), MIB).as_deref(),
+            Some("runs the score")
+        );
+        // The line stays where every other detail goes.
+        let rows = rows(&MemoryFigures {
+            score_engine: Some(ScoreEngine::Native),
+            ..figures()
+        });
+        let short = fit(rows, 1);
+        assert!(
+            short
+                .iter()
+                .any(|row| row.kind == RowKind::Detail(Detail::Script))
+        );
+    }
+
     #[test]
     fn textures_in_gpu_memory_are_said_but_not_added() {
         let rows = rows(&MemoryFigures {

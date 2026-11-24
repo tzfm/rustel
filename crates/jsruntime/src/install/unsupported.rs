@@ -141,7 +141,7 @@ fn install_absent_visuals<'js>(
 ) -> Result<(), String> {
     const NOTICE: &str = "[hydra] this build has no visuals window; initHydra() did nothing. Rebuild with `--features hydra` for one.";
 
-    let sink = runtime.logs.clone();
+    let sink = Rc::clone(runtime.logs());
     let open = Function::new(
         ctx.clone(),
         move |ctx: Ctx<'js>, _args: Rest<rquickjs::Value<'js>>| {
@@ -222,7 +222,7 @@ mod tests {
         let runtime = JsRuntime::new().expect("runtime");
         runtime.install_semantic_bindings().expect("bindings");
         for name in ["getDuration", "getDur"] {
-            let error = runtime.ctx.with(|ctx| {
+            let error = runtime.realm().ctx.with(|ctx| {
                 let function: Function = ctx.globals().get(name).expect("unsupported binding");
                 let result: rquickjs::Result<rquickjs::Value> = function.call(("value",));
                 crate::surface::effects::describe_js_error(

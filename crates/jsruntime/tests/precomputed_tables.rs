@@ -1,11 +1,6 @@
-//! The scores that the query benchmarks time answer from precomputed tables.
-//!
-//! A table is the fast path of a query. A change that leaves one of these
-//! scores to the graph walk still answers right, and shows only as a slower
-//! `rustel bench`. This test holds the path itself, for the order the
-//! scheduler asks in and the sorted order of a host query.
+//! The scores that the query benchmarks time stay pure and walk directly
+//! without building answer tables.
 
-use rustel_core::TimeSpan;
 use rustel_fraction::Fraction;
 use rustel_jsruntime::JsRuntime;
 use rustel_transpiler::TranspileOptions;
@@ -21,15 +16,17 @@ const BENCHMARKED: [&str; 7] = [
 ];
 
 #[test]
-fn every_benchmarked_score_answers_from_tables() {
+fn every_benchmarked_score_walks_pure_without_tables() {
     let runtime = JsRuntime::new().expect("runtime");
     runtime.install_semantic_bindings().expect("bindings");
-    let span = TimeSpan::new(Fraction::ZERO, Fraction::int(16));
     for source in BENCHMARKED {
         runtime
             .evaluate_score(source, &TranspileOptions::default())
             .expect("evaluate");
         let pattern = runtime.active_pattern().expect("an active pattern");
-        assert!(pattern.answers_from_tables(span), "{source}");
+        assert!(pattern.is_cacheable(), "{source}");
+        let haps = pattern.query_arc(Fraction::ZERO, Fraction::int(16));
+        assert!(!haps.is_empty(), "{source}");
+        assert_eq!(rustel_core::table_bytes(), 0, "{source}");
     }
 }

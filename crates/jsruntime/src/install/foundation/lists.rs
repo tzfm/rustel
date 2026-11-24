@@ -134,7 +134,7 @@ fn stack_with<'js>(
     for (pattern, value) in patterns.iter_mut().zip(normalized) {
         let wrapper = rquickjs::Class::<NativePatternWrapper>::from_value(&value)?;
         *pattern = pattern_with_own_steps(&ctx, &wrapper)?;
-        if pattern.steps.is_none() {
+        if pattern.steps().is_none() {
             return Err(throw_type_error(
                 &ctx,
                 "aligned stacks require a step count for each pattern",
@@ -376,13 +376,17 @@ pub(super) fn install<'js>(
         Function::new(ctx.clone(), stack).map_err(|error| error.to_string())?,
     )
     .map_err(|error| error.to_string())?;
-    globals
-        .set("stack", stack_fn.clone())
-        .map_err(|error| error.to_string())?;
-    for alias in ["polyrhythm", "pr"] {
+    for name in ["stack", "polyrhythm", "pr"] {
         globals
-            .set(alias, stack_fn.clone())
+            .set(name, stack_fn.clone())
             .map_err(|error| error.to_string())?;
+        record_builtin_global(
+            ctx,
+            name,
+            stack_fn.clone().into_value(),
+            BuiltinGlobal::List(ListKind::Stack),
+        )
+        .map_err(|error| error.to_string())?;
     }
 
     for (name, mode) in [
@@ -423,7 +427,13 @@ pub(super) fn install<'js>(
         )
         .map_err(|error| error.to_string())?;
         globals
-            .set(name, function)
+            .set(name, function.clone())
+            .map_err(|error| error.to_string())?;
+        let list = match kind {
+            CatKind::Slow => ListKind::SlowCat,
+            CatKind::Fast => ListKind::FastCat,
+        };
+        record_builtin_global(ctx, name, function.into_value(), BuiltinGlobal::List(list))
             .map_err(|error| error.to_string())?;
     }
 

@@ -7,22 +7,28 @@
 //!
 //! Two shapes are recognised. The identity arrow returns its parameter. A
 //! method chain calls methods on its parameter in sequence, and each argument
-//! is a literal or the transpiler's own mini-notation call with literal
-//! arguments. Which method names the runtime can compile is the runtime's
+//! is a literal, the transpiler's own mini-notation call with literal
+//! arguments, or one nested arrow of these same two shapes, in a method's
+//! function slot. Which method names the runtime can compile is the runtime's
 //! decision. This module knows only the syntax.
 
 use oxc_allocator::Allocator;
 use oxc_ast::ast::{
-    Argument, ArrowFunctionBody, BindingPattern, CallExpression, Expression, Statement,
-    UnaryOperator,
+    Argument, ArrowFunctionBody, ArrowFunctionExpression, BindingPattern, CallExpression,
+    Expression, Statement, UnaryOperator,
 };
 use oxc_parser::Parser;
-use oxc_span::SourceType;
+use oxc_span::{GetSpan, SourceType};
 
 /// Parsing one callback again is bounded independently from the complete
 /// score. Real callback expressions are tiny. A larger function remains on the
 /// compatibility tier instead of adding unbounded per-callback parse work.
 pub const MAX_CALLBACK_IR_SOURCE_BYTES: usize = 4 * 1024;
+
+/// How deeply one recognised arrow may take another as a method argument.
+/// Each level lowers its own bounded program, so this bounds the work one
+/// recognition performs.
+pub const MAX_CALLBACK_TRANSFORM_DEPTH: usize = 3;
 
 /// The callee the transpiler writes for every mini-notation literal.
 const MINI_CALLEE: &str = "m";
@@ -59,6 +65,13 @@ pub enum CallbackArgument {
     Mini {
         source: Box<str>,
         offset: i64,
+    },
+    /// A nested arrow in a method's function slot: the exact source of the
+    /// arrow, as its span reads in the parsed callback, and the shape the
+    /// runtime compiles for it.
+    Transform {
+        source: Box<str>,
+        candidate: Box<PatternTransformCandidate>,
     },
 }
 
@@ -114,6 +127,18 @@ pub fn lower_pattern_transform_callback(
     else {
         return Err(PatternTransformFallbackReason::NotArrowExpression);
     };
+    arrow_candidate(arrow, source, 0, false)
+}
+
+/// Recognise one arrow of either recognised shape, at `depth` levels of
+/// method-argument nesting. The same proof runs for the callback's own arrow
+/// and for a nested arrow a method call takes as its function argument.
+fn arrow_candidate(
+    arrow: &ArrowFunctionExpression<'_>,
+    source: &str,
+    depth: usize,
+    mini_shadowed: bool,
+) -> Result<PatternTransformCandidate, PatternTransformFallbackReason> {
     if arrow.r#async {
         return Err(PatternTransformFallbackReason::AsyncArrow);
     }
@@ -134,6 +159,7 @@ pub fn lower_pattern_transform_callback(
         return Err(PatternTransformFallbackReason::ParameterShape);
     };
     let parameter = parameter.name.as_str();
+    let mini_shadowed = mini_shadowed || parameter == MINI_CALLEE;
     let body = match &arrow.body {
         ArrowFunctionBody::FunctionBody(_) => {
             return Err(PatternTransformFallbackReason::BodyShape);
@@ -144,7 +170,9 @@ pub fn lower_pattern_transform_callback(
         Expression::Identifier(identifier) if identifier.name == parameter => {
             Ok(PatternTransformCandidate::Identity)
         }
-        Expression::CallExpression(_) => method_chain(body, parameter),
+        Expression::CallExpression(_) => {
+            method_chain(body, parameter, source, depth, mini_shadowed)
+        }
         _ => Err(PatternTransformFallbackReason::BodyShape),
     }
 }
@@ -153,6 +181,9 @@ pub fn lower_pattern_transform_callback(
 fn method_chain(
     body: &Expression<'_>,
     parameter: &str,
+    source: &str,
+    depth: usize,
+    mini_shadowed: bool,
 ) -> Result<PatternTransformCandidate, PatternTransformFallbackReason> {
     let mut calls = Vec::new();
     let mut receiver = body;
@@ -164,7 +195,7 @@ fn method_chain(
                 let arguments = call
                     .arguments
                     .iter()
-                    .map(|argument| literal_argument(argument, parameter))
+                    .map(|argument| literal_argument(argument, source, depth, mini_shadowed))
                     .collect::<Result<Box<[_]>, _>>()?;
                 calls.push(CallbackMethodCall {
                     method: method.into(),
@@ -199,7 +230,9 @@ fn method_callee<'s, 'a>(
 
 fn literal_argument(
     argument: &Argument<'_>,
-    parameter: &str,
+    source: &str,
+    depth: usize,
+    mini_shadowed: bool,
 ) -> Result<CallbackArgument, PatternTransformFallbackReason> {
     let Some(expression) = argument.as_expression() else {
         return Err(PatternTransformFallbackReason::ArgumentShape);
@@ -213,7 +246,24 @@ fn literal_argument(
         Expression::StringLiteral(literal) if !literal.lone_surrogates => {
             Ok(CallbackArgument::String(literal.value.as_str().into()))
         }
-        Expression::CallExpression(call) => mini_call(call, parameter),
+        Expression::CallExpression(call) => mini_call(call, mini_shadowed),
+        // A nested arrow is a method's function argument. Recognising it
+        // against the same two shapes proves it capture-free, so its own
+        // source is all a runtime needs to bridge an equivalent fallback.
+        Expression::ArrowFunctionExpression(arrow) => {
+            if depth >= MAX_CALLBACK_TRANSFORM_DEPTH {
+                return Err(PatternTransformFallbackReason::ArgumentShape);
+            }
+            let candidate = arrow_candidate(arrow, source, depth + 1, mini_shadowed)?;
+            let span = arrow.span();
+            let text = source
+                .get(span.start as usize..span.end as usize)
+                .ok_or(PatternTransformFallbackReason::ArgumentShape)?;
+            Ok(CallbackArgument::Transform {
+                source: text.into(),
+                candidate: Box::new(candidate),
+            })
+        }
         _ => Err(PatternTransformFallbackReason::ArgumentShape),
     }
 }
@@ -236,7 +286,7 @@ fn number_literal(expression: &Expression<'_>) -> Option<f64> {
 /// literal.
 fn mini_call(
     call: &CallExpression<'_>,
-    parameter: &str,
+    mini_shadowed: bool,
 ) -> Result<CallbackArgument, PatternTransformFallbackReason> {
     let Expression::Identifier(callee) = call.callee.without_parentheses() else {
         return Err(PatternTransformFallbackReason::ArgumentShape);
@@ -244,7 +294,7 @@ fn mini_call(
     if callee.name != MINI_CALLEE {
         return Err(PatternTransformFallbackReason::ArgumentShape);
     }
-    if parameter == MINI_CALLEE {
+    if mini_shadowed {
         return Err(PatternTransformFallbackReason::MiniCalleeShadowed);
     }
     if call.optional || call.type_arguments.is_some() {
@@ -290,6 +340,13 @@ mod tests {
         CallbackArgument::Mini {
             source: source.into(),
             offset,
+        }
+    }
+
+    fn transform(source: &str, candidate: PatternTransformCandidate) -> CallbackArgument {
+        CallbackArgument::Transform {
+            source: source.into(),
+            candidate: Box::new(candidate),
         }
     }
 
@@ -352,6 +409,38 @@ mod tests {
                 ]),
             ),
             ("m => m.rev()", chain(&[("rev", &[])])),
+            (
+                "x => x.fast((y) => y)",
+                chain(&[(
+                    "fast",
+                    &[transform("(y) => y", PatternTransformCandidate::Identity)],
+                )]),
+            ),
+            (
+                "y => y.when(m('< 0 [0!3 1]>', 27), (x) => x.clip(0.75).ply(m('<2 2 2 4>', 40)))",
+                chain(&[(
+                    "when",
+                    &[
+                        mini("< 0 [0!3 1]>", 27),
+                        transform(
+                            "(x) => x.clip(0.75).ply(m('<2 2 2 4>', 40))",
+                            PatternTransformCandidate::MethodChain(
+                                vec![
+                                    CallbackMethodCall {
+                                        method: "clip".into(),
+                                        arguments: vec![Number(0.75)].into_boxed_slice(),
+                                    },
+                                    CallbackMethodCall {
+                                        method: "ply".into(),
+                                        arguments: vec![mini("<2 2 2 4>", 40)].into_boxed_slice(),
+                                    },
+                                ]
+                                .into_boxed_slice(),
+                            ),
+                        ),
+                    ],
+                )]),
+            ),
             (
                 "x => x.in(m('1 0', 7))",
                 chain(&[("in", &[mini("1 0", 7)])]),
@@ -424,7 +513,16 @@ mod tests {
             ("x => x.fast(`${k}`)", Reason::ArgumentShape),
             ("x => x.fast(tag`2`)", Reason::ArgumentShape),
             ("x => x.fast(1 + 1)", Reason::ArgumentShape),
-            ("x => x.fast(y => y)", Reason::ArgumentShape),
+            // A nested arrow that captures, blocks, or recurses too deep is
+            // not one of the two shapes, so the whole chain stays QuickJS.
+            ("x => x.fast((y) => z.rev())", Reason::ReceiverShape),
+            ("x => x.fast((y) => { return y; })", Reason::BodyShape),
+            ("x => x.fast(async (y) => y)", Reason::AsyncArrow),
+            ("x => x.fast((y, z) => y)", Reason::ParameterShape),
+            (
+                "x => x.fast((y) => y.fast((z) => z.fast((w) => w.fast((v) => v))))",
+                Reason::ArgumentShape,
+            ),
             ("x => x.fast(sine.range(1, 2))", Reason::ArgumentShape),
             ("x => x.fast(mini('1 2'))", Reason::ArgumentShape),
             ("x => x.fast(m.call(null, '1 2', 3))", Reason::ArgumentShape),
@@ -442,6 +540,10 @@ mod tests {
                 Reason::MiniCallShape,
             ),
             ("m => m.fast(m('1 2', 3))", Reason::MiniCalleeShadowed),
+            (
+                "m => m.sometimesBy(1, y => y.ply(m('2', 10)))",
+                Reason::MiniCalleeShadowed,
+            ),
         ] {
             assert_eq!(
                 lower_pattern_transform_callback(source),

@@ -43,7 +43,7 @@ pub(crate) fn stage_effect(
     ctx: &Ctx<'_>,
     policy: &Cell<EffectPolicy>,
     required: u8,
-    transaction: &RefCell<Option<ScoreEffects>>,
+    transaction: &RefCell<EffectTransaction>,
     refusal: &RefCell<Option<String>>,
     message: &'static str,
     stage: impl FnOnce(&Ctx<'_>, &mut ScoreEffects) -> rquickjs::Result<()>,
@@ -52,7 +52,7 @@ pub(crate) fn stage_effect(
         return Err(throw_effect_policy(ctx, refusal, message));
     }
     let mut transaction = transaction.borrow_mut();
-    let Some(effects) = transaction.as_mut() else {
+    let Some(effects) = transaction.effects_mut() else {
         return Err(throw_effect_policy(ctx, refusal, message));
     };
     stage(ctx, effects)
@@ -281,11 +281,11 @@ pub(crate) fn from_js_bridged_value<'js>(
         if let Some(object) = value.as_object()
             && let Some(reference) = combinator_reference(object.clone())
         {
-            return Ok((Value::Function(Box::new(reference)), Vec::new(), false));
+            return Ok((Value::function(reference), Vec::new(), false));
         }
         let (id, sidecar) = bridge_callable(ctx, function.clone())?;
         return Ok((
-            Value::Function(Box::new(rustel_core::value::FunctionRef::js(id))),
+            Value::function(rustel_core::value::FunctionRef::js(id)),
             vec![sidecar],
             false,
         ));
@@ -375,7 +375,7 @@ fn materialize_js_value_within_depth<'js>(
             values.push(item);
             sidecars.append(&mut nested);
         }
-        return Ok((Value::List(values), sidecars));
+        return Ok((Value::list(values), sidecars));
     }
     if let Some(object) = value.as_object() {
         // Each property charges one element, so a child shared by several

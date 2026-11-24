@@ -286,6 +286,7 @@ impl App {
         }
         #[cfg(feature = "hydra")]
         self.warm_selected_snippet();
+        self.settle_swap();
         self.settle_marks(now);
         if let Some(take) = self.sample_take.as_mut() {
             let second = take.started.elapsed().as_secs();
