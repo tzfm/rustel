@@ -3911,8 +3911,9 @@ mod tests {
             assert_eq!(app.focus, Focus::Editor);
         }
 
-        /// A bare launch opens the set open last time, or makes a dated one in
-        /// the sets folder when there is none; a path named wins.
+        /// A bare launch opens the set open last time, else the newest recent
+        /// set still on the disk, or makes a dated one in the sets folder when
+        /// there is none; a path named wins.
         #[test]
         fn a_bare_launch_opens_the_last_set_or_makes_one() {
             crate::config::isolate_for_tests();
@@ -3931,8 +3932,13 @@ mod tests {
             prefs.remember_set(&named);
             let last = open_startup_set(None, &prefs, "// starter").expect("the last set");
             assert_eq!(last.directory(), named);
-            // Gone from the disk, the last set is no set: a new one instead.
+            // Gone from the disk, the last set gives way to the newest recent
+            // set still there.
             prefs.remember_set(&directory.path().join("gone"));
+            let recent = open_startup_set(None, &prefs, "// starter").expect("a recent set");
+            assert_eq!(recent.directory(), named);
+            // With every remembered set gone: a new one instead.
+            prefs.forget_set(&named);
             let fresh = open_startup_set(None, &prefs, "// starter").expect("a new set");
             assert_eq!(fresh.directory(), sets.join(format!("{} b", today())));
             let chosen =

@@ -499,8 +499,9 @@ enum Session {
 }
 
 /// The set a launch opens: the path named on the command line; else the
-/// set open last time, when its folder is still there; else a new set in
-/// the sets folder, so a first run starts with something to play.
+/// set open last time, when its folder is still there; else the newest
+/// recent set that is still there; else a new set in the sets folder, so a
+/// first run starts with something to play.
 fn open_startup_set(
     path: Option<&std::path::Path>,
     prefs: &StudioPrefs,
@@ -509,14 +510,13 @@ fn open_startup_set(
     if let Some(path) = path {
         return SceneSet::open(path, starter);
     }
-    if let Some(last) = prefs
-        .last_set
-        .as_deref()
-        .map(std::path::Path::new)
-        .filter(|last| last.is_dir())
-        && let Ok(set) = SceneSet::open(last, starter)
-    {
-        return Ok(set);
+    let remembered = prefs.last_set.iter().chain(&prefs.recent_sets);
+    for set in remembered.map(std::path::Path::new) {
+        if set.is_dir()
+            && let Ok(set) = SceneSet::open(set, starter)
+        {
+            return Ok(set);
+        }
     }
     let root = prefs.sets_directory().unwrap_or_else(|| PathBuf::from("."));
     SceneSet::create_in(&root, &today(), starter)
