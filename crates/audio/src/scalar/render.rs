@@ -827,6 +827,7 @@ impl ScalarBackend {
         let ducks = &mut self.orbit_ducks;
         let pending_ducks = &mut self.pending_ducks;
         let reverbs = &mut self.orbit_reverbs;
+        let inline_responses = &mut self.inline_responses;
         let chain_rooms = &mut self.chain_rooms;
         let chain_room_budget = self.chain_room_budget.0;
         let chain_room_fallbacks = &mut self.chain_room_fallbacks;
@@ -1503,7 +1504,7 @@ impl ScalarBackend {
                             } else if allow_inline_reverb {
                                 // Offline: synthesise at activation, on the
                                 // producer side of the pipeline.
-                                reverbs[orbit] = Some(Box::new(inline_reverb(sample_rate, wanted, bank, dispatch)));
+                                reverbs[orbit] = Some(Box::new(inline_responses.reverb(sample_rate, wanted, bank, dispatch)));
                                 reverb.wet
                             } else {
                                 // Live and not installed yet: this onset plays
