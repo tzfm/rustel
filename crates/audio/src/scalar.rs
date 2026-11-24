@@ -21,10 +21,10 @@ use crate::sample::{
 use crate::wavetable_kernel::WavetableKernel;
 use effects::apply_fx_stage;
 use effects::bandpass_coefs;
-use effects::inline_reverb;
 use effects::notch_coefs;
 use effects::reserve_fx_reverb_returns;
 use effects::voice_fx_pre_distort;
+use effects::{InlineResponses, inline_reverb};
 use inserts::InlineRoom;
 use inserts::InsertClock;
 use inserts::chain_room_delay;
@@ -1779,6 +1779,8 @@ pub struct ScalarBackend {
     /// hold point it contains, so order and timing match the live path.
     pending_ducks: Vec<PendingDuck>,
     orbit_reverbs: Vec<Option<Box<crate::reverb::OrbitReverb>>>,
+    /// The responses an offline render made for its orbit reverbs.
+    inline_responses: InlineResponses,
     /// The room of the chain of each bus: see [`ChainRoom`].
     chain_rooms: Vec<Option<Box<ChainRoom>>>,
     /// The rooms of the chains that left their bus, on their way back to the
