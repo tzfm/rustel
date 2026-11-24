@@ -2540,7 +2540,7 @@ fn gcd(mut a: u64, mut b: u64) -> u64 {
 /// no float orders, which only the time itself orders.
 fn time_key(time: Fraction) -> f32 {
     // A float of 32 bits rounds the float of 64 bits, and keeps its order.
-    crate::order_key(time) as f32
+    crate::order_key(&time) as f32
 }
 
 impl Place {

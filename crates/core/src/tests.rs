@@ -2889,6 +2889,6 @@ mod restart_tests {
 
     #[test]
     fn order_key_handles_i128_min_without_panicking() {
-        assert!(crate::order_key(Fraction::int(i128::MIN)).is_nan());
+        assert!(crate::order_key(&Fraction::int(i128::MIN)).is_nan());
     }
 }

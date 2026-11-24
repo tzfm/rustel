@@ -1199,7 +1199,7 @@ type StepPatchCache = [Option<(value::PatchedBase, Option<u32>, value::StepPatch
 struct SmallStepSlot {
     part: TimeSpan,
     count: u8,
-    pieces: [TimeSpan; 8],
+    bounds: [Fraction; 9],
     nums: [f64; 8],
     step_patches: StepPatchCache,
     step_next: u8,
@@ -1207,11 +1207,11 @@ struct SmallStepSlot {
 }
 
 impl SmallStepSlot {
-    fn new(part: TimeSpan, count: usize, pieces: [TimeSpan; 8], nums: [f64; 8]) -> Self {
+    fn new(part: TimeSpan, count: usize, bounds: [Fraction; 9], nums: [f64; 8]) -> Self {
         Self {
             part,
             count: count as u8,
-            pieces,
+            bounds,
             nums,
             step_patches: [None, None, None, None],
             step_next: 0,
@@ -1244,16 +1244,28 @@ fn meet_steps_small(
     {
         idx
     } else {
-        let mut pieces = [TimeSpan::new(Fraction::ZERO, Fraction::ZERO); 8];
+        let mut bounds = [Fraction::ZERO; 9];
         let mut nums = [0.0f64; 8];
-        let mut begin = grid.time(grid.steps().start)?;
-        for (i, k) in grid.steps().enumerate() {
+        let steps_range = grid.steps();
+        let grid_start = steps_range.start;
+        let grid_end = steps_range.end;
+        let mut begin = grid.time(grid_start)?;
+        bounds[0] = if begin < hf.part.begin {
+            hf.part.begin
+        } else {
+            begin
+        };
+        for (i, k) in steps_range.enumerate() {
             if thread.stop_requested() {
                 return Some(false);
             }
             let end = grid.time(k + 1)?;
-            pieces[i] = grid.cut(k, TimeSpan::new(begin, end), hf.part);
-            nums[i] = wave.step_value_at(begin, &state.controls)?;
+            bounds[i + 1] = if k + 1 == grid_end && end > hf.part.end {
+                hf.part.end
+            } else {
+                end
+            };
+            nums[i] = wave.step_value_at(&begin, &state.controls)?;
             begin = end;
         }
         let idx = if let Some(empty) = small_cache.iter().position(Option::is_none) {
@@ -1263,7 +1275,7 @@ fn meet_steps_small(
             *small_next = small_next.wrapping_add(1);
             victim
         };
-        small_cache[idx] = Some(SmallStepSlot::new(hf.part, count, pieces, nums));
+        small_cache[idx] = Some(SmallStepSlot::new(hf.part, count, bounds, nums));
         idx
     };
     let slot = small_cache[slot_idx].as_mut().expect("small slot present");
@@ -1325,7 +1337,8 @@ fn meet_steps_small(
             }
             let whole = hf.whole;
             let last = count - 1;
-            for (i, &piece) in slot.pieces[..count].iter().enumerate() {
+            for i in 0..count {
+                let piece = TimeSpan::new(slot.bounds[i], slot.bounds[i + 1]);
                 let (context, keys) = if i == last {
                     (
                         std::mem::take(&mut hf.context),
@@ -1368,7 +1381,7 @@ fn meet_steps_small(
             &mut hap,
             key,
             slot.nums[i],
-            slot.pieces[i],
+            TimeSpan::new(slot.bounds[i], slot.bounds[i + 1]),
             &apply,
             LookupFlow::Set,
             Some(&mut caches[i]),
@@ -1963,7 +1976,7 @@ impl<'a> ValueSide<'a> {
         if let Some((key, wave)) = meetings.wave(self, state)
             && hf.part.within_one_cycle()
             && let Some(part) = hf.part.intersection(&met)
-            && let Some(number) = wave.number(met, part, &state.controls)
+            && let Some(number) = wave.number(&met, &part, &state.controls)
             && Meeting::set_number_in_place_cached(
                 &mut hf,
                 key,
@@ -2612,10 +2625,10 @@ impl Pattern {
             #[inline]
             fn sample(self, met: TimeSpan, part: TimeSpan, controls: &OrderedMap) -> Option<f64> {
                 match self {
-                    Self::Wave(_, wave) => wave.number(met, part, controls),
+                    Self::Wave(_, wave) => wave.number(&met, &part, controls),
                     Self::Step(step) => step.number(part, controls),
                     Self::StepParts(_, wave, steps) => {
-                        fused::StepWave::step_number(wave, steps, part, controls)
+                        fused::StepWave::step_number(wave, steps, &part, controls)
                     }
                 }
             }
@@ -2645,7 +2658,7 @@ impl Pattern {
                         };
                         if item.steps == 0 {
                             waves[count] = Some(QuickWave::Wave(key, &item.wave));
-                        } else if fused::StepWave::step_covers_span(item.steps, state.span) {
+                        } else if fused::StepWave::step_covers_span(item.steps, &state.span) {
                             waves[count] = Some(QuickWave::StepParts(key, &item.wave, item.steps));
                         } else {
                             ok = false;
@@ -3196,7 +3209,7 @@ impl Pattern {
             met: TimeSpan,
             part: TimeSpan,
             count: u8,
-            pieces: [TimeSpan; 8],
+            bounds: [Fraction; 9],
             nums: [[f64; 4]; 8],
             step_patches: [Option<(value::PatchedBase, Option<u32>, value::StepPatch)>; 4],
             step_next: u8,
@@ -3209,7 +3222,7 @@ impl Pattern {
                     met: zero,
                     part: zero,
                     count: 0,
-                    pieces: [zero; 8],
+                    bounds: [Fraction::ZERO; 9],
                     nums: [[0.0f64; 4]; 8],
                     step_patches: [None, None, None, None],
                     step_next: 0,
@@ -3259,7 +3272,7 @@ impl Pattern {
                 if let Value::Object(controls) = &mut hap.value {
                     controls.set_data_many_cached(&patches[..n_waves], &mut caches[s_idx]);
                 }
-                hap.part = slot.pieces[s_idx];
+                hap.part = TimeSpan::new(slot.bounds[s_idx], slot.bounds[s_idx + 1]);
                 if bulk_ok {
                     out.push(hap);
                 } else if thread.stop_requested() || !thread.push_budgeted(out, from, hap) {
@@ -3285,13 +3298,13 @@ impl Pattern {
             {
                 idx
             } else {
-                let grid = fused::StepWave::step_grid_over(shared_steps, hf.part)?;
+                let grid = fused::StepWave::step_grid_over(shared_steps, &hf.part)?;
                 let count = grid.len();
                 let mut hoisted_vals = [0.0f64; 4];
                 if hoisted_mask != 0 {
                     for (w, item) in items.iter().enumerate() {
                         if hoisted_mask & (1u8 << w) != 0 {
-                            hoisted_vals[w] = item.wave.number(met, hf.part, &state.controls)?;
+                            hoisted_vals[w] = item.wave.number(&met, &hf.part, &state.controls)?;
                         }
                     }
                 }
@@ -3315,32 +3328,39 @@ impl Pattern {
                     out.truncate(from);
                     return Some(true);
                 }
+                let mut piece_begin = if begin < hf.part.begin {
+                    hf.part.begin
+                } else {
+                    begin
+                };
+                slot.bounds[0] = piece_begin;
                 for (s_idx, k) in grid_steps.enumerate() {
                     let end = grid.time(k + 1)?;
-                    let step_span = TimeSpan::new(begin, end);
-                    let piece = if k > grid_start && k + 1 < grid_end {
-                        step_span
+                    let piece_end = if k + 1 == grid_end && end > hf.part.end {
+                        hf.part.end
                     } else {
-                        grid.cut(k, step_span, hf.part)
+                        end
                     };
-                    slot.pieces[s_idx] = piece;
+                    slot.bounds[s_idx + 1] = piece_end;
+                    let piece = TimeSpan::new(piece_begin, piece_end);
                     for (w, item) in items.iter().enumerate() {
                         slot.nums[s_idx][w] = if hoisted_mask & (1u8 << w) != 0 {
                             hoisted_vals[w]
                         } else if item.steps == 0 {
-                            item.wave.number(met, piece, &state.controls)?
+                            item.wave.number(&met, &piece, &state.controls)?
                         } else if single_step_mask & (1u8 << w) != 0 {
                             fused::StepWave::step_number(
                                 &item.wave,
                                 item.steps,
-                                piece,
+                                &piece,
                                 &state.controls,
                             )?
                         } else {
-                            item.wave.step_value_at(begin, &state.controls)?
+                            item.wave.step_value_at(&begin, &state.controls)?
                         };
                     }
                     begin = end;
+                    piece_begin = end;
                 }
                 slot.met = met;
                 slot.part = hf.part;
@@ -3438,7 +3458,8 @@ impl Pattern {
                 if let Some((sp, row, layer_idx)) = resolved {
                     let whole = template.whole;
                     let last = count - 1;
-                    for (s_idx, &piece) in slot.pieces[..count].iter().enumerate() {
+                    for s_idx in 0..count {
+                        let piece = TimeSpan::new(slot.bounds[s_idx], slot.bounds[s_idx + 1]);
                         let (context, keys) = if s_idx == last {
                             (
                                 std::mem::take(&mut template.context),
@@ -3514,7 +3535,7 @@ impl Pattern {
         for (idx, item) in items.iter().enumerate() {
             if item.steps == 0 {
                 has_continuous = true;
-            } else if fused::StepWave::step_covers_span(item.steps, state.span) {
+            } else if fused::StepWave::step_covers_span(item.steps, &state.span) {
                 single_step_mask |= 1u8 << idx;
             } else if shared_steps == 0 {
                 shared_steps = item.steps;
@@ -3530,7 +3551,7 @@ impl Pattern {
             && out[from..].iter().all(|hf| {
                 fused::StepWave::takes(hf)
                     && (!has_continuous || (hf.whole.is_some() && hf.part.within_one_cycle()))
-                    && fused::StepWave::step_grid_over(shared_steps, hf.part)
+                    && fused::StepWave::step_grid_over(shared_steps, &hf.part)
                         .is_some_and(|g| (min_uniform_steps..=8).contains(&g.len()))
             });
         if inner_len <= 4 {
@@ -3562,7 +3583,7 @@ impl Pattern {
                 && let Some(key) = controls::builtin_key_ref_by_id(item.key_id)
                 && out[from..].iter().all(|hf| {
                     fused::StepWave::takes(hf)
-                        && fused::StepWave::step_grid_over(item.steps, hf.part)
+                        && fused::StepWave::step_grid_over(item.steps, &hf.part)
                             .is_some_and(|g| g.len() <= 8)
                 })
             {
@@ -3581,7 +3602,7 @@ impl Pattern {
                         _ => fused::StepWave::step_number(
                             &item.wave,
                             item.steps,
-                            hf.part,
+                            &hf.part,
                             &state.controls,
                         )
                         .inspect(|&n| {
@@ -3610,7 +3631,7 @@ impl Pattern {
                         fused::note(fused::Hit::StepOne);
                         continue;
                     }
-                    let Some(grid) = fused::StepWave::step_grid_over(item.steps, hf.part) else {
+                    let Some(grid) = fused::StepWave::step_grid_over(item.steps, &hf.part) else {
                         ok = false;
                         break;
                     };
@@ -3625,7 +3646,7 @@ impl Pattern {
                             break;
                         };
                         let piece = grid.cut(k, TimeSpan::new(begin, end), hf.part);
-                        let Some(num) = item.wave.step_value_at(begin, &state.controls) else {
+                        let Some(num) = item.wave.step_value_at(&begin, &state.controls) else {
                             ok = false;
                             break;
                         };
@@ -3717,7 +3738,7 @@ impl Pattern {
                         let num = match last_span {
                             Some((lm, lp, ln)) if lm == met && lp == part => ln,
                             _ => {
-                                let n = item.wave.number(met, part, &state.controls)?;
+                                let n = item.wave.number(&met, &part, &state.controls)?;
                                 last_span = Some((met, part, n));
                                 wave_cache = value::SharedWaveCache::default();
                                 n
@@ -3760,7 +3781,7 @@ impl Pattern {
                             _ => fused::StepWave::step_number(
                                 &item.wave,
                                 item.steps,
-                                hf.part,
+                                &hf.part,
                                 &state.controls,
                             )
                             .inspect(|&n| {
@@ -3787,7 +3808,7 @@ impl Pattern {
                             fused::note(fused::Hit::StepOne);
                             continue;
                         }
-                        let grid = fused::StepWave::step_grid_over(item.steps, hf.part)?;
+                        let grid = fused::StepWave::step_grid_over(item.steps, &hf.part)?;
                         let count = grid.len();
                         if count == 0 {
                             continue;
@@ -3797,7 +3818,7 @@ impl Pattern {
                             let begin = grid.time(k)?;
                             let end = grid.time(k + 1)?;
                             let piece = grid.cut(k, TimeSpan::new(begin, end), hf.part);
-                            let num = item.wave.step_value_at(begin, &state.controls)?;
+                            let num = item.wave.step_value_at(&begin, &state.controls)?;
                             if one_last.is_none_or(|(lp, _)| lp != hf.part) {
                                 one_last = Some((hf.part, num));
                                 one_cache = value::SharedWaveCache::default();
@@ -3853,7 +3874,7 @@ impl Pattern {
                                 let end = grid.time(k + 1)?;
                                 pieces.push(grid.cut(k, TimeSpan::new(begin, end), hf.part));
                                 vals.push(Value::F64(
-                                    item.wave.step_value_at(begin, &state.controls)?,
+                                    item.wave.step_value_at(&begin, &state.controls)?,
                                 ));
                                 begin = end;
                             }
@@ -6840,6 +6861,8 @@ impl Pattern {
                         8u16
                     } else if len <= 16 {
                         16u16
+                    } else if len <= 24 {
+                        24u16
                     } else if len <= 32 {
                         32u16
                     } else if len <= 48 {

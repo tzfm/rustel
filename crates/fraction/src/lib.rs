@@ -597,7 +597,7 @@ impl Fraction {
 
     #[cold]
     #[inline(never)]
-    fn checked_div_pow2_wide(self, shift: u32) -> Option<Self> {
+    fn checked_div_pow2_wide(&self, shift: u32) -> Option<Self> {
         let (n, d) = self.parts();
         let tz = n.trailing_zeros().min(shift);
         let rem = shift - tz;
@@ -639,7 +639,7 @@ impl Fraction {
 
     #[cold]
     #[inline(never)]
-    fn checked_mul_pow2_wide(self, shift: u32) -> Option<Self> {
+    fn checked_mul_pow2_wide(&self, shift: u32) -> Option<Self> {
         let (n, d) = self.parts();
         let tz = (d as u128).trailing_zeros().min(shift);
         let rem = shift - tz;
@@ -662,14 +662,18 @@ impl Fraction {
     #[inline]
     pub fn from_ticks(ticks: i128, ticks_per_cycle: NonZeroU32) -> Self {
         let d = ticks_per_cycle.get();
+        if let Ok(t) = i64::try_from(ticks) {
+            if d.is_power_of_two()
+                && let Some(time) = Self::dyadic_i64(t, d.trailing_zeros())
+            {
+                return time;
+            }
+            return reduced_small(t, i64::from(d));
+        }
         if d.is_power_of_two()
             && let Some(time) = Self::dyadic(ticks, d.trailing_zeros())
         {
             return time;
-        }
-        // Terms of 64 bits reduce without wide division.
-        if let Ok(ticks) = i64::try_from(ticks) {
-            return reduced_small(ticks, i64::from(d));
         }
         Self::new(ticks, i128::from(d))
     }
@@ -700,7 +704,7 @@ impl Fraction {
     /// Both components as `i64` when each fits in `i64` (sign-extension check
     /// compiles to two shifts/compares on 64-bit targets with no 128-bit math).
     #[inline(always)]
-    fn as_i64_parts(self) -> Option<(i64, i64)> {
+    fn as_i64_parts(&self) -> Option<(i64, i64)> {
         let n64 = self.n as i64;
         let d_raw = self.d.get();
         let d64 = d_raw as i64;
@@ -709,7 +713,7 @@ impl Fraction {
 
     /// Both components as `i64` when each is below [`SMALL_LIMIT`].
     #[inline(always)]
-    fn small(self) -> Option<(i64, i64)> {
+    fn small(&self) -> Option<(i64, i64)> {
         let (n, d) = self.as_i64_parts()?;
         const SMALL_I64: i64 = SMALL_LIMIT as i64;
         const SMALL_U64: u64 = SMALL_LIMIT as u64;
@@ -741,11 +745,17 @@ impl Fraction {
     }
 
     /// Lossy: for interop at the audio boundary only. Never for cycle maths.
-    #[inline(always)]
+    #[inline]
     pub fn to_f64(&self) -> f64 {
         if let Some((n, d)) = self.as_i64_parts() {
             return n as f64 / d as f64;
         }
+        self.f64_wide()
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn f64_wide(&self) -> f64 {
         self.n as f64 / self.d.get() as f64
     }
 
@@ -807,7 +817,7 @@ impl Fraction {
     /// `self + cycles`, returning `None` if the result cannot fit in `i128`
     /// components. Adding a whole number keeps the fraction reduced, so this
     /// needs no gcd.
-    #[inline(always)]
+    #[inline]
     pub fn checked_add_int(self, cycles: i128) -> Option<Self> {
         if let Some((n, d)) = self.as_i64_parts()
             && let Ok(c) = i64::try_from(cycles)
@@ -824,7 +834,7 @@ impl Fraction {
 
     #[cold]
     #[inline(never)]
-    fn checked_add_int_wide(self, cycles: i128) -> Option<Self> {
+    fn checked_add_int_wide(&self, cycles: i128) -> Option<Self> {
         let d = self.d.get();
         let scaled = match cycles.checked_mul(d) {
             Some(scaled) => scaled,
@@ -917,12 +927,12 @@ impl Fraction {
             }
             return try_reduced_small(n * od + on * d, d * od);
         }
-        self.checked_add_wide(o)
+        self.checked_add_wide(&o)
     }
 
     #[cold]
     #[inline(never)]
-    fn checked_add_wide(self, o: Self) -> Option<Self> {
+    fn checked_add_wide(&self, o: &Self) -> Option<Self> {
         let (sn, sd) = self.parts();
         let (on, od) = o.parts();
         let native = || {
@@ -969,12 +979,12 @@ impl Fraction {
             }
             return try_reduced_small(n * od - on * d, d * od);
         }
-        self.checked_sub_wide(o)
+        self.checked_sub_wide(&o)
     }
 
     #[cold]
     #[inline(never)]
-    fn checked_sub_wide(self, o: Self) -> Option<Self> {
+    fn checked_sub_wide(&self, o: &Self) -> Option<Self> {
         let (sn, sd) = self.parts();
         let (on, od) = o.parts();
         let native = || {
@@ -1031,12 +1041,12 @@ impl Fraction {
         if let (Some((n, d)), Some((on, od))) = (self.small(), o.small()) {
             return try_reduced_small(n * on, d * od);
         }
-        self.checked_mul_wide(o)
+        self.checked_mul_wide(&o)
     }
 
     #[cold]
     #[inline(never)]
-    fn checked_mul_wide(self, o: Self) -> Option<Self> {
+    fn checked_mul_wide(&self, o: &Self) -> Option<Self> {
         let (sn, sd) = self.parts();
         let (on, od) = o.parts();
         let left_cancel = gcd_u128(sn.unsigned_abs(), od as u128);
@@ -1068,12 +1078,12 @@ impl Fraction {
                 try_reduced_small(numerator, denominator)
             };
         }
-        self.checked_div_wide(o)
+        self.checked_div_wide(&o)
     }
 
     #[cold]
     #[inline(never)]
-    fn checked_div_wide(self, o: Self) -> Option<Self> {
+    fn checked_div_wide(&self, o: &Self) -> Option<Self> {
         let (sn, sd) = self.parts();
         let (on, od) = o.parts();
         let numerator_cancel = gcd_u128(sn.unsigned_abs(), on.unsigned_abs());
@@ -1212,7 +1222,7 @@ impl Fraction {
 
     #[cold]
     #[inline(never)]
-    fn floor_int_wide(self) -> i128 {
+    fn floor_int_wide(&self) -> i128 {
         let (n, d) = (self.n, self.d.get());
         if d == 1 {
             return n;
@@ -1318,7 +1328,7 @@ impl Fraction {
 
     #[cold]
     #[inline(never)]
-    fn cycle_pos_wide(self) -> Self {
+    fn cycle_pos_wide(&self) -> Self {
         let d = self.d.get();
         if d == 1 {
             return Fraction::ZERO;
@@ -1435,7 +1445,7 @@ impl PartialOrd for Fraction {
 }
 
 impl Ord for Fraction {
-    #[inline(always)]
+    #[inline]
     fn cmp(&self, o: &Self) -> Ordering {
         if self.d == o.d {
             return self.n.cmp(&o.n);
@@ -1444,14 +1454,14 @@ impl Ord for Fraction {
             // `|n| < 2^31` and `d < 2^31`, so `|n * d| < 2^62 < i64::MAX`.
             return (n1 * d2).cmp(&(n2 * d1));
         }
-        self.cmp_wide(*o)
+        self.cmp_wide(o)
     }
 }
 
 impl Fraction {
     #[cold]
     #[inline(never)]
-    fn cmp_wide(self, o: Self) -> Ordering {
+    fn cmp_wide(&self, o: &Self) -> Ordering {
         let (sn, sd) = self.parts();
         let (on, od) = o.parts();
         // Cross-multiply on the `i128` path; both denominators are positive
@@ -1460,7 +1470,7 @@ impl Fraction {
         match (sn.checked_mul(od), on.checked_mul(sd)) {
             (Some(left), Some(right)) => left.cmp(&right),
             _ => self
-                .checked_cmp(o)
+                .checked_cmp(*o)
                 .expect("checked_cmp is total for normalised fractions"),
         }
     }

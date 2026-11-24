@@ -444,7 +444,7 @@ impl Gate {
         part: TimeSpan,
         controls: &crate::OrderedMap,
     ) -> Option<bool> {
-        Some(self.wave.number(met, part, controls)? > self.above)
+        Some(self.wave.number(&met, &part, controls)? > self.above)
     }
 }
 

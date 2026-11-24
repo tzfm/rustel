@@ -274,18 +274,17 @@ pub(crate) fn query_order(a: &Hap, b: &Hap) -> std::cmp::Ordering {
     if a.part.end != b.part.end {
         return a.part.end.cmp(&b.part.end);
     }
-    if a.whole == b.whole {
-        return std::cmp::Ordering::Equal;
-    }
-    match (a.whole, b.whole) {
+    match (&a.whole, &b.whole) {
         (None, None) => std::cmp::Ordering::Equal,
         (None, Some(_)) => std::cmp::Ordering::Less,
         (Some(_), None) => std::cmp::Ordering::Greater,
         (Some(aw), Some(bw)) => {
             if aw.begin != bw.begin {
                 aw.begin.cmp(&bw.begin)
-            } else {
+            } else if aw.end != bw.end {
                 aw.end.cmp(&bw.end)
+            } else {
+                std::cmp::Ordering::Equal
             }
         }
     }
@@ -301,12 +300,15 @@ pub(crate) const FEW_HAPS: usize = 64;
 /// rounding of their division keeps in order. `NAN` for any other time,
 /// which only the time itself orders.
 #[inline(always)]
-pub(crate) fn order_key(time: Fraction) -> f64 {
+pub(crate) fn order_key(time: &Fraction) -> f64 {
     /// The first whole number that a float skips.
     const EXACT: u128 = 1 << 53;
-    match time.numer().unsigned_abs() < EXACT && time.denom().unsigned_abs() < EXACT {
-        true => time.to_f64(),
-        false => f64::NAN,
+    let n = time.numer();
+    let d = time.denom();
+    if n.unsigned_abs() < EXACT && d.unsigned_abs() < EXACT {
+        (n as i64) as f64 / (d as i64) as f64
+    } else {
+        f64::NAN
     }
 }
 
@@ -325,14 +327,14 @@ impl OrderKey {
         let pb = match prev {
             Some((ph, pk)) if ph.part.end == hap.part.begin => pk.pe,
             Some((ph, pk)) if ph.part.begin == hap.part.begin => pk.pb,
-            _ => order_key(hap.part.begin),
+            _ => order_key(&hap.part.begin),
         };
         let pe = if hap.part.end == hap.part.begin {
             pb
         } else {
             match prev {
                 Some((ph, pk)) if ph.part.end == hap.part.end => pk.pe,
-                _ => order_key(hap.part.end),
+                _ => order_key(&hap.part.end),
             }
         };
         Self { pb, pe }
@@ -359,18 +361,17 @@ fn cmp_order_keys(ak: OrderKey, bk: OrderKey, a: &Hap, b: &Hap) -> std::cmp::Ord
     if a.part.end != b.part.end {
         return a.part.end.cmp(&b.part.end);
     }
-    if a.whole == b.whole {
-        return std::cmp::Ordering::Equal;
-    }
-    match (a.whole, b.whole) {
+    match (&a.whole, &b.whole) {
         (None, None) => std::cmp::Ordering::Equal,
         (None, Some(_)) => std::cmp::Ordering::Less,
         (Some(_), None) => std::cmp::Ordering::Greater,
         (Some(aw), Some(bw)) => {
             if aw.begin != bw.begin {
                 aw.begin.cmp(&bw.begin)
-            } else {
+            } else if aw.end != bw.end {
                 aw.end.cmp(&bw.end)
+            } else {
+                std::cmp::Ordering::Equal
             }
         }
     }
