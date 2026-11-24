@@ -493,7 +493,13 @@ impl Registration {
             // were a function, and the query fails with this exact error.
             // `echoWith(..., fast(2))` reaches it; absorbing the extra
             // argument instead would produce plausible-but-wrong haps.
-            crate::query_error_pattern("hap_func.value is not a function")
+            // strudel's own text, with the count that explains it.
+            crate::query_error_pattern(format!(
+                "{}() takes {} inputs and a pattern but got {} inputs (hap_func.value is not a function)",
+                self.reference.name,
+                self.arity.saturating_sub(1),
+                args.len()
+            ))
         } else if args.len() <= 4 {
             // ---- stack fast path for 1..=4 pure leading args --------------
             let mut pures: [Value; 4] = std::array::from_fn(|_| Value::Undefined);
