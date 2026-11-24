@@ -269,7 +269,7 @@ mod tests {
 
     #[test]
     fn a_known_call_is_native_and_an_operator_is_not() {
-        let panel = panel("$: s(\"bd\").fast(2).nosuchmethod()\nconst a = 1 + 2");
+        let panel = panel("$: s(\"bd\").fast(2).nosuchmethod()\nconst a = x + 2");
         let nodes = panel.nodes.as_ref().expect("nodes");
         let said: Vec<_> = nodes
             .iter()
@@ -283,7 +283,7 @@ mod tests {
                 (".fast 2", true),
                 (".nosuchmethod", false),
                 ("const a", true),
-                ("1 + 2", false),
+                ("x + 2", false),
             ]
         );
     }

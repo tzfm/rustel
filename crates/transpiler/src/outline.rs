@@ -7,8 +7,8 @@
 
 use oxc_allocator::Allocator;
 use oxc_ast::ast::{
-    Argument, ArrayExpressionElement, ArrowFunctionBody, BindingPattern, Expression,
-    ObjectPropertyKind, Program, PropertyKey, Statement, UnaryOperator,
+    Argument, ArrayExpressionElement, ArrowFunctionBody, BinaryOperator, BindingPattern,
+    Expression, ObjectPropertyKind, Program, PropertyKey, Statement, UnaryOperator,
 };
 use oxc_parser::Parser;
 use oxc_span::{GetSpan, SourceType, Span};
@@ -423,6 +423,9 @@ enum Link<'a, 's> {
 
 /// A literal or a name: shown on its call's line, with no node of its own.
 fn simple(expression: &Expression<'_>) -> bool {
+    if number(expression) {
+        return true;
+    }
     match expression.get_inner_expression() {
         Expression::NumericLiteral(_)
         | Expression::StringLiteral(_)
@@ -432,6 +435,28 @@ fn simple(expression: &Expression<'_>) -> bool {
         Expression::UnaryExpression(unary) => {
             unary.operator == UnaryOperator::UnaryNegation
                 && matches!(unary.argument, Expression::NumericLiteral(_))
+        }
+        _ => false,
+    }
+}
+
+/// A number, or arithmetic of numbers, which the reader works out as it
+/// reads.
+fn number(expression: &Expression<'_>) -> bool {
+    match expression.get_inner_expression() {
+        Expression::NumericLiteral(_) => true,
+        Expression::UnaryExpression(unary) => {
+            unary.operator == UnaryOperator::UnaryNegation && number(&unary.argument)
+        }
+        Expression::BinaryExpression(binary) => {
+            matches!(
+                binary.operator,
+                BinaryOperator::Addition
+                    | BinaryOperator::Subtraction
+                    | BinaryOperator::Multiplication
+                    | BinaryOperator::Division
+            ) && number(&binary.left)
+                && number(&binary.right)
         }
         _ => false,
     }
@@ -512,12 +537,12 @@ mod tests {
     #[test]
     fn script_forms_and_bound_names_are_said() {
         assert_eq!(
-            lines("function f(x) { return x }\nfor (const a of b) {}\nf(1 + 2)"),
+            lines("function f(x) { return x }\nfor (const a of b) {}\nf(x + 1)"),
             [
                 "function f @1 (read)",
                 "for (const a of b) {} @2 (script)",
                 "f @3 (call f true)",
-                "  1 + 2 @3 (script)",
+                "  x + 1 @3 (script)",
             ]
         );
     }
@@ -532,6 +557,17 @@ mod tests {
                 "  x => @1 (read)",
                 "    x @1 (read)",
                 "    .rev @1 (method rev)",
+            ]
+        );
+    }
+
+    #[test]
+    fn arithmetic_of_numbers_is_read() {
+        assert_eq!(
+            lines("s(\"hh\").gain(1 + 0.2 * -2)"),
+            [
+                "s \"hh\" @1 (call s false)",
+                ".gain 1 + 0.2 * -2 @1 (method gain)",
             ]
         );
     }

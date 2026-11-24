@@ -81,6 +81,7 @@ impl App {
             at.0 -= 1;
         }
         self.focus = Focus::Editor;
+        self.status = "keyboard back on the score".into();
         if self
             .editor_mut()
             .set_selection(super::super::editor::Selection::caret(at))
@@ -91,8 +92,7 @@ impl App {
         }
     }
 
-    /// A press on the column chooses the node under it, and a press on the
-    /// chosen node goes to it.
+    /// A press on a node puts the caret on it, as Enter does.
     pub(super) fn press_outline(&mut self, x: u16, y: u16) -> bool {
         let area = self.regions.outline;
         if self.outline_panel.is_none() || !within(area, x, y) {
@@ -104,11 +104,8 @@ impl App {
             && let Some(row) = row_at(area, panel.scroll, x, y)
             && row < panel.node_count()
         {
-            if row == panel.selected {
-                self.go_to_outline_node();
-            } else {
-                panel.jump(row, rows);
-            }
+            panel.jump(row, rows);
+            self.go_to_outline_node();
         }
         self.dirty_frame = true;
         true
