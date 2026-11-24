@@ -199,8 +199,21 @@ fn compile_stage<'js>(
                 "KabelSalat pattern inputs exceed 1024 values",
             ));
         }
-        for value in array.iter::<rquickjs::Coerced<f64>>() {
-            inputs.push(value?.0);
+        for value in array.iter::<rquickjs::Value>() {
+            let value = value?;
+            let number = rquickjs::Coerced::<f64>::from_js(ctx, value.clone())?.0;
+            // A word where a number belongs is most often a persistent delay
+            // ID, which K() does not have: name it rather than a bare NaN.
+            if let Some(text) = value.as_string().filter(|_| !number.is_finite()) {
+                return Err(rquickjs::Exception::throw_type(
+                    ctx,
+                    &format!(
+                        "KabelSalat input {:?} is not a number; K() has no persistent delay IDs, use delay(input, seconds)",
+                        text.to_string()?
+                    ),
+                ));
+            }
+            inputs.push(number);
         }
     }
     let graph = super::kabelsalat::compile_graph(ctx, &source, &inputs, freq)?;
