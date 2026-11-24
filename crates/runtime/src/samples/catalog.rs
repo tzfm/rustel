@@ -2279,15 +2279,16 @@ fn map_refused(access: &ScoreSampleAccess, map: &str) -> bool {
         .is_ok_and(|spec| matches!(access.source_for(&spec), Ok(None)))
 }
 
+/// Judge a publication by the policy in force. True when it held banks back.
 pub(super) fn under_current_policy(
     shared: &Shared,
     held: &HashMap<Arc<str>, ScoreFetchAccess>,
     sources: &mut [(Arc<str>, ScoreFetchAccess)],
     staged: &mut Vec<(String, Bank)>,
-) {
+) -> bool {
     let policy = shared.score_policy.lock().expect("score policy").clone();
     let Some(policy) = policy else {
-        return;
+        return false;
     };
     for (url, grant) in sources.iter_mut() {
         *grant = match held.get(url) {
@@ -2300,13 +2301,15 @@ pub(super) fn under_current_policy(
         .filter(|(_, grant)| *grant == ScoreFetchAccess::Withdrawn)
         .map(|(url, _)| url.as_ref())
         .collect();
-    if !withdrawn.is_empty() {
-        staged.retain(|(_, bank)| {
-            !bank_file_urls(bank)
-                .into_iter()
-                .any(|url| withdrawn.contains(url.as_ref()))
-        });
+    if withdrawn.is_empty() {
+        return false;
     }
+    staged.retain(|(_, bank)| {
+        !bank_file_urls(bank)
+            .into_iter()
+            .any(|url| withdrawn.contains(url.as_ref()))
+    });
+    true
 }
 
 #[cfg(test)]
