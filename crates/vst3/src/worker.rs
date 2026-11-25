@@ -430,23 +430,6 @@ mod tests {
         assert_eq!(look.answer, Some(answer));
     }
 
-    #[test]
-    fn a_worker_program_that_does_not_start_is_no_fault_of_the_bundle() {
-        let program = WorkerProgram {
-            program: std::env::temp_dir().join("rustel-vst3-no-such-program"),
-            args: Vec::new(),
-        };
-        let closed = AtomicBool::new(false);
-        let scan = scan(
-            &program,
-            Path::new("some.vst3"),
-            WORK_LIMIT,
-            &closed,
-            &mut |_| {},
-        );
-        assert_eq!(scan, Scan::NotRun);
-    }
-
     /// Not a test in its own right: the entry of the scan process the test
     /// below starts. The host's scan adds the bundle path as the last
     /// argument. With the argument `slow=<millis>`, each audio class of

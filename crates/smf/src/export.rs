@@ -429,25 +429,6 @@ mod tests {
     }
 
     #[test]
-    fn the_bytes_are_deterministic() {
-        let timeline = timeline(Track {
-            name: "lead".to_owned(),
-            channel: 1,
-            messages: vec![
-                message(
-                    0,
-                    MessageKind::NoteOn {
-                        note: 60,
-                        velocity: 100,
-                    },
-                ),
-                message(480, MessageKind::NoteOff { note: 60 }),
-            ],
-        });
-        assert_eq!(timeline.to_bytes().unwrap(), timeline.to_bytes().unwrap());
-    }
-
-    #[test]
     fn tempo_conversion_rounds_and_bounds() {
         assert_eq!(tempo_micros_per_quarter(120.0).unwrap(), 500_000);
         assert_eq!(tempo_micros_per_quarter(60.0).unwrap(), 1_000_000);

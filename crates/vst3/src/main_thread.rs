@@ -268,13 +268,6 @@ mod tests {
         assert_eq!(run(|| 7 + 5), 12);
     }
 
-    /// A panic of a step is the panic of the thread that asked for it.
-    #[test]
-    fn a_panicking_step_panics_its_caller() {
-        let panic = std::thread::spawn(move || run::<()>(|| panic!("a step fault"))).join();
-        assert!(panic.is_err(), "the panic crossed to the caller");
-    }
-
     /// A dispatched step crosses the queue to the serving thread, and a
     /// panic of one crosses back to the thread that asked for it.
     #[test]
