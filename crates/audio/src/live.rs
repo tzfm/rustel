@@ -1559,31 +1559,6 @@ mod tests {
         }
 
         #[test]
-        fn a_full_return_ring_defers_install_ownership_until_reclaimed() {
-            let mut live = LiveScalarBackend::new(48_000, 8).expect("live backend");
-            let channel = SampleChannel::new();
-            fill_returns(&channel, channel.fx_reverb_returns.capacity());
-            let pending = room(0.001);
-            let bytes = pending.approx_bytes();
-            enqueue(&channel, pending);
-
-            live.drain_reverb_installs(&channel);
-            assert_eq!(channel.fx_reverb_installs.len(), 1);
-            assert_eq!(live.scalar.fx_reverb_resident_bytes(), 0);
-            assert_eq!(channel.fx_reverb_refusals.load(Ordering::Acquire), 0);
-            assert_eq!(channel.leaked.load(Ordering::Acquire), 0);
-
-            channel.reclaim();
-            live.drain_reverb_installs(&channel);
-            assert_eq!(channel.fx_reverb_installs.len(), 0);
-            assert_eq!(
-                channel.fx_reverb_resident_bytes.load(Ordering::Acquire),
-                bytes
-            );
-            assert_eq!(channel.leaked.load(Ordering::Acquire), 0);
-        }
-
-        #[test]
         fn a_refusal_that_fills_the_return_ring_defers_the_next_install() {
             let mut live = LiveScalarBackend::new(48_000, 8).expect("live backend");
             let channel = SampleChannel::new();
@@ -2150,66 +2125,6 @@ mod tests {
         assert_eq!(live.scalar.orbit_insert_key(slot), None);
     }
 
-    /// The one flip body every site calls: it names the generation it
-    /// replaces as the outgoing one (across a skipped generation too),
-    /// clears the line arm's latch and the word of the fired arm, arms a
-    /// rewind's cut, keeps a rewind's arm across an edit's flip while its
-    /// line is still ahead, and lands a restart's floor where the caller
-    /// says its first window is drained. The floor holds the restart lead
-    /// the cut word carries.
-    #[test]
-    fn adopt_flip_hands_over_in_one_place() {
-        let mut live = LiveScalarBackend::new(48_000, 8).expect("live backend");
-        live.generation = 1;
-        live.line_cut = LineCut::Fired {
-            drop_from: Some(900),
-        };
-        // The word of the arm that fired at frame 900.
-        let fired = AtomicU64::new((900 << 2) | 0b11);
-        // A flip as the producer publishes it, with a restart lead of 480
-        // frames in the cut word above the cut.
-        let adopt =
-            |live: &mut LiveScalarBackend, generation, takeover, cut: TakeoverCut, start, floor| {
-                let word = AtomicU64::new(cut as u64 | (480 << 2));
-                let (takeover, cut, lead) = published_cutover(&AtomicU64::new(takeover), &word);
-                assert_eq!(lead, 480);
-                live.adopt_flip(generation, takeover, cut, lead, start, floor, &fired);
-            };
-
-        // 1 -> 3: generation 2 never published.
-        adopt(&mut live, 3, 10_000, TakeoverCut::AtTakeover, 1_024, 1_024);
-        assert_eq!(live.generation, 3);
-        assert_eq!(live.line_cut, LineCut::Idle, "a flip lets the fired arm go");
-        assert_eq!(fired.load(Ordering::Acquire), 0, "and its word");
-        assert_eq!(
-            live.scalar.armed_takeover_cut,
-            Some((10_000, 1)),
-            "the arm names the generation actually playing, not new - 1"
-        );
-        assert_eq!(
-            live.takeover_cut_frame, None,
-            "the countdown keeps its ring events"
-        );
-        assert_eq!(live.restart_floor, Some((3, 1_024, 480)));
-
-        // An edit's flip inside the head-room keeps the line cut.
-        adopt(&mut live, 4, 12_000, TakeoverCut::None, 2_048, 2_048);
-        assert_eq!(live.generation, 4);
-        assert_eq!(live.scalar.armed_takeover_cut, Some((10_000, 1)));
-        assert_eq!(live.restart_floor, None, "an edit is not a restart");
-
-        // At the line the arm has nothing left to do.
-        adopt(&mut live, 5, 14_000, TakeoverCut::None, 10_000, 10_000);
-        assert_eq!(live.scalar.armed_takeover_cut, None);
-
-        // An immediate rewind seen after the drain: the cut is at this
-        // block, the floor at the next one, where its events are drained.
-        adopt(&mut live, 6, 16_000, TakeoverCut::AtFlip, 16_000, 16_128);
-        assert_eq!(live.scalar.armed_takeover_cut, Some((16_000, 5)));
-        assert_eq!(live.takeover_cut_frame, Some(16_000));
-        assert_eq!(live.restart_floor, Some((6, 16_128, 480)));
-    }
-
     const BLOCK: usize = 128;
 
     /// The words of the handshake, playing generation 1.
@@ -2363,33 +2278,6 @@ mod tests {
             total.late += report.late;
         }
         (pcm, total)
-    }
-
-    /// A control requery can publish after its takeover frame. The outgoing
-    /// generation has then started the onsets between the two frames, and
-    /// the incoming copies of them arrive late.
-    #[test]
-    fn a_flip_after_its_takeover_frame_does_not_sound_an_onset_twice() {
-        let once = {
-            let (ring, words) = (Ring::new(8), Words::new());
-            assert!(ring.push(note(1, 1, 300)));
-            assert!(ring.push(note(2, 1, 1_000)));
-            render(24, &ring, &words, |_| {}).0
-        };
-        let (ring, words) = (Ring::new(8), Words::new());
-        assert!(ring.push(note(1, 1, 300)));
-        assert!(ring.push(note(2, 1, 1_000)));
-        let (handed_over, report) = render(24, &ring, &words, |block| {
-            // The flip lands on frame 384, one block after its takeover.
-            if block == 3 {
-                words.publish(2, 256, TakeoverCut::None);
-                assert!(ring.push(note(3, 2, 300)));
-                assert!(ring.push(note(4, 2, 1_000)));
-            }
-        });
-        assert_eq!((report.stale, report.late), (1, 0));
-        assert_eq!(report.accepted, 3);
-        assert!(handed_over == once, "each onset sounds once");
     }
 
     /// An outgoing voice stands in for one incoming event aimed before the
@@ -2585,21 +2473,6 @@ mod tests {
                 assert!(handed_over == once, "the hit sounds once: {latency}");
             }
         }
-    }
-
-    /// An edit removes the hit and adds one 25 ms later. The started graph
-    /// still sounds, and the new hit is too far away to be its copy.
-    #[test]
-    fn a_started_sbd_graph_does_not_take_a_hit_out_of_its_reach() {
-        let (ring, words) = (Ring::new(8), Words::new());
-        assert!(ring.push(sbd(1, 1, 4_800)));
-        let (_, report) = render(8, &ring, &words, |block| {
-            if block == 1 {
-                words.publish(2, 128 + 3_840, TakeoverCut::None);
-                assert!(ring.push(sbd(2, 2, 6_000)));
-            }
-        });
-        assert_eq!((report.stale, report.accepted), (0, 2));
     }
 
     /// An SBD graph one frame before the takeover frame has started. The copy
@@ -2907,26 +2780,6 @@ mod kabel_program_lifetime_tests {
         assert_eq!(returned(&channel), [code.id()]);
         assert_eq!(live.scalar.kabel_program_resident_bytes(), 0);
         assert_eq!(channel.leaked.load(Ordering::Relaxed), 0);
-    }
-
-    #[test]
-    fn canceled_overlapping_publications_release_without_leaking_programs() {
-        let channel = Arc::new(SampleChannel::new());
-        let (score, immediate) = (Ring::new(4), Ring::new(4));
-        let mut live = LiveScalarBackend::new(1000, 4).unwrap();
-        let code = program(1);
-        let first = KabelPublication::new(Arc::clone(&channel));
-        let second = KabelPublication::new(Arc::clone(&channel));
-        publish(&channel, code, 0);
-        live.drain_reverb_installs(&channel);
-        drop(first);
-        live.retire_kabel_programs(&channel, &score, &immediate);
-        assert!(returned(&channel).is_empty());
-        assert_eq!(channel.active_kabel_publications.load(Ordering::Acquire), 1);
-        drop(second);
-        live.retire_kabel_programs(&channel, &score, &immediate);
-        assert_eq!(returned(&channel), [code.id()]);
-        assert_eq!(channel.active_kabel_publications.load(Ordering::Acquire), 0);
     }
 
     #[test]

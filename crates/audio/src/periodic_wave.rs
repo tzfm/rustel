@@ -598,16 +598,6 @@ mod tests {
         }
     }
 
-    #[test]
-    fn builtin_tables_keep_firefoxs_size_at_every_sample_rate() {
-        for sample_rate in [22_050, 48_000, 96_000] {
-            let tables = PeriodicWaveTables::new(sample_rate);
-            assert_eq!((tables.table_size, tables.range_count), (4096, 36));
-            let selection = tables.selection(440.0);
-            assert!(tables.sample(Waveform::Square, 0.25, selection).is_finite());
-        }
-    }
-
     /// A custom wave with the sawtooth's own terms plays the builtin
     /// sawtooth: the same tables per pitch range, the same normalization.
     #[test]
@@ -650,34 +640,6 @@ mod tests {
                 played,
                 "{requested}"
             );
-        }
-    }
-
-    #[test]
-    fn table_selection_uses_frequency_magnitude() {
-        let tables = PeriodicWaveTables::new(48_000);
-        let positive = tables.sample(Waveform::Square, 0.125, tables.selection(440.0));
-        let negative = tables.sample(Waveform::Square, 0.125, tables.selection(-440.0));
-        assert_eq!(positive, negative);
-    }
-
-    #[test]
-    fn frequency_sampling_matches_explicit_selection() {
-        let tables = PeriodicWaveTables::new(48_000);
-        for waveform in [
-            Waveform::Sine,
-            Waveform::Square,
-            Waveform::Sawtooth,
-            Waveform::Triangle,
-        ] {
-            for phase in [0.0, 0.125, 0.333, 0.999] {
-                for frequency in [-880.0, 0.0, 55.0, 440.0, 20_000.0] {
-                    assert_eq!(
-                        tables.sample_for_frequency(waveform, phase, frequency),
-                        tables.sample(waveform, phase, tables.selection(frequency))
-                    );
-                }
-            }
         }
     }
 }

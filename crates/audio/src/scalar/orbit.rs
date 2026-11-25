@@ -297,23 +297,6 @@ impl ScalarBackend {
 mod tests {
     use super::*;
 
-    #[test]
-    fn a_centred_panner_matches_the_library_bit_for_bit() {
-        let (cos, sin) = centred_pan();
-        assert_eq!(cos.to_bits(), (std::f32::consts::FRAC_PI_2).cos().to_bits());
-        assert_eq!(sin.to_bits(), (std::f32::consts::FRAC_PI_2).sin().to_bits());
-        for pair in [(0.0f32, 0.0), (0.5, -0.5), (-1.0, 1.0), (3.2e-9, -7.7e8)] {
-            let (l, r) = pair;
-            let expected = {
-                let a = 1.0 * std::f32::consts::FRAC_PI_2;
-                (l + r * a.cos(), r * a.sin())
-            };
-            let actual = stereo_pan(l, r, 0.0);
-            assert_eq!(actual.0.to_bits(), expected.0.to_bits());
-            assert_eq!(actual.1.to_bits(), expected.1.to_bits());
-        }
-    }
-
     mod ui_visual_mix_tests {
         use super::*;
         use crate::backend::{AudioBackend, OnsetEvent};

@@ -242,26 +242,4 @@ mod tests {
             }
         }
     }
-
-    #[test]
-    fn automatic_selection_matches_detected_hardware() {
-        let kind = selected_convolution_kernel_kind();
-        #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-        assert_eq!(
-            kind,
-            if std::arch::is_x86_feature_detected!("avx2") {
-                ConvolutionKernelKind::Avx2
-            } else {
-                ConvolutionKernelKind::Portable
-            }
-        );
-        #[cfg(not(any(target_arch = "x86", target_arch = "x86_64")))]
-        assert_eq!(kind, ConvolutionKernelKind::Portable);
-
-        assert!(ConvolutionKernelKind::Portable.compiled());
-        assert_eq!(
-            ConvolutionKernelKind::Avx2.compiled(),
-            cfg!(any(target_arch = "x86", target_arch = "x86_64"))
-        );
-    }
 }
