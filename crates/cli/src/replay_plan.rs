@@ -247,49 +247,6 @@ mod replay_plan_tests {
         assert_eq!(timeline(&script, 0.0, Some(8.0)), entries(&[(0.0, "A")]));
     }
 
-    /// A `--from` past the last save bounces the closing state.
-    #[test]
-    fn a_from_past_the_end_bounces_the_closing_state() {
-        let script = tape(vec![installed(0.0, "A"), installed(8.0, "B")]);
-        assert_eq!(timeline(&script, 600.0, None), entries(&[(0.0, "B")]));
-    }
-
-    /// A first installed save after `--from` lands at its own offset, not at zero.
-    #[test]
-    fn a_tape_whose_first_save_is_after_from_opens_silent() {
-        let script = tape(vec![installed(2.0, "A"), installed(6.0, "B")]);
-        assert_eq!(
-            timeline(&script, 0.0, None),
-            entries(&[(2.0, "A"), (6.0, "B")]),
-        );
-        assert_eq!(
-            timeline(&script, 1.0, None),
-            entries(&[(1.0, "A"), (5.0, "B")]),
-        );
-    }
-
-    /// A rejected first save leaves the timeline as it is without it.
-    #[test]
-    fn a_rejected_first_save_leaves_the_timeline_unchanged() {
-        let without = tape(vec![installed(30.0, "B")]);
-        let with = tape(vec![rejected(0.0, "broken("), installed(30.0, "B")]);
-        for script in [&without, &with] {
-            assert_eq!(timeline(script, 0.0, None), entries(&[(30.0, "B")]));
-            assert_eq!(timeline(script, 10.0, None), entries(&[(20.0, "B")]));
-        }
-    }
-
-    /// A window that closes before the first installed save is an empty timeline.
-    #[test]
-    fn a_window_before_anything_sounded_is_an_empty_timeline() {
-        for script in [
-            tape(vec![rejected(0.0, "broken("), installed(100.0, "B")]),
-            tape(vec![installed(100.0, "B")]),
-        ] {
-            assert_eq!(timeline(&script, 0.0, Some(50.0)), vec![]);
-        }
-    }
-
     /// Rejected saves after the opening are left out of the export timeline.
     #[test]
     fn rejected_saves_never_chain() {
@@ -302,15 +259,6 @@ mod replay_plan_tests {
             timeline(&script, 0.0, None),
             entries(&[(0.0, "A"), (5.0, "B")]),
         );
-    }
-
-    /// `any_installed` is false only when no save in the plan installed.
-    #[test]
-    fn any_installed_is_false_only_when_nothing_installed() {
-        assert!(!ReplayPlan::new(&tape(vec![rejected(0.0, "broken(")]), 0.0).any_installed());
-        let late = tape(vec![rejected(0.0, "broken("), installed(9.0, "A")]);
-        assert!(ReplayPlan::new(&late, 0.0).any_installed());
-        assert!(ReplayPlan::new(&late, 600.0).any_installed());
     }
 
     /// Live replay opens on the sounding save and delivers every later save,

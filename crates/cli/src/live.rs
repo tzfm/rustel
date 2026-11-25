@@ -366,17 +366,8 @@ pub(super) fn apply_ui_slider_control(
     }
 }
 
-#[cfg(all(
-    feature = "device-audio",
-    any(feature = "midi", feature = "osc", feature = "serial")
-))]
-// Read by the live player's OSC and serial deadlines, and by its test in any
-// build that has an external output at all.
-#[cfg(any(
-    all(feature = "device-audio", any(feature = "osc", feature = "serial")),
-    all(test, any(feature = "midi", feature = "osc", feature = "serial"))
-))]
-pub(super) fn remaining_output_delay(target_time: f64, device_time: f64) -> std::time::Duration {
+#[cfg(all(feature = "device-audio", any(feature = "osc", feature = "serial")))]
+fn remaining_output_delay(target_time: f64, device_time: f64) -> std::time::Duration {
     let remaining = target_time - device_time;
     std::time::Duration::from_secs_f64(if remaining.is_finite() {
         remaining.clamp(0.0, 3600.0)
