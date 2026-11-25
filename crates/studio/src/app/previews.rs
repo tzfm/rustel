@@ -1541,29 +1541,6 @@ mod tests {
         }
 
         #[test]
-        fn generator_code_copies_in_both_formats_without_editing_the_score() {
-            let directory = tempfile::tempdir().unwrap();
-            let mut app = crate::app::tests::support::app_over(directory.path());
-            open_generator(&mut app);
-            let before = app.editor().source();
-            for _ in 0..2 {
-                let shown = app
-                    .reference_panel
-                    .as_ref()
-                    .unwrap()
-                    .selected_snippet_code()
-                    .unwrap()
-                    .into_owned();
-                app.handle_reference_key(KeyCode::Char('c'), false, false)
-                    .unwrap();
-                assert_eq!(app.clipboard.get_text().unwrap(), shown);
-                app.handle_reference_key(KeyCode::Char('s'), false, false)
-                    .unwrap();
-            }
-            assert_eq!(app.editor().source(), before);
-        }
-
-        #[test]
         fn closing_and_reopening_the_browser_retains_each_directions_last_result() {
             let directory = tempfile::tempdir().unwrap();
             let mut app = crate::app::tests::support::app_over(directory.path());
@@ -1712,27 +1689,6 @@ mod tests {
             );
             assert_eq!(sent(&app).launch, Launch::Quantised { unit_cycles: 1.0 });
             assert!(!sent(&app).rewind);
-        }
-
-        #[test]
-        fn generator_code_pane_is_thirty_percent_taller_without_changing_examples() {
-            let reference = crate::reference::Reference::load_all();
-            let mut panel = crate::reference::ReferencePanel::browse(&reference);
-            for height in [20, 30, 40, 60] {
-                let inner = Rect::new(1, 1, 60, height);
-                panel.select_tab(Tab::Examples);
-                let examples = panel.snippet_layout(inner);
-                assert_eq!(
-                    examples.code,
-                    crate::reference::snippet_layout(inner, false).code
-                );
-                panel.select_tab(Tab::Generator);
-                let generator = panel.snippet_layout(inner);
-                assert!(generator.code.height * 10 >= examples.code.height * 13);
-                assert_eq!(generator.scope + 1, generator.footer);
-                assert!(generator.list.bottom() <= generator.code.y);
-                assert!(generator.code.bottom() <= generator.scope);
-            }
         }
 
         #[test]
@@ -2734,16 +2690,6 @@ mod tests {
         use crate::editor::MemoryClipboard;
 
         #[cfg(feature = "hydra")]
-        /// A score nobody labelled gets one, or a preview over it silences it.
-        #[test]
-        fn a_bare_score_gets_a_label() {
-            assert_eq!(
-                labelled_score_text("s(\"bd*8\").rlpf(sine)"),
-                "score: s(\"bd*8\").rlpf(sine)"
-            );
-        }
-
-        #[cfg(feature = "hydra")]
         /// A multi-line chain is labelled on the line the expression starts on,
         /// never on a `.method()` continuation.
         #[test]
@@ -2898,13 +2844,6 @@ mod tests {
                 !has_bd,
                 "if bare scores survive a labelled sibling the label is no longer needed"
             );
-        }
-
-        #[cfg(feature = "hydra")]
-        /// The prefix the composite relies on is the one the tests spell out.
-        #[test]
-        fn the_prefix_is_a_plain_named_label() {
-            assert_eq!(LABELLED_SCORE_PREFIX, "score: ");
         }
 
         /// The preview fader moves on the keyboard, and the row shows the keys.

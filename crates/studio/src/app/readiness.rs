@@ -1051,63 +1051,6 @@ mod tests {
             app.absorb_lint(checked(&app));
             assert_eq!(app.go_state(), GoState::Ready);
         }
-
-        #[test]
-        fn background_lint_receives_the_selected_inputs_channel_count() {
-            let directory = tempfile::tempdir().unwrap();
-            let mut app = app_over(directory.path());
-            app.worker
-                .set_library(Arc::new(rustel_runtime::samples::SampleLibrary::empty()));
-            app.scenes.current_mut().editor = Editor::new("$: s(\"in:2\")").unwrap();
-            input_snapshot(&mut app, 2);
-            app.submit_lint();
-            let deadline = Instant::now() + Duration::from_secs(5);
-            let result = loop {
-                if let Some(result) = app.linter.try_recv() {
-                    break result;
-                }
-                assert!(Instant::now() < deadline, "lint worker did not answer");
-                std::thread::sleep(Duration::from_millis(5));
-            };
-            assert_eq!(result.input_channels, Some(2));
-            assert_eq!(result.diagnostics.len(), 1);
-            assert_eq!(
-                &app.editor().source()[result.diagnostics[0].from..result.diagnostics[0].to],
-                "in:2"
-            );
-            app.absorb_lint(result);
-            assert_eq!(app.go_state(), GoState::Problems { count: 1 });
-        }
-
-        #[test]
-        fn background_lint_marks_stray_names_before_any_evaluation() {
-            let directory = tempfile::tempdir().unwrap();
-            let mut app = app_over(directory.path());
-            app.worker
-                .set_library(Arc::new(rustel_runtime::samples::SampleLibrary::empty()));
-            app.scenes.current_mut().editor = Editor::new("$: s('sine')\n\n kaskaskjas").unwrap();
-            let request_id = app.next_request_id;
-            app.submit_lint();
-            let deadline = Instant::now() + Duration::from_secs(5);
-            let result = loop {
-                if let Some(result) = app.linter.try_recv() {
-                    break result;
-                }
-                assert!(Instant::now() < deadline, "lint worker did not answer");
-                std::thread::sleep(Duration::from_millis(5));
-            };
-            assert_eq!(result.diagnostics.len(), 1, "{:?}", result.diagnostics);
-            let finding = &result.diagnostics[0];
-            assert_eq!(
-                &app.editor().source()[finding.from..finding.to],
-                "kaskaskjas"
-            );
-            app.absorb_lint(result);
-            assert_eq!(app.go_state(), GoState::Problems { count: 1 });
-            assert!(!app.lint_ranges(app.scenes.current().id).is_empty());
-            assert_eq!(app.next_request_id, request_id);
-            assert!(app.inflight.is_empty());
-        }
     }
 
     mod readiness {

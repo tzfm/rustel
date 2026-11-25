@@ -109,3 +109,36 @@ fn oversized_fraction_bigint_is_refused_before_host_parse() {
         "unexpected refusal: {message}"
     );
 }
+
+fn onsets_over(source: &str, end: i128) -> Vec<rustel_core::Hap> {
+    runtime(source)
+        .query_cancellable(
+            Slot::Active,
+            0,
+            Fraction::ZERO,
+            Fraction::int(end),
+            Duration::from_secs(5),
+            &AtomicBool::new(false),
+        )
+        .expect("haps")
+        .into_iter()
+        .filter(rustel_core::Hap::has_onset)
+        .collect()
+}
+
+#[test]
+fn a_negative_speed_under_one_plays_nothing() {
+    for source in [
+        "note(\"e g a\").fast(\"<-0.3333333333333333>\")",
+        "note(\"e g a\").fast(\"<-0.2>\")",
+        "note(\"{c!0 _!0, e g a}\")",
+    ] {
+        assert!(onsets_over(source, 2).is_empty(), "{source}");
+    }
+}
+
+#[test]
+fn a_lingered_note_across_a_cycle_keeps_its_onset_under_add() {
+    let source = "note(\"c e\").slow(1.5).linger(0.5).add(note(\"0 7\"))";
+    assert_eq!(onsets_over(source, 3).len(), 8);
+}

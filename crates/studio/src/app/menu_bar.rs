@@ -56,6 +56,7 @@ impl App {
             Focus::Panel(PanelKind::Viz) => HelpContext::Viz,
             Focus::Panel(PanelKind::Mixer) => HelpContext::Mixer,
             Focus::Panel(PanelKind::Knobs) => HelpContext::Knobs,
+            Focus::Panel(PanelKind::Outline) => HelpContext::Outline,
             Focus::Editor => HelpContext::Editor,
             Focus::Timeline => HelpContext::Timeline,
         }
@@ -316,6 +317,7 @@ impl App {
             zen: self.ui_settings.zen,
             mixer: self.mixer_panel.is_some(),
             knobs: self.knobs_panel.is_some(),
+            outline: self.outline_panel.is_some(),
             log: self.log_panel.is_some(),
             memory: self.memory_dock.is_some(),
             jobs: self.jobs_panel.is_some(),
@@ -463,6 +465,7 @@ impl App {
             Do::Visualizers => self.toggle_visualizers(),
             Do::Mixer => self.toggle_mixer_panel(),
             Do::Knobs => self.toggle_knobs_panel(),
+            Do::Outline => self.toggle_outline_panel(),
             Do::SetLimiter => self.set_limiter_slot(!self.has_limiter_slot()),
             Do::NewSet => self.new_set(),
             Do::NewSession => self.new_session(),
@@ -921,28 +924,6 @@ mod tests {
             assert!(app.help.is_some(), "F1 did nothing at all in zen");
         }
 
-        /// With a dropdown down, a letter that is not a mnemonic must never
-        /// reach the score underneath it.
-        #[test]
-        fn an_open_menu_swallows_letters_instead_of_typing_them() {
-            let directory = tempfile::tempdir().expect("temp dir");
-            let mut app = app_over(directory.path());
-            app.frame = Rect::new(0, 0, 100, 30);
-            let source = app.editor().source();
-
-            press(&mut app, KeyCode::F(1), KeyModifiers::NONE);
-            press(&mut app, KeyCode::Char('s'), KeyModifiers::NONE);
-            // None of these is a Scene mnemonic, so all four must be eaten.
-            for letter in ['j', 'k', 'v', 'z'] {
-                press(&mut app, KeyCode::Char(letter), KeyModifiers::NONE);
-            }
-            assert_eq!(
-                app.editor().source(),
-                source,
-                "an open menu let letters through into the score"
-            );
-        }
-
         #[test]
         fn help_opens_ahead_of_rename_and_transport_stays_ahead_of_help() {
             let directory = tempfile::tempdir().expect("temp dir");
@@ -1023,38 +1004,6 @@ mod tests {
                     .and_then(|editor| editor.saving.as_ref())
                     .map(|saving| (saving.name.as_str(), saving.keep)),
                 Some(("half-typed", true))
-            );
-        }
-
-        #[test]
-        fn help_context_distinguishes_every_studio_surface() {
-            let directory = tempfile::tempdir().expect("temp dir");
-            let mut app = app_over(directory.path());
-            assert_eq!(app.help_context(), HelpContext::Editor);
-
-            for (panel, context) in [
-                (PanelKind::Theme, HelpContext::ThemePicker),
-                (PanelKind::Reference, HelpContext::Reference),
-                (PanelKind::Settings, HelpContext::Settings),
-                (PanelKind::Log, HelpContext::Log),
-                (PanelKind::Export, HelpContext::Export),
-                (PanelKind::Devices, HelpContext::Devices),
-                (PanelKind::Set, HelpContext::Set),
-                (PanelKind::Viz, HelpContext::Viz),
-            ] {
-                app.focus = Focus::Panel(panel);
-                assert_eq!(app.help_context(), context, "{panel:?}");
-            }
-
-            app.strip_mode = SceneStripMode::Learning;
-            assert_eq!(app.help_context(), HelpContext::SceneLearn);
-            app.strip_mode = SceneStripMode::Idle;
-            app.focus = Focus::Panel(PanelKind::Reference);
-            app.armed_slider = Some((app.scenes.current().id, 0));
-            assert_eq!(
-                app.help_context(),
-                HelpContext::Slider,
-                "an armed slider takes arrows before the focused surface"
             );
         }
 

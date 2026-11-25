@@ -962,6 +962,7 @@ mod tests {
                     None,
                     None,
                     false,
+                    false,
                     u16::from(error.is_some()),
                     true,
                 );
@@ -1008,6 +1009,7 @@ mod tests {
                 None,
                 None,
                 None,
+                false,
                 false,
                 2,
                 false,
@@ -1173,6 +1175,78 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn an_error_gets_a_footer_row_of_its_own() {
+        UiSettings::default().apply();
+        let theme = theme();
+        let master = MasterState::new(Instant::now());
+        let mut chrome = chrome(&theme, &master, Path::new("live.strudel"));
+        chrome.status = "ready";
+        chrome.error = Some("evaluation · javascript: ReferenceError: ssss is not defined");
+        chrome.device = Some("Speakers");
+
+        let area = Rect::new(0, 20, 150, 3);
+        let mut buffer = Buffer::empty(Rect::new(0, 0, 150, 23));
+        Footer { chrome: &chrome }.render(area, &mut buffer);
+        let row = |y| {
+            (area.x..area.right())
+                .filter_map(|x| buffer.cell((x, y)))
+                .map(|cell| cell.symbol())
+                .collect::<String>()
+        };
+        let error = row(area.y);
+        let status = row(area.y + 1);
+        let devices = row(area.y + 2);
+        assert!(error.contains("ReferenceError"), "error row: {error:?}");
+        assert!(
+            !error.contains("ready"),
+            "status leaked onto error row: {error:?}"
+        );
+        assert!(
+            !error.contains("Speakers"),
+            "devices leaked onto error row: {error:?}"
+        );
+        assert!(
+            status.contains("ready"),
+            "ordinary status stays below: {status:?}"
+        );
+        assert!(
+            devices.contains("Speakers"),
+            "devices keep their row: {devices:?}"
+        );
+
+        let layout_area = Rect::new(0, 0, 150, 30);
+        let plain = regions_with(
+            layout_area,
+            false,
+            1,
+            false,
+            false,
+            None,
+            [None, None],
+            None,
+            None,
+        );
+        let errored = regions_with_footer(
+            layout_area,
+            ChromeLayout::shown(false),
+            1,
+            false,
+            false,
+            None,
+            [None, None],
+            None,
+            None,
+            None,
+            false,
+            false,
+            1,
+            false,
+        );
+        assert_eq!(errored.footer.height, plain.footer.height + 1);
+        assert_eq!(errored.footer.bottom(), plain.footer.bottom());
     }
 
     #[test]

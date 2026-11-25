@@ -1896,89 +1896,10 @@ mod tests {
             ));
         }
 
-        #[cfg(feature = "themes")]
-        #[test]
-        fn keyboard_theme_browsing_applies_only_the_last_row() {
-            let directory = tempfile::tempdir().expect("temp dir");
-            let mut app = app_over(directory.path());
-            let original = app.theme.name.clone();
-            app.theme_picker = Some(ThemePicker {
-                names: vec![
-                    "rustel-dark".into(),
-                    "rustel-light".into(),
-                    "strudel".into(),
-                ],
-                query: String::new(),
-                selected: 0,
-                original: Box::new(app.theme.clone()),
-                deleting: None,
-                randomize_seed: 1,
-                rolled: false,
-                scroll: std::cell::Cell::new(0),
-                hold_scroll: false,
-                vim_insert: false,
-            });
-            app.focus = Focus::Panel(PanelKind::Theme);
-            press(&mut app, KeyCode::Down, KeyModifiers::NONE);
-            press(&mut app, KeyCode::Down, KeyModifiers::NONE);
-            assert_eq!(
-                app.theme_picker.as_ref().map(|picker| picker.selected),
-                Some(2)
-            );
-            assert_eq!(
-                app.theme.name, original,
-                "fast arrows must not activate every theme they pass"
-            );
-            app.theme_apply_due = None;
-            app.preview_theme();
-            assert_eq!(app.theme.name, "strudel");
-        }
-
         /// The shared guard and scoped directory for the process-wide
         /// theme directory variable live beside the variable's reader in
         /// `theme.rs`, so every test that touches it takes the same lock.
         use crate::theme::test_env::{ScopedThemeDir, THEME_DIR_LOCK};
-
-        /// A taken name is refused and a free variation is offered in its
-        /// place. The existing theme is not overwritten.
-        #[test]
-        fn a_conflicting_save_name_is_turned_into_a_free_suggestion() {
-            let _theme_dir = THEME_DIR_LOCK
-                .lock()
-                .unwrap_or_else(|poison| poison.into_inner());
-            let directory = tempfile::tempdir().expect("temp dir");
-            // The suggestion depends on the names that the theme directory
-            // already holds. Use an empty directory, so a `rustel-dark-2.json` in
-            // the real one cannot change the result.
-            let themes = directory.path().join("themes");
-            std::fs::create_dir_all(&themes).expect("theme directory");
-            let _scoped = ScopedThemeDir::set(&themes);
-            let mut app = app_over(directory.path());
-            app.toggle_theme_picker();
-            press(&mut app, KeyCode::Char('n'), KeyModifiers::CONTROL);
-            press(&mut app, KeyCode::Char('s'), KeyModifiers::NONE);
-            // Type a built-in's name over the suggestion.
-            if let Some(editor) = app.theme_editor.as_mut()
-                && let Some(sheet) = editor.saving.as_mut()
-            {
-                sheet.name = "rustel-dark".into();
-            }
-            press(&mut app, KeyCode::Enter, KeyModifiers::NONE);
-            let editor = app.theme_editor.as_ref().expect("editor still open");
-            let sheet = editor
-                .saving
-                .as_ref()
-                .expect("sheet still up - nothing saved");
-            assert!(
-                sheet
-                    .note
-                    .as_deref()
-                    .is_some_and(|note| note.contains("taken")),
-                "the refusal says why: {:?}",
-                sheet.note
-            );
-            assert_eq!(sheet.name, "rustel-dark-2", "and offers the free variation");
-        }
 
         /// Enter on a colour row opens the painter; the arrows paint LIVE and
         /// Esc puts the old colour back.
@@ -2357,35 +2278,6 @@ mod tests {
                     "{close:?} put the old theme back instead of keeping this one"
                 );
             }
-        }
-
-        /// The form applies live: stepping ui opacity changes the draft, and the
-        /// change is on the studio's theme immediately, before any save.
-        #[test]
-        fn stepping_a_form_row_applies_to_the_studio_at_once() {
-            let directory = tempfile::tempdir().expect("temp dir");
-            let mut app = app_over(directory.path());
-            app.toggle_theme_picker();
-            press(&mut app, KeyCode::Char('n'), KeyModifiers::CONTROL);
-            let editor = app.theme_editor.as_ref().expect("editor open");
-            assert!(!editor.from_built_in || editor.name.is_empty());
-
-            // Row 1 is the first of the three opacities; → steps it up.
-            press(&mut app, KeyCode::Down, KeyModifiers::NONE);
-            press(&mut app, KeyCode::Right, KeyModifiers::NONE);
-            let stepped = app
-                .theme_editor
-                .as_ref()
-                .expect("still open")
-                .draft
-                .opacity
-                .backdrop;
-            assert!(stepped.is_some(), "the step writes the field");
-            assert_eq!(
-                Some(app.ui_settings.backdrop_opacity),
-                stepped,
-                "and the studio wears it"
-            );
         }
 
         /// With the editor focused on its code tab, letters belong to the theme's

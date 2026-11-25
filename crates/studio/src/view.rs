@@ -121,6 +121,8 @@ pub enum PanelKind {
     /// The knobs column, a rail for each numeric parameter of the call
     /// at the caret.
     Knobs,
+    /// The score outline column.
+    Outline,
 }
 
 impl PanelKind {
@@ -140,6 +142,7 @@ impl PanelKind {
             Self::Mixer => "mixer",
             Self::Memory => "memory",
             Self::Knobs => "knobs",
+            Self::Outline => "outline",
         }
     }
 }
@@ -793,6 +796,10 @@ pub struct StudioView<'a> {
     /// The knobs column, while it is open: each frame's reading of the
     /// call at the caret, and what the hand is doing to it.
     pub knobs: Option<super::knobs_panel::KnobsData<'a>>,
+    /// The score outline column, while it is open.
+    pub outline: Option<&'a super::outline_panel::OutlinePanel>,
+    /// What ran the score last, for the outline's title.
+    pub outline_native: Option<bool>,
     /// A drag selection over the mixer's devices block, painted while its
     /// rows are still the ones on screen.
     pub mixer_selection: Option<&'a super::mixer_panel::MixerSelection>,
@@ -976,6 +983,7 @@ pub fn render(frame: &mut Frame<'_>, view: StudioView<'_>, chrome: StudioChrome<
         view.log.and_then(|(_, panel)| log_dock(panel, area)),
         view.memory.as_ref().map(|(_, dock)| *dock),
         view.knobs.is_some(),
+        view.outline.is_some(),
         u16::from(chrome.error.is_some()) + u16::from(chrome.audio_warning.is_some()),
         chrome.piano_notes.is_some(),
     );
@@ -1322,6 +1330,20 @@ pub fn render(frame: &mut Frame<'_>, view: StudioView<'_>, chrome: StudioChrome<
                 theme,
                 focused: view.focused_panel == Some(PanelKind::Knobs),
                 area: layout.knobs,
+            },
+            area,
+        );
+    }
+    if let Some(panel) = view.outline
+        && !layout.outline.is_empty()
+    {
+        frame.render_widget(
+            super::outline_panel::OutlineView {
+                panel,
+                theme,
+                focused: view.focused_panel == Some(PanelKind::Outline),
+                area: layout.outline,
+                native: view.outline_native,
             },
             area,
         );
@@ -2232,6 +2254,7 @@ mod tests {
                 band(Edge::Bottom, 13),
                 memory,
                 false,
+                false,
                 0,
                 false,
             )
@@ -2595,6 +2618,7 @@ mod tests {
                 log,
                 None,
                 false,
+                false,
                 0,
                 false,
             )
@@ -2946,6 +2970,7 @@ mod tests {
                 None,
                 None,
                 false,
+                false,
                 0,
                 false,
             )
@@ -3029,6 +3054,7 @@ mod tests {
                 None,
                 None,
                 None,
+                false,
                 false,
                 notices,
                 piano,
@@ -3257,6 +3283,8 @@ mod tests {
                         mixer: None,
                         mixer_panel: None,
                         knobs: None,
+                        outline: None,
+                        outline_native: None,
                         mixer_selection: None,
                         reference_on_top: false,
                         theme_camera: None,
@@ -3384,6 +3412,8 @@ mod tests {
                         mixer: None,
                         mixer_panel: None,
                         knobs: None,
+                        outline: None,
+                        outline_native: None,
                         mixer_selection: None,
                         reference_on_top: false,
                         theme_camera: None,
@@ -3396,6 +3426,125 @@ mod tests {
             })
             .unwrap();
         assert!(!terminal.backend().cursor_visible());
+    }
+
+    #[test]
+    fn an_open_device_panel_is_drawn_over_the_frame() {
+        let source = "$: s(\"bd\")\n";
+        let mut editor = Editor::new(source).unwrap();
+        let size = Rect::new(0, 0, 140, 30);
+        let layout = regions(size, false, 1, false, true, None, None);
+        let grid = source_grid(&editor, layout.panes[0].editor, true);
+        editor.set_view_size(usize::from(grid.width), usize::from(grid.height));
+        let map = editor.screen_map(grid).unwrap();
+        let theme = theme();
+        let master = MasterState::new(Instant::now());
+        let minimap = Minimap::default();
+        let visual = VisualState::default();
+        let devices = DeviceInventory {
+            audio_outputs: vec![DeviceEntry {
+                name: "Scarlett 2i2".into(),
+                id: String::new(),
+                detail: "48000 Hz · 2ch".into(),
+                is_default: false,
+            }],
+            ..DeviceInventory::default()
+        };
+        let mut terminal = Terminal::new(TestBackend::new(size.width, size.height)).unwrap();
+        terminal
+            .draw(|frame| {
+                render(
+                    frame,
+                    StudioView {
+                        #[cfg(feature = "video")]
+                        video_windows: Vec::new(),
+                        show_scrollbars: true,
+                        midi_rows: Vec::new(),
+                        clock_in: None,
+                        clock_out: None,
+                        link_enabled: false,
+                        link: None,
+                        prebake_rows: [PrebakeRow::default(); 2],
+                        sets_folder: String::new(),
+                        recordings_folder: String::new(),
+                        set_limiter: None,
+                        sample_cache: String::new(),
+                        precache: None,
+                        sources: Vec::new(),
+                        mappings: Default::default(),
+                        keybind_rows: Vec::new(),
+                        permission_rows: Vec::new(),
+                        #[cfg(feature = "vst")]
+                        vst_page: Default::default(),
+                        latency: None,
+                        caching_samples: 0,
+                        importing_sources: 0,
+                        library_loading: false,
+                        preview_shape: None,
+                        focused_panel: None,
+                        help_open: false,
+                        preview_gain: 1.0,
+                        auto_preview: false,
+                        sounding_note: None,
+                        audition_loading: None,
+                        snippet_picture: false,
+                        snippet_refused: None,
+                        #[cfg(feature = "hydra")]
+                        snippet_playing: None,
+                        #[cfg(feature = "hydra")]
+                        snippet_preview_status: None,
+                        panes: vec![PaneView {
+                            replay: None,
+                            prebake: None,
+                            editor: &editor,
+                            map: &map,
+                            minimap: &minimap,
+                            decorations: Decorations::default(),
+                            name: "live".into(),
+                            dirty: false,
+                            playing: false,
+                            focused: true,
+                            flash: None,
+                            locate_flash: None,
+                            timeline_focus: false,
+                            line_numbers: true,
+                        }],
+                        visual: &visual,
+                        devices: &devices,
+                        scanning: false,
+                        panel: Some(DevicePanel::default()),
+                        scenes: &[],
+                        strip_mode: &SceneStripMode::Idle,
+                        reference: None,
+                        log: None,
+                        jobs: None,
+                        memory: None,
+                        log_memory: None,
+                        export: None,
+                        theme_picker: None,
+                        set_panel: None,
+                        set_prompt: None,
+                        viz: [None, None],
+                        viz_focus: 0,
+                        mixer: None,
+                        mixer_panel: None,
+                        knobs: None,
+                        outline: None,
+                        outline_native: None,
+                        mixer_selection: None,
+                        reference_on_top: false,
+                        theme_camera: None,
+                        #[cfg(feature = "hydra")]
+                        hydra_webcam: None,
+                        settings: None,
+                    },
+                    chrome(&theme, &master, Path::new("live.strudel")),
+                );
+            })
+            .unwrap();
+        let text = text_of(terminal.backend().buffer());
+        assert!(text.contains("Scarlett 2i2"), "{text}");
+        assert!(text.contains("audio out"));
     }
 
     #[test]
@@ -3518,6 +3667,8 @@ mod tests {
                         mixer: None,
                         mixer_panel: None,
                         knobs: None,
+                        outline: None,
+                        outline_native: None,
                         mixer_selection: None,
                         reference_on_top: false,
                         theme_camera: None,

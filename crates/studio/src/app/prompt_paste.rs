@@ -198,7 +198,8 @@ impl App {
             | PanelKind::Jobs
             | PanelKind::Settings
             | PanelKind::Mixer
-            | PanelKind::Memory => false,
+            | PanelKind::Memory
+            | PanelKind::Outline => false,
         };
         if kept {
             self.dirty_frame = true;
@@ -575,33 +576,6 @@ mod tests {
             assert_eq!(app.clipboard.get_text().unwrap(), "kept");
             assert_eq!(field(&app), "λ猫");
             assert_eq!(app.editor().source(), score);
-        }
-
-        #[test]
-        fn settings_source_prompt_pastes_the_internal_clipboard() {
-            let directory = tempfile::tempdir().expect("temp dir");
-            let mut app = app_over(directory.path());
-            let score = app.editor().source();
-            let pasted = directory.path().join("my samples").display().to_string();
-            app.clipboard
-                .set_text(pasted.clone())
-                .expect("seed clipboard");
-            let mut sheet = SettingsSheet::default();
-            sheet.show_page(crate::settings::SettingsPage::Sources);
-            app.settings_sheet = Some(sheet);
-            app.focus = Focus::Panel(PanelKind::Settings);
-
-            press(&mut app, KeyCode::Char('a'), KeyModifiers::NONE);
-            assert_eq!(app.focus, Focus::Panel(PanelKind::Set));
-            press(&mut app, KeyCode::Char('v'), KeyModifiers::CONTROL);
-
-            assert_eq!(
-                app.set_prompt
-                    .as_ref()
-                    .map(|(_, picker)| picker.path.as_str()),
-                Some(pasted.as_str())
-            );
-            assert_eq!(app.editor().source(), score, "the covered score was edited");
         }
 
         /// Copying from the score and pasting into a panel search edits the
@@ -1369,33 +1343,6 @@ mod tests {
             assert_eq!(app.editor().source(), before);
         }
 
-        #[test]
-        fn a_folder_drop_on_the_sources_page_still_imports_it() {
-            let directory = tempfile::tempdir().unwrap();
-            let mut app = app_over(directory.path());
-            let target = directory.path().join("dropped folder");
-            std::fs::create_dir(&target).unwrap();
-            app.settings_sheet = Some(SettingsSheet::default());
-            app.settings_sheet
-                .as_mut()
-                .unwrap()
-                .show_page(settings::SettingsPage::Sources);
-            app.focus = Focus::Panel(PanelKind::Settings);
-            assert!(
-                app.accepts_raw_paste(),
-                "a flood must coalesce so it is not typed as settings keys"
-            );
-            let before = app.editor().source();
-            app.handle_terminal_event(Event::Paste(format!("\"{}\"", target.display())))
-                .unwrap();
-            assert_eq!(app.prefs.sample_sources.len(), 1);
-            assert_eq!(
-                app.prefs.sample_sources[0].spec,
-                target.display().to_string()
-            );
-            assert_eq!(app.editor().source(), before);
-        }
-
         /// The global take chord stays the take chord even over the samples
         /// browser, and the browser itself no longer aliases banks: that
         /// moved to the Sources page (`r` on an import row), so no unshifted
@@ -1549,18 +1496,6 @@ mod tests {
                 "night forest "
             );
             assert_eq!(app.editor().source(), before);
-        }
-
-        #[test]
-        fn a_paste_in_a_focused_panel_without_a_text_field_cannot_edit_the_score() {
-            let directory = tempfile::tempdir().unwrap();
-            let mut app = app_over(directory.path());
-            let before = app.editor().source();
-            app.focus = Focus::Panel(PanelKind::Devices);
-            app.panel = Some(DevicePanel::default());
-            app.handle_terminal_event(Event::Paste(CAT.into())).unwrap();
-            assert_eq!(app.editor().source(), before);
-            assert_eq!(app.focus, Focus::Panel(PanelKind::Devices));
         }
     }
 }

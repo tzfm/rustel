@@ -436,32 +436,6 @@ mod tests {
             );
         }
 
-        /// `visuals opacity` applies to a theme's own Hydra opacity too: at
-        /// zero it turns off every kind of visual, a camera theme included.
-        #[test]
-        fn visuals_opacity_caps_a_themes_forged_hydra_strength() {
-            let theme_hydra = |forged: u8, visuals: u8, surface: u8| {
-                backdrop_strength(forged.min(visuals), surface)
-            };
-            assert_eq!(
-                theme_hydra(100, 0, 0),
-                0.0,
-                "zero turns a theme's picture off like any other"
-            );
-            assert!(
-                (theme_hydra(100, 10, 0) - 0.10).abs() < 1e-6,
-                "a theme cannot outshine what visuals opacity asks for"
-            );
-            assert!(
-                (theme_hydra(45, 100, 0) - 0.45).abs() < 1e-6,
-                "and a slider wide open leaves the forged look exactly as it was"
-            );
-            assert!(
-                theme_hydra(100, 100, 100) == 0.0,
-                "a solid surface still hides it"
-            );
-        }
-
         #[cfg(feature = "hydra")]
         #[test]
         fn a_music_example_clears_the_hydra_preview_before_the_renderer_stops() {

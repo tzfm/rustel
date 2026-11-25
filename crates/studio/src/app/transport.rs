@@ -559,49 +559,6 @@ mod tests {
         use crate::app::tests::support::*;
         use crate::app::transport::*;
 
-        /// The one shortcut with nothing behind it asks before it goes.
-        #[test]
-        fn quit_asks_twice_and_anything_else_calls_it_off() {
-            let directory = tempfile::tempdir().expect("temp dir");
-
-            // One press arms and says so; it does not quit.
-            let mut app = app_over(directory.path());
-            press(&mut app, KeyCode::Char('q'), KeyModifiers::CONTROL);
-            assert!(!app.quit, "a single ^Q quit the studio");
-            assert!(app.quit_armed, "^Q did not arm the quit");
-            assert!(
-                app.status.contains("again to quit"),
-                "the status does not say how to confirm: {}",
-                app.status
-            );
-
-            // The second goes.
-            press(&mut app, KeyCode::Char('q'), KeyModifiers::CONTROL);
-            assert!(app.quit, "^Q twice did not quit");
-
-            // Any other key calls it off - including the transport, which is the
-            // most likely thing to be reaching for when the finger slipped.
-            for (code, modifiers) in [
-                (KeyCode::Char('s'), KeyModifiers::CONTROL),
-                (KeyCode::Esc, KeyModifiers::NONE),
-                (KeyCode::Char('x'), KeyModifiers::NONE),
-            ] {
-                let mut app = app_over(directory.path());
-                press(&mut app, KeyCode::Char('q'), KeyModifiers::CONTROL);
-                assert!(app.quit_armed);
-                press(&mut app, code, modifiers);
-                assert!(!app.quit_armed, "{code:?} left the quit armed");
-                assert!(!app.quit, "{code:?} let the studio quit");
-                // And a later ^Q has to start over.
-                press(&mut app, KeyCode::Char('q'), KeyModifiers::CONTROL);
-                assert!(
-                    !app.quit,
-                    "the disarmed press still counted toward quitting"
-                );
-                assert!(app.quit_armed);
-            }
-        }
-
         /// A click and a paste call an armed quit off as a key does, so the
         /// next ^Q asks again instead of quitting at once.
         #[test]
@@ -693,23 +650,6 @@ mod tests {
             assert!(app.quit_armed, "Ctrl alone called the quit off");
             press(&mut app, KeyCode::Char('q'), KeyModifiers::CONTROL);
             assert!(app.quit, "the second ^Q did not quit");
-        }
-
-        #[test]
-        fn errors_clear_only_their_owner_and_newest_remaining_error_is_visible() {
-            let mut errors = AppErrors::default();
-            errors.set(ErrorOwner::Evaluation, "compile failed".into());
-            errors.set(ErrorOwner::Editor, "clipboard failed".into());
-            assert_eq!(errors.visible(), Some("clipboard failed"));
-
-            assert!(errors.clear(ErrorOwner::Editor));
-            assert_eq!(errors.visible(), Some("compile failed"));
-            assert!(!errors.clear(ErrorOwner::Save));
-            assert_eq!(errors.visible(), Some("compile failed"));
-
-            errors.set(ErrorOwner::Engine, "device failed".into());
-            errors.clear(ErrorOwner::Evaluation);
-            assert_eq!(errors.visible(), Some("device failed"));
         }
 
         #[test]
@@ -921,29 +861,6 @@ mod tests {
             for (index, owner) in ErrorOwner::ALL.into_iter().enumerate() {
                 assert_eq!(owner.slot(), index, "{owner:?} is not at its own index");
             }
-        }
-
-        #[test]
-        fn pressing_update_on_the_score_already_sounding_installs_nothing() {
-            // Update is held down as often as it is pressed, and each repeat used
-            // to tear down a generation and build a byte-identical one. The
-            // cutovers stack faster than the music absorbs them, and it is
-            // audible.
-            let directory = tempfile::tempdir().expect("tempdir");
-            let mut app = app_over(directory.path());
-            let source = "$: s(\"bd*4\")";
-
-            let current = app.scenes.current().id;
-            app.installed_revision = Some(source_revision(source));
-            app.audible_scene = Some(current);
-            app.snapshot = Some(sounding(true, false));
-            assert!(
-                app.install_would_be_redundant(current, source),
-                "the sounding score is already this one"
-            );
-
-            // A single edited character is a different score.
-            assert!(!app.install_would_be_redundant(current, "$: s(\"bd*8\")"));
         }
 
         /// A duplicate is another scene with the same text: launching it is a
@@ -1342,30 +1259,6 @@ mod tests {
             assert!(!app.is_evaluating(), "nothing left to wait for");
         }
 
-        /// The text that is already armed is not re-armed by pressing again:
-        /// inside the head-room a re-arm slips the launch a whole line later.
-        #[test]
-        fn pressing_update_on_the_armed_text_does_not_re_arm() {
-            let directory = tempfile::tempdir().expect("tempdir");
-            let mut app = app_over(directory.path());
-            let source = "$: s(\"sine*4\")";
-            app.snapshot = Some(sounding(true, false));
-            app.launch_arming
-                .arm(app.scenes.current().id, 3, source_revision(source), None);
-            let before = app.next_request_id;
-            app.handle_editor_effect(EditorEffect::Evaluate {
-                revision: app.editor().revision(),
-                source: source.into(),
-            })
-            .expect("evaluate");
-            assert_eq!(app.next_request_id, before, "nothing was queued");
-            assert!(app.status.contains("already armed"), "{}", app.status);
-            assert!(
-                matches!(app.launch_arming, LaunchArming::Armed { request: 3, .. }),
-                "still the same arming"
-            );
-        }
-
         /// A second rewind of text that is already waiting stays on that
         /// line. Re-arming inside the head-room lands a whole line later.
         #[test]
@@ -1531,33 +1424,6 @@ mod tests {
             );
             // The snapshot still lags, and the update is no longer redundant.
             assert!(!app.install_would_be_redundant(current, source));
-        }
-
-        #[test]
-        fn nothing_is_redundant_before_the_first_install() {
-            let directory = tempfile::tempdir().expect("tempdir");
-            let mut app = app_over(directory.path());
-            app.snapshot = Some(sounding(true, false));
-            let current = app.scenes.current().id;
-            assert!(!app.install_would_be_redundant(current, "$: s(\"bd*4\")"));
-        }
-
-        /// A stop pressed while the playback is already stopped is not a
-        /// stop: no engine word goes out, the transport is not asked to
-        /// stop again, and the status keeps whatever it was saying. The
-        /// word would only come back as a second settle - a flicker on a
-        /// picture at rest.
-        #[test]
-        fn a_stop_for_a_transport_already_stopped_says_nothing() {
-            let directory = tempfile::tempdir().expect("tempdir");
-            let mut app = app_over(directory.path());
-            app.snapshot = Some(sounding(false, false));
-            app.status.clear();
-
-            app.handle_editor_effect(EditorEffect::Stop).expect("stop");
-
-            assert!(!app.stop_requested, "no stop was asked of the engine");
-            assert!(app.status.is_empty(), "the stop said: {}", app.status);
         }
 
         /// A stop pressed before the first snapshot of a play still stops

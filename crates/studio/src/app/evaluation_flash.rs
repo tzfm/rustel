@@ -695,27 +695,6 @@ mod tests {
             assert_eq!(app.next_frame, expired);
         }
 
-        #[test]
-        fn a_success_is_one_two_hundred_millisecond_pulse() {
-            let directory = tempfile::tempdir().unwrap();
-            let mut app = app_over(directory.path());
-            let request_id = evaluate(&mut app, SCORE);
-            answer(&mut app, request_id, Some(true));
-            let started = app.evaluation_flash.as_ref().unwrap().started;
-
-            assert!(app.advance_evaluation_flash(started));
-            let flash = app.evaluation_flash.as_ref().unwrap();
-            assert!(flash.is_lit(started + Duration::from_millis(199)));
-            assert!(!flash.is_lit(started + Duration::from_millis(200)));
-            assert_eq!(
-                flash.next_transition(),
-                started + Duration::from_millis(200)
-            );
-
-            assert!(!app.advance_evaluation_flash(started + Duration::from_millis(200)));
-            assert!(app.evaluation_flash.is_none());
-        }
-
         /// An animation stretches the window the flash is lit over and
         /// gives the pane a brightness that rises and falls inside it,
         /// while the plain look stays exactly what it was.

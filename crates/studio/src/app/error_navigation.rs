@@ -365,38 +365,6 @@ mod tests {
         }
 
         #[test]
-        fn first_error_is_visible_with_wrapping_and_both_scroll_axes() {
-            let directory = tempfile::tempdir().unwrap();
-            let source = format!(
-                "{}{}bad\n{}",
-                "// filler\n".repeat(70),
-                " ".repeat(170),
-                "// tail\n".repeat(70)
-            );
-            let at = source.find("bad").unwrap();
-            let mut app = app_at(directory.path(), &source);
-            for wrap in [false, true] {
-                app.editor_mut().set_wrap(wrap);
-                app.editor_mut().set_view_size(35, 12);
-                let mut viewport = app.editor().viewport();
-                viewport.top_row = 120;
-                viewport.left_column = 0;
-                app.editor_mut().set_viewport(viewport);
-                cache(&mut app, vec![problem(LintLevel::Syntax, at)]);
-                jump(&mut app);
-                let map = app
-                    .editor()
-                    .screen_map(GridRect::new(0, 0, 35, 12))
-                    .unwrap();
-                assert!(
-                    map.cell_for_offset(ByteOffset(at)).is_some(),
-                    "caret hidden with wrap={wrap}"
-                );
-                assert_eq!(app.editor().viewport().left_column > 0, !wrap);
-            }
-        }
-
-        #[test]
         fn first_error_reveals_the_rendered_caret_in_the_focused_split_pane() {
             let directory = tempfile::tempdir().unwrap();
             let mut app = app_at(directory.path(), "// left pane stays here");

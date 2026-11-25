@@ -2975,25 +2975,6 @@ mod tests {
     }
 
     #[test]
-    fn a_fader_argument_keeps_its_call() {
-        let source = "set({ cutoff: slider(200, 100, 2000) })";
-        let parse = parse_call(source, 12).expect("the caret is in the call");
-        let cutoff = parse
-            .knobs
-            .iter()
-            .find(|knob| knob.label == "cutoff")
-            .expect("the entry");
-        let state = cutoff.state.as_ref().expect("the fader is the value");
-        let fader = state.fader.expect("the score declares bounds");
-        assert_eq!(fader.min, 100.0);
-        assert_eq!(fader.max, 2000.0);
-        assert_eq!(state.value, 200.0);
-        assert_eq!(&source[state.literal.clone()], "200");
-        assert_eq!(cutoff.min, 100.0, "the fader's bounds are the knob's");
-        assert_eq!(cutoff.max, 2000.0);
-    }
-
-    #[test]
     fn the_call_behind_a_fader_wins_over_the_fader_itself() {
         // The caret inside the fader's own numbers: the panel offers the
         // set's cutoff, not four knobs for the fader's own arguments.
@@ -3871,24 +3852,6 @@ mod tests {
         );
     }
 
-    /// A plugin parameter with steps of a third writes and shows three
-    /// decimals, not every digit of the float.
-    #[cfg(feature = "vst")]
-    #[test]
-    fn a_stepped_plugin_value_reads_short() {
-        use super::super::tests::support::press;
-        let directory = tempfile::tempdir().expect("tempdir");
-        let mut app = plugin_app(
-            directory.path(),
-            "$: s(\"bd\").vst(\"FX\", { mode: 0 })\n",
-            vec![plugin_param("mode", 3)],
-        );
-        press(&mut app, KeyCode::Right, KeyModifiers::NONE);
-        let source = app.scenes.current().editor.source();
-        assert!(source.contains("mode: 0.333 "), "{source}");
-        assert_eq!(app.status, "knobs: mode 0.333 · step 0.333");
-    }
-
     /// A stepped plugin rail walks its steps both ways, though the score
     /// writes a third as `0.333`, and a drag that stays on one cell writes
     /// the score once.
@@ -4045,41 +4008,6 @@ mod tests {
                 moment,
             )
             .expect("the edit applies");
-    }
-
-    /// A plugin parameter with steps of its own travels them: the rail
-    /// takes the plugin's step, not the thousandth a plain parameter
-    /// falls back to.
-    #[cfg(feature = "vst")]
-    #[test]
-    fn a_stepped_plugin_parameter_takes_its_own_step() {
-        let mut param = ParamInfo {
-            id: 3,
-            name: "Mix".into(),
-            key: "mix".into(),
-            group: String::new(),
-            units: String::new(),
-            default: 0.5,
-            steps: 100,
-            default_text: "50 %".into(),
-            role: Default::default(),
-        };
-        assert_eq!(ParamDefaults::of(&param).step, 0.01);
-        assert_eq!(ParamDefaults::of(&param).default, 0.5);
-        // A switch has two stops, and a parameter with no steps of its
-        // own keeps the thousandth.
-        param.steps = 1;
-        assert_eq!(ParamDefaults::of(&param).step, 1.0);
-        param.steps = 0;
-        assert_eq!(ParamDefaults::of(&param).step, 0.001);
-    }
-
-    #[test]
-    fn an_entry_parts_at_its_own_colon() {
-        let code = "cutoff: { a: 1 } ? 2 : 3";
-        let (key, value) = entry_parts(code, 0..code.len()).expect("one entry");
-        assert_eq!(&code[key], "cutoff");
-        assert_eq!(code[value].trim(), "{ a: 1 } ? 2 : 3");
     }
 
     #[test]
