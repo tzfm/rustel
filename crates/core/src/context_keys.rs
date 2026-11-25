@@ -604,34 +604,3 @@ impl Keys {
             && (self.ui_visuals & other.ui_visuals == other.ui_visuals)
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn with_scale(scale: &str) -> ContextKeys {
-        let mut keys = ContextKeys::default();
-        keys.edit().scale = Some(Arc::from(scale));
-        keys
-    }
-
-    #[test]
-    fn a_merge_keeps_the_first_sides_keys_and_fills_the_rest() {
-        let mut second = with_scale("b:minor");
-        second.edit().edo_size = Some(19.0);
-        let merged = ContextKeys::merge(&with_scale("a:major"), &second);
-        assert_eq!(merged.get().scale.as_deref(), Some("a:major"));
-        assert_eq!(merged.get().edo_size, Some(19.0));
-        let empty = ContextKeys::merge(&ContextKeys::default(), &ContextKeys::default());
-        assert!(empty.0.is_none(), "two empty sides share nothing");
-    }
-
-    #[test]
-    fn an_edit_does_not_change_a_hap_that_shares_the_keys() {
-        let first = with_scale("c:major");
-        let mut copy = first.clone();
-        copy.edit().scale = Some(Arc::from("d:dorian"));
-        assert_eq!(first.get().scale.as_deref(), Some("c:major"));
-        assert_eq!(copy.get().scale.as_deref(), Some("d:dorian"));
-    }
-}

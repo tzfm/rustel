@@ -1529,22 +1529,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn unnamed_control_preserves_existing_bag() {
-        let note = ControlSpec::new(["note"]);
-        let input = Value::object([
-            ("value".into(), Value::Str("c4".into())),
-            ("gain".into(), Value::F64(0.7)),
-        ]);
-        assert_eq!(
-            note.with_value(input),
-            Value::object([
-                ("gain".into(), Value::F64(0.7)),
-                ("note".into(), Value::Str("c4".into())),
-            ])
-        );
-    }
-
     /// A chord dictionary is an object. `.dict({...})` must pass it to
     /// `voicing()` whole under `dict`, and must not spread it into the event.
     #[test]

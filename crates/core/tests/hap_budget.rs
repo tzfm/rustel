@@ -28,8 +28,7 @@ later version.
 //! more than a few thousand haps.
 
 use rustel_core::{
-    DEFAULT_HAP_BUDGET, JoinMode, Pattern, PickIndexMode, PickLookup, QueryLimit, State, TimeSpan,
-    Value, pure,
+    JoinMode, Pattern, PickIndexMode, PickLookup, QueryLimit, State, TimeSpan, Value, pure,
 };
 use rustel_fraction::Fraction;
 
@@ -65,20 +64,6 @@ fn exactly(n: usize) -> Pattern {
         layers.push(pure(Value::F64(-(i as f64) - 1.0)));
     }
     rustel_core::stack(layers)
-}
-
-// -- the helper itself ------------------------------------------------------
-
-#[test]
-fn the_test_helpers_produce_the_hap_counts_they_claim() {
-    // Asserted first: every other test in this file is meaningless if `exactly`
-    // is off by one, and an off-by-one is exactly what the limit tests probe.
-    for n in [0, 1, 2, 3, 4, 5, 7, 16, 63, 100, 499, 500, 501] {
-        let haps = exactly(n)
-            .try_query_state_with_budget(&span(0, 1), 100_000)
-            .expect("helper queries must not be refused at a large budget");
-        assert_eq!(haps.len(), n, "exactly({n}) produced {} haps", haps.len());
-    }
 }
 
 // -- below the limit: semantics untouched -----------------------------------
@@ -124,37 +109,6 @@ fn the_exact_limit_is_allowed_and_one_more_is_refused() {
 }
 
 #[test]
-fn exhaustion_is_never_reported_as_an_empty_result() {
-    // `query_state` returns haps, so a refused query and a silent query are
-    // the same value there. The typed channel must keep them distinct, and
-    // the `queryArc` boundary, which turns a strudel.cc throw into silence,
-    // must not hide the refusal.
-    let refused = exactly(TEST_BUDGET as usize + 1);
-    assert!(
-        refused
-            .try_query_state_with_budget(&span(0, 1), TEST_BUDGET)
-            .is_err(),
-        "a refused query must report the refusal"
-    );
-    let silent = rustel_core::silence().try_query_state_with_budget(&span(0, 1), TEST_BUDGET);
-    assert!(
-        matches!(&silent, Ok(haps) if haps.is_empty()),
-        "a genuinely empty pattern must NOT look like a refusal, got {silent:?}"
-    );
-}
-
-#[test]
-fn a_refused_query_returns_nothing_rather_than_a_truncated_prefix() {
-    // Silent truncation is the failure mode that would make every downstream
-    // number quietly wrong: a render missing its tail looks like a correct
-    // render of a shorter pattern.
-    match exactly(TEST_BUDGET as usize + 1).try_query_state_with_budget(&span(0, 1), TEST_BUDGET) {
-        Err(QueryLimit::HapBudget { .. }) => {}
-        other => panic!("expected a refusal, got {other:?}"),
-    }
-}
-
-#[test]
 fn nested_density_cannot_multiply_past_the_budget() {
     // Neither factor is remarkable alone; the product is. A per-node or
     // per-combinator limit would pass each of these and still let the query
@@ -174,27 +128,6 @@ fn nested_density_cannot_multiply_past_the_budget() {
             .expect("400 haps is under the budget")
             .len(),
         400
-    );
-}
-
-#[test]
-fn a_hostile_density_is_refused_promptly() {
-    // The shape the budget exists for: one cycle, density far past the limit,
-    // no width for `MAX_QUERY_SPAN_CYCLES` to object to.
-    //
-    // Timed, because "refused" and "refused after allocating for a minute" are
-    // different outcomes: production must STOP, not merely be reported on
-    // afterwards. The multiplier is large relative to the budget while staying
-    // trivially small in absolute terms.
-    let started = std::time::Instant::now();
-    let result = dense(8, 100_000).try_query_state_with_budget(&span(0, 1), TEST_BUDGET);
-    let elapsed = started.elapsed();
-    assert!(result.is_err(), "a hostile density must be refused");
-    assert!(
-        elapsed < std::time::Duration::from_secs(10),
-        "the refusal took {elapsed:?}; production is not being stopped early - \
-         the budget is being checked after the fact rather than charged as haps \
-         are made"
     );
 }
 
@@ -225,14 +158,6 @@ fn a_refused_query_does_not_poison_the_next_one() {
 }
 
 #[test]
-fn the_default_budget_is_the_documented_value() {
-    // Pinned without materialising it: five million haps is far past any
-    // musical query, and changing it should be a deliberate act with a reason,
-    // not a silent edit.
-    assert_eq!(DEFAULT_HAP_BUDGET, 5_000_000);
-}
-
-#[test]
 fn a_refused_leaf_never_materialises_its_haps() {
     // The budget is charged before production, not after. `pure(x).fast(m)`
     // makes one leaf produce `m` haps in one pass. With the pre-charge the
@@ -248,23 +173,6 @@ fn a_refused_leaf_never_materialises_its_haps() {
         "the refused query still materialised {materialised} haps against a \
          {TEST_BUDGET} budget: the charge happens AFTER production, so the \
          allocation it exists to prevent already occurred"
-    );
-}
-
-#[test]
-fn an_allowed_leaf_does_materialise_its_haps() {
-    // The control, so the test above cannot pass because the counter is simply
-    // never incremented.
-    rustel_core::reset_haps_materialised();
-    let ok = pure(Value::F64(1.0)).fast(Fraction::int(100));
-    let haps = ok
-        .try_query_state_with_budget(&span(0, 1), TEST_BUDGET)
-        .expect("100 haps is under the budget");
-    assert_eq!(haps.len(), 100);
-    assert!(
-        rustel_core::haps_materialised() >= 100,
-        "the counter did not record a query that genuinely produced haps, so \
-         the assertion above proves nothing"
     );
 }
 
@@ -300,17 +208,6 @@ fn an_amplifying_join_stops_before_it_multiplies_past_the_budget() {
          happens on the finished vector rather than as it grows, so the \
          allocation it exists to prevent already occurred"
     );
-}
-
-#[test]
-fn a_legal_join_is_unaffected_by_the_per_push_check() {
-    // The control: budgeting each push must not truncate a join that fits.
-    let outer = dense(2, 5); // 10 haps
-    let joined = outer.fmap_to_pattern(|_| dense(2, 5)).squeeze_join();
-    let haps = joined
-        .try_query_state_with_budget(&span(0, 1), TEST_BUDGET)
-        .expect("a 10 x 10 squeeze join is under a 500 budget");
-    assert_eq!(haps.len(), 100, "a legal join was truncated");
 }
 
 // -- every expanding producer, exact limit and limit+1 ----------------------

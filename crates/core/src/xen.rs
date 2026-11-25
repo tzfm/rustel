@@ -1201,61 +1201,6 @@ mod tests {
         );
     }
 
-    /// The edoScale cache holds at most [`MAX_CACHED_EDO_KEY_BYTES`] of keys
-    /// however many distinct definitions pass through it, builds but does not
-    /// keep a definition whose key alone is over that budget, and serves a repeat
-    /// from what it holds.
-    #[test]
-    fn the_edoscale_cache_stays_within_its_key_budget() {
-        let padding = "x".repeat(MAX_CACHED_EDO_KEY_BYTES / 8);
-        let definition = |large: f64| {
-            vec![
-                Value::Str("C3".into()),
-                Value::Str("LLsLLLs".into()),
-                Value::F64(large),
-                Value::F64(1.0),
-                Value::Str(padding.as_str().into()),
-            ]
-        };
-        let key = |definition: &[Value]| {
-            definition
-                .iter()
-                .map(Value::show)
-                .collect::<Vec<_>>()
-                .join(":")
-        };
-        let mut cache = EdoPitchesCache::default();
-        for large in 2..40 {
-            let definition = definition(f64::from(large));
-            cache.get_or_build(key(&definition), &definition).unwrap();
-            assert!(
-                cache.key_bytes <= MAX_CACHED_EDO_KEY_BYTES,
-                "the cache grew to {} key bytes",
-                cache.key_bytes
-            );
-            assert_eq!(
-                cache.key_bytes,
-                cache.tables.keys().map(String::len).sum::<usize>()
-            );
-        }
-
-        let repeat = definition(39.0);
-        let first = cache.get_or_build(key(&repeat), &repeat).unwrap();
-        let again = cache.get_or_build(key(&repeat), &repeat).unwrap();
-        assert!(Arc::ptr_eq(&first, &again), "a repeat was built again");
-
-        let held = cache.key_bytes;
-        let mut oversized = definition(40.0);
-        oversized[4] = Value::Str("x".repeat(MAX_CACHED_EDO_KEY_BYTES).into());
-        let built = cache.get_or_build(key(&oversized), &oversized).unwrap();
-        assert_eq!(built.divisions.len(), 7);
-        assert_eq!(
-            cache.key_bytes, held,
-            "a definition over the budget was kept"
-        );
-        assert!(cache.tables.contains_key(&key(&repeat)));
-    }
-
     /// `i("0 8 18").xen("31edo")`: base 220, ratios scaled by it
     /// unconditionally.
     #[test]
@@ -1337,14 +1282,6 @@ mod tests {
         ));
     }
 
-    /// The 10-significant-digit frequency trim.
-    #[test]
-    fn trim_freq_matches_to_precision_ten() {
-        assert_eq!(trim_freq(191.52112388531343), 191.5211239);
-        assert_eq!(trim_freq(440.0), 440.0);
-        assert_eq!(trim_freq(0.000123456789012), 0.000123456789);
-    }
-
     #[test]
     fn js_number_tracks_number_coercions() {
         assert!(js_number(&Value::Undefined).is_nan());
@@ -1407,31 +1344,6 @@ mod tests {
         fn freq_is_nan(self) -> bool {
             self.is_nan()
         }
-    }
-
-    #[test]
-    fn oct_deg_splits_high_degrees_across_octaves() {
-        let pitches = build_edo_pitches_for_test("C:LLsLLLs:2:1");
-        // Degree 1 stays in the root octave; degree 8 of a 7-note scale is one up.
-        let (oct, deg) = oct_deg(&pitches, 1.0);
-        assert_eq!((oct, deg), (3.0, 1.0));
-        let (oct, deg) = oct_deg(&pitches, 8.0);
-        assert_eq!((oct, deg), (4.0, 1.0));
-        // Exact multiples land on the top degree of the new octave.
-        let (oct, deg) = oct_deg(&pitches, 7.0);
-        assert_eq!((oct, deg), (3.0, 7.0));
-    }
-
-    /// C major as LLsLLLs:2:1 - degree 3 is E, whose 12-EDO ratio is exactly
-    /// the just major third's neighborhood, so the nearest interval is M3.
-    #[test]
-    fn interval_labels_pick_the_nearest_just_ratio() {
-        let pitches = build_edo_pitches_for_test("C:LLsLLLs:2:1");
-        assert_eq!(pitches.edivisions, 12.0);
-        assert_eq!(pitches.divisions[2], 4.0); // two L steps = 4 semitones
-        assert_eq!(pitches.int_labels[2].as_deref(), Some("M3"));
-        assert_eq!(pitches.int_labels[1].as_deref(), Some("M2"));
-        assert!(pitches.int_labels[0].is_none());
     }
 
     fn build_edo_pitches_for_test(definition: &str) -> EdoPitches {

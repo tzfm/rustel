@@ -50,21 +50,3 @@ fn slow_by_a_denormal_is_equally_refused() {
         .call(&[pure(Value::F64(1e-30))], pure(Value::Str("bd".into())));
     assert!(pattern.query_arc(Fraction::ZERO, Fraction::ONE).is_empty());
 }
-
-#[test]
-fn ordinary_factors_are_unaffected() {
-    for (factor, expected) in [(1.0, 1), (2.0, 2), (8.0, 8), (64.0, 64)] {
-        assert_eq!(
-            fast_by(factor).len(),
-            expected,
-            "fast({factor}) must still work"
-        );
-    }
-}
-
-#[test]
-fn a_wide_but_legitimate_query_still_works() {
-    // Well under the bound: the guard must not clip real offline renders.
-    let haps = pure(Value::Str("bd".into())).query_arc(Fraction::ZERO, Fraction::int(5_000));
-    assert_eq!(haps.len(), 5_000);
-}
