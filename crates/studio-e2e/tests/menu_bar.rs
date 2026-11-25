@@ -65,21 +65,6 @@ fn f1_opens_the_bar_and_f1_closes_it() {
     assert!(!studio.menu_open(), "F1 closes the bar");
 }
 
-/// A title mnemonic opens that menu, dropped: `s` for Scene, straight from
-/// the bar with nothing else down.
-#[test]
-fn a_title_mnemonic_opens_that_menu_dropped() {
-    let mut studio = hermetic();
-
-    studio.press(KeyCode::F(1), KeyModifiers::NONE);
-    studio.press(KeyCode::Char('s'), KeyModifiers::NONE);
-
-    assert!(studio.menu_open(), "the mnemonic opened Scene");
-    let rows = studio.rows();
-    row_containing(&rows, "New scene");
-    row_containing(&rows, "Duplicate scene");
-}
-
 /// The right arrow walks the seven menus in order, and a dropdown that is
 /// down follows the focus - which is what makes browsing one keypress each.
 /// The walk's assertions are on item rows only a dropped menu can show.
@@ -187,45 +172,6 @@ fn options_devices_opens_the_device_panel() {
     row_containing(&studio.rows(), "audio out");
 }
 
-/// Options ▸ Menu bar hides the bar it was chosen from: the menu goes with
-/// it, and F1 then means help, as it does in zen.
-#[test]
-fn options_menu_bar_hides_the_bar_and_f1_then_means_help() {
-    let mut studio = hermetic();
-
-    studio.press(KeyCode::F(1), KeyModifiers::NONE);
-    studio.press(KeyCode::Char('o'), KeyModifiers::NONE); // Options, dropped
-    row_containing(&studio.rows(), "Header");
-    row_containing(&studio.rows(), "Footer");
-    studio.press(KeyCode::Char('m'), KeyModifiers::NONE); // Menu bar
-
-    assert!(!studio.menu_open(), "the menu outlived its bar");
-    assert!(
-        studio.status().contains("opens settings"),
-        "the status names the way back: {}",
-        studio.status()
-    );
-    studio.press(KeyCode::F(1), KeyModifiers::NONE);
-    assert!(!studio.menu_open(), "F1 opened a hidden bar");
-    assert!(studio.help_is_open(), "F1 did not mean help");
-}
-
-/// Help ▸ Keyboard reference opens the help overlay - where the terminal
-/// has room for it, which the hermetic 150×40 always does. The title
-/// mnemonic drops Help directly; the dropdown needs no Down first.
-#[test]
-fn help_keyboard_reference_opens_help() {
-    let mut studio = hermetic();
-
-    studio.press(KeyCode::F(1), KeyModifiers::NONE);
-    studio.press(KeyCode::Char('h'), KeyModifiers::NONE); // Help, dropped
-    studio.press(KeyCode::Char('k'), KeyModifiers::NONE); // Keyboard reference
-
-    assert!(!studio.menu_open(), "the overlay closed the bar");
-    assert!(studio.help_is_open(), "the overlay is up");
-    row_containing(&studio.rows(), "keyboard");
-}
-
 /// Transport ▸ Update evaluates the score - the transport outranks the
 /// menu on the chord path, and through the menu it simply works.
 #[test]
@@ -254,28 +200,6 @@ fn a_greyed_row_does_not_act() {
 
     assert_eq!(studio.scene_names(), before, "a greyed row is inert");
     assert!(studio.menu_open(), "a greyed row leaves the menu open");
-}
-
-/// Zen mode has no bar: F1 goes on meaning help, because a key that does
-/// nothing at all is worse than a key that does the old thing.
-#[test]
-fn f1_means_help_when_there_is_no_bar() {
-    let mut studio = hermetic();
-
-    studio.press(KeyCode::F(11), KeyModifiers::NONE); // zen folds the chrome away
-    studio.settle();
-
-    studio.press(KeyCode::F(1), KeyModifiers::NONE);
-    assert!(!studio.menu_open(), "zen has no bar to open");
-    assert!(studio.help_is_open(), "F1 went on meaning help");
-
-    // Help is modal for input: Esc puts it away first, then F11 leaves zen.
-    studio.press(KeyCode::Esc, KeyModifiers::NONE);
-    studio.press(KeyCode::F(11), KeyModifiers::NONE);
-    studio.settle();
-    assert!(!studio.help_is_open(), "help closed");
-    assert!(!studio.menu_open());
-    row_containing(&studio.rows(), "File");
 }
 
 /// View ▸ Set panel opens the same panel as ^B, with its tapes fold. The

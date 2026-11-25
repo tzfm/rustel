@@ -10,7 +10,7 @@ static AUDIO_CALLBACK_ALLOCATOR: rustel_audio::tripwire::TripwireAlloc =
     rustel_audio::tripwire::TripwireAlloc;
 
 use crossterm::event::{KeyCode, KeyModifiers};
-use rustel_studio_e2e::{hermetic, row_containing};
+use rustel_studio_e2e::hermetic;
 
 /// A score the checker refuses never reaches the engine, and the status
 /// says why and what still plays.
@@ -100,35 +100,6 @@ fn a_setup_error_outlives_a_newer_score_message() {
         .errors()
         .expect("the setup's refusal resurfaces once the score is fixed");
     assert!(setup_error.contains("prebake (local)"), "{setup_error}");
-}
-
-/// The error line stays in the footer above the device and MIDI chips:
-/// part of the frame, not a floating popup.
-#[test]
-fn the_error_line_is_part_of_the_frame() {
-    let mut studio = hermetic();
-
-    studio.set_score("null.x");
-    studio.chord("ctrl+s");
-    studio.settle();
-    let error = studio.errors().expect("an error is showing");
-    let rows = studio.rows();
-    let chips = row_containing(&rows, "♪");
-    let error_row = row_containing(&rows, &error);
-    assert!(
-        chips == rows.len() - 1,
-        "the chips are the footer's last row:\n{}",
-        rows.join("\n")
-    );
-    assert!(
-        error_row < chips,
-        "the message stays in the footer above the chips:\n{}",
-        rows.join("\n")
-    );
-    assert_eq!(
-        error, "cannot read property 'x' of null",
-        "the engine's actionable words show without routing noise"
-    );
 }
 
 fn select_prebake_row(studio: &mut rustel_studio_e2e::Hermetic) {

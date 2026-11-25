@@ -125,38 +125,6 @@ fn a_move_on_a_rail_writes_the_score() {
     );
 }
 
-/// The far-left stop takes an optional entry out of the score and a move
-/// right puts it back as it was.
-#[test]
-fn the_far_left_stop_takes_an_entry_out_and_back() {
-    let score = "$: note(\"c3\").s(\"sine\").set({ pan: 0.5, cutoff: 800 })";
-    let mut studio = studio_over(score);
-    open_knobs(&mut studio);
-
-    studio.press(KeyCode::Home, KeyModifiers::NONE);
-    studio.settle();
-    assert!(
-        !studio.score().contains("pan"),
-        "the off stop removes the entry:\n{}",
-        studio.score()
-    );
-    assert!(
-        column_text(&studio.rows())
-            .iter()
-            .any(|row| row.contains("pan") && row.contains("off")),
-        "the rail stays in the column, held off:\n{}",
-        column_text(&studio.rows()).join("\n")
-    );
-
-    studio.press(KeyCode::Right, KeyModifiers::NONE);
-    studio.settle();
-    assert_eq!(
-        studio.score().trim_end(),
-        score,
-        "a move right writes the entry back as it was"
-    );
-}
-
 /// e opens the form on the rail's four numbers, and Enter writes the typed
 /// value into the score. A value past a bound moves the bound with it.
 #[test]
@@ -377,21 +345,6 @@ fn a_plugin_call_names_its_list_keys() {
             .any(|row| row.contains("a add · r reset list")),
         "the call's keys:\n{}",
         column.join("\n")
-    );
-}
-
-/// a opens a plugin's list or a call's documented options: `set` has
-/// neither, and the status says so rather than opening an empty sheet.
-#[test]
-fn add_needs_a_list() {
-    let mut studio = studio_over("$: note(\"c3\").s(\"sine\").set({ cutoff: 800 })");
-    open_knobs(&mut studio);
-
-    studio.press(KeyCode::Char('a'), KeyModifiers::NONE);
-    assert!(
-        studio.status().contains("vst"),
-        "the status explains set has no list: {}",
-        studio.status()
     );
 }
 

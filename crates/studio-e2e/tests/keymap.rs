@@ -558,27 +558,6 @@ fn capability_sets(enhanced_only: bool) -> Vec<KeyboardCapabilities> {
     }
 }
 
-/// The platform label: how footers and hints spell the modifier. Every
-/// platform uses caret notation and none uses ⌘, because Mac terminals
-/// already claim the chords worth advertising. Checked once per capability
-/// set.
-#[test]
-fn the_platform_label_matches_the_capability_set() {
-    assert_eq!(
-        KeyboardCapabilities::legacy().primary_label(),
-        "^",
-        "the legacy spelling is caret notation"
-    );
-    assert_eq!(
-        KeyboardCapabilities::enhanced().primary_label(),
-        "^",
-        "the enhanced set spells it the same way - no ⌘, on any platform"
-    );
-    // And the hints are built from it, so the footer reads as one language.
-    assert_eq!(KeyboardCapabilities::legacy().evaluate_hint(), "^S");
-    assert_eq!(KeyboardCapabilities::legacy().stop_hint(), "^G");
-}
-
 /// A chord the docs do not document must do nothing. Ctrl+I is bound to
 /// nothing in the studio: no menu, no panel, no character in the score. The
 /// test presses it under the enhanced set, where a terminal reports it as

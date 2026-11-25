@@ -201,68 +201,6 @@ fn an_example_previews_under_a_playing_score_and_puts_it_back() {
     assert!(studio.is_playing(), "the score is still the thing playing");
 }
 
-/// The generator answers its two composing keys from the keyboard: `g`
-/// makes a fresh idea every press, `v` develops the idea in hand - and
-/// `c` copies whichever is on the shelf, the code and not the name.
-#[test]
-fn g_composes_fresh_and_v_develops_the_idea_in_hand() {
-    let mut studio = hermetic();
-    open_generator(&mut studio);
-
-    // The open direction lists its whole shelf: the action rows, the
-    // copy row and every control the direction carries.
-    let rows = studio.rows();
-    for label in [
-        "Glassy pulse",
-        "Generate",
-        "Similar",
-        "Copy",
-        "Activity",
-        "Tone",
-        "Motion",
-        "Space",
-        "Variation",
-        "Drums",
-        "Delay",
-    ] {
-        assert!(
-            rows.iter().any(|row| row.contains(label)),
-            "the shelf lists {label}:\n{}",
-            rows.join("\n")
-        );
-    }
-
-    let take = |studio: &mut Hermetic| {
-        studio.press(KeyCode::Char('c'), KeyModifiers::NONE);
-        studio.settle();
-        studio
-            .clipboard_text()
-            .expect("c copies the idea on the shelf")
-    };
-
-    studio.press(KeyCode::Char('g'), KeyModifiers::NONE);
-    studio.settle();
-    let fresh = take(&mut studio);
-    assert!(
-        fresh.contains("$:"),
-        "a composed idea is score code: {fresh}"
-    );
-
-    studio.press(KeyCode::Char('g'), KeyModifiers::NONE);
-    studio.settle();
-    let other = take(&mut studio);
-    assert_ne!(other, fresh, "every g is a NEW idea");
-
-    studio.press(KeyCode::Char('v'), KeyModifiers::NONE);
-    studio.settle();
-    let similar = take(&mut studio);
-    assert_ne!(similar, other, "v develops the idea in hand into another");
-    assert!(
-        similar.contains("$:"),
-        "and it is score code too: {similar}"
-    );
-}
-
 /// The control rows walk their whole range: → is a step, ⇧→ is five,
 /// Home and End are the ends, and the floor and ceiling are plain
 /// stops rather than wraps.

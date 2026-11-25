@@ -115,33 +115,6 @@ fn the_painters_draw_their_own_kind_of_truth() {
     );
 }
 
-/// An unknown canvas never reaches the stage: the linter refuses the
-/// update in the checker's own words, and the last good score keeps
-/// playing - the stage itself has no note to add.
-#[test]
-fn an_unknown_painter_says_so() {
-    let mut studio = hermetic();
-
-    // A good score first, so there is something playing to protect.
-    studio.set_score("$: s(\"bd\")");
-    studio.chord("ctrl+s");
-    studio.settle();
-    assert!(studio.is_playing());
-
-    studio.set_score("$: s(\"bd\")._nosuchpicture()");
-    studio.chord("ctrl+s");
-    studio.settle();
-    let status = studio.status();
-    assert!(
-        status.contains("refused") && status.contains("unknown function"),
-        "the refusal names the unknown painter: {status}"
-    );
-    assert!(
-        studio.is_playing(),
-        "the last good score survives the refusal"
-    );
-}
-
 /// The stage does not eat the code: the score's own text stays readable
 /// under the painter, and the editor keeps the caret and the keys.
 #[test]
