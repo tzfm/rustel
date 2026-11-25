@@ -32,6 +32,9 @@ pub struct OutlinePanel {
     read_of: Option<(SceneId, Revision)>,
     /// The nodes, or why the text has none.
     pub nodes: Result<Vec<OutlineNode>, String>,
+    /// The text changed to one that does not parse, and the nodes are
+    /// still those of the last text that did.
+    pub stale: bool,
 }
 
 impl Default for OutlinePanel {
@@ -41,23 +44,35 @@ impl Default for OutlinePanel {
             scroll: 0,
             read_of: None,
             nodes: Ok(Vec::new()),
+            stale: false,
         }
     }
 }
 
 impl OutlinePanel {
     /// Read the outline of `source` again when it is another score or
-    /// another text than the last one read.
+    /// another text than the last one read. The new tree takes the place
+    /// of the old one in one step. A text that does not parse, as one
+    /// does halfway through a word, keeps the last tree of the same score.
     pub fn refresh(&mut self, scene: SceneId, revision: Revision, source: impl FnOnce() -> String) {
         if self.read_of == Some((scene, revision)) {
             return;
         }
-        if self.read_of.is_some_and(|(read, _)| read != scene) {
+        let same_score = self.read_of.is_some_and(|(read, _)| read == scene);
+        if !same_score {
             self.selected = 0;
             self.scroll = 0;
         }
         self.read_of = Some((scene, revision));
-        self.nodes = rustel_transpiler::outline(&source());
+        match rustel_transpiler::outline(&source()) {
+            Err(_) if same_score && self.nodes.as_ref().is_ok_and(|nodes| !nodes.is_empty()) => {
+                self.stale = true;
+            }
+            read => {
+                self.nodes = read;
+                self.stale = false;
+            }
+        }
         self.clamp();
     }
 
@@ -74,6 +89,12 @@ impl OutlinePanel {
         let last = self.node_count().saturating_sub(1);
         self.selected = self.selected.saturating_add_signed(delta).min(last);
         self.follow(rows);
+    }
+
+    /// Move the view `delta` rows, and leave the hand where it is.
+    pub fn scroll_by(&mut self, delta: isize, rows: usize) {
+        let last = self.node_count().saturating_sub(rows.max(1));
+        self.scroll = self.scroll.saturating_add_signed(delta).min(last);
     }
 
     pub fn jump(&mut self, to: usize, rows: usize) {
@@ -153,6 +174,30 @@ pub struct OutlineView<'a> {
     pub theme: &'a Theme,
     pub focused: bool,
     pub area: Rect,
+    /// What ran the score last, when the engine has said: native or not.
+    pub native: Option<bool>,
+    /// The caret's byte in the score: its statement is lit.
+    pub caret: usize,
+}
+
+/// The rows of the top-level statement that holds `caret`: the statement's
+/// row and the rows under it.
+pub fn statement_rows(nodes: &[OutlineNode], caret: usize) -> std::ops::Range<usize> {
+    let tops = || {
+        nodes
+            .iter()
+            .enumerate()
+            .filter(|(_, node)| node.depth == 0)
+            .map(|(index, _)| index)
+    };
+    let Some(first) = tops()
+        .take_while(|index| nodes[*index].start as usize <= caret)
+        .last()
+    else {
+        return 0..0;
+    };
+    let end = tops().find(|index| *index > first).unwrap_or(nodes.len());
+    first..end
 }
 
 impl Widget for OutlineView<'_> {
@@ -184,21 +229,29 @@ impl Widget for OutlineView<'_> {
             usize::from(parts.title.width),
             title_style,
         );
-        // The key of the colours, at the title's end.
-        let key = [("native", true), ("script", false)];
-        let mut x = parts.title.right();
-        for (word, native) in key.iter().rev() {
-            x = x.saturating_sub(word.len() as u16 + 1);
-            if x <= parts.title.x + 8 {
-                break;
-            }
+        // The tree of the last text that parsed, while the new one does not.
+        if self.panel.stale {
             buffer.set_stringn(
-                x,
+                parts.title.x + 8,
                 parts.title.y,
-                word,
-                word.len(),
-                Style::default().fg(theme.engine(*native)),
+                "…",
+                1,
+                Style::default().fg(theme.muted),
             );
+        }
+        // What ran the score, at the title's end, in its colour.
+        if let Some(native) = self.native {
+            let word = if native { "native" } else { "script" };
+            let x = parts.title.right().saturating_sub(word.len() as u16);
+            if x > parts.title.x + 10 {
+                buffer.set_stringn(
+                    x,
+                    parts.title.y,
+                    word,
+                    word.len(),
+                    Style::default().fg(theme.engine(native)),
+                );
+            }
         }
         let body = parts.body;
         let muted = Style::default().fg(theme.muted);
@@ -219,6 +272,8 @@ impl Widget for OutlineView<'_> {
             }
             Ok(nodes) => {
                 let rows = usize::from(body.height);
+                let lit = statement_rows(nodes, self.caret);
+                let lane = theme.current_line.unwrap_or(theme.surface);
                 for (row, (index, node)) in nodes
                     .iter()
                     .enumerate()
@@ -233,6 +288,11 @@ impl Widget for OutlineView<'_> {
                     let text = format!("{}{branch}{}", " ".repeat(indent), node.label);
                     let text = super::view::ellipsize(&text, body.width);
                     let mut style = Style::default().fg(theme.engine(native(node)));
+                    if lit.contains(&index) {
+                        style = style.bg(lane);
+                        let blank = " ".repeat(usize::from(body.width));
+                        buffer.set_stringn(body.x, y, &blank, blank.len(), style);
+                    }
                     if chosen {
                         style = style.bg(theme.selection).add_modifier(Modifier::BOLD);
                     }
@@ -294,6 +354,29 @@ mod tests {
         panel.refresh(SceneId(1), Revision(1), || unreachable!("same text"));
         panel.refresh(SceneId(1), Revision(2), || "s(\"bd\")\nn(\"0\")".to_owned());
         assert_eq!(panel.node_count(), 2);
+    }
+
+    #[test]
+    fn a_text_that_does_not_parse_keeps_the_last_tree() {
+        let mut panel = panel("s(\"bd\")\nn(\"0\")");
+        panel.refresh(SceneId(1), Revision(2), || "s(\"bd\")\nn(\"0\"".to_owned());
+        assert!(panel.stale);
+        assert_eq!(panel.node_count(), 2);
+        panel.refresh(SceneId(1), Revision(3), || "s(\"bd\")".to_owned());
+        assert!(!panel.stale);
+        assert_eq!(panel.node_count(), 1);
+        // Another score shows why its own text has no tree.
+        panel.refresh(SceneId(2), Revision(1), || "s(".to_owned());
+        assert!(panel.nodes.is_err());
+    }
+
+    #[test]
+    fn the_statement_at_the_caret_is_lit() {
+        let panel = panel("setcpm(30)\n$: s(\"bd\").fast(2)\n$: n(\"0\")");
+        let nodes = panel.nodes.as_ref().expect("nodes");
+        assert_eq!(statement_rows(nodes, 0), 0..1);
+        assert_eq!(statement_rows(nodes, 15), 1..4);
+        assert_eq!(statement_rows(nodes, 999), 4..6);
     }
 
     #[test]

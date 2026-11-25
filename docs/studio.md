@@ -816,8 +816,10 @@ tree: each statement, each call of a chain and each argument with parts of
 its own. A part in the theme's native colour runs without the script engine.
 A part in the script colour needs it, such as an operator, a loop, or a call
 that only JavaScript has. The column reads the score again when the text
-changes, and only while it is open. ↑ and ↓ choose a node, Enter or a click
-puts the caret on it, and Esc returns the keyboard to the score.
+changes, and only while it is open. While the text does not parse, it keeps
+the last tree. Its title says native or script for the whole score, and the
+statement that holds the caret is lit. ↑ and ↓ choose a node, Enter or a
+click puts the caret on it, and Esc returns the keyboard to the score.
 
 The memory breakdown says the same for the whole score in one word: native
 or script.

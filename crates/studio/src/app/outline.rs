@@ -111,7 +111,7 @@ impl App {
         true
     }
 
-    /// The wheel over the column scrolls its nodes.
+    /// The wheel over the column scrolls its view, as the score's does.
     pub(super) fn wheel_outline_over(&mut self, x: u16, y: u16, direction: f32) -> bool {
         if !within(self.regions.outline, x, y) {
             return false;
@@ -120,7 +120,8 @@ impl App {
         let Some(panel) = self.outline_panel.as_mut() else {
             return false;
         };
-        panel.step(if direction < 0.0 { -3 } else { 3 }, rows);
+        // A swipe up is a positive direction, and shows earlier rows.
+        panel.scroll_by(if direction > 0.0 { -3 } else { 3 }, rows);
         self.dirty_frame = true;
         true
     }

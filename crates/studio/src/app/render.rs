@@ -1325,6 +1325,12 @@ impl App {
                     fine_lock: self.fine_drag.lock,
                 }),
             outline: self.outline_panel.as_ref(),
+            outline_native: self
+                .snapshot
+                .as_ref()
+                .and_then(|snapshot| snapshot.score_engine)
+                .map(|engine| engine == rustel_runtime::ScoreEngine::Native),
+            outline_caret: self.editor().primary_selection().head.0,
             mixer_selection: self.mixer_selection.as_ref(),
             reference_on_top: self.reference_on_top(),
             #[cfg(feature = "hydra")]
