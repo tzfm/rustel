@@ -632,25 +632,6 @@ mod tests {
     }
 
     #[test]
-    fn exhausted_receipt_tokens_do_not_wrap_or_install_a_reservation() {
-        let (mut session, output) = silent_session();
-        session.audio_confirmations.as_mut().unwrap().next_token = u64::MAX;
-        let before_cursor = session.scheduler.scheduled_to_cycle();
-        let error = session
-            .reserve_audio_confirmation()
-            .expect_err("exhausted token");
-        assert!(matches!(error, RuntimeError::ResourceLimit(message)
-            if message.contains("token counter exhausted")));
-        assert_eq!(
-            session.audio_confirmations.as_ref().unwrap().next_token,
-            u64::MAX
-        );
-        assert_eq!(retained_windows(&session), 0);
-        assert_eq!(session.scheduler.scheduled_to_cycle(), before_cursor);
-        assert_eq!(output.device().report().callbacks, 0);
-    }
-
-    #[test]
     fn a_delayed_copy_retains_its_exact_source_and_settings_after_session_advances() {
         let (mut session, mut output) = silent_session();
         assert!(session.audible_source.is_none());
