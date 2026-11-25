@@ -725,6 +725,7 @@ method apply registered apply
 method applyN registered applyN
 method ar registered ar
 method as registered as
+method asym distort asym
 method att control attack
 method attack control attack
 method band composer band
@@ -775,6 +776,7 @@ method ceil registered ceil
 method ch control channels
 method channel control channel
 method channels control channels
+method chebyshev distort chebyshev
 method chop registered chop
 method chord control chord
 method chorus control chorus
@@ -801,6 +803,7 @@ method csoundm registered csoundm
 method ctf control cutoff
 method ctlNum control ctlNum
 method ctranspose control ctranspose
+method cubic distort cubic
 method curve control curve
 method cut control cut
 method cutoff control cutoff
@@ -826,6 +829,7 @@ method detune control detune
 method dfb control delayfeedback
 method dict control dictionary
 method dictionary control dictionary
+method diode distort diode
 method dist control distort
 method distort control distort
 method distorttype control distorttype
@@ -1174,6 +1178,7 @@ method fmwave6 control fmwave6
 method fmwave7 control fmwave7
 method fmwave8 control fmwave8
 method focus registered focus
+method fold distort fold
 method frameRate control frameRate
 method frames control frames
 method freeze control freeze
@@ -1192,6 +1197,7 @@ method gate control gate
 method grab registered grab
 method gt composer gt
 method gte composer gte
+method hard distort hard
 method harmonic control harmonic
 method hbrick control hbrick
 method hcutoff control hcutoff
@@ -1447,12 +1453,14 @@ method semitone control semitone
 method set composer set
 method shape control shape
 method shuffle registered shuffle
+method sinefold distort sinefold
 method size control roomsize
 method slide control slide
 method slow registered slow
 method slowChunk registered chunk
 method slowchunk registered chunk
 method smear control smear
+method soft distort soft
 method someCycles registered someCycles
 method someCyclesBy registered someCyclesBy
 method sometimes registered sometimes
