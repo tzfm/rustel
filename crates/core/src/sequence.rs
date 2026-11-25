@@ -6821,6 +6821,10 @@ pub(crate) fn query_sequence_onto(
     // A span of a cycle or more meets each step of most layers. A shorter
     // one meets few, and takes room as its haps come.
     let span = state.span;
+    // A reversed span, which a negative speed asks, meets no step.
+    if span.begin > span.end {
+        return;
+    }
     let long = span
         .begin
         .checked_add_int(1)

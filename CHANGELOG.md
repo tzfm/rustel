@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Fixed: a `linger` or `zoom` note across a cycle keeps its onset under `.add()`, and a negative speed under 1 plays nothing, as in 0.1.7.
+- Fixed: a replay export with a plugin moves the fader on time, `rustel play` skips a strum voice before cycle 0, and `s("808")` warms its bank before the start.
 - Studio: View ▸ Score outline shows the score as a tree, with native parts and script parts in two colours. The memory breakdown says native or script in one word.
 - Fixed: in iTerm2, Ctrl+F9 docks the log, because iTerm2 keeps Shift+F9.
 - External editor and bridge integrations: added `rustel lsp --stdio` (completion, hover, and lint diagnostics), `rustel doc --all [--json]` for full reference catalogue export, opt-in lane ids and sound names on `--ui-events` telemetry (`ui_layout.lanes` and `ui_events`), and inbound `ui_control` commands (`lane_solo`, `lane_mute`, `lane_transpose`, `tempo`, `transport`) with `ui_control_ack` replies.
