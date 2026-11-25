@@ -19,7 +19,7 @@ use rustel_fraction::Fraction;
 
 use crate::lint::{self, Diagnostic, Level};
 use crate::samples::SampleLibrary;
-use crate::session::{RuntimeError, Session};
+use crate::session::{RuntimeError, ScoreEngine, Session};
 
 /// Where an evaluation failure happened, when the underlying message says.
 ///
@@ -38,6 +38,8 @@ pub struct EvalError {
 pub struct ScoreCheck {
     pub diagnostics: Vec<Diagnostic>,
     pub eval_error: Option<EvalError>,
+    /// What evaluated the score when evaluation succeeded.
+    pub engine: Option<ScoreEngine>,
 }
 
 impl ScoreCheck {
@@ -95,6 +97,10 @@ pub fn check_score_with(
             let line = extract_reported_line(&message);
             EvalError { message, line }
         });
+    let engine = eval_error
+        .is_none()
+        .then(|| session.score_engine())
+        .flatten();
     // A score can evaluate and still refuse when it is queried: a chunk
     // count or a Euclid step past its limit, or a KabelSalat graph that will
     // not build. Query its first cycle, as the first update would, so the
@@ -167,6 +173,7 @@ pub fn check_score_with(
     ScoreCheck {
         diagnostics,
         eval_error,
+        engine,
     }
 }
 

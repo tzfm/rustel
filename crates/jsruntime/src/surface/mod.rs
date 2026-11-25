@@ -784,3 +784,15 @@ pub fn native_method(name: &str) -> bool {
 pub fn native_global(name: &str) -> bool {
     ListedNames.global(name).is_some()
 }
+
+/// Whether the native tier can take `node`. A call is native when the
+/// score binds its name or the native tier lists it.
+pub fn outline_node_is_native(node: &rustel_transpiler::OutlineNode) -> bool {
+    match &node.form {
+        rustel_transpiler::OutlineForm::Read => true,
+        rustel_transpiler::OutlineForm::Script => false,
+        rustel_transpiler::OutlineForm::Call { bound: true, .. } => true,
+        rustel_transpiler::OutlineForm::Call { name, .. } => native_global(name),
+        rustel_transpiler::OutlineForm::Method { name } => native_method(name),
+    }
+}

@@ -131,6 +131,7 @@ calls `setMaxPolyphony`. Score-level `.limit()` still applies.
 
 ```sh
 rustel check song.strudel
+rustel check song.strudel --outline
 rustel query -e 'note("c e g").s("piano")' --begin 0 --end 2 --json
 rustel doc inspire
 rustel doc --all --json
@@ -140,6 +141,11 @@ rustel bench song.strudel
 ```
 
 `check` checks syntax, mini-notation, names, and arguments without playback.
+It reports whether the score runs natively or needs the script engine, with the
+line that needs it. Pass `--outline` to print the statement and call tree with
+each node marked `native` or `script`. With `--json`, the final `check` object
+carries `status`, `engine`, `script_line`, and `outline` when `--outline` is
+set.
 `query` prints pattern events; JSON uses exact fractions. Query errors and
 refused sample imports return a failure status. A score must end on a pattern
 or collect patterns with `$:`. A definition-only `register(...)` is valid setup.

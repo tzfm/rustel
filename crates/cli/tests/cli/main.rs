@@ -5502,9 +5502,99 @@ fn check_accepts_a_valid_score_human_and_json() {
         human.contains("no issues found"),
         "a valid score was not reported clean: {human}"
     );
+    assert!(
+        human.contains("native"),
+        "a native score did not report native engine: {human}"
+    );
     let json = ok_stdout(&["check", "-e", r#"s("bd sd")"#, "--no-samples", "--json"]);
     let verdict: serde_json::Value = serde_json::from_str(&json).expect("check verdict JSON");
     assert_eq!(verdict["check"]["status"], "ok");
+    assert_eq!(verdict["check"]["engine"], "native");
+    assert!(verdict["check"]["script_line"].is_null());
+}
+
+#[test]
+fn check_reports_script_engine_and_outline_human_and_json() {
+    let source = "$: s(\"bd\").fast(2)\nconst speed = [1, 2][1]\n$: note(\"c3\").fast(speed)";
+    let human = ok_stdout(&["check", "-e", source, "--no-samples", "--outline"]);
+    assert!(
+        human.contains("no issues found"),
+        "expected clean verdict: {human}"
+    );
+    assert!(
+        human.contains("script engine, line 2 needs it"),
+        "expected script engine line in verdict: {human}"
+    );
+    assert!(
+        human.contains("native  line 1  $:"),
+        "expected native root lane in outline: {human}"
+    );
+    assert!(
+        human.contains("script  line 2    · [1, 2][1]"),
+        "expected script index node in outline: {human}"
+    );
+
+    let json = ok_stdout(&["check", "-e", source, "--no-samples", "--outline", "--json"]);
+    let verdict: serde_json::Value = serde_json::from_str(&json).expect("check outline JSON");
+    assert_eq!(verdict["check"]["status"], "ok");
+    assert_eq!(verdict["check"]["engine"], "script");
+    assert_eq!(verdict["check"]["script_line"], 2);
+    let nodes = verdict["check"]["outline"]
+        .as_array()
+        .expect("outline array");
+    let summary: Vec<_> = nodes
+        .iter()
+        .map(|node| {
+            (
+                node["label"].as_str().unwrap_or(""),
+                node["engine"].as_str().unwrap_or(""),
+                node["depth"].as_u64().unwrap_or(99),
+                node["line"].as_u64().unwrap_or(0),
+            )
+        })
+        .collect();
+    assert!(summary.contains(&("$:", "native", 0, 1)), "{summary:?}");
+    assert!(
+        summary.contains(&("s \"bd\"", "native", 1, 1)),
+        "{summary:?}"
+    );
+    assert!(
+        summary.contains(&(".fast 2", "native", 1, 1)),
+        "{summary:?}"
+    );
+    assert!(
+        summary.contains(&("const speed", "native", 0, 2)),
+        "{summary:?}"
+    );
+    assert!(
+        summary.contains(&("[1, 2][1]", "script", 1, 2)),
+        "{summary:?}"
+    );
+
+    let broken = run(&[
+        "check",
+        "-e",
+        "s(\"bd\"",
+        "--no-samples",
+        "--outline",
+        "--json",
+    ]);
+    assert!(!broken.status.success(), "syntax error must fail check");
+    let stdout = String::from_utf8_lossy(&broken.stdout);
+    let last: serde_json::Value = stdout
+        .lines()
+        .last()
+        .and_then(|line| serde_json::from_str(line).ok())
+        .unwrap_or_else(|| panic!("expected summary JSON line: {stdout}"));
+    assert_eq!(last["check"]["status"], "error");
+    assert!(last["check"]["engine"].is_null());
+    assert!(last["check"]["outline"].is_null());
+    assert!(
+        last["check"]["outline_error"]
+            .as_str()
+            .is_some_and(|message| !message.is_empty()),
+        "expected outline_error on syntax failure: {last}"
+    );
 }
 
 #[test]

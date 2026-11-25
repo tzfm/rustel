@@ -1249,6 +1249,10 @@ enum Command {
         /// Do not load the sample library; sound names are then not judged.
         #[arg(long)]
         no_samples: bool,
+        /// Print the score's statement and call tree, marking each node as
+        /// native or script.
+        #[arg(long)]
+        outline: bool,
         /// Emit one JSON object per finding instead of the human-readable
         /// list, for scripting.
         #[arg(short = 'j', long)]
@@ -2420,6 +2424,7 @@ fn run_command(
             input,
             prebake,
             no_samples,
+            outline,
             json,
         } => {
             let source = read_source(&input)?;
@@ -2459,6 +2464,7 @@ fn run_command(
                 &context,
             );
             if let Some(error) = prebake_error {
+                check.engine = None;
                 check.eval_error = Some(rustel_runtime::score_check::EvalError {
                     message: format!("the prebake failed: {error}"),
                     line: None,
@@ -2474,6 +2480,7 @@ fn run_command(
                         line: None,
                     });
             }
+            let score_outline = outline.then(|| rustel_runtime::outline(&source));
             let diagnostics = &check.diagnostics;
             let problems = diagnostics
                 .iter()
@@ -2519,13 +2526,64 @@ fn run_command(
                         })
                     );
                 }
-                if !has_issues {
-                    outln!("{}", serde_json::json!({ "check": { "status": "ok" } }));
+                let mut summary = serde_json::Map::new();
+                summary.insert(
+                    "status".into(),
+                    serde_json::Value::from(if has_issues { "error" } else { "ok" }),
+                );
+                summary.insert(
+                    "engine".into(),
+                    serde_json::Value::from(check.engine.map(rustel_runtime::ScoreEngine::name)),
+                );
+                summary.insert(
+                    "script_line".into(),
+                    serde_json::Value::from(
+                        check
+                            .engine
+                            .and_then(rustel_runtime::ScoreEngine::script_line),
+                    ),
+                );
+                if let Some(result) = score_outline {
+                    match result {
+                        Ok(nodes) => {
+                            let items: Vec<_> = nodes
+                                .iter()
+                                .map(|node| {
+                                    let engine = if rustel_runtime::outline_node_is_native(node) {
+                                        "native"
+                                    } else {
+                                        "script"
+                                    };
+                                    serde_json::json!({
+                                        "depth": node.depth,
+                                        "line": node.line,
+                                        "start": node.start,
+                                        "label": node.label,
+                                        "engine": engine,
+                                    })
+                                })
+                                .collect();
+                            summary.insert("outline".into(), serde_json::Value::Array(items));
+                        }
+                        Err(message) => {
+                            summary.insert("outline".into(), serde_json::Value::Null);
+                            summary
+                                .insert("outline_error".into(), serde_json::Value::String(message));
+                        }
+                    }
                 }
+                outln!(
+                    "{}",
+                    serde_json::json!({ "check": serde_json::Value::Object(summary) })
+                );
             } else {
                 let on = style::stdout_on();
-                if !has_issues {
-                    outln!("{}", style::green(on, "✓ no issues found"));
+                let engine = format_check_engine(on, check.engine);
+                if let Some(result) = &score_outline {
+                    print_check_outline(on, result);
+                }
+                if !has_issues && diagnostics.is_empty() {
+                    outln!("{}{engine}", style::green(on, "✓ no issues found"));
                 } else {
                     for diagnostic in diagnostics {
                         let badge = match diagnostic.level {
@@ -2561,10 +2619,13 @@ fn run_command(
                     }
                     if has_issues {
                         let total = problems + usize::from(check.eval_error.is_some());
-                        outln!("{}", style::red(on, &format!("{total} issue(s) found")));
+                        outln!(
+                            "{}{engine}",
+                            style::red(on, &format!("{total} issue(s) found"))
+                        );
                     } else {
                         outln!(
-                            "{}",
+                            "{}{engine}",
                             style::cyan(
                                 on,
                                 &format!("{} note(s); no issues found", diagnostics.len())
@@ -3033,6 +3094,60 @@ fn run_command(
                 );
             }
             Ok(())
+        }
+    }
+}
+
+/// Format the score engine suffix for `rustel check` text output.
+fn format_check_engine(on: bool, engine: Option<rustel_runtime::ScoreEngine>) -> String {
+    match engine {
+        None => String::new(),
+        Some(rustel_runtime::ScoreEngine::Native) => format!(" {}", style::dim(on, "· native")),
+        Some(rustel_runtime::ScoreEngine::Script { line: Some(line) }) => {
+            format!(
+                " {}",
+                style::yellow(on, &format!("· script engine, line {line} needs it"))
+            )
+        }
+        Some(rustel_runtime::ScoreEngine::Script { line: None }) => {
+            format!(" {}", style::yellow(on, "· script engine"))
+        }
+    }
+}
+
+/// Print the parsed outline tree for `rustel check --outline`.
+fn print_check_outline(on: bool, outline: &Result<Vec<rustel_runtime::OutlineNode>, String>) {
+    match outline {
+        Err(message) => {
+            outln!(
+                "{} {}",
+                style::dim(on, "outline:"),
+                style::safe_source(message)
+            );
+        }
+        Ok(nodes) if nodes.is_empty() => {
+            outln!("{}", style::dim(on, "outline: empty"));
+        }
+        Ok(nodes) => {
+            let line_width = nodes
+                .iter()
+                .map(|node| node.line)
+                .max()
+                .unwrap_or(1)
+                .to_string()
+                .len();
+            for node in nodes {
+                let badge = if rustel_runtime::outline_node_is_native(node) {
+                    style::green(on, "native")
+                } else {
+                    style::yellow(on, "script")
+                };
+                let line = style::dim(on, &format!("line {:>line_width$}", node.line));
+                let indent = " ".repeat(usize::from(node.depth) * 2);
+                let branch = if node.depth == 0 { "" } else { "· " };
+                let label = style::safe_source(&node.label);
+                outln!("{badge}  {line}  {indent}{branch}{label}");
+            }
         }
     }
 }
