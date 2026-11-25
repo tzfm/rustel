@@ -203,13 +203,6 @@ impl StepGrid {
     }
 }
 
-/// The haps of an `appRight` that a fused walk answers, into `out`. `false`
-/// leaves `out` as it is, for an application that the graph answers.
-#[cfg(test)]
-pub(crate) fn app_right_onto(node: &crate::AppNode, state: &State, out: &mut Vec<Hap>) -> bool {
-    crate::host::QUERY_THREAD.with(|thread| app_right_onto_on(thread, node, state, out))
-}
-
 /// Direct scalar wave path for `FilterValues(remove_undefineds, AppRight)`
 /// (i.e. `wave.segment(n)`): returns `true` only when every emitted hap is a
 /// `Value::F64` (never `Undefined`/`Null`), so the enclosing filter pass can be

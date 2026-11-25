@@ -497,6 +497,18 @@ impl Reference {
         self.entries.get(index)
     }
 
+    /// All entries in installation order without copying.
+    pub fn entries(&self) -> &[Entry] {
+        &self.entries
+    }
+
+    /// Whether the entry at `index` belongs to the KabelSalat graph namespace.
+    pub fn is_kabel_entry(&self, index: usize) -> bool {
+        self.entries
+            .get(index)
+            .is_some_and(|entry| self.by_kabel_name.get(&entry.name) == Some(&index))
+    }
+
     /// The entry a word names, by name or synonym. Exact first, then
     /// case-insensitive, so `LPF` still finds `lpf`. Inline painters keep
     /// their underscore, which determines where the visualization appears.

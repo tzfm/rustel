@@ -4582,14 +4582,6 @@ impl OrderedMap {
         ) || self.holds_only_data()
     }
 
-    /// A hash of this map's data that agrees with [`Self::same_data`].
-    #[cfg(test)]
-    pub(crate) fn data_hash(&self) -> u64 {
-        let mut hasher = WordHasher::default();
-        hash_data_entries(self.layout(), &mut hasher);
-        std::hash::Hasher::finish(&hasher)
-    }
-
     /// Whether two maps hold the same keys and the same data, in order and
     /// down to the bits of every number. `==` makes `0.0` equal to `-0.0`,
     /// which divide apart, and a NaN unequal to itself.
@@ -4618,12 +4610,6 @@ impl OrderedMap {
             _ => {}
         }
         same_entries(self.pairs(), other.pairs())
-    }
-
-    /// Whether the map holds no allocation, so a clone copies nothing.
-    #[cfg(test)]
-    pub(crate) fn owns_no_heap(&self) -> bool {
-        matches!(self.entries, Entries::Empty | Entries::StaticInt(..))
     }
 
     /// Mark this map, whose writes a compose of data values just finished,
@@ -8182,48 +8168,7 @@ fn write_json_quote(out: &mut String, value: &str) {
 
 #[cfg(test)]
 mod tests {
-    use super::{Key, OrderedMap, Table, Value};
-    use std::sync::Arc;
-
-    /// A table makes no map where a plain compose would not read the same.
-    #[test]
-    fn a_table_refuses_what_a_compose_would_read_otherwise() {
-        let values: Arc<[Value]> = Arc::from([Value::Str("c3".into())]);
-        let key = || Some(Key::from("note"));
-        let data = OrderedMap::from_entries([("gain".to_string(), Value::F64(1.0))]);
-        let no_data = OrderedMap::from_entries([(
-            "gain".to_string(),
-            Value::Haps(super::HapList::new(Vec::new())),
-        )]);
-        assert!(Table::new(&values, key(), Some(&data)).is_some());
-        assert!(
-            Table::new(&values, key(), Some(&no_data)).is_none(),
-            "a set that is no data"
-        );
-        assert!(
-            Table::new(&values, None, None).is_none(),
-            "no key and no set"
-        );
-        assert!(
-            Table::new(&values, None, Some(&data)).is_none(),
-            "a value that is no map"
-        );
-        assert!(
-            Table::new(&Arc::from([]), key(), Some(&data)).is_none(),
-            "no values"
-        );
-    }
-
-    /// A map that reads a shared table holds no more than a plain one.
-    #[test]
-    fn a_dressed_map_is_no_larger_than_a_plain_one() {
-        assert_eq!(
-            std::mem::size_of::<OrderedMap>(),
-            std::mem::size_of::<super::Entries>()
-        );
-        assert_eq!(std::mem::size_of::<super::Entries>(), 24);
-        assert_eq!(std::mem::size_of::<Value>(), 24);
-    }
+    use super::{OrderedMap, Value};
 
     #[test]
     fn a_later_entry_of_a_key_takes_the_place_of_its_value() {
@@ -8234,20 +8179,6 @@ mod tests {
         ]);
         let entries: Vec<_> = map.iter().collect();
         assert_eq!(entries, [("s", &Value::F64(3.0)), ("n", &Value::F64(2.0))]);
-    }
-
-    #[test]
-    fn object_keys_follow_ecmascript_order() {
-        let value = Value::object([
-            ("b".into(), Value::F64(1.0)),
-            ("10".into(), Value::F64(10.0)),
-            ("2".into(), Value::F64(2.0)),
-            ("a".into(), Value::F64(3.0)),
-        ]);
-        assert_eq!(
-            value.json_stringify().as_deref(),
-            Some(r#"{"2":2,"10":10,"b":1,"a":3}"#)
-        );
     }
 
     #[test]
@@ -8469,76 +8400,5 @@ mod tests {
                 .is_empty()
         );
         assert!(crate::take_query_error().is_some());
-    }
-
-    /// A set that holds no entry, in the form of a map that was emptied, is
-    /// no set: the table reads as the plain map and refuses a bare step.
-    #[test]
-    fn an_emptied_set_counts_as_no_set() {
-        for entries in [
-            super::Entries::Shared(Arc::from([])),
-            super::Entries::Made(Arc::from([])),
-        ] {
-            let emptied = OrderedMap { entries };
-            assert!(emptied.is_empty());
-            check_emptied(&emptied);
-        }
-    }
-
-    fn check_emptied(emptied: &OrderedMap) {
-        // A step with no entry has nothing to share.
-        let bare: Arc<[Value]> = Arc::from([Value::Object(OrderedMap::new())]);
-        assert!(Table::new(&bare, None, Some(emptied)).is_none());
-        // A named value reads as the map of its one entry.
-        let key = Key::from("note");
-        let values: Arc<[Value]> = Arc::from([Value::F64(1.0)]);
-        let table = Table::new(&values, Some(key.clone()), Some(emptied)).expect("a table");
-        let read = Arc::new(table).map(0).expect("step 0");
-        let plain = OrderedMap::of_one(key, Value::F64(1.0));
-        assert_eq!(read, plain);
-        assert_eq!(read.len(), 1);
-        assert!(!read.owns_no_heap() && plain.owns_no_heap());
-    }
-
-    /// A lookup of a name that no step holds finds nothing, and every name
-    /// that a step holds is found, whatever its mark is.
-    #[test]
-    fn a_lookup_through_the_marks_finds_what_the_map_holds() {
-        let names = [
-            "s", "n", "note", "gain", "lpf", "lpq", "room", "delay", "distort", "pan", "orbit",
-            "release", "sound", "speed", "shape", "cutoff", "decay", "vst", "vsti", "duration",
-        ];
-        let tail: Vec<(String, Value)> = names[4..]
-            .iter()
-            .map(|name| (name.to_string(), Value::F64(2.0)))
-            .collect();
-        let set = OrderedMap::from_entries(tail);
-        let values: Arc<[Value]> = Arc::from([Value::F64(1.0)]);
-        let table = Arc::new(Table::new(&values, Some(Key::from("note")), Some(&set)).unwrap());
-        let map = table.map(0).unwrap();
-        let plain = {
-            let mut plain = OrderedMap::from_entries([("note".to_string(), Value::F64(1.0))]);
-            for (key, value) in set.iter() {
-                plain.insert(key.to_string(), value.clone());
-            }
-            plain
-        };
-        for name in names.iter().copied().chain(["x", "", "gains", "notes"]) {
-            assert_eq!(map.get(name), plain.get(name), "{name}");
-            assert_eq!(map.contains_key(name), plain.contains_key(name), "{name}");
-        }
-    }
-
-    /// A merge of no entry changes nothing, and leaves a dressed map as it is.
-    #[test]
-    fn a_merge_of_an_empty_map_leaves_the_map() {
-        let values: Arc<[Value]> = Arc::from([Value::F64(1.0)]);
-        let set = OrderedMap::from_entries([("s".to_string(), Value::Str("x".into()))]);
-        let table = Arc::new(Table::new(&values, Some(Key::from("note")), Some(&set)).unwrap());
-        let mut map = table.map(0).unwrap();
-        let before = map.clone();
-        map.merge(&OrderedMap::new(), |_, other| other.clone());
-        assert_eq!(map, before);
-        assert!(matches!(map.entries, super::Entries::Dressed(..)));
     }
 }

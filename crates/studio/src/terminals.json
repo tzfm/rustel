@@ -535,7 +535,8 @@
         {"chord": "ctrl+tab", "does": "switches terminal tab"},
         {"chord": "ctrl+shift+tab", "does": "switches terminal tab"},
         {"chord": "shift+pageup", "does": "scrolls terminal history"},
-        {"chord": "shift+pagedown", "does": "scrolls terminal history"}
+        {"chord": "shift+pagedown", "does": "scrolls terminal history"},
+        {"chord": "shift+f9", "does": "opens the iTerm2 profiler"}
       ],
       "alt_input": [
         {"chord": "alt+a", "received": "å", "reason": "Option as Normal sends å; Studio recovers Alt+A where the focus uses it"},

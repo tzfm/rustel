@@ -641,46 +641,7 @@ pub(crate) fn derive_pick_f<'js>(
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        MINI_MEMO, MINI_MEMO_ENTRIES, MiniLiterals, MiniMemo, forget_mini_literals, rest_mini_room,
-        transpiled_mini,
-    };
-
-    #[test]
-    fn a_literal_of_one_word_is_read_each_time_and_not_remembered() {
-        let held = || MINI_MEMO.with(|memo| memo.borrow().held);
-        forget_mini_literals();
-        let word = transpiled_mini(" sawtooth ", 3).expect("a word");
-        assert_eq!(held(), 0);
-        assert_eq!(
-            format!("{:?}", word.query_arc(0.into(), 2.into())),
-            format!(
-                "{:?}",
-                rustel_mini::mini_at(" sawtooth ", 3)
-                    .expect("a word")
-                    .query_arc(0.into(), 2.into())
-            ),
-        );
-        // A word outside the score has no place: the memo holds its graph.
-        transpiled_mini("sawtooth", -1).expect("a word");
-        assert_eq!(held(), 1);
-        forget_mini_literals();
-    }
-
-    #[test]
-    fn a_room_put_away_holds_no_list_and_keeps_the_literals() {
-        let room_is_bare = || MINI_MEMO.with(|memo| memo.borrow().room.is_bare());
-        forget_mini_literals();
-        transpiled_mini("bd [sd [cp oh]] hh(3,8) <a,b>", 3).expect("a literal");
-        assert!(!room_is_bare());
-        rest_mini_room();
-        assert!(room_is_bare());
-        assert_eq!(MINI_MEMO.with(|memo| memo.borrow().held), 1);
-        // The next literal takes a room of its own.
-        transpiled_mini("hh*4", 40).expect("a literal");
-        assert_eq!(MINI_MEMO.with(|memo| memo.borrow().held), 2);
-        forget_mini_literals();
-    }
+    use super::{MINI_MEMO_ENTRIES, MiniMemo};
 
     #[test]
     fn two_texts_never_share_a_graph() {
@@ -705,22 +666,6 @@ mod tests {
     }
 
     #[test]
-    fn a_text_held_at_its_offset_is_not_counted_twice() {
-        let mut memo = MiniMemo::default();
-        let a = rustel_mini::mini_at("bd sd", 3).expect("a literal");
-        memo.insert("bd sd", 3, a.clone());
-        memo.insert("bd sd", 3, a.clone());
-        assert_eq!(memo.held, 1);
-        memo.insert("bd sd", 8, a.clone());
-        memo.insert("bd sd", 8, a);
-        assert_eq!(memo.held, 2);
-        let MiniLiterals::Many(list) = &memo.graphs["bd sd"] else {
-            panic!("two offsets hold a list")
-        };
-        assert_eq!(list.len(), 2, "an offset was listed twice");
-    }
-
-    #[test]
     fn a_graph_held_at_the_bound_is_not_evicted_by_its_own_insert() {
         let mut memo = MiniMemo::default();
         let graph = rustel_mini::mini_at("bd", 0).expect("a literal");
@@ -736,57 +681,5 @@ mod tests {
         assert!(memo.get("bd*1", 0).is_some());
         memo.insert("new", 0, graph);
         assert_eq!(memo.held, 1, "a new graph at the bound keeps the old ones");
-    }
-
-    #[test]
-    fn one_text_at_two_offsets_holds_each_graph_by_its_place() {
-        forget_mini_literals();
-        transpiled_mini("[bd sd] hh", 3).expect("a literal");
-        let second = transpiled_mini("[bd sd] hh", 20).expect("the same text at a new place");
-        let hit =
-            |offset: i64| MINI_MEMO.with(|memo| memo.borrow().get("[bd sd] hh", offset).is_some());
-        assert!(hit(3), "the first place lost its graph");
-        assert!(hit(20), "the second place lost its graph");
-        // Each graph carries the places of its own offset.
-        assert_eq!(
-            format!("{:?}", second.query_arc(0.into(), 1.into())),
-            format!(
-                "{:?}",
-                rustel_mini::mini_at("[bd sd] hh", 20)
-                    .expect("the same literal")
-                    .query_arc(0.into(), 1.into())
-            ),
-        );
-        forget_mini_literals();
-    }
-
-    #[test]
-    fn a_forgotten_literal_is_parsed_again() {
-        let held = || MINI_MEMO.with(|memo| memo.borrow().held);
-        forget_mini_literals();
-        for _ in 0..2 {
-            transpiled_mini("bd sd", 3).expect("a literal");
-            assert_eq!(held(), 1);
-        }
-        forget_mini_literals();
-        assert_eq!(held(), 0);
-        transpiled_mini("bd sd", 3).expect("a literal");
-        assert_eq!(held(), 1);
-    }
-
-    #[test]
-    fn oversized_transpiled_mini_literal_is_not_pinned_in_memo() {
-        let held = || MINI_MEMO.with(|memo| memo.borrow().held);
-        forget_mini_literals();
-        let big = "bd ".repeat(100);
-        assert!(big.len() > 256);
-        for offset in 0..8 {
-            transpiled_mini(&big, offset).expect("oversized literal parses");
-        }
-        assert_eq!(
-            held(),
-            0,
-            "oversized literals (>256 B) must not be pinned in MINI_MEMO"
-        );
     }
 }

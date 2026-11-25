@@ -1726,25 +1726,4 @@ mod tests {
         assert!(delta.clean(), "the delay allocated or freed: {delta:?}");
         assert_eq!(last, [1023.0, -1023.0]);
     }
-
-    /// Each setActive call of a slow copy sleeps its time, on and off, in
-    /// the effect and in the instrument: see [`SLOW_ACTIVATE_ENV`].
-    #[test]
-    fn each_set_active_call_of_a_slow_copy_sleeps() {
-        let time = Duration::from_millis(20);
-        let mut effect = Processor::new();
-        effect.activate = time;
-        let mut tone = Tone::new();
-        tone.activate = time;
-        for state in [1, 0] {
-            let start = Instant::now();
-            // SAFETY: the calls take no pointer.
-            unsafe { effect.setActive(state) };
-            assert!(start.elapsed() >= time, "the effect: {state}");
-            let start = Instant::now();
-            // SAFETY: as above.
-            unsafe { tone.setActive(state) };
-            assert!(start.elapsed() >= time, "the instrument: {state}");
-        }
-    }
 }

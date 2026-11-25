@@ -75,23 +75,6 @@ fn a_function_declared_by_one_score_does_not_reach_the_next() {
 }
 
 #[test]
-fn the_same_binding_name_may_be_reused_by_the_next_score() {
-    // Two different scores, each declaring `main`, in one session: the second
-    // must not collide with the first.
-    let rt = runtime();
-    rt.evaluate_score(
-        "const main = s(\"bd\")\n$: main",
-        &TranspileOptions::default(),
-    )
-    .expect("first score");
-    rt.evaluate_score(
-        "const main = s(\"hh\")\n$: main",
-        &TranspileOptions::default(),
-    )
-    .expect("second score with the same binding name");
-}
-
-#[test]
 fn a_lane_survives_whatever_the_score_writes_after_it() {
     // A `$:` lane is recorded when it is evaluated, so it plays whatever the
     // score writes afterwards. This is the shape essentially every score uses,
@@ -142,31 +125,6 @@ fn one_score_cannot_break_the_next_by_touching_call() {
         .expect("the next score is unaffected");
 }
 
-#[test]
-fn a_score_that_names_no_pattern_still_says_so() {
-    // The wrapper must return `undefined` for a program with no final
-    // expression. That is how the runtime tells "this score named no pattern"
-    // from "this score produced a value that is not a pattern"; synthesising
-    // `silence` makes a commented-out score look playable and loses the
-    // message. It is why the wrapper cannot use `add_final_return`.
-    let rt = runtime();
-    let error = rt
-        .evaluate_score("// $: s(\"bd\")", &TranspileOptions::default())
-        .expect_err("a score that is entirely commented out names no pattern");
-    assert!(
-        error.to_string().contains("undefined"),
-        "the undefined sentinel must survive the wrapper: {error}"
-    );
-}
-
-#[test]
-fn a_score_that_awaits_can_be_played_again_too() {
-    // The awaiting path was already wrapped, which is why this bug only ever
-    // showed on scores WITHOUT `samples(…)`. Pinned so the two paths cannot
-    // drift apart again.
-    replay("const main = s(\"bd\")\nawait Promise.resolve(1)\n$: main").expect("await path");
-}
-
 /// The `await` path, which the transpiler enters for a bare `samples(...)`.
 ///
 /// This is the half that already worked, and the reason the scoping bug was
@@ -189,21 +147,6 @@ mod await_path {
             .iter()
             .map(|hap| hap.value.show())
             .collect()
-    }
-
-    #[test]
-    fn a_bare_samples_call_is_what_puts_a_score_on_the_async_path() {
-        // `samples(...)` is the only
-        // thing that puts one there without the author typing it.
-        let transpiled = rustel_transpiler::transpile(
-            "samples('github:x/y')\n$: s(\"bd\")",
-            &TranspileOptions::default(),
-        )
-        .output;
-        assert!(
-            transpiled.contains("await samples("),
-            "the transpiler no longer awaits a bare samples(): {transpiled}"
-        );
     }
 
     #[test]

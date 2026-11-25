@@ -5283,6 +5283,24 @@ impl Pattern {
         .with_steps(steps)
     }
 
+    /// Tag every hap produced by this pattern with a stable lane id, keeping
+    /// live slider bindings and visual slots intact.
+    pub fn with_lane(&self, lane: u32) -> Self {
+        static LANE_MAPS: [std::sync::OnceLock<OwnedHapMapFn>; 64] =
+            [const { std::sync::OnceLock::new() }; 64];
+        let map = if let Some(slot) = usize::try_from(lane).ok().filter(|&slot| slot < 64) {
+            // Share one closure per common lane index so repeated evaluations
+            // reuse the map pointer without per-eval allocation.
+            Arc::clone(
+                LANE_MAPS[slot]
+                    .get_or_init(|| Arc::new(move |hap: Hap| Some(hap.with_lane_context(lane)))),
+            )
+        } else {
+            Arc::new(move |hap: Hap| Some(hap.with_lane_context(lane)))
+        };
+        self.fmap_keeping_live_with(map)
+    }
+
     /// Host-only provenance for a native query-time slider. Arbitrary value
     /// maps discard this tag before it can become an audio parameter binding.
     pub fn with_slider_binding(&self, binding: u64) -> Self {

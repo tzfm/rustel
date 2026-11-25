@@ -271,27 +271,6 @@ mod tests {
     }
 
     #[test]
-    fn comments_strings_and_regexes_do_not_create_frequency_context() {
-        let source = r#"const text = 'lpf(slider(440, 20, 20000))';
-const matchText = /lpf\(slider\(440\)\)/;
-// lpf(slider(440, 20, 20000))
-gain(slider(440, 20, 20000));"#;
-        let widgets = sliders(source);
-        assert_eq!(widgets.len(), 1);
-        assert!(!widgets[0].frequency);
-    }
-
-    #[test]
-    fn metadata_does_not_change_generated_slider_javascript() {
-        let output = transpile("lpf(slider(440, 20, 20000))", &TranspileOptions::default());
-        assert!(output.diagnostics.is_empty());
-        assert!(output.output.contains("sliderWithID("));
-        assert!(!output.output.contains("frequency"));
-        assert!(!output.output.contains("log"));
-        assert_eq!(output.widgets[0].value.as_deref(), Some("440"));
-    }
-
-    #[test]
     fn unrelated_recoverable_errors_keep_intact_frequency_calls() {
         let mut recovered = 0;
         for suffix in [

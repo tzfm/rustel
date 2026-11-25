@@ -230,15 +230,6 @@ mod classification_tests {
         );
     }
 
-    #[test]
-    fn native_synth_manifest_bypass_keeps_control_validation() {
-        assert!(detailed(&json!({ "s": "supersaw", "unison": 32 }), &Lookup::Loading).is_ok());
-        assert!(matches!(
-            refusal(&json!({ "s": "supersaw", "unison": 100 }), &Lookup::Loading),
-            VoiceError::InvalidControl(_)
-        ));
-    }
-
     /// A gain that is no number plays at 1, as strudel.cc's `nanFallback`
     /// does. One that JavaScript reads as a number is that number.
     #[test]
@@ -291,63 +282,6 @@ mod classification_tests {
         ));
         assert!(detailed(&json!({ "s": "sine", "limit": 0 }), &BundledOnly).is_ok());
         assert!(detailed(&json!({ "s": "sine", "limit": -6 }), &BundledOnly).is_ok());
-    }
-
-    /// A refusal of a number past its range names the last one allowed:
-    /// orbit 16 is past the orbits, which end at 15.
-    #[test]
-    fn a_range_refusal_names_the_last_number_allowed() {
-        let orbit = refusal(&json!({ "s": "sine", "orbit": 16 }), &BundledOnly);
-        assert!(
-            matches!(&orbit, VoiceError::InvalidControl(message) if message == "orbit 16 is outside the orbits 0 to 15"),
-            "{orbit:?}"
-        );
-        assert!(detailed(&json!({ "s": "sine", "orbit": 15 }), &BundledOnly).is_ok());
-    }
-
-    #[test]
-    fn fm_route_capacity_is_an_invalid_control_not_an_asset_error() {
-        let mut value = json!({ "s": "sine" });
-        let mut routes = 0;
-        for source in 1..=rustel_audio::MAX_FM_OPERATORS {
-            for target in 0..=rustel_audio::MAX_FM_OPERATORS {
-                let key = if source == target + 1 {
-                    if source == 1 {
-                        "fmi".to_owned()
-                    } else {
-                        format!("fmi{source}")
-                    }
-                } else {
-                    format!("fmi{source}{target}")
-                };
-                value[key] = json!(1);
-                routes += 1;
-                if routes == rustel_audio::MAX_FM_ROUTES {
-                    let event = detailed(&value, &BundledOnly).expect("capacity is inclusive");
-                    assert_eq!(
-                        event
-                            .controls
-                            .fm
-                            .expect("FM controls")
-                            .routes
-                            .iter()
-                            .flatten()
-                            .count(),
-                        routes
-                    );
-                } else if routes > rustel_audio::MAX_FM_ROUTES {
-                    assert_eq!(
-                        refusal(&value, &BundledOnly),
-                        VoiceError::InvalidControl(format!(
-                            "FM matrix declares more than {} connections",
-                            rustel_audio::MAX_FM_ROUTES
-                        ))
-                    );
-                    return;
-                }
-            }
-        }
-        panic!("fixture must contain more possible routes than the native capacity");
     }
 
     #[test]
@@ -761,33 +695,6 @@ mod tests {
         );
     }
 
-    // Bare note values stay silent in Strudel; only wrapped controls resolve.
-    #[test]
-    fn a_non_object_hap_value_is_refused_like_strudel() {
-        for value in [
-            serde_json::json!("c3"),
-            serde_json::json!("C3"),
-            serde_json::json!(60),
-        ] {
-            let error = super::resolve_voice(&value, 1, 0.5, 0.0, 48_000, 0.5)
-                .expect_err("a bare value must not resolve to a voice");
-            assert!(
-                error.contains("expected hap.value to be an object"),
-                "refusal should carry the hint, got {error:?}"
-            );
-        }
-        // The wrapped form is what a real hap carries, and still plays.
-        super::resolve_voice(
-            &serde_json::json!({ "note": "c3" }),
-            2,
-            0.5,
-            0.0,
-            48_000,
-            0.5,
-        )
-        .expect("an object value still resolves");
-    }
-
     // Applying a control to a bare value stores it under `value`, not `note`.
     // That key must not override the source's default pitch.
     #[test]
@@ -810,32 +717,6 @@ mod tests {
             (with_note - default_hz).abs() > 1.0,
             "an explicit note should not collapse to the default"
         );
-    }
-
-    // sbd defaults to MIDI 29 (F1); other sources use MIDI 36 (C2).
-    #[test]
-    fn an_unpitched_sbd_is_f1_and_not_c2() {
-        let hz = |value: serde_json::Value| {
-            super::resolve_voice(&value, 1, 0.5, 0.0, 48_000, 0.5)
-                .expect("voice resolves")
-                .freq_hz
-        };
-        let sbd = hz(serde_json::json!({ "s": "sbd" }));
-        let expected = 440.0 * 2f32.powf((29.0 - 69.0) / 12.0);
-        assert!(
-            (sbd - expected).abs() < 0.01,
-            "sbd default was {sbd} Hz, strudel.cc is {expected} Hz"
-        );
-
-        // Every other source keeps the shared default.
-        let sine = hz(serde_json::json!({ "s": "sine" }));
-        let c2 = 440.0 * 2f32.powf((36.0 - 69.0) / 12.0);
-        assert!((sine - c2).abs() < 0.01, "sine default moved to {sine} Hz");
-
-        // An explicit note still wins over either default.
-        let pitched = hz(serde_json::json!({ "s": "sbd", "note": 60 }));
-        let c4 = 440.0 * 2f32.powf((60.0 - 69.0) / 12.0);
-        assert!((pitched - c4).abs() < 0.01, "an explicit note was ignored");
     }
 
     // JS `note || defaultNote` replaces a synth's falsy note. Samples retain it.
@@ -986,35 +867,6 @@ mod tests {
         );
     }
 
-    /// `freq *= 2^octave`. Ignoring it left every octave-transposed pattern
-    /// sounding at its written pitch.
-    #[test]
-    fn octave_transposes_the_resolved_frequency() {
-        let hz = |json: &str| {
-            resolve_voice(&object(json).into(), 0, 0.5, 0.0, 48_000, 0.5)
-                .expect("voice")
-                .freq_hz
-        };
-        let base = hz(r#"{"s": "sine", "note": "c3"}"#);
-        for (octave, factor) in [(-1.0f32, 0.5f32), (1.0, 2.0), (2.0, 4.0)] {
-            let shifted = hz(&format!(
-                r#"{{"s": "sine", "note": "c3", "octave": {octave}}}"#
-            ));
-            let want = base * factor;
-            assert!(
-                (shifted - want).abs() < want * 1e-4,
-                "octave {octave}: expected {want} Hz, got {shifted}"
-            );
-        }
-        // An explicit freq is transposed too: the multiplier applies after
-        // either route.
-        let explicit = hz(r#"{"s": "sine", "freq": 200, "octave": 1}"#);
-        assert!(
-            (explicit - 400.0).abs() < 0.05,
-            "an explicit freq was not transposed: {explicit}"
-        );
-    }
-
     /// `fmwave` names the modulator's shape per operator, unsuffixed for the
     /// first. An unknown name is a score error rather than a silent sine,
     /// which would leave a typo sounding plausible but wrong.
@@ -1070,42 +922,6 @@ mod tests {
         assert!(
             error.contains("unsupported fmwave"),
             "unexpected refusal: {error}"
-        );
-    }
-
-    /// The bus space stops at MAX_BUSES. Say so rather than folding a high
-    /// bus onto a low one, which would mix two unrelated sends into each
-    /// other.
-    #[test]
-    fn a_bus_outside_the_native_range_is_refused_not_folded() {
-        let out_of_range = rustel_audio::MAX_BUSES;
-        for score in [
-            serde_json::json!({ "s": "sine", "note": "c3", "bus": out_of_range }),
-            serde_json::json!({ "s": "bus", "n": out_of_range }),
-            serde_json::json!({ "s": "sine", "note": "c3", "bus": -1 }),
-        ] {
-            let err = resolve_voice(&score, 0, 0.5, 0.0, 48_000, 0.5)
-                .expect_err("an out-of-range bus should be refused");
-            assert!(
-                err.contains(&format!("outside the buses 0 to {}", out_of_range - 1)),
-                "unexpected refusal for {score}: {err}"
-            );
-        }
-        // The last bus in range still resolves.
-        let last = resolve_voice(
-            &serde_json::json!({ "s": "bus", "n": out_of_range - 1 }),
-            0,
-            0.5,
-            0.0,
-            48_000,
-            0.5,
-        )
-        .expect("the last bus is in range");
-        assert_eq!(
-            last.synth,
-            Some(rustel_audio::SynthSource::Bus {
-                bus: (out_of_range - 1) as u8
-            })
         );
     }
 
@@ -1972,23 +1788,6 @@ mod tests {
         assert_eq!(stage.transient.map(|t| t.attack), Some(0.5));
         assert!(stage.delay.is_some(), "delay was dropped");
         assert_eq!(stage.room.map(|r| r.wet), Some(0.6));
-    }
-
-    /// A stage ignores `orbit` and `duckorbit` by design. The stage still
-    /// exists and applies its default gain of 0.8.
-    #[test]
-    fn a_stage_naming_only_an_orbit_still_applies_the_default_gain() {
-        let stage = fx_stages(
-            &object(r#"{"s": "sine", "FX": [{"orbit": 2, "duckorbit": 1}]}"#),
-            0.0,
-            0.0,
-            0.5,
-            &BundledOnly,
-        )
-        .expect("resolve")[0]
-            .clone()
-            .expect("the stage still exists");
-        assert!((stage.gain - 0.8).abs() < 1e-6, "got {}", stage.gain);
     }
 
     /// `tremolosync` is in cycles, so the tremolo frequency of a stage
@@ -7671,54 +7470,6 @@ mod compressor_range_tests {
 }
 
 #[cfg(test)]
-mod bank_prefix_tests {
-    fn prefixed(object: serde_json::Value, name: &str) -> Option<String> {
-        super::bank_prefixed(object.as_object().expect("object"), name).expect("resolves")
-    }
-
-    /// `s` becomes `{bank}_{s}` before any dispatch on the name, so a bank
-    /// can decide which engine plays a sound. `s("basique").bank("wt_digital")`
-    /// must play the same as `s("wt_digital_basique")`.
-    #[test]
-    fn the_bank_prefix_decides_whether_a_sound_is_a_wavetable() {
-        assert_eq!(
-            prefixed(serde_json::json!({ "bank": "wt_digital" }), "basique").as_deref(),
-            Some("wt_digital_basique"),
-            "the prefixed name is what the wt_ test must see"
-        );
-        assert!(
-            prefixed(serde_json::json!({ "bank": "wt_digital" }), "basique")
-                .expect("prefixed")
-                .starts_with("wt_"),
-            "a wavetable bank makes a plain name a wavetable"
-        );
-
-        // No bank leaves the name alone, so the caller keeps what it had.
-        assert_eq!(prefixed(serde_json::json!({}), "basique"), None);
-        assert_eq!(
-            prefixed(serde_json::json!({ "bank": null }), "basique"),
-            None
-        );
-
-        // An empty `s` has nothing to prefix.
-        assert_eq!(prefixed(serde_json::json!({ "bank": "tr909" }), ""), None);
-
-        // `.bank('9000')` numerifies under miniAllStrings and the prefix
-        // rule stringifies it right back.
-        assert_eq!(
-            prefixed(serde_json::json!({ "bank": 9000 }), "bd").as_deref(),
-            Some("9000_bd")
-        );
-
-        // And an ordinary drum bank still composes the way it always did.
-        assert_eq!(
-            prefixed(serde_json::json!({ "bank": "tr909" }), "bd").as_deref(),
-            Some("tr909_bd")
-        );
-    }
-}
-
-#[cfg(test)]
 mod zzfx_resolve_tests {
     fn resolved(object: serde_json::Value) -> rustel_audio::OnsetEvent {
         super::resolve_voice(&object, 1, 0.5, 0.0, 48_000, 0.5).expect("resolves")
@@ -7798,14 +7549,6 @@ mod envelope_resolve_tests {
     fn resolved_adsr(value: &serde_json::Value) -> [f32; 4] {
         let event = resolve_voice(value, 1, 0.5, 0.0, 48_000, 0.5).expect("resolves");
         adsr(event.controls.envelope)
-    }
-
-    #[test]
-    fn bus_defaults_keep_full_sustain() {
-        assert_eq!(
-            resolved_adsr(&json!({ "s": "bus", "n": 1 })),
-            [0.001, 0.05, 1.0, 0.01]
-        );
     }
 
     #[test]

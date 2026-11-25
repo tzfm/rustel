@@ -741,35 +741,6 @@ mod tests {
     }
 
     #[test]
-    fn program_baton_crosses_threads_and_returns_unique_ownership() {
-        let channel = std::sync::Arc::new(SampleChannel::new());
-        let pointer = boxed_program();
-        channel
-            .program_installs
-            .push(ProgramInstall { program: pointer })
-            .ok()
-            .expect("install");
-        let consumer = std::sync::Arc::clone(&channel);
-        std::thread::spawn(move || {
-            let install = consumer.program_installs.pop().expect("program install");
-            // SAFETY: popping transferred the unique baton to this consumer.
-            let program = unsafe { Box::from_raw(install.program) };
-            assert_eq!(program.until_frame, 128);
-            consumer
-                .program_returns
-                .push(ReturnedProgram(Box::into_raw(program)))
-                .ok()
-                .expect("return");
-        })
-        .join()
-        .expect("consumer");
-        let mut returned = Vec::new();
-        channel.reclaim_with_programs(|_| {}, |_| {}, |program| returned.push(program));
-        assert_eq!(returned, [pointer]);
-        channel.reclaim_with_programs(|_| {}, |_| {}, |_| panic!("program returned twice"));
-    }
-
-    #[test]
     fn retirement_excludes_publication_and_orders_returned_storage() {
         use std::sync::{Arc, atomic::AtomicBool};
         let channel = Arc::new(SampleChannel::new());

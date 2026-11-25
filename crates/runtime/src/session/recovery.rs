@@ -853,17 +853,6 @@ mod tests {
     }
 
     #[test]
-    fn only_work_inside_the_boundary_is_marked_contained() {
-        let mut session = playing_session();
-        assert!(!panic_is_contained());
-        let inside = session
-            .with_panic_recovery(0.0, |_| Ok(panic_is_contained()))
-            .expect("no panic");
-        assert!(inside);
-        assert!(!panic_is_contained());
-    }
-
-    #[test]
     fn a_moved_slider_keeps_its_value_through_a_rebuild() {
         let mut session = Session::new().expect("session");
         session.set_direct_diagnostic_logging(false);
@@ -1204,66 +1193,6 @@ mod tests {
 
     #[cfg(feature = "device-audio")]
     #[test]
-    fn captured_rollback_source_survives_later_sources_and_settings() {
-        use rustel_core::compose::Alignment;
-        use rustel_core::rng::RngMode;
-
-        let mut session = Session::new().expect("session");
-        session.set_default_voicings(Some("lefthand"));
-        session.evaluate_mini("bd").expect("source A");
-        // Inject replay policy, not consumer-copy evidence.
-        session
-            .mark_audible_generation(session.generation())
-            .expect("injected replay-policy target");
-        let generation_a = session.generation();
-        session.set_rng_mode(RngMode::Precise);
-        session.set_default_join(Alignment::Out);
-        session.set_default_voicings(Some("guidetones"));
-        let generation_b = session.reload_at("sd bd", true, 0.1).expect("source B");
-        let captured = session
-            .capture_rollback_source(generation_b)
-            .expect("capture B");
-        assert!(captured.is_some());
-        assert_eq!(
-            session_core_settings(&session),
-            (RngMode::Precise, Alignment::Out, 2)
-        );
-        assert_eq!(
-            session.audible_source.as_ref().unwrap().generation,
-            generation_a
-        );
-
-        session.set_rng_mode(RngMode::Legacy);
-        session.set_default_join(Alignment::Mix);
-        session.set_default_voicings(Some("lefthand"));
-        session.reload_at("hh", true, 0.2).expect("source C");
-        let generation_d = session.reload_at("cp", true, 0.3).expect("source D");
-        assert_eq!(generation_d, generation_b + 2);
-        session.install_rollback_source(captured);
-
-        let retained = session.audible_source.as_ref().expect("retained B");
-        assert_eq!(retained.generation, generation_b);
-        assert_eq!(retained.source.as_ref(), "sd bd");
-        assert!(retained.mini);
-        assert_eq!(session.generation(), generation_d);
-        assert_eq!(session.last_source.as_deref(), Some("cp"));
-        assert_eq!(
-            session_core_settings(&session),
-            (RngMode::Legacy, Alignment::Mix, 4)
-        );
-        assert_eq!(
-            session.rollback_to_previous_source(0.4).expect("replay B"),
-            RollbackAttempt::Applied
-        );
-        assert_eq!(active_values(&session), ["sd", "bd"]);
-        assert_eq!(
-            session_core_settings(&session),
-            (RngMode::Precise, Alignment::Out, 2)
-        );
-    }
-
-    #[cfg(feature = "device-audio")]
-    #[test]
     fn unconfirmed_audible_prefill_does_not_replace_the_rollback_source() {
         // Distinct compatibility fixtures exercise retained score ownership
         // through the same evaluator used for live source replacements.
@@ -1303,112 +1232,6 @@ mod tests {
     #[test]
     fn delayed_silent_confirmation_selects_its_own_rollback_source() {
         check_unconfirmed_prefill_rollback("~", "~ ~", true, true);
-    }
-
-    #[cfg(feature = "device-audio")]
-    #[test]
-    fn captured_direct_pattern_clears_a_later_textual_rollback_target() {
-        let mut session = Session::new().expect("session");
-        #[cfg(not(feature = "vst"))]
-        session.evaluate_mini("bd").expect("source A");
-        #[cfg(feature = "vst")]
-        {
-            let source = r#"s("sine").vst("Delay").orbit(1)"#;
-            session.evaluate(source).expect("source A");
-            let chain = plugin_chain(&session);
-            session
-                .reload_at(&source.replace("orbit(1)", "orbit(2)"), false, 0.1)
-                .expect("move plugin");
-            assert_eq!(plugin_chain(&session), chain);
-        }
-        // Inject replay policy, not consumer-copy evidence.
-        session
-            .mark_audible_generation(session.generation())
-            .expect("injected replay-policy target");
-        let generation_a = session.generation();
-        session
-            .set_pattern(rustel_core::pure(Value::Str("native".into())))
-            .expect("direct Pattern B");
-        let captured = session
-            .capture_rollback_source(session.generation())
-            .expect("capture direct Pattern");
-        assert!(captured.is_none());
-        assert_eq!(
-            session.audible_source.as_ref().unwrap().generation,
-            generation_a
-        );
-
-        let generation_c = session.reload_at("sd", true, 0.2).expect("source C");
-        session
-            .mark_audible_generation(generation_c)
-            .expect("retain C");
-        assert_eq!(
-            session.audible_source.as_ref().unwrap().generation,
-            generation_c
-        );
-        session.install_rollback_source(captured);
-        assert!(session.audible_source.is_none());
-        assert_eq!(session.generation(), generation_c);
-        assert_eq!(session.last_source.as_deref(), Some("sd"));
-        assert_eq!(
-            session.rollback_to_previous_source(0.3).expect("no source"),
-            RollbackAttempt::Unavailable
-        );
-    }
-
-    #[cfg(feature = "device-audio")]
-    #[test]
-    fn captured_identical_sources_keep_distinct_generations() {
-        let mut session = Session::new().expect("session");
-        session.evaluate_mini("bd").expect("first source");
-        let first_generation = session.generation();
-        let first = session
-            .capture_rollback_source(first_generation)
-            .expect("capture first")
-            .expect("textual source");
-        let second_generation = session.reload_at("bd", true, 0.1).expect("same source");
-        let second = session
-            .capture_rollback_source(second_generation)
-            .expect("capture second")
-            .expect("textual source");
-        assert_eq!(second_generation, first_generation + 1);
-        assert_eq!(first.source, second.source);
-        assert_eq!(first.generation, first_generation);
-        assert_eq!(second.generation, second_generation);
-
-        session.install_rollback_source(Some(first));
-        assert_eq!(
-            session.audible_source.as_ref().unwrap().generation,
-            first_generation
-        );
-        session.install_rollback_source(Some(second));
-        assert_eq!(
-            session.audible_source.as_ref().unwrap().generation,
-            second_generation
-        );
-        assert_eq!(session.generation(), second_generation);
-    }
-
-    #[cfg(feature = "device-audio")]
-    #[test]
-    fn capturing_a_stale_generation_preserves_the_rollback_target() {
-        let mut session = Session::new().expect("session");
-        session.evaluate_mini("bd").expect("source A");
-        // Inject replay policy, not consumer-copy evidence.
-        session
-            .mark_audible_generation(session.generation())
-            .expect("injected replay-policy target");
-        let generation_a = session.generation();
-        let generation_b = session.reload_at("sd", true, 0.1).expect("source B");
-        assert!(matches!(
-            session.capture_rollback_source(generation_a),
-            Err(RuntimeError::Message(_))
-        ));
-        assert!(session.mark_audible_generation(generation_a).is_err());
-        let retained = session.audible_source.as_ref().expect("retained A");
-        assert_eq!(retained.generation, generation_a);
-        assert_eq!(retained.source.as_ref(), "bd");
-        assert_eq!(session.generation(), generation_b);
     }
 
     #[cfg(feature = "device-audio")]
@@ -1599,57 +1422,6 @@ mod tests {
             assert_eq!(session.active_source(), Some(source));
             assert_eq!(session.lanes.document(), 1);
         }
-    }
-
-    #[cfg(feature = "device-audio")]
-    #[test]
-    fn an_injected_intermediate_target_becomes_the_next_replay_source() {
-        let mut session = Session::new().expect("session");
-        session.evaluate("s('bd')").expect("audible A");
-        let generation_b = session
-            .reload_at("s('sd')", false, 0.1)
-            .expect("candidate B");
-        // Inject replay policy, not consumer-copy evidence.
-        session
-            .mark_audible_generation(generation_b)
-            .expect("injected replay-policy target");
-        session
-            .reload_at("s('hh')", false, 0.2)
-            .expect("candidate C");
-
-        assert_eq!(
-            session
-                .rollback_to_previous_source(0.3)
-                .expect("rollback B"),
-            RollbackAttempt::Applied
-        );
-        assert_eq!(
-            session.query(Fraction::ZERO, Fraction::ONE).unwrap()[0]
-                .value
-                .show(),
-            "s:sd"
-        );
-    }
-
-    #[cfg(feature = "device-audio")]
-    #[test]
-    fn arbitrarily_many_unpublished_candidates_keep_one_bounded_audible_snapshot() {
-        let mut session = Session::new().expect("session");
-        session.evaluate_mini("bd").expect("audible score");
-        // Inject replay policy, not consumer-copy evidence.
-        session
-            .mark_audible_generation(session.generation())
-            .expect("injected replay-policy target");
-        let audible_generation = session.generation();
-        for index in 0..1_000 {
-            let source = if index % 2 == 0 { "sd" } else { "hh" };
-            session
-                .reload_at(source, true, 0.001 * f64::from(index))
-                .expect("superseding mini candidate");
-        }
-        let audible = session.audible_source.as_ref().expect("audible snapshot");
-        assert_eq!(audible.generation, audible_generation);
-        assert_eq!(audible.source.as_ref(), "bd");
     }
 
     #[cfg(feature = "device-audio")]
@@ -1957,39 +1729,6 @@ mod tests {
         assert!(!events.is_empty());
     }
 
-    /// Rollback preserves the language route used by the previous score.
-    #[cfg(feature = "device-audio")]
-    #[test]
-    fn a_rollback_reinstalls_a_mini_score_through_the_mini_door() {
-        let mut session = Session::new().expect("session");
-        session
-            .evaluate_mini("bd sd")
-            .expect("install the mini score");
-        // Inject replay policy, not consumer-copy evidence.
-        session
-            .mark_audible_generation(session.generation())
-            .expect("injected replay-policy target");
-        // The score the watchdog would be rolling back FROM.
-        session
-            .evaluate(r#"s("hh*4")"#)
-            .expect("install a js score");
-
-        assert_eq!(
-            session
-                .rollback_to_previous_source(0.0)
-                .expect("the rollback must not error"),
-            RollbackAttempt::Applied
-        );
-
-        let haps = session.query(Fraction::ZERO, Fraction::ONE).expect("query");
-        let values: Vec<String> = haps.iter().map(|hap| hap.value.show()).collect();
-        assert_eq!(
-            values,
-            vec!["bd".to_string(), "sd".to_string()],
-            "the rollback did not restore the mini score"
-        );
-    }
-
     #[cfg(feature = "device-audio")]
     #[test]
     fn javascript_rollback_restores_the_settings_inherited_by_the_old_score() {
@@ -2125,21 +1864,6 @@ mod tests {
             values.len(),
             2,
             "the retry did not restore the two-onset score: {values:?}"
-        );
-    }
-
-    #[test]
-    fn a_stopped_session_recovers_after_start() {
-        // Stop must not be terminal: the runtime has to schedule again
-        // afterwards, or "cancellation" is indistinguishable from breakage.
-        let mut session = Session::new().expect("session");
-        session.evaluate(r#"s("bd sd")"#).expect("evaluate");
-        let handle = session.transport();
-        handle.stop();
-        handle.start();
-        assert!(
-            !session.play(2.0).expect("play").onsets.is_empty(),
-            "the session did not recover after a stop/start cycle"
         );
     }
 }

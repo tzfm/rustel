@@ -681,6 +681,27 @@ impl LaneTable {
         &self.playing
     }
 
+    /// Active lanes as bounded protocol metadata, keeping the lane table's
+    /// edit-stable lane ids.
+    pub(crate) fn ui_lanes(&self) -> Vec<crate::ui_events::UiLane> {
+        let mut out = Vec::new();
+        for (number, label, line, _) in self
+            .playing
+            .lanes()
+            .take(crate::ui_events::MAX_UI_LAYOUT_LANES)
+        {
+            if let Ok(id) = u32::try_from(number) {
+                let label_trimmed = crate::ui_events::truncate_lane_label(label);
+                out.push(crate::ui_events::UiLane {
+                    id,
+                    label: label_trimmed.to_owned(),
+                    line: u32::try_from(line).unwrap_or(u32::MAX),
+                });
+            }
+        }
+        out
+    }
+
     /// True when any lane in play names a plugin call.
     pub(crate) fn has_plugins(&self) -> bool {
         self.playing

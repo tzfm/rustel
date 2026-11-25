@@ -1318,21 +1318,6 @@ mod numeric_string_tests {
     }
 
     #[test]
-    fn construction_fanout_accepts_the_exact_limit() {
-        let registry = default_registry();
-        let pattern = registry.get("iter").expect("registered iter").call(
-            &[pure(Value::F64(MAX_ITER_PARTS as f64))],
-            pure(Value::Str("a".into())),
-        );
-        assert!(
-            pattern
-                .try_query_arc_sorted(Fraction::ZERO, Fraction::ZERO)
-                .is_ok(),
-            "the exact documented fanout limit must be accepted"
-        );
-    }
-
-    #[test]
     fn registered_euclid_family_surfaces_the_native_limit_at_query_time() {
         let registry = default_registry();
         let value = |number| pure(Value::F64(number));

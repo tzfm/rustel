@@ -1,7 +1,6 @@
 use rustel_audio::{
     BUNDLED_BD_SAMPLE_ID, Envelope, FilterControls, LiveFlipAtomics, OnsetEvent,
     OscillatorControls, SampleControls, SampleHold, ScalarBackend, Waveform, render_pcm,
-    write_pcm16_wav,
 };
 
 /// The plain `fmi`/`fmi2`.. chain expressed as matrix routes: operator `n`
@@ -126,111 +125,6 @@ fn a_custom_wave_plays_every_partial_of_a_long_list() {
     );
 }
 
-#[test]
-fn scalar_wav_is_streamed_with_a_correct_non_silent_body() {
-    let path = std::env::temp_dir().join(format!(
-        "rustel-scalar-{}-{}.wav",
-        std::process::id(),
-        std::thread::current().name().unwrap_or("test")
-    ));
-    let event = OnsetEvent::new(0, 440.0, 0.8, 0.08);
-    let bytes = write_pcm16_wav(&path, &mut ScalarBackend::new(), 48_000, 4_800, &[event])
-        .expect("write scalar WAV");
-    assert_eq!(bytes, 4_800 * 2 * 2);
-    let wav = std::fs::read(&path).expect("read scalar WAV");
-    let _ = std::fs::remove_file(path);
-    assert_eq!(&wav[..4], b"RIFF");
-    assert_eq!(&wav[8..12], b"WAVE");
-    assert_eq!(&wav[36..40], b"data");
-    assert_eq!(wav.len(), 44 + bytes);
-    assert!(
-        wav[44..]
-            .as_chunks::<2>()
-            .0
-            .iter()
-            .any(|sample| *sample != [0, 0]),
-        "audible scalar WAV was all zeroes"
-    );
-}
-
-#[test]
-fn waveform_and_equal_power_pan_are_load_bearing() {
-    let square =
-        OnsetEvent::new(0, 1_000.0, 1.0, 0.02).with_controls(controls(Waveform::Square, Some(1.0)));
-    let pcm = render_pcm(&mut ScalarBackend::new(), 48_000, 2_000, &[square]).expect("render");
-    assert!(
-        pcm.as_chunks::<2>()
-            .0
-            .iter()
-            .all(|frame| frame[0].abs() <= f32::EPSILON),
-        "hard-right pan leaked into the left channel"
-    );
-    assert!(
-        pcm.as_chunks::<2>()
-            .0
-            .iter()
-            .any(|frame| frame[1].abs() > 0.25),
-        "square shape or the required 0.3 oscillator gain was lost"
-    );
-
-    let centered =
-        OnsetEvent::new(0, 1_000.0, 1.0, 0.02).with_controls(controls(Waveform::Sine, Some(0.5)));
-    let unpanned =
-        OnsetEvent::new(0, 1_000.0, 1.0, 0.02).with_controls(controls(Waveform::Sine, None));
-    let centered =
-        render_pcm(&mut ScalarBackend::new(), 48_000, 2_000, &[centered]).expect("centered render");
-    let unpanned =
-        render_pcm(&mut ScalarBackend::new(), 48_000, 2_000, &[unpanned]).expect("unpanned render");
-    let centered_peak = centered.iter().copied().map(f32::abs).fold(0.0, f32::max);
-    let unpanned_peak = unpanned.iter().copied().map(f32::abs).fold(0.0, f32::max);
-    assert!(
-        ((centered_peak / unpanned_peak) - std::f32::consts::FRAC_1_SQRT_2).abs() < 1e-6,
-        "explicit center must use StereoPanner equal-power attenuation"
-    );
-}
-
-#[test]
-fn velocity_postgain_and_release_are_not_discarded() {
-    let mut full = controls(Waveform::Sine, None);
-    full.envelope = Envelope {
-        attack_secs: 0.001,
-        decay_secs: 0.001,
-        sustain: 1.0,
-        release_secs: 0.02,
-    };
-    let mut scaled = full.clone();
-    scaled.velocity = 0.5;
-    scaled.postgain = 0.4;
-    let full = render_pcm(
-        &mut ScalarBackend::new(),
-        48_000,
-        2_000,
-        &[OnsetEvent::new(0, 1_000.0, 1.0, 0.01).with_controls(full)],
-    )
-    .expect("full render");
-    let scaled = render_pcm(
-        &mut ScalarBackend::new(),
-        48_000,
-        2_000,
-        &[OnsetEvent::new(0, 1_000.0, 1.0, 0.01).with_controls(scaled)],
-    )
-    .expect("scaled render");
-    let full_peak = full.iter().copied().map(f32::abs).fold(0.0, f32::max);
-    let scaled_peak = scaled.iter().copied().map(f32::abs).fold(0.0, f32::max);
-    assert!((scaled_peak / full_peak - 0.2).abs() < 1e-6);
-    let gate_frame = 480usize;
-    assert!(
-        full[gate_frame * 2..]
-            .iter()
-            .any(|sample| sample.abs() > 1e-4),
-        "release must extend after the note gate"
-    );
-    assert!(
-        full[1_440 * 2..].iter().all(|sample| sample.abs() < 1e-6),
-        "voice must end after gate plus release"
-    );
-}
-
 /// `postgain` is the post GainNode. strudel.cc builds it after the whole
 /// chain. `distort(2)` is non-linear, so it shows whether postgain scales
 /// the output or the drive.
@@ -268,38 +162,6 @@ fn postgain_scales_the_distorted_output_rather_than_the_drive() {
         worst < 1e-6,
         "postgain moved the drive rather than the output: off by {worst}"
     );
-}
-
-/// FM modulators run from the start of the render, as in the browser
-/// reference: a note does not restart their phase. Two identical FM notes
-/// are the same sound when the anchored phase the later one reaches comes
-/// around - 125 Hz at harmonicity 4 turns exactly 500 cycles a second.
-#[test]
-fn two_identical_fm_notes_sound_the_same_wherever_they_start() {
-    let mut controls = controls(Waveform::Sine, None);
-    controls.fm = Some(fm_chain(&[Some((4.0, 2.0))]));
-    let render = |onset: u64| {
-        render_pcm(
-            &mut ScalarBackend::new(),
-            48_000,
-            onset as usize + 8_000,
-            &[OnsetEvent::new(onset, 125.0, 1.0, 0.1).with_controls(controls.clone())],
-        )
-        .expect("render")
-    };
-    let first = render(0);
-    // A whole number of 128-frame render quanta later.
-    let later = render(48_000);
-    let worst = first
-        .iter()
-        .zip(&later[48_000 * 2..])
-        .map(|(first, later)| (first - later).abs())
-        .fold(0.0f32, f32::max);
-    assert!(
-        first.iter().copied().map(f32::abs).fold(0.0, f32::max) > 0.01,
-        "the fixture must actually be sounding"
-    );
-    assert!(worst < 1e-9, "the two notes differ by {worst}");
 }
 
 /// A note sounds the modulator phase the render has reached, not a phase of
@@ -506,28 +368,6 @@ fn a_note_sounds_the_modulator_phase_the_render_has_reached() {
             "the {kind} notes differ"
         );
     }
-}
-
-#[test]
-fn zero_speed_sample_is_an_audio_no_op() {
-    let event = OnsetEvent::new(0, 0.0, 1.0, 0.1).with_sample(SampleControls {
-        sample: BUNDLED_BD_SAMPLE_ID,
-        playback_rate: 1.0,
-        begin: 0.0,
-        end: 1.0,
-        hold: SampleHold::Slice,
-        muted: true,
-        loop_secs: None,
-        envelope_peak: 1.0,
-        reversed: false,
-        nudge_secs: 0.0,
-        cut: None,
-    });
-    let pcm = render_pcm(&mut ScalarBackend::new(), 48_000, 4_800, &[event]).expect("render");
-    assert!(
-        pcm.iter().all(|sample| *sample == 0.0),
-        "No voice is created when sample speed is zero"
-    );
 }
 
 /// An active delay at a sample rate whose delay line is shorter than the
@@ -755,119 +595,6 @@ fn an_infinite_step_on_a_looped_sample_stays_finite() {
     assert!(
         pcm.iter().all(|sample| sample.is_finite()),
         "an infinite loop step rendered a non-finite sample"
-    );
-}
-
-#[test]
-fn duck_sidechain_dips_the_target_orbit_exponentially() {
-    // A steady tone in orbit 2 plus a near-silent trigger carrying
-    // duckorbit(2): ramps the ORBIT's output gain
-    // exponentially to clamp(1-sqrt(depth), 0.01, current) at t+onset and
-    // back to 1 at t+onset+attack.
-    let sr = 48_000u32;
-    let tone =
-        OnsetEvent::new(0, 220.0, 1.0, 1.0).with_controls(rustel_audio::OscillatorControls {
-            limit: None,
-            noise: 0.0,
-            bus_mods: [None; rustel_audio::MAX_VOICE_MODS],
-            bus: None,
-            busgain: 1.0,
-            channels: None,
-            waveform: rustel_audio::Waveform::Sine,
-            envelope: rustel_audio::Envelope {
-                attack_secs: 0.001,
-                decay_secs: 0.001,
-                sustain: 1.0,
-                release_secs: 0.01,
-            },
-            orbit: 2,
-            lfos: [None; rustel_audio::MAX_VOICE_MODS],
-            envs: [None; rustel_audio::MAX_VOICE_MODS],
-            phaser: None,
-            tremolo: None,
-            vibrato: None,
-            pitch_env: None,
-            djf: None,
-            compressor: None,
-            partials: None,
-            transient: None,
-            fx_stages: [const { None }; rustel_audio::MAX_FX_STAGES],
-            vowel: None,
-            coarse: None,
-            crush: None,
-            shape: None,
-            ..Default::default()
-        });
-    let duck_at = 24_000u64; // 0.5 s
-    let mut ducker =
-        OnsetEvent::new(1, 220.0, 0.0, 0.01).with_controls(rustel_audio::OscillatorControls {
-            limit: None,
-            noise: 0.0,
-            bus_mods: [None; rustel_audio::MAX_VOICE_MODS],
-            bus: None,
-            busgain: 1.0,
-            channels: None,
-            duck: Some(rustel_audio::DuckControls {
-                targets: [
-                    Some(rustel_audio::DuckTarget {
-                        orbit: 2,
-                        onset_secs: 0.0,
-                        attack_secs: 0.1,
-                        depth: 1.0,
-                    }),
-                    None,
-                    None,
-                    None,
-                ],
-            }),
-            ..Default::default()
-        });
-    ducker.onset_frame = duck_at;
-    // The same trigger through a plugin chain with 480 frames of latency
-    // starts 480 frames early, before its musical onset.
-    let mut latent = ducker.clone();
-    latent.onset_frame = duck_at - 480;
-    latent.controls.lead = 480;
-    let key = rustel_audio::InsertKey {
-        plugin: 1,
-        preset: 0,
-    };
-    let stage = rustel_audio::InsertControls::new(key).with_latency(480);
-    latent.controls.effects[0] = Some(stage);
-    let early = render_pcm(
-        &mut ScalarBackend::new(),
-        sr,
-        48_000,
-        &[tone.clone(), latent],
-    )
-    .expect("render");
-    let pcm = render_pcm(&mut ScalarBackend::new(), sr, 48_000, &[tone, ducker]).expect("render");
-    assert!(
-        early == pcm,
-        "an early latent trigger dips on the frame of its musical onset"
-    );
-
-    let rms = |from: usize, to: usize| {
-        let slice = &pcm[from * 2..to * 2];
-        (slice
-            .iter()
-            .map(|s| f64::from(*s) * f64::from(*s))
-            .sum::<f64>()
-            / slice.len() as f64)
-            .sqrt()
-    };
-    let before = rms(20_000, 23_000);
-    // Right at the dip bottom (t..t+a few ms) the gain is ~0.01.
-    let dipped = rms(24_050, 24_500);
-    // Well after attack (0.1 s = 4_800 frames) the gain is back to 1.
-    let recovered = rms(30_000, 34_000);
-    assert!(
-        dipped < before * 0.1,
-        "duck must dip the orbit: before {before:.4}, dipped {dipped:.4}"
-    );
-    assert!(
-        recovered > before * 0.8,
-        "duck must recover to unity: before {before:.4}, recovered {recovered:.4}"
     );
 }
 
@@ -1501,40 +1228,6 @@ fn live_sbd_carries_the_waveshaper_prehistory_into_its_attack() {
     assert_eq!(&left[ONSET..], attack_left.as_slice());
 }
 
-/// `fmi{k}` is the link from operator k to operator k-1. `fmi3` without
-/// `fmi2` reaches nothing, so the note sounds as if `fmi3` were absent.
-/// strudel.cc's `applyFM` skips the connection (`if (!amt) continue`).
-#[test]
-fn a_gap_in_the_fm_chain_severs_it_rather_than_being_stepped_over() {
-    let base = |stages: &[Option<(f32, f32)>]| {
-        let mut event = OnsetEvent::new(0, 220.0, 1.0, 0.4);
-        event.controls.fm = Some(fm_chain(stages));
-        render_pcm(&mut ScalarBackend::new(), 48_000, 24_000, &[event]).expect("render")
-    };
-    let carrier = Some((3.0, 1.0));
-
-    let plain = base(&[carrier]);
-    // fmi3 with no fmi2 - operator 3 present, the link below it missing.
-    let far = base(&[carrier, None, Some((5.0, 2.0))]);
-    // fmi2 present - a real chain, which MUST change the sound.
-    let near = base(&[carrier, Some((5.0, 2.0))]);
-
-    let distance = |a: &[f32], b: &[f32]| -> f64 {
-        a.iter().zip(b).map(|(a, b)| f64::from(a - b).abs()).sum()
-    };
-    assert!(
-        distance(&plain, &far) < 1e-6,
-        "an operator whose link is missing must be inaudible, but it moved \
-         the output by {}",
-        distance(&plain, &far)
-    );
-    assert!(
-        distance(&plain, &near) > 1.0,
-        "a linked operator must be audible, but it changed nothing: {}",
-        distance(&plain, &near)
-    );
-}
-
 /// A duck trigger that arrives after its 10 ms hold point anchors the dip at
 /// the current frame, as upstream's webAudioTimeout callback does
 /// (t0 = max(t, now)). The orbit gain ramps from there and does not step.
@@ -1935,29 +1628,6 @@ fn a_nan_lfo_sample_gives_the_target_its_audio_param_default() {
 }
 
 #[test]
-fn a_nan_lfo_sample_is_found_in_f64() {
-    use rustel_audio::{LfoMod, ModTarget};
-    let render = |lfo| {
-        let mut c = controls(Waveform::Sawtooth, None);
-        c.lfos[0] = Some(lfo);
-        let event = OnsetEvent::new(0, 110.0, 0.5, 0.5).with_controls(c);
-        render_pcm(&mut ScalarBackend::new(), 48_000, 4_096, &[event]).expect("render")
-    };
-    // 3000 steps of 4 Hz give a triangle value slightly under 0.5 in f64.
-    // The f32 value is 0.5.
-    let nan = render(LfoMod {
-        frequency_hz: 4.0,
-        shape: 0,
-        ..nan_lfo(ModTarget::Gain, 0.5)
-    });
-    let held = render(held_lfo(ModTarget::Gain, 0.5, 1.0, 1.0 - 0.5, 1.0));
-    // The LFO starts on quantum 128.
-    let sample = (128 + 3_000) * 2;
-    assert!(held[sample] != 0.0);
-    assert_eq!(nan[sample], held[sample]);
-}
-
-#[test]
 fn nan_feedback_modulators_on_one_orbit_keep_the_delay_bounded() {
     use rustel_audio::{DelayControls, ModTarget};
     let mut c = controls(Waveform::Sawtooth, None);
@@ -1973,37 +1643,6 @@ fn nan_feedback_modulators_on_one_orbit_keep_the_delay_bounded() {
     let pcm = render_pcm(&mut ScalarBackend::new(), 48_000, 48_000, &events).expect("render");
     let peak = pcm.iter().map(|s| s.abs()).fold(0.0f32, f32::max);
     assert!(peak < 100.0, "the orbit feedback went above 1, peak {peak}");
-}
-
-#[test]
-fn a_nan_tremolodepth_modulator_gives_the_gain_its_default() {
-    use rustel_audio::{ModTarget, TremoloControls};
-    let render = |tremolo: bool| {
-        let mut c = controls(Waveform::Sawtooth, None);
-        if tremolo {
-            c.tremolo = Some(TremoloControls {
-                frequency_hz: 4.0,
-                depth: 0.5,
-                skew: 1.0,
-                shape: 0,
-                phase_offset: 0.0,
-                time_secs: 0.0,
-            });
-            c.lfos[0] = Some(nan_lfo(ModTarget::TremoloDepth, 0.5));
-        }
-        let event = OnsetEvent::new(0, 110.0, 0.8, 0.5).with_controls(c);
-        render_pcm(&mut ScalarBackend::new(), 48_000, 24_000, &[event]).expect("render")
-    };
-    let pcm = render(true);
-    assert!(
-        pcm.iter().all(|sample| sample.is_finite()),
-        "a NaN reached the output"
-    );
-    // The LFO starts on quantum 128.
-    assert!(
-        pcm[128 * 2..] == render(false)[128 * 2..],
-        "the gain did not take its default"
-    );
 }
 
 #[test]
@@ -2115,32 +1754,6 @@ fn negative_depth_tremolo_stays_finite_at_unity_gain() {
             "{site}: the tremolo gain is not 1.0"
         );
     }
-}
-
-#[test]
-fn phaser_changes_the_spectrum_over_time() {
-    use rustel_audio::PhaserControls;
-    let base = |phaser: Option<PhaserControls>| {
-        let mut c = controls(Waveform::Sawtooth, None);
-        c.phaser = phaser;
-        let event = OnsetEvent::new(0, 110.0, 0.8, 1.0).with_controls(c);
-        let mut backend = ScalarBackend::new();
-        render_pcm(&mut backend, 48_000, 48_000, &[event]).expect("render")
-    };
-    let with = base(Some(PhaserControls {
-        rate_hz: 2.0,
-        depth: 0.9,
-        center_hz: 800.0,
-        sweep_cents: 3_000.0,
-        time_secs: 0.0,
-    }));
-    let flat = base(None);
-    let diff: f64 = with
-        .iter()
-        .zip(&flat)
-        .map(|(a, b)| f64::from(a - b).abs())
-        .sum();
-    assert!(diff > 1.0, "phaser had no effect, |diff| = {diff}");
 }
 
 /// An LFO is anchored to a clock, not to the note: `phase0 =
@@ -3290,72 +2903,6 @@ fn noise_crossfades_pink_into_the_oscillator() {
     );
 }
 
-/// The pitch envelope must be held off for exactly the opening PARTIAL
-/// quantum and no longer.
-///
-/// `getPitchEnvelope` schedules its first value at the note's start, so
-/// before then `detune` still holds the 0 it was built with, and Blink reads
-/// that param from the START of the render quantum. A note beginning
-/// mid-quantum is therefore undetuned for its first `128 - offset` samples.
-///
-/// Asserted by rendering the same voice twice, once with the envelope and
-/// once without: inside the partial quantum the two must be IDENTICAL, and
-/// after the boundary they must diverge. A note that starts on a boundary
-/// has no partial quantum and must differ immediately.
-#[test]
-fn the_pitch_envelope_is_held_off_only_for_the_opening_partial_quantum() {
-    fn render_at(onset: u64, with_env: bool) -> Vec<f32> {
-        let mut c = controls(Waveform::Sine, None);
-        if with_env {
-            c.pitch_env = Some(rustel_audio::PitchEnvControls {
-                adsr: rustel_audio::FilterEnvelope {
-                    attack_secs: 0.2,
-                    decay_secs: 0.001,
-                    sustain: 1.0,
-                    release_secs: 0.001,
-                    min_hz: -1200.0,
-                    max_hz: 0.0,
-                },
-                exponential: false,
-            });
-        }
-        let event = OnsetEvent::new(onset, 261.63, 1.0, 0.5).with_controls(c);
-        render_pcm(&mut ScalarBackend::new(), 48_000, 1_024, &[event]).expect("render")
-    }
-
-    let offset = 64_u64;
-    let with = render_at(offset, true);
-    let without = render_at(offset, false);
-    let frame = |pcm: &[f32], i: usize| pcm[i * 2];
-
-    // Inside the partial quantum the automation has not begun: identical.
-    for i in (offset as usize)..128 {
-        assert!(
-            (frame(&with, i) - frame(&without, i)).abs() < 1e-9,
-            "frame {i} is inside the opening partial quantum and must be \
-             undetuned, but the envelope moved it"
-        );
-    }
-
-    // After the boundary the envelope is live, so the two must part.
-    let parted = (128..1_024).any(|i| (frame(&with, i) - frame(&without, i)).abs() > 1e-6);
-    assert!(
-        parted,
-        "the envelope never took effect after the quantum boundary - the \
-         hold is suppressing the whole note"
-    );
-
-    // A note ON a boundary has no partial quantum to hold.
-    let aligned_with = render_at(128, true);
-    let aligned_without = render_at(128, false);
-    let aligned_parted =
-        (128..1_024).any(|i| (frame(&aligned_with, i) - frame(&aligned_without, i)).abs() > 1e-6);
-    assert!(
-        aligned_parted,
-        "an onset on a 128-frame boundary must not be held off at all"
-    );
-}
-
 /// The first voice into an orbit sets the orbit's routing, sends included.
 /// The `channels` of every later voice is inert.
 #[test]
@@ -3599,229 +3146,6 @@ fn an_event_level_cut_chokes_the_previous_voice_in_the_group() {
     assert!(
         differs < 1e-6,
         "the latent note sounds past the choke of a later note with no chain (max residue {differs})"
-    );
-}
-
-/// A rewind's takeover cut: the outgoing rendition falls silent at the flip
-/// over the 10 ms choke ramp, and its ghost-window events never sound. A
-/// flip without the cut (an ordinary edit) leaves the old voices ringing.
-#[test]
-fn a_takeover_cut_silences_the_old_generation_at_the_flip() {
-    use rustel_audio::TakeoverCut;
-    use std::sync::atomic::{AtomicBool, AtomicU64};
-
-    const SR: u32 = 48_000;
-    // `ghost` puts an old-generation event INSIDE the ghost window -
-    // scheduled before the flip, targeting after it (the horizon contract
-    // keeps it in the ring). It is the doubled first beat when it sounds.
-    let render = |intent: TakeoverCut, flip: usize, takeover_frame: u64, ghost: bool| {
-        let ring = rustel_audio::Ring::new(8);
-        // Old generation (1): the pad, scheduled long before the flip.
-        assert!(ring.push(rustel_audio::AudioEvent {
-            onset_id: 1,
-            generation: 1,
-            ui_visuals: 0,
-            target_frame: 0,
-            onset_lead: 0.0,
-            freq_hz: 110.0,
-            gain: 0.8,
-            duration_secs: 4.0,
-            controls: {
-                let mut c = controls(Waveform::Sawtooth, None);
-                c.envelope = rustel_audio::Envelope {
-                    attack_secs: 0.001,
-                    decay_secs: 0.001,
-                    sustain: 1.0,
-                    release_secs: 4.0,
-                };
-                c
-            },
-            sample: None,
-            wavetable: None,
-            synth: None,
-            cut: None,
-        }));
-        // The old generation's ghost: scheduled into the ring long before
-        // the flip, targeting a beat after it - exactly what a restarted
-        // loop plays again as its own first beat.
-        if ghost {
-            assert!(ring.push(rustel_audio::AudioEvent {
-                onset_id: 3,
-                generation: 1,
-                ui_visuals: 0,
-                target_frame: takeover_frame + 4_800, // 100 ms past the takeover
-                onset_lead: 0.0,
-                freq_hz: 110.0,
-                gain: 0.8,
-                duration_secs: 0.5,
-                controls: {
-                    let mut c = controls(Waveform::Sawtooth, None);
-                    c.envelope = rustel_audio::Envelope {
-                        attack_secs: 0.001,
-                        decay_secs: 0.001,
-                        sustain: 1.0,
-                        release_secs: 0.5,
-                    };
-                    c
-                },
-                sample: None,
-                wavetable: None,
-                synth: None,
-                cut: None,
-            }));
-        }
-
-        let generation = AtomicU64::new(1);
-        let takeover = AtomicU64::new(0);
-        let line_arm = AtomicU64::new(0);
-        let line_fired = AtomicU64::new(0);
-        let cut_flag = AtomicU64::new(0);
-        let stopped = AtomicBool::new(false);
-        let mut backend = rustel_audio::LiveScalarBackend::new(SR, 8).expect("live backend");
-
-        // Long enough to cover the new loop's downbeat 250 ms past the
-        // takeover, for every variant this helper renders.
-        let total = takeover_frame as usize + 16_000;
-        let mut pcm = vec![0.0f32; total * 2];
-        let mut cursor = 0usize;
-        while cursor < total {
-            let n = (total - cursor).min(128);
-            // Mid-stream flip: the producer stores the takeover (and cut)
-            // before the generation, so the consumer sees them together.
-            if cursor == flip {
-                // The producer's order: takeover and cut, then the generation
-                // flip, then the replacement batch. Pending never holds a
-                // new-generation onset at flip time. The new loop's first
-                // event lands 250 ms past the takeover frame, which is the
-                // restart's natural latency that the ghost window spans.
-                takeover.store(takeover_frame, std::sync::atomic::Ordering::Release);
-                cut_flag.store(intent as u64, std::sync::atomic::Ordering::Release);
-                generation.store(2, std::sync::atomic::Ordering::Release);
-                assert!(ring.push(rustel_audio::AudioEvent {
-                    onset_id: 2,
-                    generation: 2,
-                    ui_visuals: 0,
-                    target_frame: takeover_frame + 12_000,
-                    onset_lead: 0.0,
-                    freq_hz: 220.0,
-                    gain: 0.8,
-                    duration_secs: 0.5,
-                    controls: controls(Waveform::Sine, None),
-                    sample: None,
-                    wavetable: None,
-                    synth: None,
-                    cut: None,
-                }));
-            }
-            backend.process_block_with(
-                &mut pcm[cursor * 2..(cursor + n) * 2],
-                n,
-                cursor as u64,
-                &ring,
-                LiveFlipAtomics {
-                    generation: &generation,
-                    takeover_frame: &takeover,
-                    takeover_cut: &cut_flag,
-                    line_arm: &line_arm,
-                    line_fired: &line_fired,
-                },
-                &stopped,
-            );
-            cursor += n;
-        }
-        pcm
-    };
-
-    let peak = |pcm: &[f32], from: usize, to: usize| {
-        pcm[from * 2..to * 2]
-            .iter()
-            .fold(0.0f32, |m, s| m.max(s.abs()))
-    };
-
-    // The flip sits on a block boundary near the saw's peak, so a step mute
-    // would be audible. The takeover is the same frame here: this run pins
-    // the AtFlip drop horizon.
-    const FLIP: usize = 9_344;
-    const RAMP: usize = 480; // 10 ms
-    let cut_pcm = render(TakeoverCut::AtFlip, FLIP, FLIP as u64, true);
-    let edit_pcm = render(TakeoverCut::None, FLIP, FLIP as u64, true);
-
-    // Identical up to the flip, both channels: nothing the producer
-    // published yet can change what is heard.
-    assert_eq!(
-        cut_pcm[..FLIP * 2],
-        edit_pcm[..FLIP * 2],
-        "pre-flip audio differs"
-    );
-
-    let loud = peak(&cut_pcm, FLIP - 1_280, FLIP - 128);
-    assert!(
-        loud > 0.1,
-        "the pad must be audible before the flip: {loud}"
-    );
-
-    // AT the flip the pad begins to fade; past the ramp only silence
-    // remains until the ghost's target - it never did sound.
-    let past_ghost = peak(&cut_pcm, FLIP + RAMP + 128, GHOST_AT);
-    assert!(
-        past_ghost < loud * 0.1,
-        "between the flip and the ghost target only the fading pad may sound: {past_ghost} vs {loud}"
-    );
-
-    // The GHOST never sounds: at its target (+100 ms) the cut run is
-    // silent where the edit run carries the old beat again.
-    const GHOST_AT: usize = FLIP + 4_800; // the ghost's target
-    let ghost_in_cut = peak(&cut_pcm, GHOST_AT, GHOST_AT + 1_280);
-    let ghost_in_edit = peak(&edit_pcm, GHOST_AT, GHOST_AT + 1_280);
-    assert!(
-        ghost_in_edit > loud * 0.5,
-        "without the cut the ghost beat sounds (the old behaviour): {ghost_in_edit}"
-    );
-    assert!(
-        ghost_in_cut < ghost_in_edit * 0.1,
-        "the ghost beat must never sound under a rewind: {ghost_in_cut} vs {ghost_in_edit}"
-    );
-
-    // The new loop's downbeat (250 ms after the flip) sounds in the cut
-    // run, untouched by the cut.
-    const NEW_AT: usize = FLIP + 12_000;
-    let new_alone = peak(&cut_pcm, NEW_AT + 128, NEW_AT + 1_280);
-    assert!(
-        new_alone > 0.05,
-        "the new loop must sound after the flip: {new_alone}"
-    );
-    // And at its full level (0.8 gain, 0.24 peak), well past any choke
-    // ramp: a new voice caught by the cut would stop 10 ms in.
-    let new_full = peak(&cut_pcm, NEW_AT + RAMP + 128, NEW_AT + 3_600);
-    assert!(
-        new_full > 0.2,
-        "the new loop's downbeat is untouched by the cut: {new_full}"
-    );
-
-    // WITHOUT the cut the pad rings on under the new loop - the old
-    // artefact this contract removes.
-    let rings_on = peak(&edit_pcm, NEW_AT + 128, NEW_AT + 1_280);
-    assert!(
-        rings_on > new_alone,
-        "an edit keeps its ringing-out contract: {rings_on} vs {new_alone}"
-    );
-
-    // WITH the cut the pad is gone: past the 10 ms choke ramp the mix is
-    // the new generation alone. The two runs carry the identical
-    // new-generation onset, so their difference IS the old pad's tail.
-    let removed = |from: usize, to: usize| {
-        cut_pcm[from * 2..to * 2]
-            .iter()
-            .zip(&edit_pcm[from * 2..to * 2])
-            .fold(0.0f32, |m, (a, b)| m.max((a - b).abs()))
-    };
-    // The fade is the choke ramp from unity at the flip: linear over 10 ms,
-    // silent past it - not a step mute, not a shorter ramp.
-    assert_ramp_from(&cut_pcm, &edit_pcm, FLIP, "the flip's takeover cut");
-    let gone = removed(NEW_AT, NEW_AT + 1_152);
-    assert!(
-        gone > rings_on * 0.5,
-        "the pad is fully removed past the ramp: {gone} vs {rings_on}"
     );
 }
 

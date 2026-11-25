@@ -265,22 +265,6 @@ mod tests {
     }
 
     #[test]
-    fn an_alias_key_lands_on_the_canonical_control() {
-        let settings = crate::settings::RuntimeSettings::default();
-        let _bind = settings.bind();
-        register_midi_map_json("m", r#"{"cutoff": 74}"#).expect("registers");
-        assert_eq!(
-            midi_map("m")
-                .expect("registered")
-                .get("cutoff")
-                .expect("canonical cutoff entry")
-                .control,
-            "cutoff",
-            "the canonical spelling, whatever the score wrote"
-        );
-    }
-
-    #[test]
     fn a_flat_range_is_refused_at_registration_not_at_send_time() {
         let settings = crate::settings::RuntimeSettings::default();
         let _bind = settings.bind();

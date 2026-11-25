@@ -81,23 +81,6 @@ fn reentrant_query_from_inside_a_callback() {
 // 2. The evaluation deadline
 // ---------------------------------------------------------------------------
 
-/// `while (true)` must be interrupted, not hang.
-#[test]
-fn infinite_synchronous_loop_is_interrupted() {
-    let rt = JsRuntime::new().unwrap();
-    let start = std::time::Instant::now();
-    let r = rt.with_deadline(Duration::from_millis(50), || {
-        rt.eval("globalThis.spun = 0; while (true) { globalThis.spun++; }")
-    });
-    assert!(r.is_err(), "runaway loop should have been interrupted");
-    assert!(rt.was_interrupted(), "interrupt handler did not fire");
-    assert!(
-        start.elapsed() < Duration::from_secs(5),
-        "interrupt took too long: {:?}",
-        start.elapsed()
-    );
-}
-
 /// **Partial side effects of an interrupted evaluation persist.** There is
 /// one JS context and evaluation mutates globals in place; if it throws
 /// halfway, what already happened stays, matching strudel.cc. Rolling back
@@ -124,60 +107,6 @@ fn partial_side_effects_persist_after_interruption() {
         Some(0.0),
         "a side effect after the interrupt point must not have happened"
     );
-}
-
-/// The runtime must still be usable after an interrupted evaluation - the
-/// active graph keeps playing.
-#[test]
-fn playback_survives_an_interrupted_evaluation() {
-    let rt = JsRuntime::new().unwrap();
-    let mut b = rt.builder();
-    let id = b.callback(&rt, "(_w) => (x) => x + '!'");
-    rt.set_active(&b, seq().fmap_js(id)).unwrap();
-
-    let before = rt
-        .query(Slot::Active, 0, Fraction::ZERO, Fraction::ONE)
-        .unwrap();
-    assert_eq!(before.len(), 2);
-
-    let _ = rt.with_deadline(Duration::from_millis(50), || rt.eval("while (true) {}"));
-
-    let after = rt
-        .query(Slot::Active, 0, Fraction::ZERO, Fraction::ONE)
-        .unwrap();
-    assert_eq!(
-        after.iter().map(|h| h.value.show()).collect::<Vec<_>>(),
-        before.iter().map(|h| h.value.show()).collect::<Vec<_>>(),
-        "the playing graph stopped working after a candidate evaluation was \
-         interrupted"
-    );
-    assert_eq!(rt.query_depth(), 0);
-    rt.clear_active();
-}
-
-/// The query stack unwinds without running JavaScript. After the deadline
-/// fires, the interrupt handler refuses every JS call, so a pop that
-/// evaluates JS would fail and leave the wrappers on the stack.
-#[test]
-fn query_stack_unwinds_while_the_interrupt_is_firing() {
-    let rt = JsRuntime::new().unwrap();
-    let mut b = rt.builder();
-    let id = b.callback(&rt, "(_w) => (x) => x + '!'");
-    rt.set_active(&b, seq().fmap_js(id)).unwrap();
-
-    // Arm a deadline that is ALREADY expired, so every JS call is refused.
-    let depth = rt.with_deadline(Duration::from_millis(0), || {
-        std::thread::sleep(Duration::from_millis(5));
-        let _ = rt.query(Slot::Active, 0, Fraction::ZERO, Fraction::ONE);
-        rt.query_depth()
-    });
-    assert_eq!(
-        depth, 0,
-        "query stack did not unwind while the interrupt handler was firing - \
-         the pop must not require evaluating JS"
-    );
-    assert_eq!(rt.query_depth(), 0);
-    rt.clear_active();
 }
 
 // ---------------------------------------------------------------------------

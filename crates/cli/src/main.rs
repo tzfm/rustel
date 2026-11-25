@@ -56,6 +56,8 @@ use replay_plan::{ReplayOpening, ReplayPlan};
 mod completions;
 mod devices;
 mod live;
+#[cfg(feature = "studio")]
+mod lsp;
 mod midi_import;
 mod replay;
 mod sample_cache;
@@ -69,8 +71,10 @@ use devices::doctor_unavailable_report;
 #[cfg(all(test, feature = "midi"))]
 use devices::midi_summary_json;
 use devices::{run_devices, run_doctor, run_gamepad_monitor, run_midi_list, run_midi_monitor};
-#[cfg(feature = "device-audio")]
+#[cfg(all(test, feature = "device-audio"))]
 use live::read_ui_controls;
+#[cfg(feature = "device-audio")]
+use live::read_ui_controls_with_commands;
 #[cfg(all(
     test,
     feature = "device-audio",
@@ -89,9 +93,10 @@ use live::sync_live_midi_inputs;
 use live::take_tick_intents;
 #[cfg(all(test, feature = "device-audio"))]
 use live::{
-    apply_ui_slider_control, build_live_producer, install_sample_batch,
-    live_engine_pressure_detail, live_engine_pressure_event, observe_ui_layout_if_audible,
-    runtime_device_error,
+    UiDiscreteApplyOutcome, apply_ui_discrete_control, apply_ui_slider_control,
+    build_live_producer, install_sample_batch, live_engine_pressure_detail,
+    live_engine_pressure_event, observe_ui_layout_if_audible,
+    observe_ui_layout_if_audible_with_lanes, runtime_device_error,
 };
 use live::{play, play_live, run_musician, watch_file};
 #[cfg(feature = "device-audio")]
@@ -1008,15 +1013,33 @@ enum Command {
     /// Chord and scale symbols resolve exactly as spelled - `doc ^7` and
     /// `doc +` find those chords - while other names match case-insensitively
     /// and by synonym, the same way the studio's reference panel looks them
-    /// up. The text view is the very body the panel draws.
+    /// up. The text view is the very body the panel draws. Pass `--all` to
+    /// list the full catalogue (add `--json` for editor tooling).
     #[cfg(feature = "studio")]
     Doc {
         /// The name to look up.
-        #[arg(value_name = "NAME")]
-        name: String,
-        /// Emit the entry as JSON instead of readable text.
+        #[arg(
+            value_name = "NAME",
+            required_unless_present = "all",
+            conflicts_with = "all"
+        )]
+        name: Option<String>,
+        /// Emit every documented entry in the reference catalogue.
+        #[arg(long)]
+        all: bool,
+        /// Emit JSON instead of readable text.
         #[arg(long)]
         json: bool,
+    },
+    /// Run the Language Server Protocol server over stdio for external editors.
+    ///
+    /// Serves completion, hover, and live lint diagnostics from the engine's
+    /// reference catalogue and static linter without starting audio.
+    #[cfg(feature = "studio")]
+    Lsp {
+        /// Speak LSP over stdin and stdout (default transport).
+        #[arg(long)]
+        stdio: bool,
     },
     #[command(long_about = product::WATCH_CODE_LONG_ABOUT)]
     WatchCode,
@@ -2146,7 +2169,7 @@ fn run_command(
     if check_updates {
         match &command {
             #[cfg(feature = "studio")]
-            Command::Studio { .. } => {}
+            Command::Lsp { .. } | Command::Studio { .. } => {}
             _ => rustel_runtime::updates::check_for_updates(|message| eprintln!("{message}")),
         }
     }
@@ -2332,7 +2355,9 @@ fn run_command(
         } => vst::run_vst(name.as_deref(), filter.as_deref(), json, rescan, worker),
         Command::Doctor { json } => run_doctor(json, dispatch),
         #[cfg(feature = "studio")]
-        Command::Doc { name, json } => run_doc(&name, json),
+        Command::Doc { name, all, json } => run_doc(name.as_deref(), all, json),
+        #[cfg(feature = "studio")]
+        Command::Lsp { stdio: _ } => lsp::run_stdio(),
         Command::MidiList { json } => run_midi_list(json),
         Command::Completions { shell, install } => {
             let shell = match shell.or_else(shell_from_environment) {
@@ -3038,74 +3063,154 @@ fn play_tip(error: &clap::Error) -> Option<String> {
         .then(|| format!("to play a score, run `rustel play {word}`"))
 }
 
-/// Print the reference entry for a name: the very body the studio's panel
-/// draws, or a JSON projection of the entry for scripting.
 #[cfg(feature = "studio")]
-fn run_doc(name: &str, json: bool) -> Result<(), RuntimeError> {
-    use rustel_studio::reference::{Reference, ReferenceScope, entry_body};
-    let reference = Reference::load_all();
+pub(crate) enum ResolvedDocEntry<'a> {
+    Borrowed(&'a rustel_studio::reference::Entry),
+    #[cfg(feature = "hydra")]
+    Owned(Box<rustel_studio::reference::Entry>),
+}
+
+#[cfg(feature = "studio")]
+impl std::ops::Deref for ResolvedDocEntry<'_> {
+    type Target = rustel_studio::reference::Entry;
+
+    fn deref(&self) -> &Self::Target {
+        match self {
+            Self::Borrowed(entry) => entry,
+            #[cfg(feature = "hydra")]
+            Self::Owned(entry) => entry,
+        }
+    }
+}
+
+/// Resolve a name in the reference catalogue with the same precedence as
+/// `rustel doc` and the studio panel: score entries win, Hydra fallback next,
+/// graph-only names last.
+#[cfg(feature = "studio")]
+pub(crate) fn resolve_doc_entry<'a>(
+    reference: &'a rustel_studio::reference::Reference,
+    name: &str,
+) -> Option<ResolvedDocEntry<'a>> {
+    use rustel_studio::reference::ReferenceScope;
     let resolved = reference.resolve(name);
-    // Score entries take precedence; graph-only names follow the Hydra fallback.
-    let entry = resolved
+    if let Some(entry) = resolved
         .filter(|&index| {
             reference.entry(index).is_some_and(|entry| {
                 reference.lookup_in(&entry.name, ReferenceScope::Kabelsalat) != Some(index)
             })
         })
         .and_then(|index| reference.entry(index))
-        .cloned();
+    {
+        return Some(ResolvedDocEntry::Borrowed(entry));
+    }
     #[cfg(feature = "hydra")]
-    let entry = entry.or_else(|| {
-        let name = rustel_hydra::hydra_names().find(|known| known.eq_ignore_ascii_case(name))?;
-        Some(rustel_studio::reference::Entry {
-            name: name.to_owned(),
-            synonyms: Vec::new(),
-            summary: "Hydra visual function or value.".into(),
-            description: "See `rustel doc initHydra` for setup and the studio's EXAMPLES tab for Hydra snippets.".into(),
-            params: Vec::new(),
-            examples: Vec::new(),
-            tags: vec!["hydra".into()],
-            no_autocomplete: true,
-            deprecated: false,
-            source: String::new(),
-            origin: String::new(),
-            snippet: None,
-            keywords: Vec::new(),
-        })
-    });
-    let entry = entry.or_else(|| resolved.and_then(|index| reference.entry(index)).cloned());
-    let entry =
-        entry.ok_or_else(|| RuntimeError::Message(format!("no reference entry for `{name}`")))?;
-    if json {
-        let params: Vec<serde_json::Value> = entry
-            .params
-            .iter()
-            .map(|param| {
-                serde_json::json!({
-                    "name": param.name,
-                    "type": param.r#type,
-                    "description": param.description,
-                    "choices": param.choices.iter().map(|choice| serde_json::json!({
-                        "value": choice.value,
-                        "description": choice.description,
-                    })).collect::<Vec<_>>(),
-                })
+    if let Some(hydra_name) =
+        rustel_hydra::hydra_names().find(|known| known.eq_ignore_ascii_case(name))
+    {
+        return Some(ResolvedDocEntry::Owned(Box::new(
+            rustel_studio::reference::Entry {
+                name: hydra_name.to_owned(),
+                synonyms: Vec::new(),
+                summary: "Hydra visual function or value.".into(),
+                description: "See `rustel doc initHydra` for setup and the studio's EXAMPLES tab for Hydra snippets.".into(),
+                params: Vec::new(),
+                examples: Vec::new(),
+                tags: vec!["hydra".into()],
+                no_autocomplete: true,
+                deprecated: false,
+                source: String::new(),
+                origin: String::new(),
+                snippet: None,
+                keywords: Vec::new(),
+            },
+        )));
+    }
+    resolved
+        .and_then(|index| reference.entry(index))
+        .map(ResolvedDocEntry::Borrowed)
+}
+
+#[cfg(feature = "studio")]
+fn doc_entry_json(
+    entry: &rustel_studio::reference::Entry,
+    include_meta: bool,
+) -> serde_json::Value {
+    let params: Vec<serde_json::Value> = entry
+        .params
+        .iter()
+        .map(|param| {
+            serde_json::json!({
+                "name": param.name,
+                "type": param.r#type,
+                "description": param.description,
+                "choices": param.choices.iter().map(|choice| serde_json::json!({
+                    "value": choice.value,
+                    "description": choice.description,
+                })).collect::<Vec<_>>(),
             })
-            .collect();
-        let value = serde_json::json!({
-            "name": entry.name,
-            "signature": entry.signature(),
-            "synonyms": entry.synonyms,
-            "summary": entry.summary,
-            "description": entry.description,
-            "params": params,
-            "examples": entry.examples,
-            "tags": entry.tags,
-            "origin": entry.origin,
-        });
+        })
+        .collect();
+    let mut value = serde_json::json!({
+        "name": entry.name,
+        "signature": entry.signature(),
+        "synonyms": entry.synonyms,
+        "summary": entry.summary,
+        "description": entry.description,
+        "params": params,
+        "examples": entry.examples,
+        "tags": entry.tags,
+        "origin": entry.origin,
+    });
+    if include_meta {
+        value["callable"] = serde_json::json!(entry.inserts_as_call());
+        value["no_autocomplete"] = serde_json::json!(entry.no_autocomplete);
+        value["deprecated"] = serde_json::json!(entry.deprecated);
+    }
+    value
+}
+
+/// Print the reference entry for a name, or dump the full catalogue with
+/// `--all`: the very body the studio's panel draws, or JSON for editor tooling.
+#[cfg(feature = "studio")]
+fn run_doc(name: Option<&str>, all: bool, json: bool) -> Result<(), RuntimeError> {
+    use rustel_studio::reference::{Reference, entry_body};
+    let reference = Reference::load_all();
+    if all {
+        if json {
+            let entries: Vec<serde_json::Value> = reference
+                .entries()
+                .iter()
+                .map(|entry| doc_entry_json(entry, true))
+                .collect();
+            let value = serde_json::json!({
+                "version": 1,
+                "revision": reference.revision(),
+                "entries": entries,
+            });
+            outln!(
+                "{}",
+                serde_json::to_string_pretty(&value).map_err(json_err)?
+            );
+            return Ok(());
+        }
+        for entry in reference.entries() {
+            if entry.summary.is_empty() {
+                outln!("{}", entry.name);
+            } else {
+                outln!("{}\t{}", entry.name, entry.summary);
+            }
+        }
+        return Ok(());
+    }
+    let name =
+        name.ok_or_else(|| RuntimeError::Message("provide a reference name or pass --all".into()))?;
+    let entry = resolve_doc_entry(&reference, name)
+        .ok_or_else(|| RuntimeError::Message(format!("no reference entry for `{name}`")))?;
+    if json {
+        let value = doc_entry_json(&entry, false);
         outln!(
             "{}",
-            serde_json::to_string_pretty(&value).expect("the entry serializes")
+            serde_json::to_string_pretty(&value).map_err(json_err)?
         );
         return Ok(());
     }
@@ -3215,15 +3320,25 @@ struct UiLayoutDelivery {
     audio_requested: bool,
     visual_audio_mask: u64,
     sliders: std::collections::BTreeMap<String, rustel_runtime::ui_events::UiSlider>,
-    pending: Option<rustel_runtime::ui_events::UiLayoutEnvelope>,
+    pending: Option<Box<rustel_runtime::ui_events::UiLayoutEnvelope>>,
 }
 
 #[cfg(feature = "device-audio")]
 impl UiLayoutDelivery {
+    #[cfg(test)]
     fn observe(
         &mut self,
         source: &str,
         generation: u64,
+    ) -> Result<bool, rustel_runtime::ui_events::UiLayoutValidationError> {
+        self.observe_with_lanes(source, generation, Vec::new())
+    }
+
+    fn observe_with_lanes(
+        &mut self,
+        source: &str,
+        generation: u64,
+        lanes: Vec<rustel_runtime::ui_events::UiLane>,
     ) -> Result<bool, rustel_runtime::ui_events::UiLayoutValidationError> {
         if self.observed_generation == Some(generation) {
             return Ok(false);
@@ -3235,7 +3350,8 @@ impl UiLayoutDelivery {
         self.visual_audio_mask = 0;
         self.sliders.clear();
         self.pending = None;
-        let layout = rustel_runtime::ui_events::visual_layout(source, generation)?;
+        let layout =
+            rustel_runtime::ui_events::visual_layout_with_lanes(source, generation, lanes)?;
         self.source_revision = Some(layout.ui_layout.source_revision.clone());
         self.audio_requested = layout
             .ui_layout
@@ -3257,15 +3373,15 @@ impl UiLayoutDelivery {
                 .cloned()
                 .map(|slider| (slider.id.clone(), slider)),
         );
-        self.pending = Some(layout);
+        self.pending = Some(Box::new(layout));
         Ok(true)
     }
 
     fn try_deliver(
         &mut self,
         mut send: impl FnMut(
-            rustel_runtime::ui_events::UiLayoutEnvelope,
-        ) -> Result<(), rustel_runtime::ui_events::UiLayoutEnvelope>,
+            Box<rustel_runtime::ui_events::UiLayoutEnvelope>,
+        ) -> Result<(), Box<rustel_runtime::ui_events::UiLayoutEnvelope>>,
     ) -> bool {
         let Some(layout) = self.pending.take() else {
             return false;
@@ -3328,15 +3444,108 @@ const UI_CONTROL_PROTOCOL_VERSION: u16 = 1;
 const MAX_UI_CONTROL_LINE_BYTES: usize = 16 * 1024;
 #[cfg(feature = "device-audio")]
 const MAX_PENDING_UI_SLIDERS: usize = rustel_runtime::ui_events::MAX_UI_LAYOUT_SLIDERS;
+#[cfg(feature = "device-audio")]
+const MAX_PENDING_UI_COMMANDS: usize = 64;
+#[cfg(feature = "device-audio")]
+const MAX_UI_CONTROL_CPS: f64 = 100.0;
 
 #[cfg(feature = "device-audio")]
 #[derive(Clone, Debug, serde::Deserialize)]
-struct UiSliderControlEnvelope {
-    ui_control: UiSliderControl,
+struct UiControlEnvelope {
+    ui_control: UiControlWire,
 }
 
 #[cfg(feature = "device-audio")]
 #[derive(Clone, Debug, serde::Deserialize)]
+struct UiControlWire {
+    version: u16,
+    #[serde(flatten)]
+    body: UiControlBody,
+}
+
+#[cfg(feature = "device-audio")]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum UiTransportAction {
+    Stop,
+    Restart,
+}
+
+#[cfg(feature = "device-audio")]
+#[derive(Clone, Debug, serde::Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+enum UiControlBody {
+    Slider {
+        generation: u64,
+        source_revision: String,
+        id: String,
+        value: f64,
+    },
+    LaneSolo {
+        lane: Option<u32>,
+        #[serde(default)]
+        generation: Option<u64>,
+        #[serde(default)]
+        source_revision: Option<String>,
+        #[serde(default)]
+        request: Option<String>,
+    },
+    LaneMute {
+        lane: u32,
+        muted: bool,
+        #[serde(default)]
+        generation: Option<u64>,
+        #[serde(default)]
+        source_revision: Option<String>,
+        #[serde(default)]
+        request: Option<String>,
+    },
+    LaneTranspose {
+        lane: u32,
+        semitones: i16,
+        #[serde(default)]
+        generation: Option<u64>,
+        #[serde(default)]
+        source_revision: Option<String>,
+        #[serde(default)]
+        request: Option<String>,
+    },
+    Tempo {
+        #[serde(default)]
+        cps: Option<f64>,
+        #[serde(default)]
+        bpm: Option<f64>,
+        #[serde(default)]
+        request: Option<String>,
+    },
+    Transport {
+        action: UiTransportAction,
+        #[serde(default)]
+        request: Option<String>,
+    },
+}
+
+#[cfg(feature = "device-audio")]
+#[derive(Clone, Debug, PartialEq)]
+enum UiDiscreteControlKind {
+    LaneSolo { lane: Option<u32> },
+    LaneMute { lane: u32, muted: bool },
+    LaneTranspose { lane: u32, semitones: i16 },
+    Tempo { cps: Option<f64>, bpm: Option<f64> },
+    Transport { action: UiTransportAction },
+}
+
+#[cfg(feature = "device-audio")]
+#[derive(Clone, Debug, PartialEq)]
+struct UiDiscreteControl {
+    kind: UiDiscreteControlKind,
+    generation: Option<u64>,
+    source_revision: Option<String>,
+    request: Option<String>,
+}
+
+#[cfg(feature = "device-audio")]
+#[derive(Clone, Debug)]
 struct UiSliderControl {
     version: u16,
     kind: String,
@@ -3347,15 +3556,26 @@ struct UiSliderControl {
 }
 
 #[cfg(feature = "device-audio")]
+fn valid_source_revision(revision: &str) -> bool {
+    revision.len() == 64
+        && revision
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+}
+
+#[cfg(feature = "device-audio")]
+fn valid_control_request(request: Option<&str>) -> bool {
+    request.is_none_or(|id| {
+        !id.is_empty() && id.len() <= rustel_runtime::ui_events::MAX_UI_LAYOUT_ID_BYTES
+    })
+}
+
+#[cfg(feature = "device-audio")]
 impl UiSliderControl {
     fn wire_valid(&self) -> bool {
         self.version == UI_CONTROL_PROTOCOL_VERSION
             && self.kind == "slider"
-            && self.source_revision.len() == 64
-            && self
-                .source_revision
-                .bytes()
-                .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+            && valid_source_revision(&self.source_revision)
             && !self.id.is_empty()
             && self.id.len() <= rustel_runtime::ui_events::MAX_UI_LAYOUT_ID_BYTES
             && self
@@ -3367,20 +3587,147 @@ impl UiSliderControl {
 }
 
 #[cfg(feature = "device-audio")]
-#[derive(Clone, Debug, Default)]
+impl UiDiscreteControl {
+    fn wire_valid(&self) -> bool {
+        valid_control_request(self.request.as_deref())
+            && self
+                .source_revision
+                .as_deref()
+                .is_none_or(valid_source_revision)
+    }
+}
+
+#[cfg(feature = "device-audio")]
+enum ParsedUiControl {
+    Slider(UiSliderControl),
+    Discrete(UiDiscreteControl),
+}
+
+#[cfg(feature = "device-audio")]
+impl UiControlWire {
+    fn into_validated(self) -> Option<ParsedUiControl> {
+        if self.version != UI_CONTROL_PROTOCOL_VERSION {
+            return None;
+        }
+        match self.body {
+            UiControlBody::Slider {
+                generation,
+                source_revision,
+                id,
+                value,
+            } => {
+                let slider = UiSliderControl {
+                    version: self.version,
+                    kind: "slider".to_owned(),
+                    generation,
+                    source_revision,
+                    id,
+                    value,
+                };
+                slider
+                    .wire_valid()
+                    .then_some(ParsedUiControl::Slider(slider))
+            }
+            UiControlBody::LaneSolo {
+                lane,
+                generation,
+                source_revision,
+                request,
+            } => {
+                let command = UiDiscreteControl {
+                    kind: UiDiscreteControlKind::LaneSolo { lane },
+                    generation,
+                    source_revision,
+                    request,
+                };
+                command
+                    .wire_valid()
+                    .then_some(ParsedUiControl::Discrete(command))
+            }
+            UiControlBody::LaneMute {
+                lane,
+                muted,
+                generation,
+                source_revision,
+                request,
+            } => {
+                let command = UiDiscreteControl {
+                    kind: UiDiscreteControlKind::LaneMute { lane, muted },
+                    generation,
+                    source_revision,
+                    request,
+                };
+                command
+                    .wire_valid()
+                    .then_some(ParsedUiControl::Discrete(command))
+            }
+            UiControlBody::LaneTranspose {
+                lane,
+                semitones,
+                generation,
+                source_revision,
+                request,
+            } => {
+                let command = UiDiscreteControl {
+                    kind: UiDiscreteControlKind::LaneTranspose { lane, semitones },
+                    generation,
+                    source_revision,
+                    request,
+                };
+                command
+                    .wire_valid()
+                    .then_some(ParsedUiControl::Discrete(command))
+            }
+            UiControlBody::Tempo { cps, bpm, request } => {
+                let command = UiDiscreteControl {
+                    kind: UiDiscreteControlKind::Tempo { cps, bpm },
+                    generation: None,
+                    source_revision: None,
+                    request,
+                };
+                command
+                    .wire_valid()
+                    .then_some(ParsedUiControl::Discrete(command))
+            }
+            UiControlBody::Transport { action, request } => {
+                let command = UiDiscreteControl {
+                    kind: UiDiscreteControlKind::Transport { action },
+                    generation: None,
+                    source_revision: None,
+                    request,
+                };
+                command
+                    .wire_valid()
+                    .then_some(ParsedUiControl::Discrete(command))
+            }
+        }
+    }
+}
+
+#[cfg(feature = "device-audio")]
+#[derive(Debug)]
 struct UiControlInbox {
+    // Coalesced latest continuous slider drags, shared only with the stdin reader.
     pending: std::sync::Arc<std::sync::Mutex<std::collections::BTreeMap<String, UiSliderControl>>>,
+    // Lock-free SPSC receiver for bounded discrete commands from the stdin reader.
+    commands: std::sync::mpsc::Receiver<UiDiscreteControl>,
 }
 
 #[cfg(feature = "device-audio")]
 impl UiControlInbox {
     fn stdin() -> io::Result<Self> {
-        let inbox = Self::default();
-        let pending = std::sync::Arc::clone(&inbox.pending);
+        let pending = std::sync::Arc::new(std::sync::Mutex::new(std::collections::BTreeMap::new()));
+        let (tx, rx) = std::sync::mpsc::sync_channel(MAX_PENDING_UI_COMMANDS);
+        let reader_pending = std::sync::Arc::clone(&pending);
         std::thread::Builder::new()
             .name("ui-control-reader".to_owned())
-            .spawn(move || read_ui_controls(std::io::stdin(), &pending))?;
-        Ok(inbox)
+            .spawn(move || {
+                read_ui_controls_with_commands(std::io::stdin(), &reader_pending, Some(&tx))
+            })?;
+        Ok(Self {
+            pending,
+            commands: rx,
+        })
     }
 
     fn drain(&self) -> Vec<UiSliderControl> {
@@ -3392,6 +3739,13 @@ impl UiControlInbox {
             Err(std::sync::TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
         };
         std::mem::take(&mut *pending).into_values().collect()
+    }
+
+    fn drain_commands(&self) -> Vec<UiDiscreteControl> {
+        self.commands
+            .try_iter()
+            .take(MAX_PENDING_UI_COMMANDS)
+            .collect()
     }
 }
 
@@ -4186,6 +4540,8 @@ impl Cli {
             } => !follow && !score_events,
             Command::Trace { score_events, .. } => !score_events,
             #[cfg(feature = "studio")]
+            Command::Lsp { .. } => false,
+            #[cfg(feature = "studio")]
             Command::Studio {
                 list_themes,
                 probe_terminal,
@@ -4623,6 +4979,22 @@ mod live_output_contract_tests {
                     Cli::try_parse_from(["rustel", "studio", flag]).expect("the arguments parse");
                 assert!(!cli.checks_for_updates(true, false), "{flag}");
             }
+            for args in [vec!["rustel", "lsp"], vec!["rustel", "lsp", "--stdio"]] {
+                let cli = Cli::try_parse_from(&args).expect("lsp parses");
+                assert!(!cli.checks_for_updates(true, false), "{args:?}");
+                assert!(!cli.wants_json(), "{args:?}");
+            }
+            let doc_all = Cli::try_parse_from(["rustel", "doc", "--all", "--json"])
+                .expect("doc --all --json parses");
+            assert!(doc_all.wants_json());
+            assert!(
+                Cli::try_parse_from(["rustel", "doc"]).is_err(),
+                "doc needs either a name or --all"
+            );
+            assert!(
+                Cli::try_parse_from(["rustel", "doc", "lpf", "--all"]).is_err(),
+                "doc rejects name together with --all"
+            );
         }
     }
 
@@ -6159,6 +6531,123 @@ mod tests {
             bounded.into_inner().expect("bounded controls").len(),
             MAX_PENDING_UI_SLIDERS
         );
+    }
+
+    #[test]
+    fn ui_control_discrete_commands_parse_bound_and_apply_with_acks() {
+        let score = "$: s(\"bd\").note(60)\n$: s(\"sawtooth\").note(67)";
+        let mut session = Session::new().expect("session");
+        session.set_lane_tracking_enabled(true);
+        session.evaluate(score).expect("evaluate score");
+        let generation = session.generation();
+        let lanes = session.active_ui_lanes();
+        assert_eq!(lanes.len(), 2);
+
+        let mut layout = UiLayoutDelivery::default();
+        assert!(
+            observe_ui_layout_if_audible_with_lanes(
+                &mut layout,
+                score,
+                lanes.clone(),
+                generation,
+                generation,
+            )
+            .expect("observe layout with lanes")
+        );
+        assert!(layout.try_deliver(|envelope| {
+            assert_eq!(envelope.ui_layout.lanes, lanes);
+            Ok(())
+        }));
+        let revision = layout.source_revision.clone().expect("source revision");
+
+        let lines = [
+            serde_json::json!({
+                "ui_control": {
+                    "version": 1,
+                    "kind": "lane_solo",
+                    "lane": lanes[1].id,
+                    "generation": generation,
+                    "source_revision": revision,
+                    "request": "req-solo"
+                }
+            }),
+            serde_json::json!({
+                "ui_control": {
+                    "version": 1,
+                    "kind": "lane_mute",
+                    "lane": lanes[0].id,
+                    "muted": true,
+                    "request": "req-mute"
+                }
+            }),
+            serde_json::json!({
+                "ui_control": {
+                    "version": 1,
+                    "kind": "lane_transpose",
+                    "lane": lanes[1].id,
+                    "semitones": 12,
+                    "request": "req-tr"
+                }
+            }),
+            serde_json::json!({
+                "ui_control": {
+                    "version": 1,
+                    "kind": "lane_transpose",
+                    "lane": lanes[1].id,
+                    "semitones": 99,
+                    "request": "req-bad-tr"
+                }
+            }),
+            serde_json::json!({
+                "ui_control": {
+                    "version": 1,
+                    "kind": "tempo",
+                    "bpm": 144.0,
+                    "request": "req-tempo"
+                }
+            }),
+            serde_json::json!({
+                "ui_control": {
+                    "version": 1,
+                    "kind": "transport",
+                    "action": "stop",
+                    "request": "req-stop"
+                }
+            }),
+        ];
+        let mut wire = Vec::new();
+        for line in &lines {
+            wire.extend_from_slice(line.to_string().as_bytes());
+            wire.push(b'\n');
+        }
+        let pending = std::sync::Mutex::new(std::collections::BTreeMap::new());
+        let (tx, rx) = std::sync::mpsc::sync_channel(MAX_PENDING_UI_COMMANDS);
+        read_ui_controls_with_commands(std::io::Cursor::new(wire), &pending, Some(&tx));
+        drop(tx);
+        let commands: Vec<UiDiscreteControl> = rx.try_iter().collect();
+        assert_eq!(commands.len(), 6);
+
+        let outcomes: Vec<UiDiscreteApplyOutcome> = commands
+            .into_iter()
+            .map(|cmd| apply_ui_discrete_control(&mut session, &layout, cmd, 0.5, 0.05, None))
+            .collect();
+        assert!(outcomes[0].needs_requery);
+        assert_eq!(
+            outcomes[0].ack.as_ref().map(|a| a.ui_control_ack.accepted),
+            Some(true)
+        );
+        assert_eq!(session.lane_controls().solo(), Some(lanes[1].id));
+        assert!(session.lane_controls().is_muted(lanes[0].id));
+        assert_eq!(session.lane_controls().transpose_of(lanes[1].id), 12);
+        // Out-of-range transpose rejected cleanly.
+        assert!(!outcomes[3].needs_requery);
+        assert_eq!(
+            outcomes[3].ack.as_ref().map(|a| a.ui_control_ack.accepted),
+            Some(false)
+        );
+        // BPM 144 -> 0.6 cps.
+        assert!((session.cps() - 0.6).abs() < 1e-9);
+        assert!(session.transport().is_stopped());
     }
 
     #[test]

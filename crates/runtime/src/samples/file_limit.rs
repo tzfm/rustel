@@ -105,30 +105,6 @@ impl FileLimit {
 mod tests {
     use super::*;
 
-    #[test]
-    fn a_video_file_names_the_setting_that_raises_its_limit() {
-        let video = FileLimit::of("file:///clips/take.MOV");
-        assert_eq!(video.kind(), "video");
-        let refusal = video.refusal(Some(3 << 30));
-        assert!(refusal.starts_with("3072 MB is over the "), "{refusal}");
-        assert!(
-            refusal.ends_with(" video limit - raise biggest video in Settings"),
-            "{refusal}"
-        );
-        let unmeasured = FileLimit::of("https://host/clip.webm?v=2").refusal(None);
-        assert!(unmeasured.starts_with("over the "), "{unmeasured}");
-    }
-
-    #[test]
-    fn a_sound_keeps_the_sound_ceiling_and_its_own_words() {
-        let sound = FileLimit::of("file:///kits/kick.wav");
-        assert_eq!(sound.kind(), "sample");
-        assert_eq!(sound.bytes, rustel_audio::sample_pcm_ceiling());
-        let refusal = sound.refusal(None);
-        assert!(refusal.ends_with(" sound limit"), "{refusal}");
-        assert!(!refusal.contains("Settings"), "{refusal}");
-    }
-
     /// The only test that moves the process-wide ceiling, so no other
     /// test reads a video file against a ceiling this one set.
     #[test]

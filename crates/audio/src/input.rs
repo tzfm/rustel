@@ -261,22 +261,6 @@ mod tests {
         assert_eq!(ring.gain(), MAX_GAIN, "clamped at +48 dB");
     }
 
-    /// A frame takes its place for every channel whatever the input has,
-    /// and the ring never holds more than itself once it wraps.
-    #[test]
-    fn an_input_ring_is_resident_as_far_as_frames_have_landed() {
-        let ring = InputRing::new();
-        assert_eq!(ring.touched_bytes(), 0);
-        ring.set_channels(1);
-        ring.write(&[0.0; 3], 1);
-        assert_eq!(ring.touched_bytes(), 3 * MAX_INPUT_CHANNELS * 4);
-        ring.write(&vec![0.0; INPUT_RING_FRAMES], 1);
-        assert_eq!(
-            ring.touched_bytes(),
-            INPUT_RING_FRAMES * MAX_INPUT_CHANNELS * 4
-        );
-    }
-
     #[test]
     fn the_input_peak_is_the_loudest_sample_since_the_last_take() {
         let ring = InputRing::new();

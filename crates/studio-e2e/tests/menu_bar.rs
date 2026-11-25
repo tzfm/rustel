@@ -241,16 +241,16 @@ fn transport_update_evaluates() {
 }
 
 /// Rows that cannot act are greyed and choosing them does nothing: with
-/// one scene, Scene ▸ Delete scene is disabled, and its mnemonic is inert.
+/// one scene, Scene ▸ Next scene is disabled, and its mnemonic is inert.
 #[test]
 fn a_greyed_row_does_not_act() {
     let mut studio = hermetic();
 
-    // One score scene that cannot be deleted: the starter is the last.
+    // One scene, so there is no next one to step to.
     let before = studio.scene_names();
     studio.press(KeyCode::F(1), KeyModifiers::NONE);
     studio.press(KeyCode::Char('s'), KeyModifiers::NONE);
-    studio.press(KeyCode::Char('t'), KeyModifiers::NONE); // Delete scene: greyed
+    studio.press(KeyCode::Char('x'), KeyModifiers::NONE); // Next scene: greyed
 
     assert_eq!(studio.scene_names(), before, "a greyed row is inert");
     assert!(studio.menu_open(), "a greyed row leaves the menu open");

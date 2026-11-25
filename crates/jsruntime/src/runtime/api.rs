@@ -57,7 +57,22 @@ impl JsRuntime {
             last_good_timeline: RefCell::new(None),
             pointer,
             script_may_have_run: Cell::new(true),
+            lane_tagging: Cell::new(false),
         }
+    }
+
+    /// Enable or disable attaching lane ids to haps produced by subsequent
+    /// evaluations. Clears native evaluation memoization when toggled so the
+    /// next evaluation rebuilds with the updated setting.
+    pub fn set_lane_tagging(&self, enabled: bool) {
+        if self.lane_tagging.replace(enabled) != enabled {
+            *self.native_memo.borrow_mut() = native::Memo::default();
+        }
+    }
+
+    /// Whether score evaluations currently tag haps with their lane id.
+    pub fn lane_tagging(&self) -> bool {
+        self.lane_tagging.get()
     }
 
     /// The lazy QuickJS bridge cells, initialized on first JavaScript use.

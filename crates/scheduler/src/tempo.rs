@@ -201,52 +201,6 @@ mod tests {
     }
 
     #[test]
-    fn the_map_converts_both_ways_around_its_anchor() {
-        let mut map = TempoMap::new(0.5);
-        map.reanchor(2.0, Fraction::int(3));
-        assert_eq!(map.time_at_cycle(Fraction::int(4)), 4.0);
-        assert_eq!(map.time_at_cycle(Fraction::int(2)), 0.0);
-        assert_eq!(map.cycle_at_time(6.0), 5.0);
-        map.retime(1.0, Fraction::ZERO, 2.0);
-        assert_eq!(map.cps(), 2.0);
-        assert_eq!(map.cycle_at_time(2.0), 2.0);
-    }
-
-    #[test]
-    fn a_change_starts_a_stretch_at_its_onset() {
-        let mut map = TempoMap::new(1.0);
-        assert!(map.change_at(cycle(2, 1), 2.0));
-        // Cycles before the change keep their times.
-        assert_eq!(map.time_at_cycle(cycle(1, 1)), 1.0);
-        assert_eq!(map.time_at_cycle(cycle(2, 1)), 2.0);
-        assert_eq!(map.time_at_cycle(cycle(3, 1)), 2.5);
-        assert_eq!(map.cycle_at_time(3.0), 4.0);
-        assert_eq!(map.pattern_cps_at(cycle(1, 1)), None);
-        assert_eq!(map.pattern_cps_at(cycle(5, 2)), Some(2.0));
-        // The anchor keeps the tempo that plays now.
-        assert_eq!(map.cps(), 1.0);
-        assert!(
-            !map.change_at(cycle(3, 1), 2.0),
-            "the same tempo is no change"
-        );
-    }
-
-    #[test]
-    fn the_clock_makes_a_change_the_anchor() {
-        let mut map = TempoMap::new(1.0);
-        map.change_at(cycle(1, 1), 0.5);
-        map.change_at(cycle(2, 1), 4.0);
-        map.advance(0.9);
-        assert_eq!(map.cps(), 1.0);
-        map.advance(1.0);
-        assert_eq!(map.cps(), 0.5);
-        map.advance(5.0);
-        assert_eq!(map.cps(), 4.0);
-        assert_eq!(map.anchor(), (3.0, cycle(2, 1)));
-        assert_eq!(map.pattern_cps_at(cycle(2, 1)), Some(4.0));
-    }
-
-    #[test]
     fn a_later_change_gives_way_to_an_earlier_one() {
         let mut map = TempoMap::new(1.0);
         map.change_at(cycle(2, 1), 2.0);

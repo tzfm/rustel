@@ -132,6 +132,19 @@ fn an_arrow_of_controls_plays_as_javascript_plays_it() {
 }
 
 #[test]
+fn a_distortion_shortcut_plays_as_javascript_plays_it() {
+    let scores = [
+        "$: note(\"d1 e1\").s(\"saw\").diode(0.9).lpf(800)",
+        "$: s(\"bd*4\").fold(\"<2 4>\", 0.5)",
+        "$: s(\"hh*8\").soft(\"3:0.4\").gain(0.8)",
+        "$: s(\"bd*2\").every(2, x => x.hard(sine.range(1, 4)))",
+    ];
+    for score in scores {
+        assert!(plays_as_javascript_plays_it(score, score), "{score}");
+    }
+}
+
+#[test]
 fn the_script_engine_starts_at_the_first_score_that_needs_it() {
     let mut session = Session::with_config(SessionConfig::default()).expect("a session");
     let native = "$: note(\"c e g a\").s(\"sawtooth\").every(2, x => x.fast(2))";

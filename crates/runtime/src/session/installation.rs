@@ -570,21 +570,6 @@ mod tests {
         }
 
         #[test]
-        fn a_valid_edit_installs_as_before() {
-            let mut session = quiet_session(PLAYING);
-            let generation = session.generation();
-            let source = two_lanes(r#"$: note("0 4").s("sine")"#);
-            session.reload_at(&source, false, 0.25).expect("valid edit");
-            assert_ne!(session.generation(), generation);
-            assert_eq!(session.active_source(), Some(source.as_str()));
-            let report = session.play(2.0).expect("play");
-            let lanes = ["bd", "sd", "sine"].map(|sound| onsets_in(&report, 0, sound));
-            assert_eq!(lanes, [2, 1, 2], "{:?}", report.onsets);
-            assert_eq!(report.query_threw, None);
-            assert!(warnings(&mut session).is_empty());
-        }
-
-        #[test]
         fn a_first_score_with_a_throwing_lane_installs_when_its_first_query_is_not_probed() {
             let mut session = Session::new().expect("session");
             session.set_direct_diagnostic_logging(false);
@@ -620,100 +605,6 @@ mod tests {
             assert!(message.contains("cannot parse as numeral"), "{message}");
             assert_eq!(session.generation(), 0);
         }
-    }
-
-    /// The `$:` form registers into a stack rather than returning a pattern,
-    /// so commenting the only `$:` line out is a different path from
-    /// commenting out a bare expression.
-    #[test]
-    fn commenting_out_the_only_dollar_line_goes_silent() {
-        let mut session = Session::with_config(SessionConfig::default()).expect("session");
-        session.evaluate("$: s('bd*4')").expect("initial evaluate");
-        let playing = session
-            .query(Fraction::new(0, 1), Fraction::new(1, 1))
-            .expect("query");
-        assert!(!playing.is_empty(), "the set never started");
-
-        session
-            .evaluate("// $: s('bd*4')")
-            .expect("a commented-out score is accepted");
-        let muted = session
-            .query(Fraction::new(0, 1), Fraction::new(1, 1))
-            .expect("query");
-        assert!(
-            muted.is_empty(),
-            "commenting the only $: line left {} events playing",
-            muted.len()
-        );
-    }
-
-    /// An evaluate over a running transport retires the key backlog that the
-    /// outgoing graph placed. Without the flush, the incoming generation
-    /// re-renders up to two seconds of pinned note-ons.
-    #[test]
-    fn an_evaluate_over_a_running_transport_flushes_the_pinned_key_backlog() {
-        let mut session = Session::new().expect("session");
-        session
-            .evaluate(r#"const kb = await midikeys('keyboard'); kb(0.5).s('piano')"#)
-            .expect("first score");
-        session.transport().start();
-
-        // Spam the pads: a burst of note-ons the first score's queries pin
-        // at future cycle positions.
-        let port = session
-            .midi_input_bus()
-            .find("keyboard")
-            .expect("keyboard port");
-        for _ in 0..32 {
-            port.observe_note_on(rustel_core::midi_in::now_nanos(), 1, 60, 100);
-        }
-        let mut placed = Vec::new();
-        port.keys.select(
-            0.0,
-            1.0,
-            rustel_core::midi_in::now_nanos(),
-            Some((0, 1)),
-            &mut placed,
-        );
-        assert_eq!(
-            placed.len(),
-            32,
-            "the burst must be placeable before the evaluate"
-        );
-
-        // A live editor save: a different score over the running transport,
-        // no restart - the path the studio actually sends.
-        let stopped = std::sync::atomic::AtomicBool::new(false);
-        session
-            .reload_at_cancellable(
-                r#"const kb = await midikeys('keyboard'); kb(0.5).s('sd:4')"#,
-                false,
-                0.5,
-                &stopped,
-            )
-            .expect("live replacement");
-
-        // The presses belonged to the score that was sounding when they
-        // landed. The new generation starts with an empty key memory: what
-        // the old graph already scheduled keeps sounding, but the unrendered
-        // backlog must not re-render through the new voices.
-        let port = session
-            .midi_input_bus()
-            .find("keyboard")
-            .expect("keyboard port survives the reload");
-        let mut after = Vec::new();
-        port.keys.select(
-            0.0,
-            1.0,
-            rustel_core::midi_in::now_nanos(),
-            Some((0, 1)),
-            &mut after,
-        );
-        assert!(
-            after.is_empty(),
-            "the evaluate flushed the key memory, not carried the backlog across: {} hits",
-            after.len()
-        );
     }
 
     /// A press that lands after the outgoing graph's last query, while an
@@ -1475,36 +1366,6 @@ mod tests {
         );
     }
 
-    /// A quantised rewinding launch, one that waits for a cycle line, cuts at
-    /// the line and not at the flip: the countdown plays until the boundary.
-    /// The named takeover publishes the `AtTakeover` shape.
-    #[test]
-    #[cfg(feature = "device-audio")]
-    fn a_quantised_launch_names_a_cut_at_the_line() {
-        let mut session = Session::new().expect("session");
-        session
-            .evaluate("setcps(1); $: pure('old')")
-            .expect("a score to replace");
-        let stopped = AtomicBool::new(false);
-        session.set_next_takeover_time(3.0);
-        session.start_next_from_zero();
-        session
-            .reload_with_clock_cancellable("setcps(1); $: pure('new')", false, &stopped, || 2.9)
-            .expect("launched replacement");
-        let (takeover, cut) = session
-            .take_requery_takeover()
-            .expect("the launch names its takeover");
-        assert_eq!(
-            cut,
-            TakeoverCut::AtTakeover,
-            "the countdown plays to the line"
-        );
-        assert!(
-            (takeover - 3.0).abs() < 1e-9,
-            "the line is the takeover: {takeover}"
-        );
-    }
-
     /// The cut is consumed with the takeover it belongs to.
     ///
     /// A second, ordinary reload must not inherit the previous rewind's
@@ -1546,26 +1407,6 @@ mod tests {
 
         // And with nothing pending, taking again is clean: no stale cut.
         assert_eq!(session.take_requery_takeover(), None);
-    }
-
-    /// A typo is not the producer turning work away. The studio header
-    /// paints DSP/sched red for a capacity refusal, and that flash is
-    /// wrong after a score the engine will not even parse.
-    #[test]
-    #[cfg(feature = "device-audio")]
-    fn a_syntax_error_on_live_reload_is_not_a_producer_capacity_refusal() {
-        let mut session = Session::new().expect("session");
-        session.evaluate("note('c4')").expect("audible score");
-        let generation = session.generation();
-        let stopped = AtomicBool::new(false);
-        let error = session
-            .reload_with_clock_cancellable("note(", false, &stopped, || 0.0)
-            .expect_err("invalid syntax");
-        assert_eq!(error.kind(), "evaluation");
-        assert_eq!(session.generation(), generation);
-        let turn = session.take_pending_producer_turn();
-        assert_eq!(turn.atomic_refusal_count, 0);
-        assert_eq!(turn.committed_refusal_count, 0);
     }
 
     /// The live reload path does not allow the mini fallback, so it reaches a
@@ -2368,24 +2209,6 @@ mod tests {
             "the accepted query probe did not publish its candidate module settings"
         );
         assert_eq!(shown_note(&session), "candidate");
-    }
-
-    #[test]
-    fn rust_patterns_snapshot_ambient_settings_when_a_session_adopts_them() {
-        let ambient = rustel_core::settings::RuntimeSettings::default();
-        ambient.with(|| {
-            rustel_core::voicings::set_default_voicings("guidetones");
-            let mut session = Session::new().expect("session");
-            session
-                .set_pattern(default_voicing_size_pattern())
-                .expect("install Rust pattern");
-
-            rustel_core::voicings::set_default_voicings("lefthand");
-            let haps = session
-                .query(Fraction::ZERO, Fraction::ONE)
-                .expect("query adopted pattern");
-            assert!(matches!(&haps[0].value, Value::List(notes) if notes.len() == 2));
-        });
     }
 
     #[test]

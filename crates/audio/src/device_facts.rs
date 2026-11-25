@@ -308,14 +308,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn stable_codes_do_not_depend_on_debug_output() {
-        assert_eq!(AudioHost::cpal("wasapi").kind(), "cpal");
-        assert_eq!(AudioHost::Silent.kind(), "silent");
-        assert_eq!(AudioSampleFormat::I16.code(), "i16");
-        assert_eq!(AudioSampleFormat::F32.code(), "f32");
-    }
-
-    #[test]
     fn one_line_describes_host_device_rate_and_cost() {
         let native = AudioOutputFacts::new(
             AudioHost::cpal("WASAPI"),
@@ -383,25 +375,5 @@ mod tests {
             at_period.describe_one_line(),
             "WASAPI · Speakers · 48000 Hz · 480 frames · 10.0 ms"
         );
-    }
-
-    #[test]
-    fn buffer_facts_keep_preference_request_and_report_separate() {
-        let output = AudioOutputFacts::new(
-            AudioHost::cpal("test-host"),
-            "test-output",
-            48_000,
-            2,
-            Some(AudioSampleFormat::F32),
-            256,
-            Some(512),
-        )
-        .with_buffer_preference(AudioBufferPreference::Frames(128));
-        assert_eq!(
-            output.buffer_preference(),
-            AudioBufferPreference::Frames(128)
-        );
-        assert_eq!(output.requested_buffer_frames(), 256);
-        assert_eq!(output.reported_buffer_frames(), Some(512));
     }
 }

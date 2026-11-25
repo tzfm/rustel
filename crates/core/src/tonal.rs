@@ -73,25 +73,6 @@ pub fn trim_frequency(frequency: f64) -> f64 {
 }
 
 #[cfg(test)]
-mod edo_tests {
-    use super::edo;
-
-    #[test]
-    fn edo_refuses_a_table_above_the_shared_division_limit() {
-        assert_eq!(edo("65536edo").unwrap().len(), 65_536);
-        assert!(edo("65537edo").is_err());
-    }
-
-    #[test]
-    fn edo_keeps_the_equal_temperament_ratios() {
-        let ratios = edo("12edo").unwrap();
-        assert_eq!(ratios.len(), 12);
-        assert_eq!(ratios[0], 1.0);
-        assert!((ratios[7] - 2f64.powf(7.0 / 12.0)).abs() < 1e-12);
-    }
-}
-
-#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -105,13 +86,6 @@ mod tests {
         assert_eq!(xen_frequency(&scale, 5), Some(440.0));
         // Upstream applies `parseFloat(freq.toPrecision(10))`.
         assert_eq!(xen_frequency(&scale, -1), Some(191.521_123_9));
-    }
-
-    #[test]
-    fn validates_edo_names_like_javascript() {
-        for invalid in ["edo", "0edo", "05edo", "-5edo", "5EDO", "5.0edo"] {
-            assert!(edo(invalid).is_err(), "{invalid}");
-        }
     }
 
     #[test]

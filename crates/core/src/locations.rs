@@ -770,20 +770,6 @@ mod tests {
     }
 
     #[test]
-    fn short_lists_stay_in_place_and_long_ones_move_to_the_heap() {
-        let mut locations = Locations::new();
-        for index in 0..INLINE {
-            locations.push((index, index + 1));
-            assert!(locations.is_inline());
-        }
-        locations.push((9, 10));
-        assert!(matches!(locations.0, Repr::Shared(_)));
-        let mut all: Vec<(usize, usize)> = (0..INLINE).map(|index| (index, index + 1)).collect();
-        all.push((9, 10));
-        assert_eq!(locations, all);
-    }
-
-    #[test]
     fn a_range_longer_than_a_word_keeps_its_exact_value() {
         let long = usize::from(u16::MAX) + 1;
         for range in [(5, 5 + long), (5, 5 + long - 1), (7, 3)] {

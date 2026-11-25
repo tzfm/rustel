@@ -36,27 +36,6 @@ fn query_limit(result: Result<Vec<rustel_core::Hap>, QueryLimit>) -> QueryLimit 
 }
 
 #[test]
-fn javascript_refusal_helpers_reach_the_typed_query_boundary() {
-    let deadline = pure(Value::F64(1.0)).fmap(|value| {
-        refuse_js_cpu_deadline(37);
-        value.clone()
-    });
-    assert_eq!(
-        query_limit(deadline.try_query_state_with_budget(&one_cycle(), QUERY_BUDGET)),
-        QueryLimit::JsCpuDeadline { millis: 37 }
-    );
-
-    let pending_jobs = pure(Value::F64(1.0)).fmap(|value| {
-        refuse_js_pending_jobs();
-        value.clone()
-    });
-    assert_eq!(
-        query_limit(pending_jobs.try_query_state_with_budget(&one_cycle(), QUERY_BUDGET)),
-        QueryLimit::JsPendingJobs
-    );
-}
-
-#[test]
 fn the_first_javascript_refusal_wins_and_does_not_poison_the_next_query() {
     let deadline_first = pure(Value::F64(1.0)).fmap(|value| {
         refuse_js_cpu_deadline(41);

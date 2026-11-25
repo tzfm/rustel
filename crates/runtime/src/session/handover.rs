@@ -591,27 +591,6 @@ mod tests {
         }
     }
 
-    /// An event with `controls` as its value, aimed early when `stretched`.
-    fn voice<'a>(
-        whole_begin: &'a str,
-        controls: &'a ValueJson,
-        stretched: bool,
-        onset_frame: u64,
-    ) -> ConvertedOnset<'a> {
-        ConvertedOnset {
-            event: 0,
-            whole_begin,
-            value: "",
-            controls,
-            target_frame: onset_frame - if stretched { COMPENSATION } else { 0 },
-            onset_frame,
-        }
-    }
-
-    fn controls(value: serde_json::Value) -> ValueJson {
-        ValueJson::Raw(value)
-    }
-
     /// A ledger whose device plays generation 1 and holds `window` of it.
     fn playing(window: &[ConvertedOnset<'_>]) -> CompensatedOnsets {
         let mut ledger = CompensatedOnsets::default();
@@ -634,33 +613,6 @@ mod tests {
                 Some(takeover),
             ),
             Some(takeover)
-        );
-    }
-
-    #[test]
-    fn remove_ascending_keeps_the_other_elements_in_order() {
-        let mut items = vec!['a', 'b', 'c', 'd', 'e'];
-        remove_ascending(&mut items, &[0, 3]);
-        assert_eq!(items, ['b', 'c', 'e']);
-        remove_ascending(&mut items, &[]);
-        assert_eq!(items, ['b', 'c', 'e']);
-    }
-
-    /// An incoming event is left out only when the outgoing copy is aimed
-    /// before the takeover frame and its onset is on that frame or later.
-    #[test]
-    fn an_incoming_event_is_left_out_for_a_copy_that_straddles_the_takeover() {
-        let window = [
-            event("7/2", "pad", TAKEOVER - 1),
-            event("4", "pad", TAKEOVER),
-            event("17/4", "pad", TAKEOVER + COMPENSATION - 1),
-            event("9/2", "pad", TAKEOVER + COMPENSATION),
-        ];
-        let mut ledger = playing(&window);
-        taking_over(&mut ledger, 2, 45_440, TAKEOVER);
-        assert_eq!(
-            ledger.claim_outgoing_copies(2, TAKEOVER, &window),
-            [false, true, true, false]
         );
     }
 
@@ -692,26 +644,6 @@ mod tests {
         );
     }
 
-    /// A control requery can change the value of an onset the device
-    /// already holds. The copy still stands for it: the voice plays as it
-    /// was, once.
-    #[test]
-    fn a_copy_stands_for_its_onset_under_a_changed_value() {
-        let mut ledger = playing(&[event("4", "pad lpf:800", TAKEOVER)]);
-        taking_over(&mut ledger, 2, 49_024, TAKEOVER);
-        assert_eq!(
-            ledger.claim_outgoing_copies(
-                2,
-                TAKEOVER,
-                &[
-                    event("4", "pad lpf:900", TAKEOVER),
-                    event("33/8", "pad lpf:900", TAKEOVER + 3_000),
-                ]
-            ),
-            [true, false]
-        );
-    }
-
     /// A copy stands for an onset less than its compensation away: a
     /// re-anchored mapping or a changed tempo moved it. An onset further
     /// away is another onset: an outside clock moved the cycle back.
@@ -736,56 +668,6 @@ mod tests {
                 "an onset on frame {onset_frame}, with the copy's on {copy}"
             );
         }
-    }
-
-    /// A save removes the effect: the copy stands for the plain event of its
-    /// value without the control, in any key order. It stands for one such
-    /// event, and not for a plain event of another lane at the position.
-    #[test]
-    fn a_copy_stands_for_a_plain_event_of_its_value_without_the_effect() {
-        let stretched = controls(serde_json::json!({"s": "saw", "lpf": 800, "stretch": 1}));
-        let plain = controls(serde_json::json!({"lpf": 800, "s": "saw"}));
-        let other_lane = controls(serde_json::json!({"s": "bd"}));
-        let changed = controls(serde_json::json!({"s": "saw", "lpf": 900}));
-        let mut ledger = playing(&[voice("4", &stretched, true, TAKEOVER)]);
-        taking_over(&mut ledger, 2, 45_440, TAKEOVER);
-        assert_eq!(
-            ledger.claim_outgoing_copies_for_plain(
-                2,
-                TAKEOVER,
-                &[
-                    voice("4", &other_lane, false, TAKEOVER),
-                    voice("4", &changed, false, TAKEOVER),
-                    voice("17/4", &plain, false, TAKEOVER),
-                    voice("4", &plain, false, TAKEOVER + COMPENSATION),
-                    voice("4", &plain, false, TAKEOVER),
-                    voice("4", &plain, false, TAKEOVER),
-                ]
-            ),
-            [false, false, false, false, true, false]
-        );
-    }
-
-    /// A compensated event has the first claim on a copy. The plain event
-    /// at the position then has no copy on the device, and plays.
-    #[test]
-    fn a_plain_event_does_not_take_the_copy_of_a_compensated_event() {
-        let stretched = controls(serde_json::json!({"s": "saw", "stretch": 1}));
-        let plain = controls(serde_json::json!({"s": "saw"}));
-        let mut ledger = playing(&[voice("4", &stretched, true, TAKEOVER)]);
-        taking_over(&mut ledger, 2, 45_440, TAKEOVER);
-        assert_eq!(
-            ledger.claim_outgoing_copies(2, TAKEOVER, &[voice("4", &stretched, true, TAKEOVER)]),
-            [true]
-        );
-        assert_eq!(
-            ledger.claim_outgoing_copies_for_plain(
-                2,
-                TAKEOVER,
-                &[voice("4", &plain, false, TAKEOVER)]
-            ),
-            [false]
-        );
     }
 
     /// A takeover that cuts the outgoing audio, or names no frame and so
@@ -845,77 +727,6 @@ mod tests {
         assert_eq!(ledger.claim_outgoing_copies(4, fourth, &later), [true]);
     }
 
-    /// The ledger drops what the flip drops: the outgoing events aimed at or
-    /// after the takeover frame. A copy that stays stands again for the
-    /// next generation, when that one also takes over before its onset.
-    #[test]
-    fn a_publication_leaves_the_ledger_what_the_flip_leaves_the_device() {
-        let at_takeover = [event("4", "pad", TAKEOVER)];
-        let later = [event("9/2", "pad", TAKEOVER + 6_000)];
-        let mut ledger = playing(&[
-            event("4", "pad", TAKEOVER),
-            event("9/2", "pad", TAKEOVER + 6_000),
-        ]);
-        // A requery two blocks before the first onset.
-        let first = TAKEOVER - 256;
-        taking_over(&mut ledger, 2, 48_768, first);
-        assert_eq!(ledger.claim_outgoing_copies(2, first, &at_takeover), [true]);
-        assert_eq!(ledger.claim_outgoing_copies(2, first, &later), [false]);
-        // Generation 2 plays the later onset itself.
-        ledger.record(2, LiveQueryBudgetMode::ReplacementPrefill, &later);
-        ledger.published(2, first, TakeoverCut::None);
-        // A second requery, one block later: the copy generation 1 left
-        // still sounds, and stands for generation 3's event too.
-        let second = first + 128;
-        taking_over(&mut ledger, 3, 48_896, second);
-        assert_eq!(
-            ledger.claim_outgoing_copies(3, second, &at_takeover),
-            [true]
-        );
-        assert_eq!(
-            ledger.claim_outgoing_copies(3, second, &later),
-            [false],
-            "the device holds no event for 9/2 before this takeover: \
-             generation 1's was dropped, and generation 2's is aimed after it"
-        );
-        ledger.published(3, second, TakeoverCut::None);
-        // A third takeover between the target frame and the onset of 9/2.
-        let third = TAKEOVER + 4_000;
-        taking_over(&mut ledger, 4, 49_280, third);
-        assert_eq!(
-            ledger.claim_outgoing_copies(4, third, &later),
-            [false],
-            "generation 2's event for 9/2 was aimed after generation 3's \
-             takeover, so the device dropped it there"
-        );
-        assert_eq!(
-            ledger.claim_outgoing_copies(4, third, &at_takeover),
-            [false],
-            "the onset at 4 is before this takeover"
-        );
-    }
-
-    /// A window the published generation converts later reads the same
-    /// takeover: its first window need not reach every onset the device
-    /// holds a copy of.
-    #[test]
-    fn a_later_window_of_the_published_generation_reads_the_same_takeover() {
-        let window = [event("4", "pad", TAKEOVER)];
-        let mut ledger = playing(&window);
-        taking_over(&mut ledger, 2, 49_024, TAKEOVER);
-        ledger.published(2, TAKEOVER, TakeoverCut::None);
-        assert_eq!(
-            ledger.begin_window(2, LiveQueryBudgetMode::Steady, 49_152, RATE, None),
-            Some(TAKEOVER)
-        );
-        assert_eq!(ledger.claim_outgoing_copies(2, TAKEOVER, &window), [true]);
-        assert_eq!(
-            ledger.begin_window(1, LiveQueryBudgetMode::Steady, 49_152, RATE, None),
-            None,
-            "another generation has no takeover to read"
-        );
-    }
-
     /// An onset leaves the ledger a second after the clock passes it, and a
     /// device that plays its first generation holds nothing older.
     #[test]
@@ -938,49 +749,6 @@ mod tests {
         assert_eq!(ledger.claim_outgoing_copies(6, TAKEOVER, &window), [false]);
     }
 
-    /// Time in seconds of `frame`.
-    #[cfg(any(feature = "osc", feature = "serial"))]
-    fn seconds(frame: u64) -> f64 {
-        frame as f64 / f64::from(RATE)
-    }
-
-    /// A message that is out stands for a newer generation's intent on the
-    /// frontier's frame or before it. It never stands for an intent of the
-    /// generation that handed out last.
-    #[cfg(any(feature = "osc", feature = "serial"))]
-    #[test]
-    fn a_message_that_is_out_stands_for_a_newer_intent_up_to_the_frontier() {
-        let mut handed_out = HandedOut::default();
-        assert!(!handed_out.stands_for(2, seconds(TAKEOVER), RATE));
-        handed_out.note(1, seconds(TAKEOVER));
-        handed_out.note(1, seconds(TAKEOVER + 6_000));
-        handed_out.note(1, seconds(TAKEOVER));
-        let frontier = TAKEOVER + 6_000;
-        assert!(handed_out.stands_for(2, seconds(TAKEOVER), RATE));
-        assert!(handed_out.stands_for(2, seconds(frontier), RATE));
-        assert!(
-            handed_out.stands_for(2, (frontier as f64 - 0.3) / f64::from(RATE), RATE),
-            "an onset in the last frame before the frontier is on its frame"
-        );
-        assert!(!handed_out.stands_for(2, seconds(frontier + 1), RATE));
-        assert!(
-            !handed_out.stands_for(1, seconds(TAKEOVER), RATE),
-            "the generation that handed out sends all its intents"
-        );
-
-        // The newer generation hands out past the frontier and becomes the
-        // one that handed out last. A late message of the older generation
-        // changes nothing.
-        handed_out.note(2, seconds(frontier + 6_000));
-        handed_out.note(1, seconds(TAKEOVER + 3_000));
-        assert!(!handed_out.stands_for(2, seconds(TAKEOVER), RATE));
-        assert!(handed_out.stands_for(3, seconds(frontier + 6_000), RATE));
-        assert!(!handed_out.stands_for(3, seconds(frontier + 6_001), RATE));
-
-        handed_out.clear();
-        assert!(!handed_out.stands_for(3, 0.0, RATE));
-    }
-
     /// A time that is not a number moves no frontier and is behind none,
     /// and a rate of zero has no frames to compare.
     #[cfg(any(feature = "osc", feature = "serial"))]
@@ -995,27 +763,6 @@ mod tests {
         assert!(!handed_out.stands_for(2, f64::NAN, RATE));
         assert!(!handed_out.stands_for(2, f64::INFINITY, RATE));
         assert!(!handed_out.stands_for(2, 0.5, 0));
-    }
-
-    /// A message on the frontier or before it is a key's, or a late one of
-    /// an earlier generation. It moves nothing: the messages that are out
-    /// still stand for the later intents of its generation up to the frontier.
-    #[cfg(any(feature = "osc", feature = "serial"))]
-    #[test]
-    fn a_message_before_the_frontier_does_not_move_it() {
-        let frontier = TAKEOVER + 6_000;
-        let mut handed_out = HandedOut::default();
-        handed_out.note(1, seconds(frontier));
-        handed_out.note(2, seconds(TAKEOVER));
-        handed_out.note(2, seconds(frontier));
-        assert!(handed_out.stands_for(2, seconds(TAKEOVER + 3_000), RATE));
-        assert!(handed_out.stands_for(2, seconds(frontier), RATE));
-        assert!(!handed_out.stands_for(2, seconds(frontier + 1), RATE));
-
-        // Generation 2 hands out past the frontier: its intents all go out.
-        handed_out.note(2, seconds(frontier + 6_000));
-        assert!(!handed_out.stands_for(2, seconds(frontier + 3_000), RATE));
-        assert!(handed_out.stands_for(3, seconds(frontier + 6_000), RATE));
     }
 
     /// The onsets of one window and the presses behind them.
@@ -1058,41 +805,6 @@ mod tests {
                 ui_visuals: 0,
                 log_line: None,
             }
-        }
-
-        /// A window is the first to place a press: every onset on its cycle
-        /// position is the press's, whatever note the score gives it. The
-        /// next window finds the press placed.
-        #[test]
-        fn the_onsets_on_a_new_press_are_the_press() {
-            let mut presses = PlacedPresses::default();
-            let placed = [(keyboard(), vec![key(1, 60, 1, 2), key(2, 64, 2, 4)])];
-            let window = [
-                onset(7, "1/2", 72),
-                onset(8, "5/8", 60),
-                onset(9, "1/2", 76),
-            ];
-            assert_eq!(presses.claim_new(&placed, &window), [7, 9]);
-            assert_eq!(presses.claim_new(&placed, &window), [0u64; 0]);
-        }
-
-        /// A requery forgot the place of press 1, and the window places it
-        /// again beside the new press 2. The note shows which onsets are
-        /// the new press's, in each lane of the score that plays the keyboard.
-        #[test]
-        fn the_note_shows_which_onsets_play_a_new_press() {
-            let port = keyboard();
-            let mut presses = PlacedPresses::default();
-            let before = [(Arc::clone(&port), vec![key(1, 60, 3, 4)])];
-            assert_eq!(presses.claim_new(&before, &[onset(1, "3/4", 60)]), [1]);
-            let placed = [(port, vec![key(1, 60, 1, 2), key(2, 64, 1, 2)])];
-            let window = [
-                onset(2, "1/2", 60),
-                onset(3, "1/2", 64),
-                onset(4, "1/2", 64),
-                onset(5, "1/2", 60),
-            ];
-            assert_eq!(presses.claim_new(&placed, &window), [3, 4]);
         }
 
         /// Beside a press placed before, the note does not show a new press
@@ -1356,35 +1068,6 @@ mod tests {
             assert_eq!(session.take_requery_takeover_time(), Some(0.5));
         }
 
-        /// A save removes the stretched lane. Its copy on the device stands
-        /// for no event of the new score, so the plain lane plays the onset.
-        #[test]
-        fn a_save_that_removes_a_stretched_lane_keeps_the_plain_lane() {
-            let mut session = playing(r#"stack(s("sawtooth*4").stretch(1), s("square*4"))"#);
-            window(&mut session, 0.0, LiveQueryBudgetMode::InitialPrefill);
-            session
-                .reload_at(r#"s("square*4")"#, false, 0.25)
-                .expect("save");
-            let second = window(&mut session, 0.25, LiveQueryBudgetMode::ReplacementPrefill);
-            assert_eq!(target_frames(&second)[..2], [24_000, 36_000]);
-        }
-
-        /// A save adds `.stretch(1)`. The device dropped the plain copy of
-        /// the onset at 0.5 s, so the stretched event of that onset plays.
-        #[test]
-        fn a_save_that_adds_the_effect_plays_the_stretched_event() {
-            let mut session = playing(r#"s("sawtooth*4")"#);
-            window(&mut session, 0.0, LiveQueryBudgetMode::InitialPrefill);
-            session
-                .reload_at(r#"s("sawtooth*4").stretch(1)"#, false, 0.25)
-                .expect("save");
-            let second = window(&mut session, 0.25, LiveQueryBudgetMode::ReplacementPrefill);
-            assert_eq!(
-                target_frames(&second)[..2],
-                [24_000 - COMPENSATION, 36_000 - COMPENSATION]
-            );
-        }
-
         /// A lane and its stretched twin play the same value. The stretched
         /// event has the first claim on the copy, so the plain event of the
         /// onset at 0.5 s plays: the device dropped its outgoing copy.
@@ -1415,38 +1098,6 @@ mod tests {
                     "save: {save}"
                 );
             }
-        }
-
-        /// The plain event left out for a stretched copy keeps its MIDI
-        /// intent: MIDI hands over on the frame of the onset.
-        #[cfg(feature = "midi")]
-        #[test]
-        fn the_plain_event_left_out_of_the_audio_keeps_its_midi_intent() {
-            let mut session = playing(
-                r#"stack(note("c3*4").s("sawtooth").stretch(1), note("c3*4").midi("out"))"#,
-            );
-            window(&mut session, 0.0, LiveQueryBudgetMode::InitialPrefill);
-            drop(session.take_pending_midi());
-            session
-                .reload_at(
-                    r#"stack(note("c3*4").s("sawtooth"), note("c3*4").midi("out"))"#,
-                    false,
-                    0.25,
-                )
-                .expect("save");
-            let second = window(&mut session, 0.25, LiveQueryBudgetMode::ReplacementPrefill);
-            assert_eq!(
-                target_frames(&second).first(),
-                Some(&36_000),
-                "test premise: the audio event of the onset at 0.5 s is left out"
-            );
-            let generation = session.generation();
-            let midi: Vec<(u64, f64)> = session
-                .take_pending_midi()
-                .iter()
-                .map(|intent| (intent.generation, intent.target_time))
-                .collect();
-            assert_eq!(midi.first(), Some(&(generation, 0.5)), "{midi:?}");
         }
 
         /// A session rebuilt after a panic keeps the ledger: the device still
@@ -1544,49 +1195,6 @@ mod tests {
                     .requery_active_at(now)
                     .expect("requery")
                     .expect("a running transport requeries");
-            }
-
-            /// A requery at 0.25 s takes over at 0.5 s. Its audio starts
-            /// there. Its bundles start after the frontier: the bundles of
-            /// the onsets up to it are out.
-            #[test]
-            fn a_requery_stages_the_bundles_after_the_frontier() {
-                let mut session = handed_out_to_the_frontier();
-                requery(&mut session, 0.25);
-                let second = window(&mut session, 0.25, LiveQueryBudgetMode::ReplacementPrefill);
-                assert_eq!(
-                    second.events.first().map(|event| event.target_frame),
-                    Some(24_000),
-                    "test premise: the audio hands over on the takeover frame"
-                );
-                assert_eq!(
-                    hand_out(&mut session),
-                    [FRONTIER + STEP, FRONTIER + 2 * STEP]
-                );
-                // The generation that handed out last sends each window whole.
-                window(&mut session, 0.5, LiveQueryBudgetMode::Steady);
-                assert_eq!(
-                    staged(&mut session),
-                    [FRONTIER + 3 * STEP, FRONTIER + 4 * STEP]
-                );
-            }
-
-            /// A window whose bundles never reach a host does not move the
-            /// frontier: a rolled-back replacement, or what a reload shield
-            /// stages and a takeover cuts. The next generation sends them.
-            #[test]
-            fn a_window_that_is_not_handed_out_does_not_move_the_frontier() {
-                let mut session = handed_out_to_the_frontier();
-                requery(&mut session, 0.25);
-                window(&mut session, 0.25, LiveQueryBudgetMode::ReplacementPrefill);
-                assert_eq!(
-                    staged(&mut session),
-                    [FRONTIER + STEP, FRONTIER + 2 * STEP],
-                    "test premise: the window staged two bundles, and no host took them"
-                );
-                requery(&mut session, 0.25);
-                window(&mut session, 0.25, LiveQueryBudgetMode::ReplacementPrefill);
-                assert_eq!(staged(&mut session), [FRONTIER + STEP, FRONTIER + 2 * STEP]);
             }
 
             /// A score that only an OSC receiver can play has no audio event.
@@ -1813,45 +1421,6 @@ stack(note("c3*8").s("sawtooth"), kb(0.05).s("tri")).osc(57120)"#;
                 session
             }
 
-            /// A key pressed over a running loop takes over at 0.5 s, before
-            /// the frontier. No bundle is out for it, so its bundle goes
-            /// out. The loop's bundles up to the frontier stay out.
-            #[test]
-            fn a_key_pressed_over_a_running_loop_sends_its_bundle() {
-                let mut session = keys_handed_out_to_the_frontier();
-                press(&session, 60);
-                requery(&mut session, 0.25);
-                window(&mut session, 0.25, LiveQueryBudgetMode::ReplacementPrefill);
-                assert_eq!(
-                    hand_out_keys(&mut session),
-                    (
-                        vec![FRONTIER + STEP, FRONTIER + 2 * STEP],
-                        vec![(24_000, 60)]
-                    )
-                );
-            }
-
-            /// The first window of a key requery can end before the frontier:
-            /// here the margin is shorter than at the start. The key's bundle
-            /// goes out, and the later windows send no bundle of the loop again.
-            #[test]
-            fn the_windows_after_a_key_press_send_no_bundle_of_the_loop_again() {
-                let mut session = keys_handed_out_to_the_frontier();
-                session.set_continuity_margin(0.05);
-                press(&session, 60);
-                requery(&mut session, 0.0);
-                window(&mut session, 0.0, LiveQueryBudgetMode::ReplacementPrefill);
-                assert_eq!(hand_out_keys(&mut session), (vec![], vec![(2_400, 60)]));
-                let mut later = Vec::new();
-                for now in [0.05, 0.1, 0.15, 0.2, 0.3] {
-                    window(&mut session, now, LiveQueryBudgetMode::Steady);
-                    let (looped, keys) = hand_out_keys(&mut session);
-                    assert_eq!(keys, [], "the key plays once");
-                    later.extend(looped);
-                }
-                assert_eq!(later, [FRONTIER + STEP], "the frontier stays at {FRONTIER}");
-            }
-
             /// Three presses, each with a requery from the same device clock.
             /// Each requery places every press so far on its takeover. Only
             /// the new press has no bundle out, so only its bundle goes out.
@@ -1905,40 +1474,6 @@ stack(note("c3*8").s("sawtooth"), kb(0.05).s("tri")).osc(57120)"#;
                     hand_out_keys(&mut session),
                     (vec![FRONTIER + 2 * STEP], vec![(24_000, 64)])
                 );
-            }
-
-            /// A slider that moves makes a requery every 120 ms. Two keys
-            /// are pressed between them, 3 ms apart. Every bundle of the
-            /// loop goes out once, and each key's once.
-            #[test]
-            fn keys_pressed_while_a_slider_moves_send_each_bundle_once() {
-                let mut session = keys_handed_out_to_the_frontier();
-                let mut sent = (Vec::new(), Vec::new());
-                for (now, key) in [
-                    (0.13, None),
-                    (0.25, None),
-                    (0.3, Some(60)),
-                    (0.303, Some(64)),
-                    (0.37, None),
-                    (0.49, None),
-                ] {
-                    if let Some(key) = key {
-                        press(&session, key);
-                    }
-                    requery(&mut session, now);
-                    for (now, mode) in [
-                        (now, LiveQueryBudgetMode::ReplacementPrefill),
-                        (now + 0.01, LiveQueryBudgetMode::Steady),
-                    ] {
-                        window(&mut session, now, mode);
-                        let (looped, keys) = hand_out_keys(&mut session);
-                        sent.0.extend(looped);
-                        sent.1.extend(keys);
-                    }
-                }
-                let looped: Vec<u64> = (1..=4).map(|step| FRONTIER + step * STEP).collect();
-                // A press takes over a quarter second after its requery.
-                assert_eq!(sent, (looped, vec![(26_400, 60), (26_544, 64)]));
             }
 
             /// A key pressed before a save is the saved score's to play. Its

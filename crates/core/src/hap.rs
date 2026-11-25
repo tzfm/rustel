@@ -886,6 +886,15 @@ impl Hap {
         self.keys.get().ui_visuals
     }
 
+    pub fn lane_context(&self) -> Option<u32> {
+        self.keys.get().lane
+    }
+
+    pub fn with_lane_context(mut self, lane: u32) -> Self {
+        self.keys.set_lane(lane);
+        self
+    }
+
     pub fn with_ui_visual_slot(mut self, slot: u8) -> Self {
         self.keys.add_ui_visual_slot(slot);
         self

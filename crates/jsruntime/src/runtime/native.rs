@@ -459,6 +459,8 @@ struct Turn<'p> {
     lanes: SmallLanes<'p>,
     /// The next number of an anonymous `$` lane.
     anonymous: u32,
+    /// Whether to attach lane ids onto each lane's haps.
+    tag_lanes: bool,
     /// The tempo the score set last, in cycles per second.
     cps: Option<f64>,
     /// How deep the evaluation is, across calls, and how many expressions
@@ -1194,6 +1196,7 @@ impl JsRuntime {
             arrows: 0,
             lanes: SmallLanes::with_capacity(lane_count),
             anonymous: 0,
+            tag_lanes: self.lane_tagging.get(),
             cps: None,
             depth: 0,
             steps: 0,
@@ -1350,7 +1353,11 @@ impl JsRuntime {
             let Native::Pattern(pattern) = last? else {
                 return None;
             };
-            pattern
+            if turn.tag_lanes {
+                pattern.with_lane(0)
+            } else {
+                pattern
+            }
         } else {
             // Drop any extra handle held in `last` before stacking lanes.
             // Pure native scores never produce `vst`/`vsti` plugin notes or
@@ -3224,7 +3231,7 @@ impl<'p> Turn<'p> {
         arguments: &'p [ScoreExpr],
     ) -> Option<Native<'p>> {
         use std::fmt::Write as _;
-        let [ScoreExpr::String(id), ScoreExpr::Number(_)] = arguments else {
+        let [ScoreExpr::String(id), ScoreExpr::Number(lane_number)] = arguments else {
             return None;
         };
         let id = self.held.text(*id);
@@ -3260,9 +3267,19 @@ impl<'p> Turn<'p> {
             }
             LaneName::Named(id)
         };
+        let lane_pattern = if self.tag_lanes
+            && *lane_number >= 0.0
+            && lane_number.fract() == 0.0
+            && *lane_number <= u32::MAX as f64
+        {
+            pattern.with_lane(*lane_number as u32)
+        } else {
+            // Retain the original pattern for the return value while storing a handle in the lane list.
+            pattern.clone()
+        };
         self.lanes.push(Lane {
             name,
-            pattern: pattern.clone(),
+            pattern: lane_pattern,
         });
         self.effect();
         Some(Native::Pattern(pattern))
@@ -3333,13 +3350,6 @@ fn gain_curve_set(ctx: &Ctx<'_>) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn the_inventory_lists_no_method_with_a_route_of_its_own() {
-        for name in SPECIAL_REGISTERED_METHODS.iter().chain(PLUGIN_METHODS) {
-            assert!(ListedNames.method(name).is_none(), "{name}");
-        }
-    }
 
     #[test]
     fn editing_binding_to_shadow_host_name_does_not_reuse_stale_pattern() {

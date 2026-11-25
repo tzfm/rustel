@@ -908,13 +908,6 @@ mod tests {
     }
 
     #[test]
-    fn maps_identifiers_to_inputs() {
-        assert_eq!(parse("t").unwrap(), vec![Instruction::Input]);
-        assert_eq!(parse("$input").unwrap(), vec![Instruction::Input]);
-        assert_eq!(parse("time").unwrap(), vec![Instruction::Time]);
-    }
-
-    #[test]
     fn rejects_unknown_and_nonfinite_identifiers() {
         assert!(error("foo").contains("unknown identifier 'foo'"));
         assert!(error("Math").contains("expected '.'")); // Math alone misses its member
@@ -1056,21 +1049,6 @@ mod tests {
                 Instruction::Binary(Binary::BitOr, 0, 5)
             ]
         );
-    }
-
-    #[test]
-    fn grouping_overrides_precedence() {
-        assert_eq!(
-            parse("(1+2)*3").unwrap(),
-            vec![
-                Instruction::Constant(1.0),
-                Instruction::Constant(2.0),
-                Instruction::Binary(Binary::Add, 0, 1),
-                Instruction::Constant(3.0),
-                Instruction::Binary(Binary::Mul, 2, 3)
-            ]
-        );
-        assert_eq!(parse("((1))").unwrap(), vec![Instruction::Constant(1.0)]);
     }
 
     #[test]

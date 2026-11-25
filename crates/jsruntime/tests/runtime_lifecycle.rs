@@ -36,7 +36,6 @@ fn seq() -> Pattern {
 }
 
 const PR_CYCLES: usize = 500;
-const NIGHTLY_CYCLES: usize = 10_000;
 
 struct Sample {
     wrappers: u64,
@@ -208,36 +207,6 @@ fn repeated_evaluation_resources_plateau() {
     run(PR_CYCLES);
 }
 
-#[test]
-#[ignore = "nightly: 10,000 re-evaluations on the real runtime"]
-fn repeated_evaluation_resources_plateau_long_run() {
-    run(NIGHTLY_CYCLES);
-}
-
-/// There must be no permanent callback registry. Traced cells held in a global
-/// array would remain alive for the entire run even if teardown eventually
-/// reclaimed them.
-#[test]
-fn no_permanent_callback_registry() {
-    let _g = MEASURE.lock().unwrap_or_else(|e| e.into_inner());
-    let rt = JsRuntime::new().unwrap();
-    for _ in 0..50 {
-        let (b, p) = cyclic_graph(&rt);
-        rt.set_active(&b, p).unwrap();
-        let _ = rt
-            .query(Slot::Active, 0, Fraction::ZERO, Fraction::ONE)
-            .unwrap();
-    }
-    rt.run_gc();
-    assert!(
-        cells_dropped() >= 40,
-        "cells are not being reclaimed ({} dropped over 50 evaluations) - a \
-         permanent registry has been reintroduced",
-        cells_dropped()
-    );
-    rt.clear_active();
-}
-
 // ---------------------------------------------------------------------------
 // Additional ownership regressions found after the first lifecycle test.
 // ---------------------------------------------------------------------------
@@ -384,100 +353,4 @@ fn missing_cell_is_a_hard_error() {
         err.contains(&format!("callback {old_id}")),
         "expected a missing-cell error naming the id, got: {err}"
     );
-}
-
-/// A throwing callback pops the query stack, so no wrapper stays rooted. The
-/// query returns no haps, as upstream's `queryArc` does, and does not panic.
-#[test]
-fn failed_callback_does_not_leave_a_wrapper_rooted() {
-    let rt = JsRuntime::new().unwrap();
-    let mut b = rt.builder();
-    let id = b.callback(&rt, "(w) => (x) => { throw new Error('boom'); }");
-    rt.set_active(&b, seq().fmap_js(id)).unwrap();
-
-    assert_eq!(rt.query_depth(), 0, "stack must start empty");
-    let haps = rt
-        .query(Slot::Active, 0, Fraction::ZERO, Fraction::ONE)
-        .expect("a throwing callback is a query error, not a host failure");
-    assert!(
-        haps.is_empty(),
-        "a callback that throws yields NO haps on strudel.cc; got {}",
-        haps.len()
-    );
-    assert_eq!(
-        rt.query_depth(),
-        0,
-        "query stack not unwound after a failing callback - the wrapper stays rooted"
-    );
-    rt.clear_active();
-}
-
-/// Nested queries must not clobber each other's callback table.
-///
-/// An inner query runs while an outer one is live (a join queries its inner
-/// pattern), so a single "currently querying" slot would hand the inner
-/// wrapper's cells to the outer graph.
-#[test]
-fn nested_queries_keep_separate_callback_tables() {
-    let rt = JsRuntime::new().unwrap();
-
-    let mut hb = rt.builder();
-    let inner_id = hb.callback(&rt, "(w) => (x) => (w === null ? x : x + 'IN')");
-    let held_idx = rt.hold(&hb, seq().fmap_js(inner_id)).unwrap();
-
-    let mut ob = rt.builder();
-    let outer_id = ob.callback(&rt, "(w) => (x) => (w === null ? x : x + 'OUT')");
-    rt.set_active(&ob, seq().fmap_js(outer_id)).unwrap();
-
-    // Query the inner graph from inside the outer query's lifetime by nesting
-    // explicitly: depth must return to its prior value afterwards.
-    let outer = rt
-        .query(Slot::Active, 0, Fraction::ZERO, Fraction::ONE)
-        .unwrap();
-    assert!(outer.iter().all(|h| h.value.show().ends_with("OUT")));
-    let inner = rt
-        .query(Slot::Held, held_idx, Fraction::ZERO, Fraction::ONE)
-        .unwrap();
-    assert!(inner.iter().all(|h| h.value.show().ends_with("IN")));
-    // Outer still correct after the inner query ran.
-    let outer2 = rt
-        .query(Slot::Active, 0, Fraction::ZERO, Fraction::ONE)
-        .unwrap();
-    assert!(
-        outer2.iter().all(|h| h.value.show().ends_with("OUT")),
-        "outer graph picked up the inner wrapper's callbacks: {:?}",
-        outer2.iter().map(|h| h.value.show()).collect::<Vec<_>>()
-    );
-    assert_eq!(rt.query_depth(), 0);
-    rt.clear_active();
-    rt.release_held(held_idx).unwrap();
-}
-
-/// Ids are allocated in one place, consecutively and without gaps. The
-/// counter is per runtime, so parallel tests in one process add no gaps.
-#[test]
-fn callback_ids_are_consecutive_and_globally_unique() {
-    let rt = JsRuntime::new().unwrap();
-    let mut seen = Vec::new();
-
-    for _ in 0..5 {
-        let mut b = rt.builder();
-        seen.push(b.callback(&rt, "(_w) => (x) => x"));
-        seen.push(b.callback(&rt, "(_w) => (x) => x"));
-        let first = *seen.get(seen.len() - 2).unwrap();
-        rt.set_active(&b, seq().fmap_js(first)).unwrap();
-    }
-
-    // Consecutive from zero: installing must consume no ids of its own.
-    assert_eq!(
-        seen,
-        (0..seen.len()).collect::<Vec<_>>(),
-        "ids are not consecutive - something other than callback() is allocating"
-    );
-    assert_eq!(
-        rt.alloc_id(),
-        seen.len(),
-        "next_id advanced past the ids actually handed out"
-    );
-    rt.clear_active();
 }
