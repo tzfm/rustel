@@ -2,18 +2,18 @@
 
 ## Unreleased
 
-- Fixed: a `linger` or `zoom` note across a cycle keeps its onset under `.add()`, and a negative speed under 1 plays nothing, as in 0.1.7.
-- Fixed: a replay export with a plugin moves the fader on time, `rustel play` skips a strum voice before cycle 0, and `s("808")` warms its bank before the start.
-- Studio: View ▸ Score outline shows the score as a tree, with native parts and script parts in two colours. The memory breakdown says native or script in one word.
-- Fixed: in iTerm2, Ctrl+F9 docks the log, because iTerm2 keeps Shift+F9.
-- External editor and bridge integrations: added `rustel lsp --stdio` (completion, hover, and lint diagnostics), `rustel doc --all [--json]` for full reference catalogue export, opt-in lane ids and sound names on `--ui-events` telemetry (`ui_layout.lanes` and `ui_events`), and inbound `ui_control` commands (`lane_solo`, `lane_mute`, `lane_transpose`, `tempo`, `transport`) with `ui_control_ack` replies.
-- Studio deletes the last open score of a set: the next score in the set panel opens in its place, or a new empty score when it was the only one.
-- The set panel marks empty scores with `○`.
-- Fixed: when the set open last time is gone from the disk, `rustel studio` opens the newest recent set that is still there, instead of a new empty set.
-- Fixed: a stopped Studio closes its audio output after 30 seconds with nothing playing, so the output's buffers no longer keep the memory figure up after a score stops or its tab closes. Piano mode and a recording keep it open.
-- Fixed: a session tape that the first save opens records the master fader at its start, so a replay export plays its first seconds at the level of the take.
-- Fixed: an export where a voice's `roomsize` changes from note to note, such as `roomsize("<4, 1, 2>")` on stacked tracks, reuses the reverb it made for each size instead of making it again: 8 such tracks render in about a sixth of the time.
-- Fixed: `rustel replay --export` plays the master fader the take was played at, ahead of the limiter as live, so it sounds at the level of the take.
+## v0.1.9
+
+- Studio: View ▸ Score outline shows the score as a tree.
+- `rustel lsp --stdio` for editors, `rustel doc --all` for the full reference, and lane controls over `--ui-events`.
+- Studio can delete the last open score of a set, and marks empty scores with `○`.
+- A stopped Studio closes its idle audio output after 30 seconds, which frees its memory.
+- Replay exports play the master fader of the take. Exports reuse a reverb when `roomsize` changes back.
+- Includes every change of [v0.1.8](https://github.com/tzfm/rustel/blob/main/CHANGELOG.md#v018), whose release was withdrawn.
+
+### Sound changes
+
+- Fixed: a `linger` or `zoom` note across a cycle keeps its onset under `.add()`, and a negative speed under 1 plays nothing, as in v0.1.7.
 
 ## v0.1.8
 
