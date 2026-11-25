@@ -180,3 +180,88 @@ fn an_outside_clock_ignores_the_control() {
     assert!(played.iter().all(|(.., cps)| cps.is_none()));
     assert_eq!(scheduler.cps(), 1.0);
 }
+
+/// Restarting at cycle zero or installing a score without a `cps` lane returns
+/// to the session tempo instead of leaking the previous pattern's tempo.
+#[test]
+fn a_restart_or_replacement_without_cps_returns_to_session_tempo() {
+    let mut scheduler = scheduler(1.0, 0.5);
+    let with_tempo = stack(vec![quarters(), slowcat(vec![tempo(1.0), tempo(2.0)])]);
+    let _ = play(&mut scheduler, with_tempo.clone(), 1.25);
+    assert_eq!(scheduler.cps(), 2.0, "cycle 1 moved the tempo to 2.0");
+
+    // Re-starting from cycle zero restores the session tempo (1.0) on cycle 0.
+    let clock = VirtualClock::new(0.0);
+    scheduler.set_pattern(with_tempo, clock.now());
+    scheduler.rebase_start_anchor(clock.now());
+    assert_eq!(scheduler.cps(), 1.0);
+    let mut events = Vec::new();
+    while clock.now() < 1.0 {
+        scheduler.tick(&clock);
+        events.extend(scheduler.drain_through(&clock, clock.now() + 1.0));
+        clock.advance(0.01);
+    }
+    let played = notes(&events);
+    assert_notes(&played, 1, |q| q as f64 * 0.25);
+    assert_eq!(played[0].2, None, "cycle 0 plays at session tempo");
+
+    // Installing a score without `setcps` also restores session tempo.
+    let _ = play(
+        &mut scheduler,
+        stack(vec![quarters(), slowcat(vec![tempo(1.0), tempo(2.0)])]),
+        1.25,
+    );
+    assert_eq!(scheduler.cps(), 2.0);
+    scheduler.replace_pattern(quarters(), 2.0, None);
+    assert_eq!(scheduler.cps(), 1.0);
+
+    // Continuous live edit that keeps a covering `cps(2)` stays at 2.0, while
+    // removing the `cps` lane returns to 1.0.
+    let mut live = scheduler_at_two();
+    live.replace_pattern_continued(stack(vec![quarters(), tempo(2.0)]), 1.25, None, 1.5, 1.6);
+    let clock = VirtualClock::new(1.25);
+    live.tick(&clock);
+    assert_eq!(live.cps(), 2.0, "kept tempo lane stays active mid-cycle");
+
+    live.replace_pattern_continued(quarters(), 1.35, None, 1.7, 1.8);
+    let clock = VirtualClock::new(1.35);
+    live.tick(&clock);
+    assert_eq!(
+        live.cps(),
+        1.0,
+        "removing tempo lane restores session tempo"
+    );
+}
+
+fn scheduler_at_two() -> Scheduler {
+    let mut scheduler = scheduler(1.0, 0.5);
+    let pattern = stack(vec![quarters(), slowcat(vec![tempo(1.0), tempo(2.0)])]);
+    let clock = VirtualClock::new(0.0);
+    scheduler.set_pattern(pattern, 0.0);
+    while clock.now() < 1.25 {
+        scheduler.tick(&clock);
+        let _ = scheduler.drain_due(&clock);
+        clock.advance(0.01);
+    }
+    assert_eq!(scheduler.cps(), 2.0);
+    scheduler
+}
+
+/// Soloing a musical lane keeps a separate pure `cps(...)` tempo lane active.
+#[test]
+fn soloing_a_lane_keeps_a_separate_cps_tempo_lane_active() {
+    let mut scheduler = scheduler(1.0, 0.5);
+    scheduler.lane_controls_mut().set_solo(Some(0));
+    let pattern = stack(vec![
+        quarters().with_lane(0),
+        slowcat(vec![tempo(1.0), tempo(2.0)]).with_lane(1),
+    ]);
+    let played = notes(&play(&mut scheduler, pattern, 2.0));
+    assert_notes(&played, 2, |q| {
+        if q < 4 {
+            q as f64 * 0.25
+        } else {
+            1.0 + (q - 4) as f64 * 0.125
+        }
+    });
+}

@@ -1331,6 +1331,10 @@ struct App {
     /// The newest move of each slider the engine has not taken yet, in the
     /// order the sliders were first owed.
     pending_sliders: Vec<(String, f64, bool)>,
+    /// Control values sent to the playing generation since it was installed,
+    /// keyed by slider or live-number id. Used to detect when reverting text
+    /// back to the installed source still differs from what the engine plays.
+    moved_slider_values: HashMap<String, f64>,
     next_request_id: u64,
     snapshot: Option<StudioSnapshot>,
     /// Whether the Link session is joined, and what its transport last
@@ -1921,6 +1925,7 @@ impl App {
             lint_status: None,
             pending_evaluation: None,
             pending_sliders: Vec::new(),
+            moved_slider_values: HashMap::new(),
             next_request_id: 1,
             snapshot: None,
             link: LinkFollow::Off,

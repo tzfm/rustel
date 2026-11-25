@@ -4567,11 +4567,13 @@ impl Command {
     /// the command has no other form.
     fn wants_json(&self) -> bool {
         match self {
-            Self::Play(musician) => musician.json,
+            Self::Play(musician) => musician.json || musician.ui_events,
             Self::MidiMonitor { json, .. }
             | Self::Devices { json, .. }
             | Self::Doctor { json, .. }
             | Self::MidiList { json, .. }
+            | Self::Vst { json, .. }
+            | Self::ImportMidi { json, .. }
             | Self::Check { json, .. }
             | Self::Query { json, .. }
             | Self::Trace { json, .. }
@@ -6523,6 +6525,118 @@ mod tests {
         // BPM 144 -> 0.6 cps.
         assert!((session.cps() - 0.6).abs() < 1e-9);
         assert!(session.transport().is_stopped());
+
+        // Idempotent lane_mute (unmuting an unmuted lane) and lane_transpose
+        // (clearing transpose to 0 when already 0) must be accepted cleanly.
+        let mut session = Session::new().expect("session");
+        session.set_lane_tracking_enabled(true);
+        session.evaluate(score).expect("score");
+        let generation = session.generation();
+        let mut layout = UiLayoutDelivery::default();
+        assert!(
+            observe_ui_layout_if_audible_with_lanes(
+                &mut layout,
+                score,
+                session.active_ui_lanes(),
+                generation,
+                generation,
+            )
+            .expect("layout")
+        );
+        assert!(layout.try_deliver(|_| Ok(())));
+        let unmute = UiDiscreteControl {
+            kind: UiDiscreteControlKind::LaneMute {
+                lane: 0,
+                muted: false,
+            },
+            generation: Some(generation),
+            source_revision: None,
+            request: Some("unmute-noop".into()),
+        };
+        let unmute_outcome =
+            apply_ui_discrete_control(&mut session, &layout, unmute, 0.5, 0.05, None);
+        assert!(!unmute_outcome.needs_requery);
+        assert_eq!(
+            unmute_outcome
+                .ack
+                .as_ref()
+                .map(|a| a.ui_control_ack.accepted),
+            Some(true)
+        );
+        assert_eq!(
+            unmute_outcome
+                .ack
+                .as_ref()
+                .and_then(|a| a.ui_control_ack.message.as_deref()),
+            None
+        );
+
+        let clear_transpose = UiDiscreteControl {
+            kind: UiDiscreteControlKind::LaneTranspose {
+                lane: 0,
+                semitones: 0,
+            },
+            generation: Some(generation),
+            source_revision: None,
+            request: Some("transpose-noop".into()),
+        };
+        let clear_outcome =
+            apply_ui_discrete_control(&mut session, &layout, clear_transpose, 0.5, 0.05, None);
+        assert!(!clear_outcome.needs_requery);
+        assert_eq!(
+            clear_outcome
+                .ack
+                .as_ref()
+                .map(|a| a.ui_control_ack.accepted),
+            Some(true)
+        );
+        assert_eq!(
+            clear_outcome
+                .ack
+                .as_ref()
+                .and_then(|a| a.ui_control_ack.message.as_deref()),
+            None
+        );
+
+        // Transport restart flags restart and `restart_active_at` anchors cycle 0
+        // cleanly without wiping the active score or dropping beat 1.
+        let restart = UiDiscreteControl {
+            kind: UiDiscreteControlKind::Transport {
+                action: UiTransportAction::Restart,
+            },
+            generation: Some(generation),
+            source_revision: None,
+            request: Some("restart".into()),
+        };
+        let restart_outcome =
+            apply_ui_discrete_control(&mut session, &layout, restart, 1.0, 0.05, None);
+        assert!(restart_outcome.needs_restart);
+        let (before, after) = session
+            .restart_active_at(1.0)
+            .expect("restart_active_at")
+            .expect("running session restarts");
+        assert_eq!(after, before + 1);
+        let anchor = session.time_at_cycle(Fraction::ZERO);
+        assert!(anchor >= 1.0, "cycle 0 anchored at or after 1.0s: {anchor}");
+        let onsets = session
+            .schedule_at(anchor)
+            .expect("schedule_at after restart");
+        assert!(
+            onsets.iter().any(|onset| onset.whole_begin == "0/1"),
+            "beat 1 (cycle 0) must sound after restart: {onsets:?}"
+        );
+    }
+
+    #[test]
+    fn wants_json_includes_ui_events_vst_and_import_midi() {
+        let play_ui = Cli::try_parse_from(["rustel", "play", "song.strudel", "--ui-events"])
+            .expect("play --ui-events");
+        assert!(play_ui.command.wants_json());
+        let vst_json = Cli::try_parse_from(["rustel", "vst", "-j"]).expect("vst -j");
+        assert!(vst_json.command.wants_json());
+        let import_json =
+            Cli::try_parse_from(["rustel", "import-midi", "in.mid", "-j"]).expect("import-midi -j");
+        assert!(import_json.command.wants_json());
     }
 
     #[test]

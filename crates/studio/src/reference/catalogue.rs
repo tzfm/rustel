@@ -53,11 +53,19 @@ impl From<&rustel_core::reference::ReferenceEntry> for Entry {
 }
 
 impl Entry {
+    /// Whether this entry names a vocabulary word or non-callable value
+    /// (sound, scale, chord, or global value) rather than a callable function.
+    fn is_vocabulary(&self) -> bool {
+        self.tags
+            .iter()
+            .any(|tag| matches!(tag.as_str(), "sound" | "value" | "scale" | "chord"))
+    }
+
     /// Whether insertion should add call parentheses. Non-callable globals,
-    /// sound names and snippets do not receive them.
+    /// sound/scale/chord names and snippets do not receive them.
     pub fn inserts_as_call(&self) -> bool {
         self.snippet.is_none()
-            && !self.tags.iter().any(|tag| tag == "sound" || tag == "value")
+            && !self.is_vocabulary()
             && (self.tags.iter().any(|tag| tag == "kabelsalat")
                 || self.is_hydra()
                 || !rustel_runtime::lint::global_values().contains(self.name.as_str()))
@@ -72,8 +80,9 @@ impl Entry {
 
     /// The signature line: `lpf(frequency)` plus its other names.
     pub fn signature(&self) -> String {
-        // A snippet is lines, not a call: its name is its heading.
-        if self.snippet.is_some() || self.tags.iter().any(|tag| tag == "value") {
+        // Snippets and vocabulary words (sounds, scales, chords, values) are
+        // not calls: their name is their heading.
+        if self.snippet.is_some() || self.is_vocabulary() {
             return self.name.clone();
         }
         let params = self

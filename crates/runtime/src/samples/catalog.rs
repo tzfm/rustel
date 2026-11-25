@@ -894,8 +894,7 @@ impl SampleLibrary {
             .expect("samples source tables")
             .states
             .retain(|_, standing| {
-                !matches!(&standing.state, SourceState::Failed(why)
-                    if why.contains("is not an allowed sample source"))
+                !matches!(&standing.state, SourceState::Failed(why) if is_policy_refusal(why))
             });
     }
 
@@ -960,10 +959,13 @@ impl SampleLibrary {
         // publishes after this reads it: see [`under_current_policy`].
         *self.shared.score_policy.lock().expect("score policy") = Some(access.clone());
         let mut withdrawn = HashSet::new();
+        let mut withdrawn_local = false;
         for (url, grant) in grants.iter_mut().filter(|(url, _)| !own.contains(*url)) {
+            let was_local = matches!(grant, ScoreFetchAccess::Local { .. });
             *grant = access.regrant(url, grant);
             if *grant == ScoreFetchAccess::Withdrawn {
                 withdrawn.insert(Arc::clone(url));
+                withdrawn_local |= was_local;
             }
         }
         if withdrawn.is_empty() {
@@ -1024,6 +1026,12 @@ impl SampleLibrary {
                 .filter(|map| !packs.contains(*map) && map_refused(access, map))
                 .cloned(),
         );
+        // If the local sample folder switched directly from one directory to
+        // another, drop cached `local:` map standings so they re-read from the
+        // new root immediately.
+        if withdrawn_local && access.has_local_root() {
+            tables.forget(|map| !packs.contains(map) && is_local_map(map));
+        }
     }
 
     #[cfg(any(test, feature = "test-support"))]
@@ -2273,10 +2281,34 @@ impl SampleLibrary {
 /// grant: the withdrawal judged it, and kept the files of the player's own
 /// banks. The caller holds the write lock of `held`, the grants, so no
 /// withdrawal runs between this and the publication.
-/// Whether `access` refuses the URL a score's `samples("…")` map names.
+/// Whether `why` is a policy refusal that a new grant may resolve immediately.
+fn is_policy_refusal(why: &str) -> bool {
+    why.contains("is not an allowed sample source")
+        || why.contains("requires a host-selected local sample root")
+        || why.contains("without a host grant")
+}
+
+/// Whether `map` (JSON-encoded score spec) names a `local:` sample source.
+fn is_local_map(map: &str) -> bool {
+    serde_json::from_str::<String>(map).is_ok_and(|spec| {
+        matches!(
+            read_source(&spec, GITHUB_SAMPLE_MANIFEST),
+            SampleSource::LocalFolder(_)
+        )
+    })
+}
+
+/// Whether `access` refuses the source a score's `samples("…")` map names,
+/// expanding shorthands (`github:`, `bubo:`, `shabda:`, `local:`) and GitHub
+/// repository pages the same way `preapprove_effect` and manifest fetches do.
 fn map_refused(access: &ScoreSampleAccess, map: &str) -> bool {
-    serde_json::from_str::<String>(map)
-        .is_ok_and(|spec| matches!(access.source_for(&spec), Ok(None)))
+    let Ok(spec) = serde_json::from_str::<String>(map) else {
+        return false;
+    };
+    match read_source(&spec, GITHUB_SAMPLE_MANIFEST) {
+        SampleSource::LocalFolder(_) => !access.has_local_root(),
+        SampleSource::Url(url) => matches!(access.source_for(&url), Ok(None)),
+    }
 }
 
 /// Judge a publication by the policy in force. True when it held banks back.
@@ -3044,6 +3076,63 @@ mod tests {
         assert!(
             library.banks_for_import(&import).is_empty(),
             "the import files a name it no longer brings"
+        );
+    }
+
+    #[test]
+    fn map_refused_and_import_policy_handle_shorthands_repo_urls_and_local_maps() {
+        let local_root = tempfile::tempdir().expect("local sample root");
+        let mut with_raw_and_local = ScoreSampleAccess::denied();
+        with_raw_and_local
+            .permit_source("raw.githubusercontent.com")
+            .expect("raw github");
+        with_raw_and_local
+            .permit_local_root(local_root.path())
+            .expect("local root");
+        let denied = ScoreSampleAccess::denied();
+
+        for spec in [
+            "github:user/repo",
+            "https://github.com/user/repo",
+            "local:kits/q.json",
+        ] {
+            let map = serde_json::to_string(spec).expect("json spec");
+            assert!(
+                !map_refused(&with_raw_and_local, &map),
+                "{spec} should be allowed when its resolved source is permitted"
+            );
+            assert!(
+                map_refused(&denied, &map),
+                "{spec} should be refused when its resolved source is denied"
+            );
+        }
+
+        // `set_import_policy` clears local-root and host-grant failures as well
+        // as remote-origin failures so re-granting retries immediately.
+        let library = SampleLibrary::empty();
+        library.note_samples_source_state_for_tests(
+            "local:kits/q.json",
+            SourceState::Failed(
+                "samples('local:') requires a host-selected local sample root".into(),
+            ),
+        );
+        library.note_samples_source_state_for_tests(
+            "github:user/repo",
+            SourceState::Failed(
+                "score-level samples() cannot access files or the network without a host grant"
+                    .into(),
+            ),
+        );
+        library.set_import_policy(with_raw_and_local);
+        let tables = library
+            .shared
+            .source_tables
+            .lock()
+            .expect("samples source tables");
+        assert!(
+            tables.states.is_empty(),
+            "policy refusals must be cleared on new grant: {:?}",
+            tables.states.keys().collect::<Vec<_>>()
         );
     }
 }

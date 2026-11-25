@@ -133,6 +133,48 @@ impl Session {
         Ok(Some((generation_before, generation_after)))
     }
 
+    /// Restart the active graph from cycle zero under a fresh generation,
+    /// anchored at `now` plus the continuity/schedule lead (and plugin lead).
+    /// Unlike `restart_transport_at` followed by `requery_active_at`, this
+    /// keeps `queried_to` at cycle zero so beat 1 is not skipped and retains
+    /// `audible_source` for rollback recovery.
+    pub fn restart_active_at(&mut self, now: f64) -> Result<Option<(u64, u64)>, RuntimeError> {
+        if !now.is_finite() || now < 0.0 {
+            return Err(RuntimeError::Message(format!(
+                "transport restart time must be finite and non-negative, got {now}"
+            )));
+        }
+        if self.transport.is_stopped() {
+            return Ok(None);
+        }
+        let generation_before = self.generation();
+        let margin = self
+            .continuity_margin
+            .unwrap_or(self.schedule_lead)
+            .max(0.0);
+        let takeover_time = now + margin;
+        let anchor = takeover_time + self.plugin_lead();
+        self.js.midi_input_bus().clear_keys();
+        let Some(generation_after) = self.scheduler.restart_active_from_zero(anchor) else {
+            return Ok(None);
+        };
+        self.newest_window = None;
+        #[cfg(feature = "vst")]
+        self.plugin_lead_changed();
+        self.js
+            .midi_input_bus()
+            .republish_current_generation(generation_after);
+        self.requery_takeover_time = Some(takeover_time);
+        self.requery_takeover_cut = TakeoverCut::AtTakeover;
+        self.requery_anchor_time = Some(anchor);
+        #[cfg(all(feature = "vst", feature = "device-audio"))]
+        {
+            self.takeover_added = 0.0;
+        }
+        self.requeried_generation = None;
+        Ok(Some((generation_before, generation_after)))
+    }
+
     /// Refill a live device after its output stream discarded the complete
     /// event ring. Unlike an ordinary control re-query, no old audio horizon
     /// remains to cover a continuity takeover: resume at the replacement

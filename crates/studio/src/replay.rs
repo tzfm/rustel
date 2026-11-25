@@ -221,6 +221,16 @@ pub struct ReplayRun {
 /// before it stops here rather than crossing it.
 pub const MIN_BLOCK_SECONDS: f64 = 0.1;
 
+/// A recorded master fader move kept with the block it sounded during, or
+/// before the first block (`after: None`) so block resizes carry it along.
+#[derive(Clone, Copy, Debug)]
+struct ReplayFader {
+    after: Option<usize>,
+    /// Seconds after block `after`'s start, or tape time when `after` is `None`.
+    offset: f64,
+    db: f32,
+}
+
 #[derive(Clone, Debug)]
 pub struct ReplayTab {
     /// The tape.
@@ -234,6 +244,8 @@ pub struct ReplayTab {
     pub events: Vec<ReplayEvent>,
     /// The saves kept off the timeline, written back with the rest.
     pub aside: Vec<Aside>,
+    /// Recorded master fader moves, written back with the tape.
+    faders: Vec<ReplayFader>,
     /// A trailing recorded stop bounds the final block. Legacy tapes with
     /// no such stop remain indefinite; no duration is guessed for them.
     end_at: Option<f64>,
@@ -256,6 +268,7 @@ impl ReplayTab {
         let script = SessionScript::load_for_editing(path)?;
         let (events, mut aside) = events_of(&script)?;
         let end_at = take_endpoint(&events, &mut aside);
+        let faders = faders_of(&events, &script.faders);
         Ok(Self {
             path: path.to_path_buf(),
             recorded: script.recorded,
@@ -263,6 +276,7 @@ impl ReplayTab {
             baseline_cps: script.baseline_cps,
             events,
             aside,
+            faders,
             end_at,
             dirty: false,
             selected: 0,
@@ -338,13 +352,34 @@ impl ReplayTab {
                 .unwrap_or(std::cmp::Ordering::Equal)
                 .then_with(|| owner_a.cmp(owner_b))
         });
+        let mut faders: Vec<(f64, f32)> = Vec::with_capacity(self.faders.len());
+        for fader in &self.faders {
+            let at = match fader.after {
+                None => fader.offset,
+                Some(after) => {
+                    let Some(block) = self.events.get(after) else {
+                        continue;
+                    };
+                    let limit = self
+                        .events
+                        .get(after + 1)
+                        .map(|next| next.at)
+                        .or(self.end_at)
+                        .map(|end| (end - block.at).max(0.0));
+                    let offset = limit.map_or(fader.offset, |limit| fader.offset.min(limit));
+                    block.at + offset
+                }
+            };
+            faders.push((at, fader.db));
+        }
+        faders.sort_by(|(a, _), (b, _)| a.total_cmp(b));
         SessionScript {
             keeps: self.keeps.clone(),
             recorded: self.recorded.clone(),
             baseline_cps: self.baseline_cps,
             saves: saves.into_iter().map(|(_, save)| save).collect(),
             logs: 0,
-            faders: Vec::new(),
+            faders,
         }
     }
 
@@ -455,8 +490,17 @@ impl ReplayTab {
                 aside.after -= 1;
             }
         }
+        self.faders.retain(|fader| fader.after != Some(index));
+        for fader in &mut self.faders {
+            if let Some(after) = &mut fader.after
+                && *after > index
+            {
+                *after -= 1;
+            }
+        }
         self.end_at = if self.events.is_empty() {
             self.aside.clear();
+            self.faders.retain(|fader| fader.after.is_none());
             None
         } else if was_last {
             Some(start)
@@ -494,6 +538,7 @@ impl ReplayTab {
         }
         self.events = events;
         self.aside = aside;
+        self.faders = faders_of(&self.events, &script.faders);
         self.end_at = end_at;
         self.selected = self.selected.min(self.events.len().saturating_sub(1));
         self.scroll = self.scroll.min(self.events.len().saturating_sub(1));
@@ -761,6 +806,38 @@ impl ReplayTab {
             event.minimap.sync(&event.document, thumb);
         }
     }
+}
+
+/// Attach each recorded master fader move to the block it sounded during,
+/// keeping moves at or before the first block unattached (`after: None`).
+fn faders_of(events: &[ReplayEvent], faders: &[(f64, f32)]) -> Vec<ReplayFader> {
+    faders
+        .iter()
+        .copied()
+        .filter(|(at, db)| at.is_finite() && db.is_finite())
+        .map(|(at, db)| {
+            let Some(first) = events.first() else {
+                return ReplayFader {
+                    after: None,
+                    offset: at,
+                    db,
+                };
+            };
+            if at <= first.at {
+                return ReplayFader {
+                    after: None,
+                    offset: at,
+                    db,
+                };
+            }
+            let after = events.iter().rposition(|event| event.at <= at).unwrap_or(0);
+            ReplayFader {
+                after: Some(after),
+                offset: at - events[after].at,
+                db,
+            }
+        })
+        .collect()
 }
 
 /// A trailing stop explicitly ends the tape. Keep it outside ordinary
@@ -1474,5 +1551,35 @@ mod tests {
         );
         assert!(row(8).contains("0:38 · 20 saves"), "{:?}", row(8));
         assert!(row(8).contains('━'), "a scrollbar: {:?}", row(8));
+    }
+
+    #[test]
+    fn saving_an_edited_replay_preserves_recorded_master_faders() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("faders.rustel-session");
+        let mut recorder = rustel_runtime::session_log::SessionRecorder::create(
+            path.clone(),
+            SessionMode::Normal,
+            Some(0.5),
+        )
+        .unwrap();
+        recorder.record_control(0.0, serde_json::json!({ "fader_db": -6.0 }));
+        recorder.record_save(0.0, SaveStatus::Installed, "$: s(\"bd\")", None);
+        recorder.record_save(4.0, SaveStatus::Installed, "$: s(\"sd\")", None);
+        recorder.record_control(5.5, serde_json::json!({ "fader_db": -2.5 }));
+        drop(recorder);
+
+        let mut tab = ReplayTab::open(&path).unwrap();
+        tab.set_source(0, "$: s(\"bd*2\")").unwrap();
+        tab.set_duration(0, 6.0);
+        tab.save().unwrap();
+
+        let reloaded = SessionScript::load(&path).unwrap();
+        assert_eq!(reloaded.faders.len(), 2, "faders: {:?}", reloaded.faders);
+        assert!((reloaded.faders[0].0 - 0.0).abs() < 1e-6);
+        assert!((reloaded.faders[0].1 - (-6.0)).abs() < 1e-5);
+        // Block 0 grew by +2.0s, carrying block 1's fader move from 5.5s to 7.5s.
+        assert!((reloaded.faders[1].0 - 7.5).abs() < 1e-6);
+        assert!((reloaded.faders[1].1 - (-2.5)).abs() < 1e-5);
     }
 }

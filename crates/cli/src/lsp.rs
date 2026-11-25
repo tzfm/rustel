@@ -344,8 +344,14 @@ impl LspServer {
         let prefix_lower = prefix.to_ascii_lowercase();
         let wants_underscore = prefix.starts_with('_');
         let include_hydra = doc.contains("initHydra");
-        let include_kabel = doc.contains("kabel");
+        let include_kabel = doc_uses_kabel(doc);
         let insert_call_snippet = self.snippet_support && !has_following_paren(doc, offset);
+        let chord_root = if string_tag == Some("chord") {
+            split_chord_root(prefix)
+        } else {
+            None
+        };
+        let chord_quality_lower = chord_root.map(|(_, quality)| quality.to_ascii_lowercase());
         let mut seen = HashSet::<&str>::new();
         let mut items = Vec::new();
 
@@ -355,14 +361,29 @@ impl LspServer {
                     continue;
                 }
                 if !entry.name.is_empty() && seen.insert(entry.name.as_str()) {
-                    push_completion_item(
-                        &mut items,
-                        entry.name.as_str(),
-                        entry,
-                        &prefix_lower,
-                        12, // LSP CompletionItemKind::Value
-                        false,
-                    );
+                    if let (Some((root, _)), Some(quality_lower)) =
+                        (chord_root, chord_quality_lower.as_deref())
+                    {
+                        let full = format!("{root}{}", entry.name);
+                        push_completion_item_matching(
+                            &mut items,
+                            &full,
+                            entry.name.as_str(),
+                            entry,
+                            quality_lower,
+                            12, // LSP CompletionItemKind::Value
+                            false,
+                        );
+                    } else {
+                        push_completion_item(
+                            &mut items,
+                            entry.name.as_str(),
+                            entry,
+                            &prefix_lower,
+                            12, // LSP CompletionItemKind::Value
+                            false,
+                        );
+                    }
                 }
                 continue;
             }
@@ -463,6 +484,42 @@ impl LspServer {
     }
 }
 
+/// Split a leading chord root note (`A`..`G` plus optional `#` or `b`) from a
+/// chord completion prefix so quality symbols in `CHORD_REFERENCE` match after
+/// typing a root such as `C`, `Cm`, `F#7`, or `Bb^`.
+fn split_chord_root(prefix: &str) -> Option<(&str, &str)> {
+    let bytes = prefix.as_bytes();
+    let &first = bytes.first()?;
+    if !matches!(first, b'A'..=b'G') {
+        return None;
+    }
+    let root_len = if bytes.get(1).is_some_and(|b| matches!(b, b'#' | b'b')) {
+        2
+    } else {
+        1
+    };
+    Some(prefix.split_at(root_len))
+}
+
+/// Whether `doc` contains a KabelSalat graph (`K(...)` or `worklet(...)`).
+fn doc_uses_kabel(doc: &str) -> bool {
+    fn has_call(doc: &str, name: &str) -> bool {
+        let bytes = doc.as_bytes();
+        let is_ident = |b: u8| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'$');
+        for (at, _) in doc.match_indices(name) {
+            if at > 0 && is_ident(bytes[at - 1]) {
+                continue;
+            }
+            let after = doc[at + name.len()..].trim_start();
+            if after.starts_with('(') {
+                return true;
+            }
+        }
+        false
+    }
+    has_call(doc, "K") || has_call(doc, "worklet") || doc.contains("kabel")
+}
+
 fn push_completion_item(
     items: &mut Vec<Value>,
     label: &str,
@@ -471,14 +528,35 @@ fn push_completion_item(
     kind: u32,
     insert_call_snippet: bool,
 ) {
-    let label_lower = label.to_ascii_lowercase();
-    let rank = if prefix_lower.is_empty() || label_lower.starts_with(prefix_lower) {
+    push_completion_item_matching(
+        items,
+        label,
+        label,
+        entry,
+        prefix_lower,
+        kind,
+        insert_call_snippet,
+    );
+}
+
+fn push_completion_item_matching(
+    items: &mut Vec<Value>,
+    label: &str,
+    match_target: &str,
+    entry: &Entry,
+    prefix_lower: &str,
+    kind: u32,
+    insert_call_snippet: bool,
+) {
+    let target_lower = match_target.to_ascii_lowercase();
+    let rank = if prefix_lower.is_empty() || target_lower.starts_with(prefix_lower) {
         0u8
-    } else if label_lower.contains(prefix_lower) {
+    } else if target_lower.contains(prefix_lower) {
         1u8
     } else {
         return;
     };
+    let label_lower = label.to_ascii_lowercase();
     let mut item = json!({
         "label": label,
         "kind": kind,
@@ -1534,5 +1612,112 @@ mod tests {
             assert_eq!(sig["activeParameter"], 1);
             assert_eq!(sig["signatures"][0]["parameters"][1]["label"], "steps");
         }
+    }
+
+    #[test]
+    fn lsp_chords_with_root_kabelsalat_k_and_vocabulary_signatures() {
+        let reference = Reference::load_all();
+        for name in ["major", "^7", "sawtooth"] {
+            let entry = reference
+                .entries()
+                .iter()
+                .find(|entry| entry.name == name)
+                .unwrap_or_else(|| panic!("missing reference entry {name}"));
+            assert!(
+                !entry.inserts_as_call(),
+                "{name} must not be marked callable"
+            );
+            assert_eq!(
+                entry.signature(),
+                name,
+                "{name} signature must not carry call parentheses"
+            );
+        }
+
+        let uri = "file:///chords_kabel.strudel";
+        let text = "chord(\"Cm\")\nchord(\"F#7\")\n$: note(\"c3\").K(sFreq)\n$: note(\"c3\").K(si)";
+        let mut input = Vec::new();
+        input.extend(frame(&json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": {}
+        })));
+        input.extend(frame(&json!({
+            "jsonrpc": "2.0",
+            "method": "initialized",
+            "params": {}
+        })));
+        input.extend(frame(&json!({
+            "jsonrpc": "2.0",
+            "method": "textDocument/didOpen",
+            "params": {
+                "textDocument": {
+                    "uri": uri,
+                    "languageId": "strudel",
+                    "version": 1,
+                    "text": text
+                }
+            }
+        })));
+        // Inside `chord("Cm|")` -> offers `Cm`, `Cm7`, etc.
+        input.extend(frame(&json!({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "textDocument/completion",
+            "params": { "textDocument": { "uri": uri }, "position": { "line": 0, "character": 9 } }
+        })));
+        // Inside `chord("F#7|")` -> offers `F#7`, `F#7b9`, etc.
+        input.extend(frame(&json!({
+            "jsonrpc": "2.0",
+            "id": 3,
+            "method": "textDocument/completion",
+            "params": { "textDocument": { "uri": uri }, "position": { "line": 1, "character": 10 } }
+        })));
+        // Inside `.K(si|)` -> offers KabelSalat `sine`.
+        input.extend(frame(&json!({
+            "jsonrpc": "2.0",
+            "id": 4,
+            "method": "textDocument/completion",
+            "params": { "textDocument": { "uri": uri }, "position": { "line": 3, "character": 18 } }
+        })));
+        input.extend(frame(&json!({
+            "jsonrpc": "2.0",
+            "id": 5,
+            "method": "shutdown"
+        })));
+        input.extend(frame(&json!({
+            "jsonrpc": "2.0",
+            "method": "exit"
+        })));
+
+        let mut output = Vec::new();
+        serve(io::Cursor::new(input), &mut output).expect("serve");
+        let messages = read_all_frames(&output);
+
+        let labels = |req_id: i64| -> Vec<String> {
+            messages
+                .iter()
+                .find(|m| m.get("id") == Some(&json!(req_id)))
+                .expect("completion response")["result"]["items"]
+                .as_array()
+                .expect("items")
+                .iter()
+                .filter_map(|item| item["label"].as_str().map(str::to_owned))
+                .collect()
+        };
+
+        let cm = labels(2);
+        assert!(cm.iter().any(|l| l == "Cm7"), "Cm completions: {cm:?}");
+        let fsharp = labels(3);
+        assert!(
+            fsharp.iter().any(|l| l == "F#7") && fsharp.iter().any(|l| l == "F#7b9"),
+            "F#7 completions: {fsharp:?}"
+        );
+        let kabel = labels(4);
+        assert!(
+            kabel.iter().any(|l| l == "sine"),
+            "KabelSalat completions inside K(...): {kabel:?}"
+        );
     }
 }

@@ -417,6 +417,7 @@ impl App {
             && self.is_playing()
             && !self.is_stopping()
             && self.audible_scene == Some(id)
+            && !self.controls_diverged_from(&source)
             && self.evaluated_source.as_deref().is_some_and(|playing| {
                 playing != source.as_ref() && rustel_transpiler::same_instructions(playing, &source)
             })
@@ -879,6 +880,7 @@ impl App {
                         self.audible_scene = None;
                     }
                 }
+                self.moved_slider_values.clear();
                 self.rebuild_slider_spans();
                 self.sync_live_numbers();
                 self.invalidate_maps();

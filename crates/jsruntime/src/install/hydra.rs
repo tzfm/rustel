@@ -609,6 +609,7 @@ fn analyser_effect<'js>(
 const HYDRA_STATE: &str = "__rustel_hydra_state";
 const SAVED: usize = 0;
 const ASSIGNED: usize = 1;
+const DEFAULTS: usize = 2;
 
 fn state<'js>(ctx: &Ctx<'js>) -> rquickjs::Result<rquickjs::Array<'js>> {
     host_stack(ctx)?.as_object().get(HYDRA_STATE)
@@ -1268,7 +1269,10 @@ fn install_setting<'js>(
     // the pattern speed control, Hydra's time recorder, and the ignored
     // update(...) all remain callable/readable.
     let current: rquickjs::Value = ctx.globals().get(name)?;
-    let assigned: rquickjs::Object = state(ctx)?.get(ASSIGNED)?;
+    let hydra_state = state(ctx)?;
+    let assigned: rquickjs::Object = hydra_state.get(ASSIGNED)?;
+    let defaults: rquickjs::Object = hydra_state.get(DEFAULTS)?;
+    defaults.set(name, current.clone())?;
     assigned.set(name, current)?;
     let get = move |ctx: Ctx<'js>| -> rquickjs::Result<rquickjs::Value<'js>> {
         let assigned: rquickjs::Object = state(&ctx)?.get(ASSIGNED)?;
@@ -1296,9 +1300,6 @@ fn install_setting<'js>(
             .ok_or_else(|| {
                 throw_type_error(&ctx, &format!("Hydra's {name} takes a finite number"))
             })?;
-        // A read gives back the last write, a number after a helper too.
-        let assigned: rquickjs::Object = state(&ctx)?.get(ASSIGNED)?;
-        assigned.set(name, value)?;
         push_statement(
             &ctx,
             &transaction,
@@ -1309,7 +1310,19 @@ fn install_setting<'js>(
                 "name": name,
                 "value": { "c": "num", "v": value },
             }),
-        )
+        )?;
+        let hydra_state = state(&ctx)?;
+        let assigned: rquickjs::Object = hydra_state.get(ASSIGNED)?;
+        if matches!(name, "speed" | "time") {
+            // Keep the `speed(...)` control and Hydra's live `time` recorder
+            // intact across numeric clock assignments.
+            let defaults: rquickjs::Object = hydra_state.get(DEFAULTS)?;
+            let restored: rquickjs::Value = defaults.get(name)?;
+            assigned.set(name, restored)
+        } else {
+            // A read of `bpm`/`fps` gives back the last write, even after a helper.
+            assigned.set(name, value)
+        }
     };
     ctx.globals()
         .prop(name, Accessor::new(get, set).configurable().enumerable())
@@ -1445,6 +1458,12 @@ pub(super) fn install<'js>(
     state
         .set(
             ASSIGNED,
+            bare_object(ctx).map_err(|error| error.to_string())?,
+        )
+        .map_err(|error| error.to_string())?;
+    state
+        .set(
+            DEFAULTS,
             bare_object(ctx).map_err(|error| error.to_string())?,
         )
         .map_err(|error| error.to_string())?;

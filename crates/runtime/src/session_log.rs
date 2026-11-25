@@ -589,8 +589,31 @@ impl SessionScript {
         }
         let mut text = header.to_string();
         text.push('\n');
+        let mut faders: Vec<(f64, f32)> = self
+            .faders
+            .iter()
+            .copied()
+            .filter(|(at, db)| at.is_finite() && db.is_finite())
+            .collect();
+        faders.sort_by(|(a, _), (b, _)| a.total_cmp(b));
+        let mut next_fader = 0usize;
+        let write_fader = |text: &mut String, at: f64, db: f32| {
+            let record = serde_json::json!({
+                "t": at,
+                "kind": "control",
+                "fader_db": f64::from(db),
+            });
+            text.push_str(&record.to_string());
+            text.push('\n');
+        };
         let mut seen: HashMap<String, usize> = HashMap::new();
         for (index, save) in self.saves.iter().enumerate() {
+            while let Some(&(at, db)) = faders.get(next_fader)
+                && at <= save.at
+            {
+                write_fader(&mut text, at, db);
+                next_fader += 1;
+            }
             let mut record = serde_json::json!({
                 // Edited block lengths can be finer than the recorder's
                 // millisecond clock. A rewrite preserves their exact f64.
@@ -615,6 +638,9 @@ impl SessionScript {
             }
             text.push_str(&record.to_string());
             text.push('\n');
+        }
+        for &(at, db) in &faders[next_fader..] {
+            write_fader(&mut text, at, db);
         }
         crate::atomic_file::replace_file(
             path,

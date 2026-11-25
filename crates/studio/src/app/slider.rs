@@ -767,6 +767,12 @@ impl App {
     /// Owe the engine this slider's newest value. A newer move of the same
     /// slider replaces the older one, and every other slider keeps its own.
     pub(super) fn owe_slider(&mut self, id: String, value: f64, smooth: bool) {
+        if let Some(slot) = self.moved_slider_values.get_mut(&id) {
+            *slot = value;
+        } else {
+            // Cloned once per distinct moved control so both maps own their key.
+            self.moved_slider_values.insert(id.clone(), value);
+        }
         match self
             .pending_sliders
             .iter_mut()
