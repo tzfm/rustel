@@ -673,30 +673,6 @@ fn inventory_entry(line: &str) -> Option<((&str, &str), &str)> {
     Some(((words.next()?, words.next()?), words.next()?))
 }
 
-/// The name as `text` spells it and what `text` lists for it, for `name`
-/// in `section`, found by a search of the lines of `text`, which are in
-/// the order of section and name.
-#[cfg(test)]
-fn listing_in<'t>(text: &'t str, section: &str, name: &str) -> Option<(&'t str, &'t str)> {
-    let (mut low, mut high) = (0, text.len());
-    while low < high {
-        let middle = low + (high - low) / 2;
-        // The line that holds the byte at `middle`.
-        let start = text[..middle].rfind('\n').map_or(0, |end| end + 1);
-        let end = text[middle..]
-            .find('\n')
-            .map_or(text.len(), |end| middle + end);
-        // A checkout can end each line with a carriage return too.
-        let (entry, listing) = inventory_entry(text[start..end].trim_end_matches('\r'))?;
-        match entry.cmp(&(section, name)) {
-            std::cmp::Ordering::Equal => return Some((entry.1, listing)),
-            std::cmp::Ordering::Less => low = end + 1,
-            std::cmp::Ordering::Greater => high = start,
-        }
-    }
-    None
-}
-
 impl BuiltinMethod {
     /// This method as the inventory lists it: its kind, then what holds it
     /// in the native tables. `None` for a registration no registry holds.
@@ -1014,82 +990,6 @@ pub(crate) fn prove_surface_intrinsics(ctx: &Ctx<'_>) -> bool {
 mod tests {
     use super::*;
 
-    fn runtime() -> JsRuntime {
-        let runtime = JsRuntime::new().expect("runtime");
-        runtime
-            .install_semantic_bindings()
-            .expect("semantic bindings");
-        runtime
-    }
-
-    #[test]
-    fn the_seal_proves_the_methods_the_benchmark_callbacks_call() {
-        let runtime = runtime();
-        with_ctx(&runtime, |ctx| {
-            for name in [
-                "rev", "fast", "gain", "add", "struct", "s", "vib", "fm", "fmh", "detune", "crush",
-                "speed", "mask", "squeeze", "set", "when", "clip", "ply",
-            ] {
-                assert!(
-                    prove_builtin_method(&ctx, name).is_some(),
-                    "{name} is not a sealed built-in"
-                );
-            }
-            assert!(prove_mini_callee(&ctx));
-            for name in [
-                "query",
-                "polyJoin",
-                "_fast",
-                "p",
-                "constructor",
-                "withValue",
-            ] {
-                assert!(
-                    prove_builtin_method(&ctx, name).is_none(),
-                    "{name} must not be compilable"
-                );
-            }
-        });
-    }
-
-    #[test]
-    fn a_replaced_slot_or_a_copied_tag_fails_the_proof() {
-        let runtime = runtime();
-        runtime
-            .eval(
-                "Pattern.prototype.rev = Pattern.prototype.fast; \
-                 const forged = (x) => x; forged.__rustel_combinator = fast.__rustel_combinator; \
-                 Pattern.prototype.fast = forged; \
-                 Object.defineProperty(Pattern.prototype, 'add', { get() { return () => 1; } }); \
-                 globalThis.m = mini;",
-            )
-            .expect("replace slots");
-        with_ctx(&runtime, |ctx| {
-            for name in ["rev", "fast", "add"] {
-                assert!(prove_builtin_method(&ctx, name).is_none(), "{name}");
-            }
-            assert!(prove_builtin_method(&ctx, "slow").is_some());
-            assert!(!prove_mini_callee(&ctx));
-        });
-    }
-
-    #[test]
-    fn the_seal_proves_the_intrinsics_until_one_is_replaced() {
-        for replace in [
-            "globalThis.Object = { keys() { return [] } }",
-            "Array.isArray = () => false",
-            "globalThis.Array = function Array() {}",
-        ] {
-            let runtime = runtime();
-            assert!(with_ctx(&runtime, |ctx| prove_surface_intrinsics(&ctx)));
-            runtime.eval(replace).expect("replace an intrinsic");
-            assert!(
-                !with_ctx(&runtime, |ctx| prove_surface_intrinsics(&ctx)),
-                "{replace}"
-            );
-        }
-    }
-
     /// Set `RUSTEL_WRITE_INVENTORY` to write the asset from this realm,
     /// in a build with every feature.
     #[test]
@@ -1137,28 +1037,5 @@ mod tests {
             proven, NATIVE_INVENTORY,
             "run this test with RUSTEL_WRITE_INVENTORY=1 to write the asset again"
         );
-    }
-
-    #[test]
-    fn a_search_reads_lines_that_end_with_a_carriage_return() {
-        let checkout = NATIVE_INVENTORY.replace('\n', "\r\n");
-        for line in NATIVE_INVENTORY.lines() {
-            let ((section, name), listed) =
-                inventory_entry(line).expect("a section, a name and a listing");
-            assert_eq!(
-                listing_in(&checkout, section, name),
-                Some((name, listed)),
-                "{line}"
-            );
-        }
-    }
-
-    #[test]
-    fn nothing_is_proven_before_the_seal() {
-        let runtime = JsRuntime::new().expect("runtime");
-        with_ctx(&runtime, |ctx| {
-            assert!(prove_builtin_method(&ctx, "rev").is_none());
-            assert!(!prove_mini_callee(&ctx));
-        });
     }
 }

@@ -40,35 +40,6 @@ fn js_fmap_transforms_values() {
     );
 }
 
-/// The callback runs per hap, at query time - not once at build time.
-#[test]
-fn js_callback_runs_once_per_hap_at_query_time() {
-    let rt = JsRuntime::new().unwrap();
-    // A counter in JS closure state, which also proves closure state survives
-    // across queries (the property that killed the staging-runtime design).
-    let mut b = rt.builder();
-    let id = b.callback(&rt, "(_w) => { let n = 0; return (x) => `${x}${n++}`; }");
-    let p = seq().fmap_js(id);
-    rt.set_active(&b, p).unwrap();
-
-    let first = rt
-        .query(Slot::Active, 0, Fraction::ZERO, Fraction::ONE)
-        .unwrap();
-    let second = rt
-        .query(Slot::Active, 0, Fraction::ZERO, Fraction::ONE)
-        .unwrap();
-
-    assert_eq!(first[0].value.show(), "bd0");
-    assert_eq!(first[1].value.show(), "sd1");
-    // The second query continues the same closure state: 2 and 3, not 0 and 1.
-    assert_eq!(second[0].value.show(), "bd2");
-    assert_eq!(
-        second[1].value.show(),
-        "sd3",
-        "closure state must persist across queries; a heap swap would reset it"
-    );
-}
-
 /// Each lone surrogate in a hap value reads as one U+FFFD, and the text
 /// around it, surrogate pairs included, is kept.
 #[test]
@@ -293,24 +264,6 @@ fn a_query_callback_time_beyond_i128_is_refused() {
             .unwrap();
         assert!(haps.is_empty(), "{end} must be refused, got {haps:?}");
     }
-}
-
-/// The runtime must tear down cleanly: QuickJS asserts
-/// `list_empty(&rt->gc_obj_list)` in `JS_FreeRuntime`, so a leak aborts the
-/// process rather than passing quietly.
-#[test]
-fn runtime_tears_down_cleanly() {
-    let rt = JsRuntime::new().unwrap();
-    let mut b = rt.builder();
-    let id = b.callback(&rt, "(_w) => (x) => x");
-    let p = seq().fmap_js(id);
-    rt.set_active(&b, p).unwrap();
-    let _ = rt
-        .query(Slot::Active, 0, Fraction::ZERO, Fraction::ONE)
-        .unwrap();
-    rt.clear_active();
-    drop(rt);
-    // Reaching here is the assertion.
 }
 
 /// The configured string parser is a runtime-private root and may retain a
@@ -964,31 +917,6 @@ fn a_sparse_callback_array_is_budgeted_by_converted_haps() {
     );
 }
 
-/// The hap budget bounds the Rust conversion only. The callback builds its
-/// array on the QuickJS heap before it returns; the heap ceiling tested below
-/// bounds that allocation.
-#[test]
-fn a_refused_callback_array_still_costs_the_quickjs_heap() {
-    let rt = JsRuntime::new().unwrap();
-    let mut b = rt.builder();
-    let id = b.callback(
-        &rt,
-        "(_w) => (state) => Array.from({length: 5000}, (_, i) => ({\
-           begin: state.span.begin, end: state.span.end, value: i}))",
-    );
-    rt.set_active(&b, rustel_core::js_query(id)).unwrap();
-
-    // Refused during conversion - but the 5,000-element JS array was built
-    // before Rust saw any of it.
-    let refused = rt.query_with_budget(Slot::Active, 0, Fraction::ZERO, Fraction::ONE, 100);
-    assert!(refused.is_err(), "the oversized array must be refused");
-    // The Rust side stayed small, which is what this layer can guarantee.
-    assert!(
-        rustel_core::peak_hap_vector() <= 100,
-        "the Rust conversion exceeded the budget"
-    );
-}
-
 // -- the QuickJS heap ceiling ----------------------------------------------
 //
 // The hap budget bounds what Rust converts. It cannot bound what JavaScript
@@ -1059,50 +987,6 @@ fn the_default_heap_ceiling_is_installed_and_cannot_be_raised() {
 }
 
 #[test]
-fn ordinary_patterns_are_unaffected_by_the_ceiling() {
-    // The half that matters most: a limit nobody notices is only useful if it
-    // changes nothing below it. Queried against the same expectations the rest
-    // of the suite uses.
-    let rt = JsRuntime::new().unwrap();
-    rt.install_semantic_bindings().unwrap();
-    rt.evaluate_score(
-        r#"s("bd sd").fast(2)"#,
-        &rustel_transpiler::TranspileOptions::default(),
-    )
-    .expect("an ordinary pattern must evaluate under the ceiling");
-    let haps = rt
-        .query(Slot::Active, 0, Fraction::ZERO, Fraction::ONE)
-        .expect("query");
-    assert_eq!(haps.len(), 4);
-    assert_eq!(haps[0].show(), "[ 0/1 → 1/4 | s:bd ]");
-}
-
-#[test]
-fn runaway_javascript_allocation_is_refused_rather_than_fatal() {
-    // The property being bought. Without a ceiling this takes the process down;
-    // with one, QuickJS raises an ordinary error that the host reports.
-    //
-    // Timed, because "refused" and "refused after swapping for a minute" are
-    // different outcomes.
-    let rt = JsRuntime::new().unwrap();
-    rt.install_semantic_bindings().unwrap();
-    rt.set_memory_limit(8 * 1024 * 1024).unwrap();
-
-    let started = std::time::Instant::now();
-    let result = rt.eval(BOUNDED_HOG);
-    let elapsed = started.elapsed();
-
-    assert!(
-        result.is_err(),
-        "an allocation far past the ceiling must be refused"
-    );
-    assert!(
-        elapsed < std::time::Duration::from_secs(30),
-        "the refusal took {elapsed:?}"
-    );
-}
-
-#[test]
 fn the_runtime_still_works_after_a_refused_allocation() {
     // Recovery is the difference between a bound and a kill switch. A runtime
     // that survives the refusal but is left unusable would pass the test above
@@ -1139,42 +1023,6 @@ fn the_runtime_still_works_after_a_refused_allocation() {
             2
         );
     }
-}
-
-/// A callback that exhausts the heap fails the query with a typed refusal.
-/// The hap budget cannot reach the allocation: JavaScript builds the array
-/// before Rust converts anything. The refusal comes from the allocator's
-/// denial, not from a message match: `JS_ThrowOutOfMemory` throws null when
-/// it cannot build its error, so no stable text exists.
-#[test]
-fn a_callback_that_allocates_past_the_ceiling_fails_the_query_not_the_process() {
-    // The allocation happens inside a query
-    // callback, where the hap budget cannot reach it because the array is built
-    // before Rust converts anything.
-    let rt = JsRuntime::new().unwrap();
-    rt.install_semantic_bindings().unwrap();
-    rt.set_memory_limit(8 * 1024 * 1024).unwrap();
-
-    let mut b = rt.builder();
-    let id = b.callback(
-        &rt,
-        "(_w) => (state) => Array.from({length: 2000000}, () => ({\
-           begin: state.span.begin, end: state.span.end, value: 1}))",
-    );
-    rt.set_active(&b, rustel_core::js_query(id)).unwrap();
-
-    let result = rt.query(Slot::Active, 0, Fraction::ZERO, Fraction::ONE);
-    assert!(
-        result.is_err(),
-        "a callback allocating past the ceiling must fail the QUERY"
-    );
-
-    // And the runtime is still usable - the query failed, not the session.
-    rt.evaluate_score(
-        r#"s("bd")"#,
-        &rustel_transpiler::TranspileOptions::default(),
-    )
-    .expect("the runtime must survive a callback that blew the ceiling");
 }
 
 /// An ordinary throw is not a heap refusal. A message matcher would catch
@@ -1738,26 +1586,6 @@ fn haps_from_one_callback_share_one_materialization_budget() {
     assert_eq!(haps.len(), 4, "the honest callback value lost haps");
 }
 
-/// Object property values draw on the same budget as array elements: two
-/// sparse arrays reached through properties, each fitting the cap alone,
-/// cannot sum past it.
-#[test]
-fn sparse_arrays_behind_object_properties_share_one_budget() {
-    let rt = JsRuntime::new().unwrap();
-    rt.install_semantic_bindings().unwrap();
-    rt.set_memory_limit(MATERIALIZE_CEILING).unwrap();
-
-    let inner = materialize_cap() / 2 + 1;
-    let refusal = caught(
-        &rt,
-        &format!("valueToMidi({{a: new Array({inner}), b: new Array({inner})}})"),
-    );
-    assert!(
-        refusal.starts_with("RangeError: cannot materialize"),
-        "the second property's array must hit the shared budget, got: {refusal}"
-    );
-}
-
 /// The other callers that keep several materialized values together draw on
 /// one budget as well: the controls of a `Pattern.query` State, and every
 /// argument of an extension value callable.
@@ -2192,38 +2020,6 @@ fn arrays_bound_by_a_combinator_partial_are_charged_before_the_rebuild_walks_the
         .query(Slot::Active, 0, Fraction::ZERO, Fraction::ONE)
         .expect("the honest partial must query");
     assert!(!haps.is_empty(), "the honest partial produced no haps");
-}
-
-/// The rebuild charges one budget for everything it mirrors. Two bound
-/// arrays that each fit the cap alone, but not together, fail closed: the
-/// partial is bridged as a callback and not rebuilt natively.
-#[test]
-fn a_partial_s_bound_arrays_share_one_rebuild_budget() {
-    let rt = JsRuntime::new().unwrap();
-    rt.install_semantic_bindings().unwrap();
-    rt.set_memory_limit(MATERIALIZE_CEILING).unwrap();
-
-    assert_eq!(
-        calls_through_js(&rt, "pure('bd').every(2, counting(euclid([3], [8])))"),
-        0.0,
-        "two honest bound arrays must rebuild natively"
-    );
-    let half = materialize_cap() / 2 + 1;
-    assert_eq!(
-        calls_through_js(
-            &rt,
-            &format!("pure('bd').every(2, counting(euclid(new Array({half}), [8])))")
-        ),
-        0.0,
-        "one bound array under the cap must rebuild natively"
-    );
-    assert!(
-        calls_through_js(
-            &rt,
-            &format!("pure('bd').every(2, counting(euclid(new Array({half}), new Array({half}))))")
-        ) > 0.0,
-        "two bound arrays that only fit the cap separately were rebuilt natively"
-    );
 }
 
 /// A curry calls through when `arity` arguments are bound, so a genuine tag

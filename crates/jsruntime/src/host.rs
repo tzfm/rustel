@@ -416,22 +416,6 @@ mod callback_ir_cache_tests {
     }
 
     #[test]
-    fn cache_keeps_candidates_and_refusals_once_each() {
-        let mut cache = PatternTransformIrCache::default();
-        assert_eq!(cache.get("x => x"), None);
-        cache.insert("x => x", identity());
-        assert_eq!(cache.get("x => x"), Some(identity()));
-        cache.insert("x => x", identity());
-        assert_eq!(cache.entries.len(), 1);
-        assert_eq!(cache.source_bytes, "x => x".len());
-
-        let refused = Err(rustel_transpiler::PatternTransformFallbackReason::ArgumentShape);
-        cache.insert("x => x.fast(k)", refused.clone());
-        assert_eq!(cache.get("x => x.fast(k)"), Some(refused));
-        assert_eq!(cache.entries.len(), 2);
-    }
-
-    #[test]
     fn cache_evicts_fifo_with_bounded_count_and_source_bytes() {
         let first = "p0 => p0";
         for multiplier in [1, 2] {

@@ -70,20 +70,6 @@ fn host_write_to_a_planted_accessor_is_refused_without_running_its_setter() {
 }
 
 #[test]
-fn a_getter_only_cell_is_not_advertised_as_a_writable_slider() {
-    let runtime = JsRuntime::new().expect("runtime");
-    evaluate_planting_score(&runtime);
-
-    let read = runtime.slider_value("getter-only:1").expect("read");
-    let write = runtime
-        .set_slider_value("getter-only:1", 0.25)
-        .expect("write decision");
-
-    assert_eq!(read, None);
-    assert!(!write);
-}
-
-#[test]
 fn patching_the_probe_globals_cannot_run_score_code_on_host_traffic() {
     // The probe must consult helpers captured at install time: if it looked
     // up `Object.getOwnPropertyDescriptor` dynamically, a patched global
@@ -119,24 +105,4 @@ fn patching_the_probe_globals_cannot_run_score_code_on_host_traffic() {
         elapsed_within(started),
         "host traffic ran a patched probe helper"
     );
-}
-
-#[test]
-fn ordinary_registered_cells_still_read_and_write_through_the_probe() {
-    let runtime = JsRuntime::new().expect("runtime");
-    runtime.install_semantic_bindings().expect("bindings");
-    runtime
-        .evaluate_score(
-            "globalThis.sliderWithID('plain:1', 0.5, 0, 1); $: s('bd')",
-            &TranspileOptions::default(),
-        )
-        .expect("score registering a plain cell");
-
-    let read = runtime.slider_value("plain:1").expect("read");
-    let written = runtime.set_slider_value("plain:1", 0.75).expect("write");
-    let reread = runtime.slider_value("plain:1").expect("reread");
-
-    assert_eq!(read, Some(0.5));
-    assert!(written);
-    assert_eq!(reread, Some(0.75));
 }

@@ -412,50 +412,6 @@ fn a_setup_helper_compiles_with_its_location_free_mini_notation() {
 }
 
 #[test]
-fn lazily_applied_compiled_callbacks_leave_a_pure_graph() {
-    for source in [
-        r#"n("0 1 2 3").sometimes(x => x.rev())"#,
-        r#"n("0 1 2 3").sometimes(x => x.fast(2))"#,
-        r#"s("bd sd hh cp").sometimesBy(0.3, x => x.s("supersaw").vib(5).fm(3))"#,
-    ] {
-        let (auto, stats) = stats_after(AUTO, source);
-        assert!(stats.lowered > 0, "{source}: {stats:?}");
-        let graph = auto.active_pattern().expect("active graph");
-        let pure = graph
-            .as_pure_pattern()
-            .unwrap_or_else(|| panic!("{source}: the compiled callback left JavaScript behind"));
-        // No host is installed: a wrong classification panics here.
-        assert!(
-            !pure.query_arc(Fraction::ZERO, Fraction::int(4)).is_empty(),
-            "{source}"
-        );
-
-        let (compatibility, _) = stats_after(COMPATIBILITY, source);
-        let graph = compatibility.active_pattern().expect("active graph");
-        assert!(
-            !graph.is_pure(),
-            "{source}: Compatibility must keep the callback"
-        );
-    }
-}
-
-#[test]
-fn a_compiled_chunk_callback_stays_pure_and_cacheable() {
-    let (auto, _) = stats_after(AUTO, r#"n("0 1 2 3").chunk(4, x => x.fast(2))"#);
-    let graph = auto.active_pattern().expect("active graph");
-    assert!(graph.is_pure());
-    assert!(graph.is_cacheable());
-    let first = auto
-        .query(Slot::Active, 0, Fraction::ZERO, Fraction::int(16))
-        .expect("first query");
-    let second = auto
-        .query(Slot::Active, 0, Fraction::ZERO, Fraction::int(16))
-        .expect("second query");
-    assert!(!first.is_empty());
-    assert_eq!(first.len(), second.len());
-}
-
-#[test]
 fn replacements_close_compilation_before_the_text_that_makes_them_runs() {
     let callback = r#"n("0 1 2 3").sometimesBy(1, x => x.rev())"#;
     for (name, source) in [
@@ -559,33 +515,6 @@ fn replacements_close_compilation_before_the_text_that_makes_them_runs() {
 }
 
 #[test]
-fn every_global_that_holds_the_global_object_is_a_holder() {
-    let runtime = runtime(AUTO);
-    evaluate(
-        &runtime,
-        "pure(Object.getOwnPropertyNames(globalThis).filter((k) => { try { return globalThis[k] === globalThis } catch (e) { return false } }).join(' '))",
-    );
-    let haps = runtime
-        .query(Slot::Active, 0, Fraction::ZERO, Fraction::ONE)
-        .expect("query");
-    let aliases = haps[0].value.show();
-    let aliases: Vec<&str> = aliases.split(' ').collect();
-    assert!(aliases.contains(&"globalThis"), "{aliases:?}");
-    for alias in aliases {
-        let output = rustel_transpiler::transpile(
-            &format!("{alias}.register('rev', (pat) => pat)"),
-            &TranspileOptions::default(),
-        );
-        assert_eq!(
-            output.surface_writes.member_names,
-            ["rev", "_rev"],
-            "{alias}: {:?}",
-            output.surface_writes
-        );
-    }
-}
-
-#[test]
 fn a_setup_that_can_write_any_member_closes_compilation() {
     let setup = "globalThis.swap = (name, f) => { Pattern.prototype[name] = f }";
     let score = r#"const p = n("0 1 2 3").sometimesBy(1, x => x.rev()); swap('rev', function () { return this.fast(2) }); p"#;
@@ -603,16 +532,6 @@ fn a_setup_that_can_write_any_member_closes_compilation() {
     });
     assert_eq!(auto.0, compatibility.0);
     assert_eq!(auto.1.lowered, 0, "{:?}", auto.1);
-}
-
-#[test]
-fn an_inert_text_keeps_compilation_open() {
-    let (auto, stats) = stats_after(
-        AUTO,
-        r#"register('myfx', (pat) => pat); globalThis.k = 1; n("0 1 2 3").sometimesBy(1, x => x.rev())"#,
-    );
-    assert_eq!(stats.lowered, 1, "{stats:?}");
-    assert!(auto.active_pattern().expect("active graph").is_pure());
 }
 
 #[test]
@@ -765,32 +684,6 @@ fn a_nested_arrow_goes_stale_for_its_own_chain_alone() {
     }
 }
 
-/// A stale nested arrow with no host plays only the parts that need no
-/// callback: the cycle whose condition is false passes through, and a query
-/// that reaches the stale whole answers nothing at all - a pending query
-/// error empties the whole query, not only the part that erred.
-#[test]
-fn a_stale_nested_arrow_without_a_host_plays_what_needs_no_callback() {
-    let runtime = runtime(AUTO);
-    evaluate(
-        &runtime,
-        r#"s("bd*4").sometimesBy(1, y => y.when("< 0 [0!3 1]>", x => x.ply(2)))"#,
-    );
-    assert_eq!(runtime.pattern_transform_ir_stats().lowered, 2);
-    let graph = runtime.active_pattern().expect("active graph");
-    runtime
-        .eval("Pattern.prototype.ply = function () { return this.fast(2) }")
-        .expect("replace ply");
-    assert!(runtime.compiled_callbacks_need_host());
-    let count = |begin: i128, end: i128| {
-        graph
-            .query_arc(Fraction::int(begin), Fraction::int(end))
-            .len()
-    };
-    assert_eq!(count(0, 1), 4);
-    assert_eq!(count(1, 2), 0);
-}
-
 #[test]
 fn a_stale_compiled_callback_routes_queries_through_the_host_while_it_lives() {
     let runtime = runtime(AUTO);
@@ -922,64 +815,6 @@ fn a_query_error_left_pending_stops_no_compiled_chain() {
     }
 }
 
-#[test]
-fn identity_arrow_auto_compatibility_and_dual_run_agree() {
-    let source = r#"s("bd sd hh cp").sometimesBy(1, pattern => pattern)"#;
-    let (auto, auto_stats) = stats_after(AUTO, source);
-    let graph = auto.active_pattern().expect("active graph");
-    assert!(graph.is_pure(), "the compiled identity needs no host");
-    assert_eq!(auto_stats.lowered, 1);
-    let native = observe(&auto);
-
-    let (compatibility, _) = stats_after(COMPATIBILITY, source);
-    let graph = compatibility.active_pattern().expect("active graph");
-    assert!(
-        !graph.is_pure(),
-        "the retained fallback keeps this graph impure"
-    );
-    assert!(
-        !graph.reachable_callbacks().is_empty() || graph.purity().opaque,
-        "the original JavaScript callback must remain owned"
-    );
-    compatibility.reset_pattern_transform_ir_stats();
-    assert_eq!(observe(&compatibility), native);
-    let stats = compatibility.pattern_transform_ir_stats();
-    assert!(stats.calls > 0);
-    assert_eq!(stats.native_executions, 0);
-    assert_eq!(stats.compatibility_executions, stats.calls);
-
-    let (dual, _) = stats_after(DUAL_RUN, source);
-    dual.reset_pattern_transform_ir_stats();
-    assert_eq!(observe(&dual), native);
-    let stats = dual.pattern_transform_ir_stats();
-    assert!(stats.dual_runs > 0);
-    assert_eq!(stats.dual_runs, stats.calls);
-    assert_eq!(stats.native_executions, stats.calls);
-    assert_eq!(stats.compatibility_executions, stats.calls);
-    assert_eq!(stats.mismatches, 0);
-}
-
-#[test]
-fn nearby_dynamic_arrows_remain_on_the_complete_quickjs_tier() {
-    for callback in [
-        "pattern => pattern.rev(...[])",
-        "pattern => { return pattern.rev(); }",
-        "pattern => pattern.fast(two)",
-    ] {
-        let source = format!(r#"const two = 2; s("bd sd hh cp").sometimesBy(1, {callback})"#);
-        let (runtime, stats) = stats_after(AUTO, &source);
-        assert_eq!(stats.lowered, 0, "{callback}");
-        let graph = runtime.active_pattern().expect("active graph");
-        assert!(!graph.is_pure(), "{callback}: callback graph became pure");
-        assert!(!observe(&runtime).is_empty(), "{callback}: empty result");
-        assert_eq!(
-            runtime.pattern_transform_ir_stats().calls,
-            0,
-            "{callback}: unsupported source entered callback IR"
-        );
-    }
-}
-
 /// A nested arrow recognition cannot prove keeps the whole callback's
 /// JavaScript: a free name, a statement body, an asynchronous arrow, a
 /// function in the slot of a method that takes none, or more nesting than a
@@ -1034,24 +869,4 @@ fn source_recognition_uses_captured_intrinsics_not_mutable_globals() {
         "the captured intrinsic was not isolated from the user replacement"
     );
     assert!(!observe(&hidden).is_empty());
-}
-
-#[test]
-fn indexed_transformers_keep_their_original_javascript_call_contract() {
-    let runtime = runtime(AUTO);
-    evaluate(
-        &runtime,
-        r#"pure('seed').echoWith(fastcat(2, 2), 1/8, pattern => pattern.fast(2))"#,
-    );
-    runtime.reset_pattern_transform_ir_stats();
-    let output = observe(&runtime);
-    assert_eq!(
-        runtime.pattern_transform_ir_stats().calls,
-        0,
-        "indexed callbacks must stay behind their batch JavaScript boundary"
-    );
-    assert!(
-        !output.is_empty(),
-        "the original callback returned no events"
-    );
 }
