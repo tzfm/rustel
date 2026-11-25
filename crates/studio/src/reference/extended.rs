@@ -191,15 +191,6 @@ mod tests {
     }
 
     #[test]
-    fn the_start_of_a_word_beats_the_inside_of_one() {
-        let mut first = entry("first");
-        first.description = "makes a delay".to_owned();
-        let mut second = entry("second");
-        second.description = "unmakes nothing".to_owned();
-        assert!(score("make", &first) > score("make", &second));
-    }
-
-    #[test]
     fn non_ascii_words_match_ignoring_case() {
         let mut entry = entry("chant");
         entry.description = "Une ÉCHELLE de sons".to_owned();

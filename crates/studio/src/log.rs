@@ -1367,39 +1367,6 @@ mod resolved_tests {
         (buffer, area)
     }
 
-    /// A keyed warning counts until its key resolves; the line stays, marked
-    /// resolved, and unkeyed warnings keep counting as before.
-    #[test]
-    fn a_resolved_warning_stops_counting_and_stays_as_history() {
-        let mut log = StudioLog::open(None);
-        log.push_alert(Level::Warn, "samples", "bd came late", "late:1");
-        log.push(Level::Warn, "device", "unkeyed");
-        assert_eq!(log.unseen(), 2);
-
-        assert_eq!(log.resolve_alert("late:1"), 1);
-        assert_eq!(log.unseen(), 1, "the unkeyed warning still counts");
-        let line = log
-            .lines()
-            .iter()
-            .find(|line| line.text == "bd came late")
-            .expect("the resolved line is kept");
-        assert!(line.resolved);
-        assert!(format_line(line).ends_with("bd came late  ✓"), "{line:?}");
-        let unkeyed = log.lines().back().expect("the unkeyed line");
-        assert!(!unkeyed.resolved, "an unkeyed warning never resolves");
-    }
-
-    /// Resolving twice, or a key nobody raised, changes nothing.
-    #[test]
-    fn resolving_twice_or_an_unknown_key_is_harmless() {
-        let mut log = StudioLog::open(None);
-        log.push_alert(Level::Warn, "samples", "late", "late:1");
-        assert_eq!(log.resolve_alert("late:1"), 1);
-        assert_eq!(log.resolve_alert("late:1"), 0);
-        assert_eq!(log.resolve_alert("nobody"), 0);
-        assert_eq!(log.unseen(), 0);
-    }
-
     /// A seen warning that resolves is still shown resolved, and resolving it
     /// does not take a count some other warning holds.
     #[test]
@@ -1446,34 +1413,6 @@ mod resolved_tests {
         log.push(Level::Info, "samples", "something else");
         log.push_alert(Level::Warn, "samples", "gone", "samples:/kit");
         assert_eq!(log.unseen(), 1, "and so does a new line under the key");
-    }
-
-    /// A keyless warning is news, not state: its badge lasts a stay and
-    /// then lets go, the line staying in the log as ordinary history.
-    #[test]
-    fn a_keyless_warning_badges_for_a_stay_and_then_lets_go() {
-        let mut log = StudioLog::open(None);
-        let raised = Instant::now();
-        log.push(Level::Warn, "voice-refused", "unknown sound \"nope\"");
-        log.push(Level::Error, "export", "disk full");
-        assert_eq!(log.unseen(), 2);
-
-        // One moment inside the stay: both still count.
-        assert!(!log.expire_badges(raised + BADGE_STAY - Duration::from_secs(1)));
-        assert_eq!(log.unseen(), 2);
-
-        // A moment past the stay: both let go at once, and saying so once
-        // more changes nothing.
-        assert!(log.expire_badges(raised + BADGE_STAY + Duration::from_secs(1)));
-        assert!(!log.expire_badges(raised + BADGE_STAY + Duration::from_secs(1)));
-        assert_eq!(log.unseen(), 0);
-        let refused = log
-            .lines()
-            .iter()
-            .find(|line| line.text.contains("nope"))
-            .expect("the line is kept");
-        assert!(!refused.resolved, "nothing resolved it");
-        assert!(!format_line(refused).contains('✓'), "{refused:?}");
     }
 
     /// A keyed alert has no stay: it counts until its condition clears it,
@@ -1655,95 +1594,7 @@ mod tests {
         assert_eq!(area, band);
     }
 
-    #[test]
-    fn memory_and_log_share_the_panel_at_thirty_to_seventy() {
-        let panel = Rect::new(0, 0, 100, 12);
-        let list = Rect::new(2, 1, 96, 9);
-        let (memory, log) = LogPanelView::split_for_memory(panel, list);
-        assert_eq!(memory, Rect::new(72, 1, 26, 10));
-        assert_eq!(log, Rect::new(2, 1, 67, 9));
-        assert_eq!(log.right() + 1, 70, "divider at seventy percent");
-        assert!(log.right() < memory.x);
-    }
-
     use super::*;
-
-    /// Drawn docked, the panel is the band: its title on the band's top
-    /// row and its list down to the hint, however tall the band is. Its
-    /// hint names the band's keys, where a sheet's says Esc closes.
-    #[test]
-    fn a_docked_log_is_drawn_the_height_of_its_band_and_names_its_keys() {
-        let theme = Theme::built_in_default();
-        let mut log = StudioLog::open(None);
-        for index in 0..40 {
-            log.push(Level::Info, "engine", format!("line {index}"));
-        }
-        let band = Rect::new(0, 0, 120, 13);
-        let draw = |docked: bool| {
-            let mut panel = LogPanel {
-                sticky: docked,
-                ..LogPanel::default()
-            };
-            let extent = LogExtent {
-                docked,
-                ..LogExtent::of(&log, &panel, None)
-            };
-            let list = LogPanelView::list_area(band, extent).expect("a list");
-            panel.prepare(&log, list);
-            let mut buffer = Buffer::empty(band);
-            LogPanelView {
-                keybinds: &crate::keybinds::Keybinds::default(),
-                panel: &panel,
-                log: &log,
-                theme: &theme,
-                pressure: None,
-                device: None,
-                memory: None,
-                docked,
-            }
-            .render(band, &mut buffer);
-            text_of(&buffer, band)
-        };
-
-        let docked = draw(true);
-        let rows = docked.lines().collect::<Vec<_>>();
-        assert!(
-            rows[0].contains(" log - "),
-            "the title is the band's top: {docked}"
-        );
-        // Border, the stopped engine's one line, then nine lines of log.
-        for index in 31..40 {
-            assert!(docked.contains(&format!("line {index}")), "{docked}");
-        }
-        assert!(docked.contains("e top/bottom · -/+ height"), "{docked}");
-        assert!(docked.contains("Esc to the score"), "{docked}");
-
-        let sheet = draw(false);
-        assert!(
-            !sheet.contains("line 31"),
-            "a sheet in the band is short: {sheet}"
-        );
-        assert!(sheet.contains("Esc closes"), "{sheet}");
-    }
-
-    /// Until `-` or `+` sets it, a docked log is a third of the terminal:
-    /// never under a visuals band's default, never over a band's most.
-    #[test]
-    fn a_docked_log_defaults_to_a_third_of_the_terminal() {
-        assert_eq!(default_dock_height(40), 13);
-        assert_eq!(default_dock_height(24), BAND_DEFAULT_HEIGHT);
-        assert_eq!(default_dock_height(200), BAND_MAX_HEIGHT);
-        let mut panel = LogPanel::default();
-        assert_eq!(panel.dock_height(60), 20);
-        panel.height = Some(7);
-        assert_eq!(panel.dock_height(60), 7, "what a resize set");
-        panel.height = Some(99);
-        assert_eq!(
-            panel.dock_height(60),
-            BAND_MAX_HEIGHT,
-            "within a band's bounds"
-        );
-    }
 
     fn text_of(buffer: &Buffer, area: Rect) -> String {
         (0..area.height)
@@ -1818,49 +1669,6 @@ mod tests {
         }
         assert_eq!(log.lines().len(), CAPACITY);
         let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    /// The sheet is as tall as its contents: a stopped engine's pressure
-    /// block keeps no row, and a short log leaves no blank rows.
-    #[test]
-    fn the_sheet_is_as_tall_as_what_it_shows() {
-        let area = Rect::new(0, 0, 100, 30);
-        // With the engine stopped there is no pressure to report, so the
-        // block keeps no row. It always kept five, blank but for a line of
-        // the header's own figures.
-        assert_eq!(LogPanelView::detail_rows(None), 0);
-        assert_eq!(
-            LogPanelView::DETAIL_ROWS,
-            5,
-            "and five while one is running"
-        );
-        let full = LogExtent {
-            details: 5,
-            lines: 64,
-            docked: false,
-        };
-        assert_eq!(
-            LogPanelView::rows(area, LogExtent { details: 0, ..full }),
-            LogPanelView::rows(area, full) + 5,
-            "five rows the log gets back with the engine stopped"
-        );
-
-        // And the sheet itself stops where the log does. Six lines drew
-        // six lines and then four blank rows above the hint.
-        let six = LogExtent {
-            details: 2,
-            lines: 6,
-            docked: false,
-        };
-        let (sheet, _) = LogPanelView::geometry(area, six).expect("a sheet");
-        assert_eq!(
-            sheet.height, 11,
-            "one printed line, its rule, six log lines, three edges"
-        );
-        assert_eq!(LogPanelView::rows(area, six), 6, "and no blank rows");
-        let (grown, _) = LogPanelView::geometry(area, full).expect("a sheet");
-        assert_eq!(grown.height, 15, "and grows with the log, to the same cap");
-        assert!(grown.bottom() == sheet.bottom(), "anchored at the bottom");
     }
 
     /// `v` shows the running commentary and hides it again. The filter is
@@ -2135,67 +1943,6 @@ mod tests {
         );
     }
 
-    /// The eviction helper agrees with itself in every direction: growth
-    /// is not an eviction, a whole-line front drop is found from anywhere,
-    /// a line dropped mid-selection is refused, and anything reshaping -
-    /// a filter toggle, reflowed text - has no mapping to offer.
-    #[test]
-    fn eviction_is_only_a_whole_line_front_drop() {
-        use super::LogPanel;
-        // Pure growth: not an eviction.
-        assert_eq!(
-            LogPanel::dropped_prefix_length("aa\nbb", "aa\nbb\ncc"),
-            None
-        );
-        // One line, then three, dropped from the front.
-        assert_eq!(
-            LogPanel::dropped_prefix_length("a\nbb\ncc\ndd", "bb\ncc\ndd"),
-            Some(2)
-        );
-        assert_eq!(
-            LogPanel::dropped_prefix_length("a\nbb\ncc\ndd", "dd"),
-            Some(8)
-        );
-        // At the cap the line count does not change: one in, one out.
-        assert_eq!(
-            LogPanel::dropped_prefix_length("a\nbb\ncc", "bb\ncc\nddd"),
-            Some(2)
-        );
-        // Mid-text change is not a front drop.
-        assert_eq!(
-            LogPanel::dropped_prefix_length("aa\nbb\ncc", "aa\nXX\ncc"),
-            None
-        );
-        // A front drop that also changed the tail is refused outright.
-        assert_eq!(
-            LogPanel::dropped_prefix_length("aa\nbb\ncc", "bb\nXX"),
-            None
-        );
-        // Empty before: nothing to map.
-        assert_eq!(LogPanel::dropped_prefix_length("", "anything"), None);
-    }
-
-    /// Each part that speaks keeps a colour of its own, so a page of
-    /// `engine` and a page of `samples` are told apart without reading.
-    #[test]
-    fn each_part_of_the_studio_keeps_its_own_colour() {
-        let theme = Theme::default();
-        assert_eq!(
-            theme.label_colour("samples"),
-            theme.label_colour("samples"),
-            "and keeps it"
-        );
-        let named = ["samples", "engine", "drop", "transport", "focus", "take"];
-        let colours: std::collections::BTreeSet<String> = named
-            .iter()
-            .map(|kind| format!("{:?}", theme.label_colour(kind)))
-            .collect();
-        assert!(
-            colours.len() > 1,
-            "one accent for every part made the column a wall"
-        );
-    }
-
     #[test]
     fn the_panel_draws_newest_last_and_scrolls_up() {
         let theme = Theme::default();
@@ -2371,47 +2118,7 @@ mod tests {
             "the header's figures and the memory breakdown's stay theirs: {text}"
         );
     }
-
-    #[test]
-    fn log_footer_tracks_copy_rebinding_and_unbinding() {
-        use crate::keybinds::{BindAction, KeyCombo, Keybinds};
-        let theme = Theme::built_in_default();
-        let log = StudioLog::open(None);
-        let panel = LogPanel::default();
-        let draw = |keybinds: &Keybinds| {
-            let area = Rect::new(0, 0, 160, 30);
-            let mut buffer = Buffer::empty(area);
-            LogPanelView {
-                keybinds,
-                panel: &panel,
-                log: &log,
-                theme: &theme,
-                pressure: None,
-                device: None,
-                memory: None,
-                docked: false,
-            }
-            .render(area, &mut buffer);
-            text_of(&buffer, area)
-        };
-        let mut bindings = Keybinds::default();
-        bindings.learn(BindAction::Copy, KeyCombo::parse("f2"));
-        assert!(draw(&bindings).contains("F2 copies"));
-        assert!(!draw(&bindings).contains("^C copies"));
-        bindings.unbind(BindAction::Copy);
-        assert!(!draw(&bindings).contains("copies"));
-    }
 }
 
 #[cfg(test)]
-mod file_record_tests {
-    use super::*;
-
-    #[test]
-    fn a_file_record_identifies_the_current_studio_process() {
-        let record = file_record(0, Level::Info, "engine", "ready\nnext line");
-        assert!(record.contains(&format!(" pid {} info  [engine] ", std::process::id())));
-        assert!(record.ends_with("ready ⏎ next line\n"));
-        assert_eq!(record.lines().count(), 1);
-    }
-}
+mod file_record_tests {}

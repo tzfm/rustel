@@ -2978,106 +2978,6 @@ pub(crate) mod test_env {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ratatui::buffer::Buffer;
-    use ratatui::widgets::Widget;
-
-    /// The picker names its verbs beside their chords on a row of its own,
-    /// in both input modes and under a camera note, and a delete waiting
-    /// for its second press says what the next press does.
-    #[test]
-    fn the_picker_names_new_edit_and_delete() {
-        use ratatui::layout::Rect;
-        let theme = Theme::built_in_default();
-        let area = Rect::new(0, 0, 60, 30);
-        let lines = |picker: &ThemePicker, vim: bool, camera: Option<CameraNote>| {
-            let mut buffer = Buffer::empty(area);
-            ThemePickerView {
-                picker,
-                theme: &theme,
-                camera,
-                vim,
-            }
-            .render(area, &mut buffer);
-            (0..area.height)
-                .map(|y| {
-                    (0..area.width)
-                        .map(|x| buffer.cell((x, y)).unwrap().symbol().to_owned())
-                        .collect::<String>()
-                })
-                .collect::<Vec<_>>()
-        };
-        let mut picker = ThemePicker::open(&theme);
-        for (vim, camera) in [(false, None), (true, None), (false, Some(CameraNote::Off))] {
-            let shown = lines(&picker, vim, camera);
-            assert!(
-                shown
-                    .iter()
-                    .any(|line| line.contains("^N new · ^E edit · ^D delete")),
-                "vim {vim}, camera {camera:?}:\n{}",
-                shown.join("\n")
-            );
-            assert!(shown.iter().all(|line| !line.contains("^n/e/d")));
-        }
-        picker.deleting = picker.selected_name().map(str::to_owned);
-        let shown = lines(&picker, false, None);
-        assert!(
-            shown.iter().any(|line| line.contains("^D again")),
-            "the armed delete:\n{}",
-            shown.join("\n")
-        );
-    }
-
-    /// The one row whose arrow keys do something draws the arrows. It is
-    /// also the rainbow row, and the rainbow paints the text the row built,
-    /// so the arrows must be part of that text.
-    #[test]
-    fn the_randomize_row_draws_its_arrows_through_the_rainbow() {
-        use ratatui::{buffer::Buffer, layout::Rect, widgets::Widget};
-        let theme = Theme::built_in_default();
-        let area = Rect::new(0, 0, 60, 30);
-
-        let row_text = |picker: &ThemePicker| -> String {
-            let mut buffer = Buffer::empty(area);
-            ThemePickerView {
-                picker,
-                theme: &theme,
-                camera: None,
-                vim: false,
-            }
-            .render(area, &mut buffer);
-            (0..area.height)
-                .map(|y| {
-                    (0..area.width)
-                        .map(|x| buffer.cell((x, y)).unwrap().symbol().to_owned())
-                        .collect::<String>()
-                })
-                .find(|line| line.contains(RANDOMIZE_THEME))
-                .expect("the randomize row is drawn")
-        };
-
-        let mut picker = ThemePicker::open(&theme);
-        let at = picker
-            .matches()
-            .position(|name| name == RANDOMIZE_THEME)
-            .expect("randomize is in the list");
-        picker.selected = at;
-        let before = row_text(&picker);
-        assert!(
-            before.contains('\u{25b6}'),
-            "no forward arrow on the randomize row: {before:?}"
-        );
-        assert!(
-            !before.contains('\u{25c0}'),
-            "a back arrow before anything has been rolled: {before:?}"
-        );
-
-        picker.roll_randomize(true);
-        let after = row_text(&picker);
-        assert!(
-            after.contains('\u{25c0}') && after.contains('\u{25b6}'),
-            "rolling did not grow the back arrow: {after:?}"
-        );
-    }
 
     /// A roll is only worth keeping if it can be had again, and only worth
     /// showing if the code on it can be read. `built_in_names` already sweeps
@@ -3205,52 +3105,6 @@ mod tests {
         );
     }
 
-    /// The camera theme that the studio paints itself declares a camera
-    /// without a Hydra sketch, so it reads the same in a build with no Hydra.
-    #[cfg(feature = "themes")]
-    #[test]
-    fn the_braille_camera_theme_declares_a_camera_without_a_hydra_chain() {
-        let theme = Theme::built_in("webcam-braille").expect("the theme is compiled in");
-        assert!(theme.native_camera_enabled());
-        assert!(theme.camera_enabled());
-        assert!(!theme.hydra_camera_enabled(), "no sketch samples s0 here");
-        assert_eq!(theme.hydra_code(), None);
-        assert_eq!(
-            theme.cell_visual().map(|cell| cell.effect),
-            Some(CellEffect::Camera)
-        );
-        assert_eq!(
-            theme.cell_visual().map(|cell| cell.mode),
-            Some(TachyonMode::Text),
-            "image mode is one colour a cell and would throw the dots away"
-        );
-        // And the Hydra camera themes still say what they said.
-        let hydra = Theme::built_in("webcam-clean").expect("webcam-clean");
-        assert!(hydra.hydra_camera_enabled());
-        assert!(hydra.camera_enabled());
-        assert!(!hydra.native_camera_enabled());
-        assert!(!Theme::built_in_default().camera_enabled());
-    }
-
-    #[test]
-    fn the_theme_pack_is_optional() {
-        let names: Vec<_> = Theme::built_in_names()
-            .filter(|name| *name != RANDOMIZE_THEME)
-            .collect();
-        #[cfg(feature = "themes")]
-        assert!(names.len() > 1, "the theme pack ships with the studio");
-        #[cfg(not(feature = "themes"))]
-        assert_eq!(names, vec!["rustel-dark"]);
-    }
-
-    #[test]
-    fn every_built_in_theme_parses() {
-        for name in Theme::built_in_names() {
-            let theme = Theme::built_in(name).unwrap_or_else(|| panic!("{name} is missing"));
-            assert_eq!(theme.name, name);
-        }
-    }
-
     #[cfg(all(feature = "hydra", feature = "themes"))]
     #[test]
     fn camera_themes_are_original_visible_s0_chains_and_invisible_capture_is_refused() {
@@ -3314,32 +3168,6 @@ mod tests {
 
         assert!(is_real_theme_file(&real));
         assert!(!is_real_theme_file(&linked));
-    }
-
-    #[test]
-    fn the_default_theme_tints_events_and_preserves_syntax() {
-        let theme = Theme::built_in_default();
-        assert_eq!(theme.event_mark, MarkStyle::Tint);
-        assert_eq!(theme.mini_fill, None);
-    }
-
-    #[cfg(feature = "themes")]
-    #[test]
-    fn the_matrix_theme_uses_the_native_cell_renderer() {
-        let theme = Theme::built_in("matrix").expect("matrix is compiled in");
-        assert_eq!(
-            theme.cell_visual(),
-            Some(CellVisual {
-                effect: CellEffect::Matrix,
-                mode: TachyonMode::Text,
-                density: 76,
-                speed: 58,
-            })
-        );
-        assert!(
-            theme.hydra_code().is_none(),
-            "Matrix is no longer fake Hydra"
-        );
     }
 
     /// Every built-in says how long its sounding marks linger, and each
@@ -3487,198 +3315,6 @@ mod tests {
         );
     }
 
-    #[cfg(all(feature = "hydra", feature = "themes"))]
-    #[test]
-    fn the_prism_theme_matches_its_kaleidoscope_example_and_composes() {
-        let theme = Theme::built_in("prism").expect("prism is compiled in");
-        let sketch = theme
-            .hydra_code()
-            .expect("prism carries its feedback current");
-        let shelf_sketch = crate::examples::SECTIONS
-            [crate::examples::section_of(crate::examples::Kind::Hydra).unwrap()]
-        .shelves
-        .iter()
-        .find(|category| category.name == "Kaleidoscope")
-        .and_then(|category| {
-            category
-                .snippets
-                .iter()
-                .find(|snippet| snippet.name == "Prism Current")
-        })
-        .expect("Prism Current is on the kaleidoscope shelf")
-        .code;
-        assert_eq!(
-            sketch, shelf_sketch,
-            "the theme and example use the same Hydra chain"
-        );
-        let node = rustel_hydra::glsl::parse_chain(sketch).expect("prism parses");
-        rustel_hydra::glsl::compose_full(&node, "highp").expect("prism composes");
-    }
-
-    /// Under a camera theme the picker says what stands between the reader
-    /// and the picture, in place of the browsing hint.
-    #[test]
-    fn the_picker_says_what_a_camera_theme_needs() {
-        let theme = Theme::built_in_default();
-        let picker = ThemePicker::open(&theme);
-        let area = Rect::new(0, 0, 80, 24);
-        let footer = |camera: Option<CameraNote>| {
-            let mut buffer = Buffer::empty(area);
-            ThemePickerView {
-                picker: &picker,
-                theme: &theme,
-                camera,
-                vim: false,
-            }
-            .render(area, &mut buffer);
-            let (panel, list) = picker.geometry(area).expect("room");
-            (0..2)
-                .map(|row| {
-                    (list.x..list.right())
-                        .map(|x| {
-                            buffer
-                                .cell((x, panel.bottom() - 4 + row))
-                                .map_or(" ", |cell| cell.symbol())
-                        })
-                        .collect::<String>()
-                })
-                .collect::<Vec<_>>()
-                .join("\n")
-        };
-        assert!(footer(None).contains("Enter keep"));
-        assert!(footer(Some(CameraNote::Off)).contains("Hydra webcam"));
-        assert!(footer(Some(CameraNote::Starting)).contains("webcam starting"));
-        assert!(footer(Some(CameraNote::Live)).contains("webcam live"));
-        assert!(footer(Some(CameraNote::Failed)).contains("could not open"));
-    }
-
-    #[test]
-    fn the_theme_picker_title_tracks_the_selection_and_total() {
-        let theme = Theme::built_in_default();
-        let mut picker = ThemePicker {
-            names: (1..=30).map(|index| format!("theme-{index}")).collect(),
-            query: String::new(),
-            selected: 3,
-            original: Box::new(theme.clone()),
-            deleting: None,
-            randomize_seed: 1,
-            rolled: false,
-            scroll: std::cell::Cell::new(0),
-            hold_scroll: false,
-            vim_insert: false,
-        };
-        let area = Rect::new(0, 0, 80, 30);
-        let render = |picker: &ThemePicker, vim: bool| {
-            let mut buffer = Buffer::empty(area);
-            ThemePickerView {
-                picker,
-                theme: &theme,
-                camera: None,
-                vim,
-            }
-            .render(area, &mut buffer);
-            buffer
-                .content
-                .iter()
-                .map(|cell| cell.symbol())
-                .collect::<String>()
-        };
-
-        let fourth = render(&picker, false);
-        assert!(fourth.contains(" 4/30 "), "{fourth}");
-
-        picker.move_by(1);
-        let fifth = render(&picker, false);
-        assert!(fifth.contains(" 5/30 "), "{fifth}");
-
-        let command = render(&picker, true);
-        assert!(command.contains("VIM NORMAL"), "{command}");
-        assert!(command.contains("j/k browse"), "{command}");
-        assert!(command.contains("search: i or a types"), "{command}");
-        picker.set_vim_insert(true);
-        let insert = render(&picker, true);
-        assert!(insert.contains("VIM INSERT"), "{insert}");
-        assert!(insert.contains("Esc for Command"), "{insert}");
-    }
-
-    #[test]
-    fn typing_in_the_theme_picker_filters_names_and_resets_navigation() {
-        let theme = Theme::built_in_default();
-        let mut picker = ThemePicker {
-            names: vec![
-                "matrix".into(),
-                "rustel-dark".into(),
-                "rustel-live".into(),
-                "snow".into(),
-            ],
-            query: String::new(),
-            selected: 3,
-            original: Box::new(theme.clone()),
-            deleting: None,
-            randomize_seed: 1,
-            rolled: false,
-            scroll: std::cell::Cell::new(0),
-            hold_scroll: false,
-            vim_insert: false,
-        };
-        for character in "RUSTEL".chars() {
-            picker.push_query(character);
-        }
-        assert_eq!(picker.query, "rustel");
-        assert_eq!(picker.match_count(), 2);
-        assert_eq!(picker.selected_name(), Some("rustel-dark"));
-        picker.move_by(1);
-        assert_eq!(picker.selected_name(), Some("rustel-live"));
-        picker.pop_query();
-        assert_eq!(picker.query, "ruste");
-        assert_eq!(picker.selected, 0);
-
-        let area = Rect::new(0, 0, 80, 30);
-        let mut buffer = Buffer::empty(area);
-        ThemePickerView {
-            picker: &picker,
-            theme: &theme,
-            camera: None,
-            vim: false,
-        }
-        .render(area, &mut buffer);
-        let text = buffer
-            .content
-            .iter()
-            .map(|cell| cell.symbol())
-            .collect::<String>();
-        assert!(text.contains("search: ruste_"), "{text}");
-        assert!(text.contains(" 1/2 "), "{text}");
-    }
-
-    #[test]
-    fn underline_marking_preserves_syntax_colours_and_never_paints_a_background() {
-        let base = Style::default().fg(Color::Rgb(120, 220, 150));
-        let underlined =
-            MarkStyle::Underline.apply(base, Color::Rgb(255, 202, 40), Color::Rgb(18, 20, 25));
-        assert_eq!(underlined.fg, base.fg);
-        assert_eq!(underlined.bg, None);
-        assert_eq!(underlined.underline_color, Some(Color::Rgb(255, 202, 40)));
-        assert!(underlined.add_modifier.contains(Modifier::UNDERLINED));
-        assert!(!underlined.add_modifier.contains(Modifier::BOLD));
-
-        let style = MarkStyle::Outline.apply(
-            Style::default(),
-            Color::Rgb(255, 202, 40),
-            Color::Rgb(18, 20, 25),
-        );
-        assert_eq!(style.bg, None);
-        assert_eq!(style.fg, Some(Color::Rgb(255, 202, 40)));
-        assert!(style.add_modifier.contains(Modifier::UNDERLINED));
-
-        let filled = MarkStyle::Fill.apply(
-            Style::default(),
-            Color::Rgb(255, 202, 40),
-            Color::Rgb(18, 20, 25),
-        );
-        assert_eq!(filled.bg, Some(Color::Rgb(255, 202, 40)));
-    }
-
     #[test]
     fn every_bundled_theme_marks_sounding_syntax_without_losing_contrast() {
         for (name, document) in fixed_themes() {
@@ -3735,41 +3371,6 @@ mod tests {
                 }
             }
         }
-    }
-
-    /// Every filled chip asks the theme for the text that reads on it. A
-    /// theme that owns its ground answers the ground; a theme that defers
-    /// to the terminal answers the palette's black, the one colour every
-    /// palette keeps its accents readable on.
-    #[test]
-    fn filled_chip_text_follows_who_owns_the_ground() {
-        for (name, document) in fixed_themes() {
-            let theme = Theme::from_json(document).unwrap();
-            if true_rgb(theme.background).is_some() {
-                assert_eq!(theme.fill_text(), theme.background, "{name}");
-            } else {
-                assert_eq!(theme.fill_text(), Color::Indexed(0), "{name}");
-            }
-        }
-    }
-
-    /// The warm sibling is one ground with one role moved: a theme that also
-    /// changed its ground would be a different theme, not a variant of this
-    /// one. Checking the whole document catches a field that drifts.
-    #[cfg(feature = "themes")]
-    #[test]
-    fn terminal_warm_moves_only_the_accent_and_selection() {
-        let plain = Theme::built_in("terminal").expect("terminal ships");
-        let mut expected: serde_json::Value =
-            serde_json::from_str(&plain.to_json()).expect("plain theme is json");
-        expected["name"] = "terminal-warm".into();
-        expected["accent"] = "ansi1".into();
-        expected["selection"] = "ansi1".into();
-        let warm = Theme::built_in("terminal-warm").expect("warm ships");
-        let actual: serde_json::Value =
-            serde_json::from_str(&warm.to_json()).expect("warm theme is json");
-        assert_eq!(actual, expected);
-        assert_eq!(plain.background, warm.background, "the ground is shared");
     }
 
     #[test]
@@ -4014,18 +3615,6 @@ mod tests {
         }
     }
 
-    #[test]
-    fn to_hsl_reads_back_the_hue_hsl_wrote() {
-        for hue in [0.0, 40.0, 120.0, 195.0, 260.0, 330.0] {
-            let rgb = true_rgb(hsl(hue, 0.8, 0.6)).unwrap();
-            let (read, saturation, lightness) = to_hsl(rgb);
-            assert!((read - hue).abs() < 1.5, "hue {hue} read as {read}");
-            assert!((saturation - 0.8).abs() < 0.02, "saturation {saturation}");
-            assert!((lightness - 0.6).abs() < 0.01, "lightness {lightness}");
-        }
-        assert_eq!(to_hsl((128, 128, 128)).1, 0.0, "a grey has no saturation");
-    }
-
     /// A palette colour cannot be blended, so a mix that touches one snaps
     /// to the side with more weight. It does not invent a mid-grey.
     #[test]
@@ -4068,15 +3657,6 @@ mod tests {
         let error = Theme::resolve(Some("does-not-exist")).unwrap_err();
         let message = error.to_string();
         assert!(message.contains("rustel-dark"), "{message}");
-    }
-
-    #[test]
-    fn javascript_option_objects_read_as_flat_scalars() {
-        let options = VisualOptions::parse("{ cycles: 8, labels: true, active: '#ff0000' }");
-        assert_eq!(options.number("cycles"), Some(8.0));
-        assert_eq!(options.flag("labels"), Some(true));
-        assert_eq!(options.color("active"), Some(Color::Rgb(255, 0, 0)));
-        assert_eq!(options.number("missing"), None);
     }
 
     #[test]

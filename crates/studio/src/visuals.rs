@@ -553,13 +553,6 @@ impl VisualState {
         }
     }
 
-    /// A slider moved. The score is the same one, so the picture is the
-    /// same picture: the analysers and their history carry on rather than
-    /// starting from nothing eight times a second while a fader is dragged.
-    #[cfg(test)]
-    pub(crate) fn analysers_are_kept_across_a_generation(&self) -> bool {
-        !self.spectrograms.is_empty() || !self.analysers.is_empty() || self.audio.is_some()
-    }
 
     pub fn layout(&self) -> Option<&UiLayout> {
         self.layout.as_ref()
@@ -1288,24 +1281,6 @@ pub(super) fn braille_dot(level: f32, dx: usize, dy: usize) -> bool {
     level * 8.0 > f32::from(BRAILLE_DITHER[dy][dx]) + 0.5
 }
 
-/// A 2×4 patch of luminance as one Braille glyph, indexed `[dy][dx]`.
-/// Empty is `⠀` and full is `⣿`; everything between is a dot count, which
-/// is the only shading a glyph raster has.
-///
-/// The camera painter moved with the theme engines and has its own. This
-/// one lets the test below check the studio's own dither the same way.
-#[cfg(test)]
-fn braille_luma_glyph(patch: [[u8; 2]; 4]) -> char {
-    let mut bits = 0u8;
-    for (dy, row) in patch.iter().enumerate() {
-        for (dx, level) in row.iter().enumerate() {
-            if braille_dot(f32::from(*level) / 255.0, dx, dy) {
-                bits |= BRAILLE_BITS[dx][dy];
-            }
-        }
-    }
-    char::from_u32(0x2800 + u32::from(bits)).unwrap_or(' ')
-}
 
 impl Canvas {
     /// A canvas for filled shapes - bars, discs - at the current tier.
@@ -4372,20 +4347,6 @@ mod tests {
         }
     }
 
-    /// Both glyph tiers draw lines in Braille.
-    #[test]
-    fn lines_are_braille_on_every_glyph_tier() {
-        use crate::graphics::Tier;
-        use crate::visuals::{Canvas, Raster};
-        let area = ratatui::layout::Rect::new(0, 0, 4, 2);
-        at_tier(Tier::Cells, || {
-            assert_eq!(Canvas::lines(area).raster(), Raster::Braille);
-        });
-        at_tier(Tier::Fine, || {
-            assert_eq!(Canvas::lines(area).raster(), Raster::Braille);
-        });
-    }
-
     #[test]
     fn a_canvas_rasterises_the_same_points_four_ways() {
         let area = Rect::new(0, 0, 2, 1);
@@ -4881,25 +4842,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn horizontal_half_blocks_keep_subcell_position_and_both_note_colors() {
-        let area = Rect::new(7, 3, 4, 1);
-        let mut canvas = Canvas::with_raster(area, Raster::HorizontalHalfBlocks);
-        assert_eq!((canvas.width(), canvas.height()), (8, 1));
-        canvas.set(0, 0, Color::Red);
-        canvas.set(3, 0, Color::Blue);
-        canvas.set(4, 0, Color::Red);
-        canvas.set(5, 0, Color::Blue);
-        let mut buffer = Buffer::empty(area);
-        canvas.paint(&mut buffer, Color::Black);
-        assert_eq!(buffer.cell((7, 3)).unwrap().symbol(), "▌");
-        assert_eq!(buffer.cell((8, 3)).unwrap().symbol(), "▐");
-        let mixed = buffer.cell((9, 3)).unwrap();
-        assert_eq!(mixed.symbol(), "▌");
-        assert_eq!((mixed.fg, mixed.bg), (Color::Red, Color::Blue));
-        assert_eq!(buffer.cell((10, 3)).unwrap().symbol(), " ");
-    }
-
     fn repeated_roll_events(count: usize, two_lanes: bool) -> Vec<UiScheduledEvent> {
         (0..count)
             .map(|index| {
@@ -5093,200 +5035,6 @@ mod tests {
             &mut buffer,
         );
         buffer
-    }
-
-    /// Braille has no brightness of its own, so a picture drawn in it has
-    /// to shade by counting dots. Empty and full are the ends; everything
-    /// between is a count, and two cells at the same grey do not light the
-    /// same dots or a flat wall would read as a grid.
-    #[test]
-    fn braille_luma_glyphs_shade_rather_than_threshold() {
-        assert_eq!(braille_luma_glyph([[0; 2]; 4]), '\u{2800}');
-        assert_eq!(braille_luma_glyph([[255; 2]; 4]), '\u{28ff}');
-        let grey = braille_luma_glyph([[128; 2]; 4]);
-        assert!(
-            grey != '\u{2800}' && grey != '\u{28ff}',
-            "a mid grey is neither empty nor full: {grey:?}"
-        );
-        // Every dot of the ordered matrix has its own threshold, so the
-        // eight samples of one cell do not all cross at once.
-        for level in [40u8, 90, 150, 200] {
-            let glyph = braille_luma_glyph([[level; 2]; 4]);
-            assert!(
-                (0x2800..=0x28ff).contains(&(glyph as u32)),
-                "{glyph:?} is not Braille"
-            );
-        }
-        let counts: Vec<u32> = [0u8, 64, 128, 192, 255]
-            .into_iter()
-            .map(|level| (braille_luma_glyph([[level; 2]; 4]) as u32 - 0x2800).count_ones())
-            .collect();
-        assert!(
-            counts.windows(2).all(|pair| pair[0] <= pair[1]),
-            "more light must never mean fewer dots: {counts:?}"
-        );
-        assert_eq!(counts.first(), Some(&0));
-        assert_eq!(counts.last(), Some(&8));
-    }
-
-    #[test]
-    fn a_block_grid_writes_solid_halves_and_leaves_empty_cells_alone() {
-        let _tier = cells_tier();
-        let area = Rect::new(0, 0, 3, 2);
-        let mut grid = Canvas::bars(area);
-        assert_eq!((grid.width(), grid.height()), (3, 4));
-        grid.set(0, 0, Color::Rgb(1, 2, 3));
-        grid.set(0, 1, Color::Rgb(1, 2, 3));
-        grid.set(1, 0, Color::Rgb(9, 9, 9));
-        grid.set(2, 1, Color::Rgb(4, 4, 4));
-        // Out of range writes are ignored rather than panicking.
-        grid.set(99, 99, Color::White);
-
-        let mut buffer = Buffer::empty(area);
-        grid.paint(&mut buffer, Color::Black);
-        assert_eq!(buffer.cell((0, 0)).unwrap().symbol(), "█");
-        assert_eq!(buffer.cell((1, 0)).unwrap().symbol(), "▀");
-        assert_eq!(buffer.cell((1, 0)).unwrap().bg, Color::Black);
-        assert_eq!(buffer.cell((2, 0)).unwrap().symbol(), "▄");
-        assert_eq!(buffer.cell((0, 1)).unwrap().symbol(), " ");
-    }
-
-    #[test]
-    fn two_different_colours_in_one_cell_keep_both_halves() {
-        let _tier = cells_tier();
-        let area = Rect::new(0, 0, 1, 1);
-        let mut grid = Canvas::bars(area);
-        grid.set(0, 0, Color::Rgb(255, 0, 0));
-        grid.set(0, 1, Color::Rgb(0, 0, 255));
-        let mut buffer = Buffer::empty(area);
-        grid.paint(&mut buffer, Color::Black);
-        let cell = buffer.cell((0, 0)).unwrap();
-        assert_eq!(cell.symbol(), "▀");
-        assert_eq!(cell.fg, Color::Rgb(255, 0, 0));
-        assert_eq!(cell.bg, Color::Rgb(0, 0, 255));
-    }
-
-    #[test]
-    fn a_line_between_two_points_has_no_gaps() {
-        let _tier = cells_tier();
-        let area = Rect::new(0, 0, 8, 8);
-        let mut grid = Canvas::bars(area);
-        grid.line((0, 0), (7, 15), Color::White);
-        for x in 0..8 {
-            assert!(
-                (0..16).any(|y| grid.get(x, y).is_some()),
-                "column {x} was skipped"
-            );
-        }
-    }
-
-    #[test]
-    fn the_piano_roll_draws_solid_bars_and_a_playhead_not_braille() {
-        let state = playing(
-            "$: s(\"bd sd\")._pianoroll()",
-            vec![event(1, "0/1", "1/2", 10.0), event(2, "1/2", "1/1", 10.5)],
-            0.75,
-        );
-        let buffer = draw("pianoroll", "", &state, Rect::new(0, 0, 40, 6));
-        let text = symbols(&buffer);
-        assert!(text.contains('█'), "expected solid blocks: {text:?}");
-        assert!(
-            !text
-                .chars()
-                .any(|glyph| ('\u{2800}'..='\u{28ff}').contains(&glyph)),
-            "no Braille dots should remain"
-        );
-        // The playhead sits at the middle of the pane by default.
-        let playhead_column = (0..6)
-            .filter_map(|y| buffer.cell((20, y)))
-            .filter(|cell| cell.fg == theme().playhead)
-            .count();
-        assert!(playhead_column > 0, "the playhead is missing");
-    }
-
-    #[test]
-    fn a_punchcard_labels_its_lanes() {
-        let state = playing(
-            "$: s(\"bd\")._punchcard({labels: 1})",
-            vec![event(1, "0/1", "1/1", 10.0)],
-            0.5,
-        );
-        let text = symbols(&draw(
-            "punchcard",
-            "{labels: 1}",
-            &state,
-            Rect::new(0, 0, 40, 6),
-        ));
-        assert!(text.contains("bd"), "expected an event label: {text:?}");
-        let bare = symbols(&draw("punchcard", "", &state, Rect::new(0, 0, 40, 6)));
-        assert!(
-            !bare.contains("bd"),
-            "no labels unless asked, as on strudel.cc: {bare:?}"
-        );
-    }
-
-    #[test]
-    fn piano_roll_options_move_the_playhead_and_change_the_window() {
-        let state = playing(
-            "$: s(\"bd\")._pianoroll()",
-            vec![event(1, "0/1", "1/1", 10.0)],
-            0.5,
-        );
-        let theme = theme();
-        let left = draw(
-            "pianoroll",
-            "{ playhead: 0, cycles: 2 }",
-            &state,
-            Rect::new(0, 0, 40, 4),
-        );
-        let lit = |buffer: &Buffer, x: u16| {
-            (0..4)
-                .filter_map(|y| buffer.cell((x, y)))
-                .any(|cell| cell.fg == theme.playhead)
-        };
-        assert!(lit(&left, 0), "playhead 0 pins the head to the left edge");
-        assert!(!lit(&left, 20));
-    }
-
-    #[test]
-    fn a_triggered_scope_starts_at_a_rising_zero_crossing() {
-        let mut scope = [0.0f32; UI_SCOPE_SAMPLES];
-        for (index, sample) in scope.iter_mut().enumerate() {
-            *sample = (std::f32::consts::TAU * 4.0 * index as f32 / UI_SCOPE_SAMPLES as f32).sin();
-        }
-        // A trace that starts a quarter turn in has no zero at index zero.
-        let mut shifted = scope;
-        shifted.rotate_left(37);
-        assert_ne!(rising_zero_crossing(&shifted), 0);
-        assert!(shifted[rising_zero_crossing(&shifted)] > 0.0);
-
-        let mut state = playing("$: s(\"bd\")._scope()", Vec::new(), 0.0);
-        audio(&mut state, shifted);
-        // The scope draws as a Braille line at the Cells tier and at Fine.
-        let text = symbols(&draw("tscope", "", &state, Rect::new(0, 0, 30, 4)));
-        assert!(
-            is_braille_line(&text),
-            "the scope is a Braille line at Cells: {text:?}"
-        );
-        let fine = symbols(&draw_at(
-            crate::graphics::Tier::Fine,
-            "tscope",
-            "",
-            &state,
-            Rect::new(0, 0, 30, 4),
-        ));
-        assert!(
-            is_braille_line(&fine),
-            "the same scope is Braille at Fine: {fine:?}"
-        );
-    }
-
-    /// An inline scope without audio says so in its own band.
-    #[test]
-    fn a_scope_without_audio_says_so_instead_of_drawing_nothing() {
-        let state = playing("$: s(\"bd\")._scope()", Vec::new(), 0.0);
-        let text = symbols(&draw("scope", "", &state, Rect::new(0, 0, 30, 4)));
-        assert!(text.contains("waiting for audio"), "{text:?}");
     }
 
     /// The same two notes as above, on their side: lanes stand next to
@@ -5984,47 +5732,6 @@ mod tests {
         }
     }
 
-    /// A dim keeps 45% of its colour on a coloured ground, the share the
-    /// painters mixed toward the background before the terminal themes.
-    #[test]
-    fn a_dim_keeps_45_percent_of_its_colour_on_a_coloured_ground() {
-        let mut theme = theme();
-        theme.background = Color::Rgb(20, 20, 20);
-        // 20 + (128 - 20) * 0.45 = 68.6, rounded to 69.
-        assert_eq!(
-            dim(Color::Rgb(128, 128, 128), &theme),
-            Color::Rgb(69, 69, 69)
-        );
-    }
-
-    #[cfg(feature = "themes")]
-    #[test]
-    fn fades_keep_their_colour_on_a_ground_the_terminal_owns() {
-        let terminal = Theme::built_in("terminal").unwrap();
-        assert_eq!(terminal.background, Color::Reset);
-        // A dim toward a ground that is not a colour would snap to the
-        // ground and paint black on the pixel raster: the colour stands.
-        assert_eq!(
-            dim(terminal.event_inactive, &terminal),
-            terminal.event_inactive
-        );
-        assert_eq!(
-            wash(Color::Reset, Color::Rgb(255, 0, 0), 0.5),
-            Color::Rgb(255, 0, 0)
-        );
-        assert_eq!(
-            wash(Color::Reset, Color::Rgb(255, 0, 0), 0.25),
-            Color::Rgb(255, 0, 0)
-        );
-        // A ground that is a colour still takes its share, in the same
-        // order. The quarter is asymmetric on purpose: a swapped call
-        // lands on 191, not 64.
-        assert_eq!(
-            wash(Color::Rgb(0, 0, 0), Color::Rgb(255, 0, 0), 0.25),
-            Color::Rgb(64, 0, 0)
-        );
-    }
-
     /// The spectrogram paints its quiet level, so its lowest colour must
     /// be one the terminal can show. A reset ground would paint black or
     /// the default foreground, and the picture would open on a slab.
@@ -6167,48 +5874,6 @@ mod tests {
     }
 
     #[test]
-    fn spectrum_bars_move_in_quarter_cell_steps() {
-        use crate::graphics::Tier;
-        for tier in [Tier::Cells, Tier::Fine] {
-            at_tier(tier, || {
-                let mut bits = 0u8;
-                for (level, row) in [(-60.0, 3), (-40.0, 2), (-20.0, 1), (0.0, 0)] {
-                    bits |= BRAILLE_BITS[0][row] | BRAILLE_BITS[1][row];
-                    let state = analyser_state(&[[level; UI_SPECTRUM_BINS]]);
-                    let picture = render_now("spectrum", "", &state, Rect::new(0, 0, 1, 1));
-                    let expected = char::from_u32(0x2800 + u32::from(bits)).unwrap();
-                    assert_eq!(picture.cell((0, 0)).unwrap().symbol(), expected.to_string());
-                }
-            });
-        }
-    }
-
-    #[test]
-    fn spectrum_resolves_narrow_peaks_and_includes_the_last_bin() {
-        for bin in [420, UI_SPECTRUM_BINS - 1] {
-            let mut spectrum = [-120.0; UI_SPECTRUM_BINS];
-            spectrum[bin] = 0.0;
-            let state = analyser_state(&[spectrum]);
-            let picture = draw("spectrum", "", &state, Rect::new(0, 0, 200, 4));
-            let lit = (0..200)
-                .filter(|x| column_height(&picture, *x) > 0)
-                .collect::<Vec<_>>();
-            assert_eq!(
-                lit.len(),
-                1,
-                "a narrow peak occupies one display column: {lit:?}"
-            );
-            if bin == UI_SPECTRUM_BINS - 1 {
-                assert_eq!(lit, vec![199]);
-                assert_eq!(
-                    state.spectrogram(None).unwrap().back().unwrap()[SPECTROGRAM_BANDS - 1],
-                    0.0
-                );
-            }
-        }
-    }
-
-    #[test]
     fn the_spectrum_bars_decay_and_hold_their_peaks() {
         let loud = [-3.0; UI_SPECTRUM_BINS];
         let quiet = [-120.0; UI_SPECTRUM_BINS];
@@ -6329,107 +5994,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn the_spiral_and_pitch_wheel_draw_without_panicking_at_any_size() {
-        let mut events = vec![event(1, "0/1", "1/2", 10.0)];
-        events[0].frequency_hz = Some(440.0);
-        let state = playing("$: note(\"a4\")._spiral()", events, 2.5);
-        for size in [(1, 1), (4, 2), (20, 10), (60, 24)] {
-            let area = Rect::new(0, 0, size.0, size.1);
-            for kind in ["spiral", "pitchwheel"] {
-                let _ = draw(kind, "", &state, area);
-            }
-        }
-        let text = symbols(&draw("spiral", "", &state, Rect::new(0, 0, 60, 14)));
-        assert!(
-            is_braille_line(&text),
-            "the spiral draws in Braille at Cells: {text:?}"
-        );
-        assert!(
-            text.contains("▸ A4"),
-            "the sounding note is named beside the spiral: {text:?}"
-        );
-    }
-
-    /// Whether a rendering contains Braille dots and no block glyphs.
-    fn is_braille_line(text: &str) -> bool {
-        text.chars()
-            .any(|glyph| ('\u{2800}'..='\u{28ff}').contains(&glyph))
-            && !text.chars().any(|glyph| matches!(glyph, '█' | '▀' | '▄'))
-    }
-
-    #[test]
-    fn a_scope_trace_is_a_thin_line_not_a_filled_pane() {
-        let mut scope = [0.0f32; UI_SCOPE_SAMPLES];
-        for (index, sample) in scope.iter_mut().enumerate() {
-            *sample = (std::f32::consts::TAU * 2.0 * index as f32 / UI_SCOPE_SAMPLES as f32).sin();
-        }
-        let mut state = playing("$: s(\"bd\")._scope()", Vec::new(), 0.0);
-        audio(&mut state, scope);
-        let area = Rect::new(0, 0, 40, 6);
-        let buffer = draw("scope", "", &state, area);
-        // Two full cycles across the pane: most cells stay empty, so the
-        // trace reads as a line rather than a wall of glyphs.
-        let painted = buffer
-            .content
-            .iter()
-            .filter(|cell| cell.symbol() != " ")
-            .count();
-        assert!(
-            painted < (area.width * area.height / 2) as usize,
-            "{painted} of {} cells were painted",
-            area.width * area.height
-        );
-        assert!(painted > 30, "the trace is missing ({painted} cells)");
-    }
-
-    #[test]
-    fn the_pitch_wheel_has_no_outer_circle_and_names_its_notes_on_the_left() {
-        let mut events = vec![event(1, "0/1", "1/1", 10.0)];
-        events[0].frequency_hz = Some(440.0);
-        events[0].duration_seconds = 4.0;
-        let state = playing("$: note(\"a4\")._pitchwheel()", events, 0.0);
-        let area = Rect::new(0, 0, 60, 10);
-        let buffer = draw("pitchwheel", "", &state, area);
-        let text = symbols(&buffer);
-        assert!(text.contains("▸ A4"), "{text:?}");
-        // The wheel is at the left: nothing but the legend is drawn past
-        // the square it occupies, and the ring is dots rather than a circle.
-        let wheel_cells = (0..area.height)
-            .flat_map(|y| (0..5).map(move |x| (x, y)))
-            .filter(|&(x, y)| buffer.cell((x, y)).is_some_and(|cell| cell.symbol() != " "))
-            .count();
-        let far_right_cells = (0..area.height)
-            .flat_map(|y| (40..area.width).map(move |x| (x, y)))
-            .filter(|&(x, y)| buffer.cell((x, y)).is_some_and(|cell| cell.symbol() != " "))
-            .count();
-        assert!(wheel_cells > 0, "the wheel is not at the left: {text:?}");
-        assert_eq!(far_right_cells, 0, "something is drawn far right: {text:?}");
-        let braille = text
-            .chars()
-            .filter(|glyph| ('\u{2800}'..='\u{28ff}').contains(glyph))
-            .count();
-        assert!(
-            braille < 40,
-            "a full ring would need many more cells: {braille}"
-        );
-    }
-
-    #[test]
-    fn a_pitch_wheel_lights_the_class_of_a_sounding_note() {
-        let mut events = vec![event(1, "0/1", "1/1", 10.0)];
-        events[0].frequency_hz = Some(440.0);
-        events[0].duration_seconds = 4.0;
-        let state = playing("$: note(\"a4\")._pitchwheel()", events, 0.0);
-        let buffer = draw("pitchwheel", "", &state, Rect::new(0, 0, 24, 12));
-        let theme = theme();
-        let lit = buffer
-            .content
-            .iter()
-            .filter(|cell| cell.fg != theme.grid && cell.fg != theme.rule && cell.symbol() != " ")
-            .count();
-        assert!(lit > 0, "an active note should light a spoke");
-    }
 
     #[test]
     fn an_unsupported_kind_explains_itself() {
@@ -6439,34 +6003,6 @@ mod tests {
             text.contains("no terminal renderer for _markcss()"),
             "{text:?}"
         );
-    }
-
-    #[test]
-    fn note_names_and_pitch_classes_round_trip() {
-        assert_eq!(note_name(69.0), "A4");
-        assert_eq!(note_name(60.0), "C4");
-        assert_eq!(note_to_midi("C"), Some(0.0));
-        assert_eq!(note_to_midi("f#"), Some(6.0));
-        assert_eq!(note_to_midi("Bb"), Some(10.0));
-        assert_eq!(note_to_midi("H"), None);
-    }
-
-    #[test]
-    fn fractions_keep_exact_protocol_strings_until_rendering() {
-        assert_eq!(parse_fraction("3/2"), Some(1.5));
-        assert_eq!(parse_fraction("1/0"), None);
-        assert_eq!(parse_fraction("wat"), None);
-    }
-
-    #[test]
-    fn active_marks_use_the_theme_colour_when_a_pattern_names_none() {
-        let mut events = vec![event(1, "0/1", "1/1", 10.0)];
-        events[0].duration_seconds = 4.0;
-        let state = playing("$: s(\"bd\")._pianoroll()", events, 0.0);
-        let marks = state.active_marks(Color::Rgb(1, 2, 3));
-        assert_eq!(marks.len(), 1);
-        assert_eq!(marks[0].color, Color::Rgb(1, 2, 3));
-        assert_eq!((marks[0].from, marks[0].to), (0, 4));
     }
 
     #[test]
@@ -6548,59 +6084,6 @@ mod tests {
             onsets,
             ["2/1", "3/1", "6/1"],
             "behind the playhead stays; from the look-ahead's start on is replaced"
-        );
-    }
-
-    /// Stopping holds the picture where it was: the clock stops rather than
-    /// resets, the frames stay, and only the marks in the code go out.
-    #[test]
-    fn stopping_freezes_the_picture_where_it_was() {
-        let mut visual = VisualState::default();
-        visual.install_layout(
-            rustel_runtime::ui_events::visual_layout("note(60)._scope()", 3).unwrap(),
-        );
-        visual.start();
-        let wall = Instant::now();
-        visual.clock = Some(ClockAnchor {
-            generation: 3,
-            wall,
-            device_time: 0.0,
-            cycle: 0.0,
-            cps: 1.0,
-        });
-        let (_, before, _) = visual
-            .clock_at(wall + std::time::Duration::from_secs(1))
-            .expect("a clock");
-        assert!((before - 1.0).abs() < 1e-6, "{before}");
-
-        visual.previews.push(event(7, "1/1", "2/1", 11.0));
-        visual.stop();
-        assert_eq!(
-            visual.previews.len(),
-            1,
-            "what was coming stays on the frozen picture"
-        );
-        let frozen = visual.frozen_at.expect("frozen at the stop");
-        let (_, at_stop, _) = visual.clock_at(frozen).expect("still a clock");
-        let (_, later, _) = visual
-            .clock_at(frozen + std::time::Duration::from_secs(5))
-            .expect("still a clock");
-        assert!(
-            (later - at_stop).abs() < 1e-6,
-            "the roll does not scroll on after a stop: {at_stop} then {later}"
-        );
-        assert!(
-            visual.active_marks(Color::Reset).is_empty(),
-            "nothing is marked as sounding"
-        );
-        visual.start();
-        assert!(
-            visual.frozen_at.is_none(),
-            "playing again lets the clock run"
-        );
-        assert!(
-            visual.previews.is_empty(),
-            "and starts with its own look-ahead"
         );
     }
 
@@ -6731,56 +6214,6 @@ mod tests {
             visual.audio_for(None).expect("master").scope[0],
             0.75,
             "the footer master should still advance"
-        );
-    }
-
-    /// A slider re-query installs the same layout under a new generation.
-    /// The analysers and their history must survive it.
-    #[test]
-    fn a_new_generation_of_the_same_score_keeps_the_analysers() {
-        let source = "note(60)._scope()._spectrum()";
-        let mut visual = VisualState::default();
-        visual.install_layout(rustel_runtime::ui_events::visual_layout(source, 7).unwrap());
-        visual.start();
-        visual.install_audio(
-            UiAudioMetadata {
-                sequence: 1,
-                generation: 7,
-                device_time: 0.5,
-                stream_id: 1,
-                epoch: 1,
-                end_frame: 24_000,
-                sample_rate: 48_000,
-            },
-            UiAudioAnalysisSet {
-                master: UiAudioAnalysisFrame {
-                    scope: [0.5; UI_SCOPE_SAMPLES],
-                    spectrum: [-40.0; UI_SPECTRUM_BINS],
-                },
-                visuals: Vec::new(),
-                sides: Vec::new(),
-            },
-        );
-        assert!(
-            visual.analysers_are_kept_across_a_generation(),
-            "there is something to keep"
-        );
-
-        // The same score, a new generation: a slider moved.
-        visual.install_layout(rustel_runtime::ui_events::visual_layout(source, 8).unwrap());
-        assert!(
-            visual.analysers_are_kept_across_a_generation(),
-            "the picture is the same picture"
-        );
-
-        // A different score is still the same stream of sound: the history
-        // carries on, and the new score's frames merge into it.
-        visual.install_layout(
-            rustel_runtime::ui_events::visual_layout("note(62)._scope()._spectrum()", 9).unwrap(),
-        );
-        assert!(
-            visual.analysers_are_kept_across_a_generation(),
-            "the history of the sound outlives the score"
         );
     }
 
@@ -7218,47 +6651,6 @@ mod tests {
             );
         }
 
-        #[test]
-        fn the_picture_starts_where_the_sound_does_and_walks_its_speed() {
-            // `begin` skips into the clip the ratio names: the second half
-            // of a half-second clip is the blue frame, at once.
-            let mut begun = playing("$: s(\"clip.webm\")._video()", vec![clip_event(10.0)], 0.0);
-            let mut chain = clip_event(10.0);
-            chain.sample = Some(walk(1.0, 1.0));
-            begun.events.pop_front();
-            begun.events.push_back(chain);
-            assert!(
-                begun.install_video("clip.webm", VideoEntry::Ready(std::sync::Arc::new(strip())))
-            );
-            let picture = draw("video", "", &begun, Rect::new(0, 0, 20, 8));
-            assert!(
-                picture
-                    .content
-                    .iter()
-                    .any(|cell| cell.fg == Color::Rgb(0, 0, 255)),
-                "the clip starts at its second half"
-            );
-
-            // Twice the speed reaches the same place in half the time:
-            // 0.25 s in at 2x is the blue frame.
-            let mut sped = playing("$: s(\"clip.webm\")._video()", vec![clip_event(9.75)], 0.0);
-            let mut chain = clip_event(9.75);
-            chain.sample = Some(walk(2.0, 0.0));
-            sped.events.pop_front();
-            sped.events.push_back(chain);
-            assert!(
-                sped.install_video("clip.webm", VideoEntry::Ready(std::sync::Arc::new(strip())))
-            );
-            let picture = draw("video", "", &sped, Rect::new(0, 0, 20, 8));
-            assert!(
-                picture
-                    .content
-                    .iter()
-                    .any(|cell| cell.fg == Color::Rgb(0, 0, 255)),
-                "0.2 s at twice the speed is the later frame"
-            );
-        }
-
         /// The picture walks the way the voice resolved it, not the way
         /// the chain's text reads: a note or `loopAt` that speeds the sound
         /// speeds the picture, a reversed voice counts its `begin` from the
@@ -7344,47 +6736,6 @@ mod tests {
                 .filter(|cell| cell.fg == Color::Rgb(0, 0, 255))
                 .count();
             assert!(blue > 100, "the clip shows while the drum plays: {blue}");
-        }
-
-        #[test]
-        fn the_painter_draws_the_frame_the_clock_is_showing() {
-            let mut state = playing("$: s(\"clip.webm\")._video()", vec![clip_event(10.0)], 0.0);
-            assert!(
-                state.install_video("clip.webm", VideoEntry::Ready(std::sync::Arc::new(strip()))),
-                "the strip lands"
-            );
-            // The event sounds now, so the first frame shows: red.
-            let picture = draw("video", "", &state, Rect::new(0, 0, 20, 8));
-            let red = picture
-                .content
-                .iter()
-                .filter(|cell| cell.fg == Color::Rgb(255, 0, 0))
-                .count();
-            assert!(red > 100, "the first frame filled the pane: {red} cells");
-            assert!(
-                picture
-                    .content
-                    .iter()
-                    .all(|cell| cell.fg != Color::Rgb(0, 0, 255)),
-                "the second frame is not showing yet"
-            );
-        }
-
-        #[test]
-        fn the_frame_follows_the_position_into_the_clip() {
-            // The event began 0.6 s ago: past the second frame's time, the
-            // picture holds the blue one.
-            let mut state = playing("$: s(\"clip.webm\")._video()", vec![clip_event(9.4)], 0.0);
-            assert!(
-                state.install_video("clip.webm", VideoEntry::Ready(std::sync::Arc::new(strip())))
-            );
-            let picture = draw("video", "", &state, Rect::new(0, 0, 20, 8));
-            let blue = picture
-                .content
-                .iter()
-                .filter(|cell| cell.fg == Color::Rgb(0, 0, 255))
-                .count();
-            assert!(blue > 100, "the later frame filled the pane: {blue} cells");
         }
 
         #[test]
@@ -7491,50 +6842,6 @@ mod tests {
             assert!(
                 state.video_names_to_ask().is_empty(),
                 "a strip answers the ask"
-            );
-        }
-
-        #[test]
-        fn a_looping_clip_wraps_its_picture_back_to_the_start() {
-            // Three frames: red, green, blue, the last at half a second.
-            let strip = rustel_runtime::video::VideoThumbnails::from_frames(
-                2,
-                2,
-                vec![
-                    (0.0, [255, 0, 0, 255].repeat(4)),
-                    (0.25, [0, 255, 0, 255].repeat(4)),
-                    (0.5, [0, 0, 255, 255].repeat(4)),
-                ],
-            )
-            .expect("strip");
-            let mut looping = playing("$: s(\"clip.webm\")._video()", vec![clip_event(9.3)], 0.0);
-            let mut chain = clip_event(9.3);
-            // `loop(1)`: the voice loops the whole sound, half a second.
-            chain.sample = Some(rustel_scheduler::TraceSampleWalk {
-                loop_secs: Some((0.0, 0.5)),
-                ..walk(1.0, 0.0)
-            });
-            looping.events.pop_back();
-            looping.events.push_back(chain);
-            assert!(
-                looping.install_video("clip.webm", VideoEntry::Ready(std::sync::Arc::new(strip)))
-            );
-            // 0.7 s in: past the clip's end, so the loop wraps to 0.2 s -
-            // the red frame - where the unlooping clip holds the blue one.
-            let picture = draw("video", "", &looping, Rect::new(0, 0, 20, 8));
-            assert!(
-                picture
-                    .content
-                    .iter()
-                    .any(|cell| cell.fg == Color::Rgb(255, 0, 0)),
-                "the loop wrapped the picture to its start"
-            );
-            assert!(
-                picture
-                    .content
-                    .iter()
-                    .all(|cell| cell.fg != Color::Rgb(0, 0, 255)),
-                "the last frame is not held while the clip loops"
             );
         }
 

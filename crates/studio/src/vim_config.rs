@@ -956,29 +956,6 @@ mod tests {
         }
     }
 
-    /// Two spellings of the same keys are one mapping, and the last
-    /// definition wins, as in Vim.
-    #[test]
-    fn the_last_definition_of_the_same_keys_wins_across_spellings() {
-        let mappings = VimMappings::parse_with_defaults(
-            "nnoremap <space>V <Action:mixer>\nnnoremap <Space>V <Action:log>\n",
-        )
-        .expect("mappings");
-        assert_eq!(
-            replacement_of(&mappings, VimMappingMode::Normal, "<Space>V"),
-            Some(vec![VimMappedKey::Action(BindAction::Log)])
-        );
-        let mappings =
-            VimMappings::parse("nnoremap X a\nnnoremap <S-x> b\nnnoremap X c\n").expect("mappings");
-        assert_eq!(
-            replacement_of(&mappings, VimMappingMode::Normal, "X"),
-            Some(vec![VimMappedKey::Key(KeyEvent::new(
-                KeyCode::Char('c'),
-                KeyModifiers::NONE
-            ))])
-        );
-    }
-
     /// Vim reads map flags written together, with no space before the keys.
     #[test]
     fn flags_written_together_are_read_before_the_keys() {

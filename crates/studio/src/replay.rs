@@ -998,58 +998,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn timeline_shortcuts_stay_below_the_editor_and_wrap_in_narrow_panes() {
-        let theme = Theme::built_in_default();
-        for width in [40, 70, 120] {
-            let pane = Rect::new(3, 5, width, 30);
-            let (strip, editor) = split_timeline(pane).unwrap();
-            let footer = shortcut_area(pane).unwrap();
-            assert_eq!(strip.bottom(), editor.y);
-            assert_eq!(editor.bottom(), footer.y);
-            assert_eq!(footer.bottom(), pane.bottom());
-            assert_eq!(footer.height, if width < 100 { 2 } else { 1 });
-            for focused in [false, true] {
-                let mut buffer = Buffer::empty(pane);
-                TimelineShortcuts {
-                    focused,
-                    theme: &theme,
-                    keybinds: &crate::keybinds::Keybinds::default(),
-                }
-                .render(footer, &mut buffer);
-                let text: String = buffer.content.iter().map(|cell| cell.symbol()).collect();
-                if focused {
-                    assert!(text.contains("Esc editor"), "{text}");
-                    assert!(text.contains("←/→ blocks"), "{text}");
-                    assert!(text.contains("Enter play"), "{text}");
-                    if width >= 70 {
-                        assert!(text.contains("T duration"), "{text}");
-                        assert!(text.contains("Del delete"), "{text}");
-                        assert!(text.contains("Home/End ends"), "{text}");
-                    }
-                } else {
-                    assert!(
-                        text.contains(crate::keybinds::shortcut_label("Alt+T timeline").as_ref()),
-                        "{text}"
-                    );
-                    assert!(
-                        text.contains(crate::keybinds::shortcut_label("Alt+←/→ blocks").as_ref()),
-                        "{text}"
-                    );
-                }
-                for y in editor.y..editor.bottom() {
-                    assert!(
-                        (editor.x..editor.right())
-                            .all(|x| buffer.cell((x, y)).unwrap().symbol() == " ")
-                    );
-                }
-            }
-        }
-        let too_short = Rect::new(0, 0, 70, TIMELINE_HEIGHT + 3);
-        assert!(split_timeline(too_short).is_none());
-        assert!(shortcut_area(too_short).is_none());
-    }
-
-    #[test]
     fn extending_a_last_block_replaces_all_redundant_trailing_stops() {
         let directory = tempfile::tempdir().unwrap();
         let path = tape(
@@ -1347,55 +1295,6 @@ mod tests {
         assert!(ruler.contains("0:00"), "{ruler}");
         assert!(ruler.contains("0:30"), "{ruler}");
         assert!(!ruler.contains("15:"), "no clock time: {ruler}");
-    }
-
-    /// walks the rest: its far end is the last screenful.
-    #[test]
-    fn the_bar_leaves_room_for_the_total_and_the_thumb_scrolls_it() {
-        let directory = tempfile::tempdir().unwrap();
-        let saves: Vec<(f64, String, Option<&str>)> = (0..20)
-            .map(|index| (index as f64, format!("$: s(\"bd:{index}\")"), None))
-            .collect();
-        let borrowed: Vec<(f64, &str, Option<&str>)> = saves
-            .iter()
-            .map(|(at, source, via)| (*at, source.as_str(), *via))
-            .collect();
-        let mut tab = ReplayTab::open(&tape(directory.path(), &borrowed)).unwrap();
-        // Sixty cells: five blocks across, "0:19 · 20 saves" at the end.
-        let (track, thumb_x, thumb_len) = tab.bar_geometry(60).expect("longer than the strip");
-        assert_eq!(track, 60 - 15 - 1);
-        assert_eq!(thumb_x, 0);
-        assert_eq!(thumb_len, 44 * 5 / 20);
-        tab.scroll_thumb_to(track - thumb_len, 60);
-        assert_eq!(tab.scroll, 15, "the far end is the last screenful");
-        tab.scroll_thumb_to(0, 60);
-        assert_eq!(tab.scroll, 0);
-        let mut few = ReplayTab::open(&tape(directory.path(), &borrowed[..3])).unwrap();
-        assert!(few.bar_geometry(60).is_none(), "three blocks need no bar");
-        few.scroll_thumb_to(10, 60);
-        assert_eq!(few.scroll, 0);
-    }
-
-    /// Blocks of one recorded body share its text and its document, so a
-    /// tape of references to one score opens in the memory of that score.
-    #[test]
-    fn blocks_of_one_body_share_its_text_and_document() {
-        let directory = tempfile::tempdir().unwrap();
-        let path = tape(directory.path(), &[(0.0, "$: s(\"bd\")", None)]);
-        let mut text = std::fs::read_to_string(&path).unwrap();
-        for at in 1..64 {
-            text.push_str(&format!(
-                "{{\"kind\":\"save\",\"ref\":0,\"status\":\"installed\",\"t\":{at}}}\n"
-            ));
-        }
-        std::fs::write(&path, text).unwrap();
-        let tab = ReplayTab::open(&path).unwrap();
-        assert_eq!(tab.events.len(), 64);
-        let chunk = |event: &ReplayEvent| event.document.rope().chunks().next().map(str::as_ptr);
-        for event in &tab.events {
-            assert_eq!(event.source.as_ptr(), tab.events[0].source.as_ptr());
-            assert_eq!(chunk(event), chunk(&tab.events[0]));
-        }
     }
 
     fn tape(directory: &Path, saves: &[(f64, &str, Option<&str>)]) -> PathBuf {

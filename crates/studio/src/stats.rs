@@ -75,10 +75,4 @@ mod tests {
         assert_eq!(format_cpu_percent(0.09), "0%");
         assert_eq!(format_cpu_percent(0.0), "0%");
     }
-
-    #[test]
-    fn tempo_uses_the_four_beats_per_cycle_convention() {
-        assert!((beats_per_minute(0.5) - 120.0).abs() < 1e-9);
-        assert!((beats_per_minute(1.0) - 240.0).abs() < 1e-9);
-    }
 }

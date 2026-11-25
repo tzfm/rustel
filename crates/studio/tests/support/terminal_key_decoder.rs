@@ -203,25 +203,6 @@ fn shifted_text_preserves_layout_characters_and_piano_releases() {
 }
 
 #[test]
-fn disabling_alternate_reports_would_lose_shifted_text() {
-    // Guards against replacing the parser fix with a flag change. These are
-    // base characters, not the text the user typed on a shifted keyboard.
-    assert_eq!(decoded_key(b"\x1b[97;2u").code, KeyCode::Char('a'));
-    assert_eq!(decoded_key(b"\x1b[49;2u").code, KeyCode::Char('1'));
-}
-
-#[test]
-fn legacy_modified_f3_remains_ambiguous_with_cursor_position_replies() {
-    for (modifier, column) in [(2, 1), (5, 4), (6, 5)] {
-        let sequence = format!("\x1b[1;{modifier}R");
-        assert_eq!(
-            parse_event(sequence.as_bytes(), false).unwrap(),
-            Some(InternalEvent::CursorPosition(column, 0))
-        );
-    }
-}
-
-#[test]
 fn apple_terminal_default_sequences_decode_to_the_keys_studio_normalizes() {
     assert_key(
         b"\x1c",

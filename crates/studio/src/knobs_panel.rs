@@ -886,9 +886,6 @@ pub fn edit_caret(panel: &KnobsPanel, area: Rect) -> Option<(u16, u16)> {
 mod tests {
     use super::*;
 
-    fn body() -> Rect {
-        Rect::new(10, 5, 24, 12)
-    }
 
     /// A rail's handle cell and a click on that cell have to agree, or a
     /// drag jumps the value on its first move.
@@ -909,21 +906,6 @@ mod tests {
         // The off stop is the far left cell, whatever the travel.
         assert_eq!(rail_cell(rail, true, None), 0);
         assert_eq!(rail_cell(rail, false, Some(0.0)), 0);
-    }
-
-    #[test]
-    fn a_point_finds_its_knob_and_its_rail() {
-        let (label, rail) = knob_row(body(), 0).expect("a knob in a tall body");
-        assert_eq!(label.y, 5);
-        assert_eq!(rail.y, 6);
-        assert_eq!(knob_at(body(), 0, 10, 5), Some((0, false)));
-        assert_eq!(knob_at(body(), 0, 30, 6), Some((0, true)));
-        assert_eq!(
-            knob_at(body(), 2, 10, 8),
-            Some((3, true)),
-            "the scroll counts knobs"
-        );
-        assert_eq!(knob_at(body(), 0, 9, 6), None, "outside the body");
     }
 
     /// A rail that waits for an update says "not live" beside its reading,

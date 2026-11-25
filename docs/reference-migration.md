@@ -62,8 +62,8 @@ control with a native effect does not take `superdirt`. A test fails when a
 ## Existing checks
 
 - Studio reference tests check installed names, aliases, and exact symbols.
-- `crates/studio/tests/reference_examples.rs` evaluates examples in real
-  sessions, with explicit exceptions for remote samples.
+- `crates/studio/src/reference.rs` evaluates every reference example in a
+  real session, with explicit exceptions for remote samples.
 - Core tests check hidden lists and combinator parameter counts.
 - `crates/voice/tests/source_controls.rs` checks controls through voice
   conversion and audio rendering with local fixtures.

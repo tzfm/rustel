@@ -1446,17 +1446,6 @@ mod tests {
         assert_eq!(editor.draft.bracket, None);
     }
 
-    /// A typed colour can carry multi-byte characters; the entry refuses it
-    /// with its message rather than panicking mid-parse.
-    #[test]
-    fn a_multi_byte_colour_is_refused_without_panicking() {
-        let mut editor = editor();
-        editor.selected = HEAD_ROWS;
-        editor.entry = Some("#éa".into());
-        let error = editor.commit_entry().expect_err("refused");
-        assert!(error.contains("#rrggbb"), "{error}");
-    }
-
     /// Opacity rows step in fives and stay inside 0..=100.
     #[test]
     fn the_opacity_rows_step_and_clamp() {

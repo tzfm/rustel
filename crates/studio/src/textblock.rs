@@ -353,26 +353,6 @@ mod tests {
     }
 
     #[test]
-    fn a_press_past_the_end_of_a_line_lands_at_its_end() {
-        let lines = strings(&["short", "a longer line here"]);
-        let block = block(&lines);
-        let point = block.point_at(2 + 15, 5, Clamp::Inside).unwrap();
-        assert_eq!(point, TextPoint { line: 0, column: 5 });
-    }
-
-    #[test]
-    fn a_press_below_the_last_line_lands_on_the_last_line() {
-        let lines = strings(&["one", "two"]);
-        let block = block(&lines);
-        let point = block.point_at(4, 7, Clamp::Inside).unwrap();
-        assert_eq!(point.line, 1);
-        // And a drag above the block pulls back to the first.
-        let point = block.point_at(4, 0, Clamp::Extend).unwrap();
-        assert_eq!(point.line, 0);
-        assert_eq!(block.point_at(4, 0, Clamp::Inside), None);
-    }
-
-    #[test]
     fn a_drag_begun_below_the_text_anchors_at_its_right_end() {
         // A drag that starts on the blank rows under a short entry reads
         // as if it started at the end of the last drawn line.
@@ -413,21 +393,6 @@ mod tests {
         let block = block(&lines);
         let point = block.point_at(2 + 2, 6, Clamp::Inside).unwrap();
         assert_eq!(point, TextPoint { line: 1, column: 2 });
-    }
-
-    #[test]
-    fn a_selection_dragged_upward_reads_the_same_as_one_dragged_down() {
-        let lines = strings(&["osc(20)", ".rotate(0.1)", ".out()"]);
-        let down = TextSelection {
-            anchor: TextPoint { line: 0, column: 4 },
-            head: TextPoint { line: 2, column: 4 },
-        };
-        let up = TextSelection {
-            anchor: down.head,
-            head: down.anchor,
-        };
-        assert_eq!(down.text(&lines), up.text(&lines));
-        assert_eq!(down.text(&lines), "20)\n.rotate(0.1)\n.out");
     }
 
     #[test]

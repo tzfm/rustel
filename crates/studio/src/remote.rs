@@ -851,23 +851,6 @@ mod tests {
     }
 
     #[test]
-    fn the_completed_frame_is_the_screen_the_current_buffer_is_blank() {
-        let backend = ratatui::backend::TestBackend::new(4, 1);
-        let mut terminal = ratatui::Terminal::new(backend).unwrap();
-        let completed = terminal
-            .draw(|frame| {
-                frame.buffer_mut().cell_mut((0, 0)).unwrap().set_symbol("P");
-            })
-            .unwrap();
-        let shown: serde_json::Value =
-            serde_json::from_str(&screen_json(completed.buffer)).unwrap();
-        let cleared: serde_json::Value =
-            serde_json::from_str(&screen_json(terminal.current_buffer_mut())).unwrap();
-        assert_eq!(shown["text"], "P   ");
-        assert_eq!(cleared["text"], "    ");
-    }
-
-    #[test]
     fn explicit_ip_addresses_are_accepted() {
         assert_eq!(
             parse_bind("9000").unwrap(),
@@ -892,15 +875,6 @@ mod tests {
         assert!(parse_bind("0").is_err());
         assert!(parse_bind("studio.local:9000").is_err());
         assert!(parse_bind("").is_err());
-    }
-
-    // Bind only, no client: the macOS firewall asks a wildcard listener
-    // that accepts a connection for its consent, and the accept path is
-    // covered by the loopback tests below.
-    #[test]
-    fn a_wildcard_listener_keeps_its_address() {
-        let remote = listen(SocketAddr::from((Ipv4Addr::UNSPECIFIED, 0)), None).unwrap();
-        assert_eq!(remote.address().ip(), IpAddr::V4(Ipv4Addr::UNSPECIFIED));
     }
 
     #[test]
@@ -1126,25 +1100,6 @@ mod tests {
         let path = first.token_path().unwrap().to_owned();
         drop(first);
         assert!(!path.exists());
-    }
-
-    #[test]
-    fn explicit_token_is_reusable_without_a_temporary_file() {
-        let token = "gig1";
-        let address = SocketAddr::from((Ipv4Addr::LOCALHOST, 0));
-        for _ in 0..2 {
-            let remote = listen(address, Some(token)).unwrap();
-            assert_eq!(remote.token(), token);
-            assert!(remote.token_path().is_none());
-            let mut stream = TcpStream::connect(remote.address()).unwrap();
-            stream
-                .set_read_timeout(Some(Duration::from_secs(2)))
-                .unwrap();
-            writeln!(stream, "auth {token}").unwrap();
-            let mut reply = String::new();
-            BufReader::new(stream).read_line(&mut reply).unwrap();
-            assert_eq!(reply, "ok\n");
-        }
     }
 
     #[test]

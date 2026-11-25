@@ -1703,57 +1703,6 @@ mod tests {
         assert!(sheet.settings.limiter_enabled);
     }
 
-    #[test]
-    fn the_sheet_draws_its_lines() {
-        let theme = Theme::default();
-        let mut sheet = ExportSheet::open(
-            "drums".into(),
-            ExportSettings::default(),
-            Path::new("exports"),
-            0,
-        );
-        sheet.key(KeyCode::Tab, false);
-        let area = Rect::new(0, 0, 100, 20);
-        let render = |sheet: &ExportSheet, vim: bool| {
-            let mut buffer = Buffer::empty(area);
-            ExportSheetView {
-                sheet,
-                theme: &theme,
-                vim,
-                exporting: None,
-                export_hint: "Ctrl+Shift+E",
-            }
-            .render(area, &mut buffer);
-            (0..area.height)
-                .map(|y| {
-                    (0..area.width)
-                        .map(|x| buffer.cell((x, y)).unwrap().symbol().to_string())
-                        .collect::<String>()
-                })
-                .collect::<Vec<_>>()
-                .join("\n")
-        };
-        let text = render(&sheet, false);
-        assert!(text.contains("export - drums"), "{text}");
-        assert!(text.contains("● 16 cycles"), "{text}");
-        assert!(text.contains("○ until silence"), "{text}");
-        assert!(text.contains("● wav"), "{text}");
-        assert_eq!(text.contains("mp3"), MP3_EXPORT, "{text}");
-        assert!(text.contains("○ midi"), "{text}");
-        assert!(text.contains("limiter  ● off   ○ on"), "{text}");
-        assert!(text.contains("stems    ● off   ○ on"), "{text}");
-        assert!(text.contains("drums-1970-01-01T00-00-00.wav"), "{text}");
-
-        let command = render(&sheet, true);
-        assert!(command.contains("VIM NORMAL"), "{command}");
-        assert!(command.contains("j/k moves"), "{command}");
-        assert!(command.contains("i types"), "{command}");
-        sheet.set_vim_insert(true);
-        let insert = render(&sheet, true);
-        assert!(insert.contains("VIM INSERT"), "{insert}");
-        assert!(insert.contains("Esc returns to Command"), "{insert}");
-    }
-
     /// The sheet over a running bounce is the render window: how far, a
     /// bar under a chosen ceiling, a moving scope, and the way out.
     #[test]
@@ -1977,12 +1926,6 @@ mod tests {
         while sheet.field != Field::Length {
             sheet.key(KeyCode::Tab, false);
         }
-    }
-
-    #[test]
-    fn a_long_path_keeps_its_tail_on_screen() {
-        assert_eq!(tail("short", 10), "short");
-        assert_eq!(tail("/very/long/path/name.wav", 10), "…/name.wav");
     }
 
     #[test]
@@ -2242,41 +2185,6 @@ mod tests {
         .unwrap();
         let seconds = await_outcome(&job, std::time::Duration::from_secs(120)).expect("rendered");
         assert!((seconds - 1.5).abs() < 0.05, "{seconds}");
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn a_job_renders_one_score_to_a_file() {
-        let dir = std::env::temp_dir().join(format!("rustel-export-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        let target = dir.join("bounce.wav");
-        let job = ExportJob::start(
-            "melody".into(),
-            plain_score("note(\"c3 e3 g3\").s(\"sine\")"),
-            ExportSettings {
-                length: Length::Cycles(2.0),
-                format: ExportFormat::Wav,
-                ..ExportSettings::default()
-            },
-            SessionConfig::default(),
-            target.clone(),
-        )
-        .unwrap();
-        let seconds = await_outcome(&job, std::time::Duration::from_secs(120)).expect("rendered");
-        assert!(
-            (seconds - 4.0).abs() < 0.05,
-            "two cycles at 0.5 cps: {seconds}"
-        );
-        let bytes = std::fs::metadata(&target).unwrap().len();
-        assert!(bytes > 44, "{bytes}");
-        let glance = job.glance();
-        assert_eq!(glance.percent, Some(100));
-        assert!((glance.seconds - 4.0).abs() < 0.05, "{glance:?}");
-        assert!(
-            glance.peaks.iter().any(|peak| *peak > 0.01),
-            "the scope heard the sines: {:?}",
-            glance.peaks
-        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

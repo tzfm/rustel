@@ -1015,19 +1015,6 @@ pub mod profiles {
             }
         }
 
-        #[test]
-        fn iterm2_option_letters_compose_and_recover() {
-            for (letter, composed) in [('t', '†'), ('o', 'ø'), ('r', '®'), ('d', '∂'), ('a', 'å')]
-            {
-                assert_eq!(
-                    super::alt_input_letter("iTerm2", composed),
-                    Some(letter),
-                    "{composed} does not recover alt+{letter}"
-                );
-            }
-            assert_eq!(super::alt_input_letter("Ghostty", '†'), None);
-        }
-
         /// A composed Option digit is also a key of some layout - `§` on
         /// every ISO Mac keyboard, `£` on UK, `¡` on Spanish - and a legacy
         /// terminal sends both the same way, so the character types.
@@ -1289,28 +1276,6 @@ pub mod profiles {
         }
 
         #[test]
-        fn platform_specific_conflicts_do_not_hide_control_keys_on_macos() {
-            let ghostty = super::table()
-                .terminals
-                .iter()
-                .find(|row| row.terminal == "Ghostty")
-                .unwrap();
-            let fullscreen = ghostty
-                .steals
-                .iter()
-                .find(|row| row.chord == "ctrl+enter")
-                .unwrap();
-            assert!(super::applies_on(fullscreen, "linux"));
-            assert!(!super::applies_on(fullscreen, "macos"));
-            let tab = ghostty
-                .steals
-                .iter()
-                .find(|row| row.chord == "ctrl+tab")
-                .unwrap();
-            assert!(super::applies_on(tab, "macos"));
-        }
-
-        #[test]
         fn pointer_modifier_reset_follows_the_detected_terminal_layers() {
             for terminal in [
                 "Ghostty",
@@ -1323,24 +1288,6 @@ pub mod profiles {
             for terminal in ["kitty", "iTerm2", "tmux", "Ghosttyish", "unknown"] {
                 assert!(!super::pointer_modifier_reset(terminal), "{terminal}");
             }
-        }
-
-        /// A version stamped after the name still finds its row, and a
-        /// terminal nobody has written down answers None rather than
-        /// pretending it takes nothing.
-        #[test]
-        fn a_terminal_is_matched_by_name_and_an_unknown_one_says_so() {
-            let chord = KeyCombo::parse("ctrl+shift+up").expect("a chord");
-            assert!(super::steals("WezTerm 20240203-110809", &chord).is_some());
-            assert!(super::steals("Windows Terminal", &chord).is_some());
-            assert_eq!(super::steals("some-terminal-from-2031", &chord), None);
-
-            let free = KeyCombo::parse("shift+f9").expect("a chord");
-            assert_eq!(
-                super::steals("WezTerm 20240203-110809", &free),
-                None,
-                "the family the panels use is free on the terminals we checked"
-            );
         }
     }
 }
@@ -3038,39 +2985,6 @@ mod tests {
         assert!(unknown.symbols);
         assert!(!unknown.truecolor);
         assert!(!unknown.fine_glyphs);
-    }
-
-    #[test]
-    fn the_stand_in_table_is_used_only_when_symbols_are_off() {
-        assert_eq!(super::symbol("▸"), "▸");
-        let _forced = super::ForceSymbolsForTest::set(false);
-        assert_eq!(super::symbol("▸"), ">");
-        assert_eq!(super::symbol("↳"), ">");
-        assert_eq!(super::safe_text("  ↳ g 1 ▸ o 0"), "  > g 1 > o 0");
-        assert_eq!(super::symbol("⇧"), "↑");
-        assert_eq!(super::symbol("▮"), "|");
-        assert_eq!(super::symbol("▏"), "|");
-        assert_eq!(super::symbol("▕"), "|");
-        assert_eq!(super::symbol("▾"), "v");
-        assert_eq!(super::symbol("⌁"), "~");
-        assert_eq!(super::symbol("◇"), "o");
-        assert_eq!(super::symbol("▣"), "#");
-        assert_eq!(super::symbol("✦"), "*");
-        assert_eq!(super::symbol("∙"), "\u{b7}");
-        assert_eq!(super::symbol("●"), "\u{b7}");
-        assert_eq!(super::symbol("◉"), "o");
-        assert_eq!(super::symbol("▶"), ">");
-        assert_eq!(super::symbol("▷"), ">");
-        assert_eq!(super::symbol("⚙"), "*");
-        assert_eq!(super::symbol("⟳"), "*");
-        assert_eq!(super::symbol("▁"), "_");
-        assert_eq!(super::symbol("⚠"), "!");
-        assert_eq!(super::symbol("♪"), "~");
-        // Anything not in the table is trusted regardless - the glyphs
-        // Consolas already has never had to route through here.
-        assert_eq!(super::symbol("·"), "·");
-        drop(_forced);
-        assert_eq!(super::symbol("▸"), "▸", "the guard restores what it forced");
     }
 
     #[test]

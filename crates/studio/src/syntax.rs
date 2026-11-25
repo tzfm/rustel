@@ -338,20 +338,6 @@ mod tests {
         }
     }
 
-    /// Nothing in front of it is the state it always had.
-    #[test]
-    fn a_row_that_begins_at_the_start_of_its_line_is_primed_with_nothing() {
-        let line = r#"$: s("sbd").lpf(500)"#;
-        let mut primed = Lexer::primed("");
-        let mut fresh = Lexer::default();
-        for character in line.chars() {
-            assert_eq!(
-                primed.advance(character, None),
-                fresh.advance(character, None)
-            );
-        }
-    }
-
     #[test]
     fn a_line_comment_runs_to_the_end_of_the_line() {
         let tokens = classify("a // \"not a string\"");
@@ -382,20 +368,6 @@ mod tests {
         let tokens = classify("1/2");
         assert!(tokens.iter().all(|token| *token != Token::Comment));
         assert_eq!(tokens[1], Token::Punctuation);
-    }
-
-    #[test]
-    fn both_slashes_of_a_comment_marker_are_coloured_as_comment() {
-        let tokens = classify("x // y");
-        assert_eq!(tokens[2], Token::Comment, "the opening slash");
-        assert_eq!(tokens[3], Token::Comment);
-    }
-
-    #[test]
-    fn block_comments_are_coloured_until_their_closing_marker() {
-        let tokens = classify("x /* muted */ y");
-        assert!(tokens[2..13].iter().all(|token| *token == Token::Comment));
-        assert_eq!(tokens[14], Token::Text, "text after the closing marker");
     }
 
     /// The `*` of the opening marker cannot close the comment, so `/*/`

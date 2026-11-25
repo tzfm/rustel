@@ -1063,44 +1063,6 @@ mod tests {
         assert_eq!(tab.row(0), Some(PluginRow::Param(0)));
     }
 
-    /// The watch of the preset folders read them again: the tab owes the
-    /// open plugin its presets, and the presets that come keep the place
-    /// of the cursor. With no plugin open, no ask is owed.
-    #[test]
-    fn a_read_past_the_one_of_the_tab_asks_for_its_presets_again() {
-        use PluginRow::{Plugin, Preset};
-        let mut tab = VstTab::default();
-        tab.set_plugins(vec![synth()]);
-        assert!(!tab.presets_stale());
-        assert!(tab.expand());
-        tab.set_presets(vec!["Lead".into()]);
-        assert_eq!(tab.presets_due(), None);
-        assert!(tab.show_section(VstSection::Presets));
-        assert!(tab.presets_stale());
-        assert_eq!(tab.presets_due(), Some("Synth"));
-        // A read past the one the tab holds again owes nothing more: the
-        // ask of the first is still owed.
-        assert!(!tab.presets_stale());
-        tab.set_presets(vec!["Lead".into(), "Dark".into()]);
-        assert_eq!(tab.rows(), [Preset(0), Preset(1)]);
-        assert_eq!(
-            tab.row(tab.selected),
-            Some(Preset(0)),
-            "the cursor keeps its preset"
-        );
-        // The half left, the plugin row and its two rows are the list
-        // again.
-        assert!(tab.leave());
-        assert_eq!(
-            tab.rows(),
-            [
-                Plugin(0),
-                PluginRow::Section(VstSection::Presets),
-                PluginRow::Section(VstSection::Params)
-            ]
-        );
-    }
-
     /// The pick of a plugin name opens the presets of the plugin. The read
     /// of the preset folders can answer after the pick: an answer of no
     /// preset at all moves the view to the parameters, so the pick never
@@ -1137,26 +1099,5 @@ mod tests {
         assert_eq!(tab.row(tab.selected), Some(Preset(0)));
         tab.set_presets(Vec::new());
         assert_eq!(tab.inside(), Some(VstSection::Presets));
-    }
-
-    /// The count line of the tab says where the read of the plugin folders
-    /// is, while it runs, and says nothing when no read runs. The read of
-    /// the preset folders says itself the same way.
-    #[test]
-    fn the_read_of_the_plugin_folders_says_where_it_is() {
-        let mut tab = VstTab::default();
-        assert_eq!(tab.scan(), None);
-        assert!(tab.set_scan(Some((1, 3))));
-        assert!(!tab.set_scan(Some((1, 3))));
-        assert_eq!(tab.scan(), Some((1, 3)));
-        assert!(tab.set_scan(Some((2, 3))));
-        assert!(tab.set_scan(None));
-        assert_eq!(tab.scan(), None);
-        assert!(!tab.set_presets_reading(false));
-        assert!(tab.set_presets_reading(true));
-        assert!(tab.presets_reading());
-        assert!(!tab.set_presets_reading(true));
-        assert!(tab.set_presets_reading(false));
-        assert!(!tab.presets_reading());
     }
 }

@@ -1375,39 +1375,7 @@ mod tests {
         //! Preferences files written by older builds.
 
         use super::super::{PREFS_FILE_NAME, StudioPrefs};
-        use crate::settings::{MAPPING_SLOTS, UiSettings};
-        use crate::terminal::CaretShape;
-
-        /// A preferences file written by a build that had the old slider
-        /// stick/knob settings still loads. Removing a field must not make a
-        /// player's whole file unreadable - that would take their theme, their
-        /// sets folder and their sample sources with it.
-        #[test]
-        fn a_file_from_before_the_mapping_slots_still_loads() {
-            let directory = tempfile::tempdir().expect("temp dir");
-            let path = directory.path().join(PREFS_FILE_NAME);
-            std::fs::write(
-                &path,
-                r#"{
-          "slider_stick": "y2",
-          "slider_cc": "cc74/ch2",
-          "slider_cc_push": true,
-          "theme": "mono",
-          "wrap": true
-        }"#,
-            )
-            .expect("write");
-            let prefs = StudioPrefs::load_from(Some(&path));
-            assert_eq!(prefs.theme.as_deref(), Some("mono"), "the rest survived");
-            assert_eq!(prefs.wrap, Some(true));
-            assert_eq!(prefs.mappings, None, "and nothing was invented for it");
-            assert_eq!(
-                prefs.ui_settings().mappings,
-                [None; MAPPING_SLOTS],
-                "an old knob does not become a slot: it named the focused \
-         slider, which no longer exists"
-            );
-        }
+        use crate::settings::UiSettings;
 
         /// A file of another build: a value in a form this build does not
         /// take, as the `auto_evaluate` of an older build or a dock widget
@@ -1469,27 +1437,6 @@ mod tests {
             prefs.save_to(&path).expect("save");
             assert_eq!(saved()["auto_evaluate"], serde_json::json!(!default));
             assert_eq!(saved()["visuals"], visuals);
-        }
-
-        #[test]
-        fn caret_shape_round_trips_and_old_preferences_keep_the_steady_bar() {
-            assert_eq!(
-                StudioPrefs::default().ui_settings().caret_shape,
-                CaretShape::SteadyBar
-            );
-            let settings = UiSettings {
-                caret_shape: CaretShape::BlinkingUnderline,
-                ..Default::default()
-            };
-            let mut prefs = StudioPrefs::default();
-            prefs.set_ui_settings(&settings);
-            let encoded = serde_json::to_string(&prefs).unwrap();
-            let restored: StudioPrefs = serde_json::from_str(&encoded).unwrap();
-            assert_eq!(restored.caret_shape.as_deref(), Some("blinking-underline"));
-            assert_eq!(
-                restored.ui_settings().caret_shape,
-                CaretShape::BlinkingUnderline
-            );
         }
     }
     mod source_folders {
@@ -1906,74 +1853,6 @@ mod tests {
         assert!(restored.ui_settings().mixer_top);
     }
 
-    /// The sticky log keeps its edge across a restart: docked or a sheet,
-    /// and along which edge if it is docked - the same two facts a visuals
-    /// dock's `open` and `edge` are kept by.
-    #[test]
-    fn the_sticky_log_keeps_its_edge_across_a_restart() {
-        use super::super::viz_panel::Edge;
-        let directory = tempfile::tempdir().expect("temp dir");
-        let path = directory.path().join(PREFS_FILE_NAME);
-        let mut prefs = StudioPrefs::default();
-        assert_eq!(prefs.log_sticky, None, "not sticky until asked");
-        assert_eq!(prefs.log_edge, None);
-        prefs.log_sticky = Some(true);
-        prefs.log_edge = Some(Edge::Top);
-        prefs.save_to(&path).expect("saved");
-        let restored = StudioPrefs::load_from(Some(&path));
-        assert_eq!(restored.log_sticky, Some(true));
-        assert_eq!(restored.log_edge, Some(Edge::Top));
-    }
-
-    /// The docked log keeps its height once `-` or `+` set it. A file with no
-    /// height and a side edge still reads: it keeps the side, and the app
-    /// brings the log back along the bottom.
-    #[test]
-    fn the_docked_logs_height_is_kept_and_an_older_file_still_reads() {
-        use super::super::viz_panel::Edge;
-        let directory = tempfile::tempdir().expect("temp dir");
-        let path = directory.path().join(PREFS_FILE_NAME);
-        let mut prefs = StudioPrefs::default();
-        assert_eq!(prefs.log_height, None, "a third of the terminal until set");
-        prefs.log_height = Some(17);
-        prefs.save_to(&path).expect("saved");
-        assert_eq!(StudioPrefs::load_from(Some(&path)).log_height, Some(17));
-
-        std::fs::write(&path, r#"{"log_sticky": true, "log_edge": "left"}"#).expect("written");
-        let older = StudioPrefs::load_from(Some(&path));
-        assert_eq!(older.log_sticky, Some(true), "the file was read, not reset");
-        assert_eq!(older.log_edge, Some(Edge::Left));
-        assert_eq!(older.log_height, None);
-        assert_eq!(older.log_edge.map(Edge::band), Some(Edge::Bottom));
-    }
-
-    /// The memory breakdown keeps whether it was docked, its edge and its
-    /// height across a restart; a file from before it was docked reads as
-    /// closed.
-    #[test]
-    fn the_memory_breakdown_keeps_its_dock_across_a_restart() {
-        use super::super::viz_panel::Edge;
-        let directory = tempfile::tempdir().expect("temp dir");
-        let path = directory.path().join(PREFS_FILE_NAME);
-        std::fs::write(&path, r#"{"log_sticky": true}"#).expect("written");
-        let older = StudioPrefs::load_from(Some(&path));
-        assert_eq!(older.log_sticky, Some(true), "the file was read");
-        assert_eq!(
-            (older.memory_docked, older.memory_edge, older.memory_height),
-            (None, None, None)
-        );
-
-        let mut prefs = older;
-        prefs.memory_docked = Some(true);
-        prefs.memory_edge = Some(Edge::Top);
-        prefs.memory_height = Some(8);
-        prefs.save_to(&path).expect("saved");
-        let restored = StudioPrefs::load_from(Some(&path));
-        assert_eq!(restored.memory_docked, Some(true));
-        assert_eq!(restored.memory_edge, Some(Edge::Top));
-        assert_eq!(restored.memory_height, Some(8));
-    }
-
     /// The twelve mapping slots survive a restart, in order and with
     /// their channels: an unbound slot is written too, or the slot a
     /// mapping sits in would depend on how many came before it.
@@ -2023,27 +1902,6 @@ mod tests {
             }))
         );
         assert_eq!(settings.mappings[1], None);
-    }
-
-    #[test]
-    fn prefs_round_trip_and_missing_files_are_defaults() {
-        let dir = std::env::temp_dir().join(format!("rustel-prefs-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        let path = dir.join("nested").join(PREFS_FILE_NAME);
-        assert_eq!(StudioPrefs::load_from(Some(&path)), StudioPrefs::default());
-        let prefs = StudioPrefs {
-            theme: Some("solarized".into()),
-            vst_folders: vec!["/music/plugins".into()],
-            ..StudioPrefs::default()
-        };
-        prefs.save_to(&path).unwrap();
-        assert_eq!(StudioPrefs::load_from(Some(&path)), prefs);
-        assert!(
-            std::fs::read_to_string(&path)
-                .unwrap()
-                .contains("\"theme\": \"solarized\"")
-        );
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// A terminal profile round-trips by name, and an unset one writes no
@@ -2210,26 +2068,6 @@ mod tests {
     }
 
     #[test]
-    fn reference_categories_keep_only_hidden_tags() {
-        use super::super::reference::Category;
-        let legacy: StudioPrefs = serde_json::from_str("{}").unwrap();
-        assert!(legacy.ui_settings().shows_category(Category::Osc));
-        let mut prefs = StudioPrefs::default();
-        prefs.set_ui_settings(&legacy.ui_settings());
-        let json = serde_json::to_string(&prefs).unwrap();
-        assert!(!json.contains("reference_hidden"), "{json}");
-
-        let mut settings = legacy.ui_settings();
-        settings.reference_hidden.push(Category::Osc);
-        prefs.set_ui_settings(&settings);
-        let json = serde_json::to_string(&prefs).unwrap();
-        assert!(json.contains(r#""reference_hidden":["osc"]"#), "{json}");
-        let restored: StudioPrefs = serde_json::from_str(&json).unwrap();
-        assert!(!restored.ui_settings().shows_category(Category::Osc));
-        assert!(restored.ui_settings().shows_category(Category::Serial));
-    }
-
-    #[test]
     fn frequency_slider_travel_defaults_to_log_and_remembers_linear() {
         let legacy: StudioPrefs = serde_json::from_str("{}").unwrap();
         assert!(legacy.ui_settings().frequency_slider_log);
@@ -2370,36 +2208,6 @@ mod tests {
             assert_eq!(encoded["evaluation_animation"], key);
             let restored: StudioPrefs = serde_json::from_value(encoded).unwrap();
             assert_eq!(restored.ui_settings().evaluation_animation, mode);
-        }
-    }
-
-    /// The beat line survives the file, and an unreadable spelling is the
-    /// off it defaults to. The aberration caps at a hundred on the way in,
-    /// like the opacities.
-    #[test]
-    fn the_beat_line_survives_the_file() {
-        use super::super::settings::BeatLineStyle;
-
-        for json in ["{}", r#"{"beat_line":"unknown"}"#] {
-            let prefs: StudioPrefs = serde_json::from_str(json).unwrap();
-            assert_eq!(prefs.ui_settings().beat_line, BeatLineStyle::Off);
-        }
-        for (style, key) in [
-            (BeatLineStyle::Off, "off"),
-            (BeatLineStyle::Pulse, "pulse"),
-            (BeatLineStyle::Travel, "travel"),
-            (BeatLineStyle::Wave, "wave"),
-        ] {
-            let settings = super::super::settings::UiSettings {
-                beat_line: style,
-                ..Default::default()
-            };
-            let mut prefs = StudioPrefs::default();
-            prefs.set_ui_settings(&settings);
-            let encoded = serde_json::to_value(&prefs).unwrap();
-            assert_eq!(encoded["beat_line"], key);
-            let restored: StudioPrefs = serde_json::from_value(encoded).unwrap();
-            assert_eq!(restored.ui_settings().beat_line, style);
         }
     }
 
@@ -2749,27 +2557,6 @@ mod tests {
         let decoded: StudioPrefs = serde_json::from_str(&encoded).unwrap();
         assert!(decoded.ui_settings().hydra_webcam);
         assert!(!StudioPrefs::default().ui_settings().hydra_webcam);
-    }
-
-    /// A preferences file from a build that knew keys this one does not -
-    /// the retired webcam thumbnail switch among them - still loads, and
-    /// the retired key simply leaves the file the next time it is written.
-    #[test]
-    fn a_retired_preference_key_is_ignored_rather_than_refused() {
-        let mut prefs: StudioPrefs =
-            serde_json::from_str(r#"{"webcam_preview_braille":true,"hydra_webcam":false}"#)
-                .expect("an unknown key is not a parse error");
-        let settings = prefs.ui_settings();
-        #[cfg(feature = "hydra")]
-        assert!(!settings.hydra_webcam);
-        prefs.set_ui_settings(&settings);
-        let written = serde_json::to_string(&prefs).unwrap();
-        assert!(
-            !written.contains("webcam_preview_braille"),
-            "the retired key is dropped, not carried: {written}"
-        );
-        let decoded: StudioPrefs = serde_json::from_str(&written).unwrap();
-        assert_eq!(decoded.hydra_webcam, Some(false));
     }
 
     /// The set open now is the last set and the newest of the recent

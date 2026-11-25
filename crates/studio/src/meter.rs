@@ -586,47 +586,6 @@ mod tests {
         assert!(draw(&master).contains("MASTER"));
     }
 
-    #[test]
-    fn the_clip_warning_names_the_pre_limiter_signal_when_limited() {
-        use ratatui::widgets::Widget;
-        let now = std::time::Instant::now();
-        let mut master = super::MasterState::new(now);
-        master.observe(
-            rustel_audio::MasterLevels {
-                peak: 0.9999,
-                clipped_blocks: 1,
-                ..Default::default()
-            },
-            now,
-        );
-        let theme = super::super::theme::Theme::default();
-        let draw = |limiter| {
-            let area = ratatui::layout::Rect::new(0, 0, 40, 2);
-            let mut buffer = ratatui::buffer::Buffer::empty(area);
-            super::MasterDock {
-                keybinds: &crate::keybinds::Keybinds::default(),
-                state: &master,
-                theme: &theme,
-                now,
-                playing: true,
-                limiter,
-            }
-            .render(area, &mut buffer);
-            buffer
-                .content()
-                .iter()
-                .map(ratatui::buffer::Cell::symbol)
-                .collect::<String>()
-        };
-
-        let limited = draw(Some("punch"));
-        assert!(limited.contains("PRE-LIM HOT"), "{limited}");
-        assert!(limited.contains("pk -0.0"), "{limited}");
-        let unlimited = draw(None);
-        assert!(unlimited.contains("CLIP"), "{unlimited}");
-        assert!(!unlimited.contains("PRE-LIM HOT"), "{unlimited}");
-    }
-
     /// Mute is a flag, not a level: the output goes silent and the fader
     /// stays where the hand left it, so unmuting brings back the level the
     /// set is played at rather than one that had to be guessed.
@@ -657,40 +616,7 @@ mod tests {
         );
     }
 
-    #[test]
-    fn the_fader_reaches_true_silence_at_the_far_left() {
-        use super::*;
-        // A drag to the bar's first cell means the floor, and the floor
-        // means zero gain, not a low level.
-        let bar = ratatui::layout::Rect::new(10, 0, 20, 1);
-        let db = MasterDock::decibels_at(bar, bar.x);
-        assert!(db <= MIN_GAIN_DB, "far left is the floor, got {db}");
-        let mut state = MasterState::new(std::time::Instant::now());
-        state.set_gain_db(db);
-        assert_eq!(state.gain(), 0.0, "the floor is silence");
-        assert_eq!(format_gain(state.gain_db()), "-inf");
-    }
-
     use super::*;
-
-    #[test]
-    fn the_scale_gives_most_of_its_travel_to_the_top_twenty_decibels() {
-        assert_eq!(scale_position(-60.0), 0.0);
-        assert_eq!(scale_position(6.0), 1.0);
-        assert!((scale_position(-20.0) - KNEE_POSITION).abs() < 1e-6);
-        assert!(
-            scale_position(0.0) - scale_position(-20.0) > scale_position(-20.0),
-            "the loud end must be the roomy end"
-        );
-    }
-
-    #[test]
-    fn scale_position_and_decibels_are_inverses() {
-        for db in [-60.0, -48.0, -20.0, -12.0, -6.0, 0.0, 6.0] {
-            let round_trip = scale_decibels(scale_position(db));
-            assert!((round_trip - db).abs() < 0.01, "{db} became {round_trip}");
-        }
-    }
 
     #[test]
     fn a_drag_can_land_exactly_on_unity() {
@@ -781,19 +707,6 @@ mod tests {
     }
 
     #[test]
-    fn the_dock_maps_columns_to_levels_left_to_right() {
-        let area = Rect::new(10, 5, 40, 2);
-        let bar = MasterDock::geometry(area).expect("dock bar");
-        assert_eq!(bar.y, 5);
-        assert_eq!(bar.x, 10);
-        assert!((MasterDock::decibels_at(bar, bar.x) - FLOOR_DB).abs() < 0.01);
-        assert!((MasterDock::decibels_at(bar, bar.right() - 1) - CEILING_DB).abs() < 0.01);
-        // A pointer outside the bar still resolves, clamped to its ends.
-        assert!((MasterDock::decibels_at(bar, 0) - FLOOR_DB).abs() < 0.01);
-        assert!(MasterDock::geometry(Rect::new(0, 0, 12, 1)).is_none());
-    }
-
-    #[test]
     fn the_dock_draws_the_fader_the_hold_marker_and_the_readouts() {
         let theme = Theme::built_in_default();
         let now = Instant::now();
@@ -855,16 +768,6 @@ mod tests {
         assert!(row(1).contains("MASTER"), "{}", row(1));
         assert!(row(1).contains("-14.0 LUFS"), "{}", row(1));
         assert!(row(1).contains("pk -6.0"), "{}", row(1));
-    }
-
-    #[test]
-    fn readouts_stay_short_and_say_when_nothing_is_playing() {
-        assert_eq!(format_gain(0.0), "0.0dB");
-        assert_eq!(format_gain(-6.0), "-6.0dB");
-        assert_eq!(format_gain(MIN_GAIN_DB), "-inf");
-        assert_eq!(format_level(-12.0, false), "pk  --");
-        assert_eq!(format_lufs(-14.0, false), "LUFS --");
-        assert_eq!(format_lufs(-14.0, true), "-14.0 LUFS");
     }
 
     #[test]

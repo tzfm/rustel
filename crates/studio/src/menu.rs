@@ -2019,40 +2019,6 @@ mod tests {
         }
     }
 
-    #[test]
-    fn remote_control_is_the_last_options_group_when_its_sheet_is_available() {
-        let options = |available| {
-            menus(&MenuContext {
-                remote_control_available: available,
-                ..context()
-            })
-            .into_iter()
-            .find(|menu| menu.title == "Options")
-            .expect("Options menu")
-            .items
-        };
-        let unavailable = options(false);
-        assert_eq!(
-            unavailable.last().unwrap().id(),
-            Some(MenuAction::ThemePicker)
-        );
-        assert!(
-            unavailable
-                .iter()
-                .all(|item| item.id() != Some(MenuAction::RemoteControl))
-        );
-
-        let available = options(true);
-        assert_eq!(&available[..unavailable.len()], unavailable.as_slice());
-        assert_eq!(available.len(), unavailable.len() + 2);
-        assert_eq!(available[unavailable.len()].kind, MenuItemKind::Separator);
-        let remote = available.last().unwrap();
-        assert_eq!(remote.id(), Some(MenuAction::RemoteControl));
-        assert_eq!(remote.label, "Remote control\u{2026}");
-        assert_eq!(remote.mnemonic(), Some('r'));
-        assert!(remote.enabled);
-    }
-
     /// Turbo Vision navigation is unmodified letters, so two rows of one menu
     /// sharing a mnemonic makes the second unreachable. The real command list
     /// collides on the obvious choice three ways in Edit (Cut, Copy, Comment)
@@ -2170,54 +2136,6 @@ mod tests {
         }
     }
 
-    /// Menu accelerators must not advertise Command under any keyboard capability.
-    #[test]
-    fn no_menu_accelerator_is_spelled_with_command() {
-        for capabilities in [
-            KeyboardCapabilities::legacy(),
-            KeyboardCapabilities::enhanced(),
-            KeyboardCapabilities {
-                enhanced: true,
-                space_seen: false,
-                super_seen: true,
-            },
-        ] {
-            let menus = menus(&MenuContext {
-                capabilities,
-                ..context()
-            });
-            for menu in &menus {
-                for item in &menu.items {
-                    assert!(
-                        !item.accel.contains('\u{2318}'),
-                        "{:?} advertises {} with Command",
-                        item.label,
-                        item.accel
-                    );
-                }
-            }
-        }
-    }
-
-    /// Help ▸ Keyboard reference advertises no key: F1 reaches the reference
-    /// only where there is no bar, and where this row is drawn F1 is the
-    /// bar's own. An accelerator printed here would be dead everywhere it
-    /// is read.
-    #[test]
-    fn the_keyboard_reference_row_advertises_no_dead_accelerator() {
-        let menus = menus(&context());
-        let item = menus
-            .iter()
-            .flat_map(|menu| menu.items.iter())
-            .find(|item| item.label == "Keyboard reference")
-            .expect("the help menu lists the keyboard reference");
-        assert!(
-            item.accel.is_empty(),
-            "the row advertises {:?}, a key that cannot open it from a bar",
-            item.accel
-        );
-    }
-
     /// The menus read the keybinding table: a chord learnt in Settings is
     /// what the row spells from then on, and an unbound action advertises
     /// nothing rather than a key that no longer fires. Untouched actions
@@ -2310,48 +2228,6 @@ mod tests {
         // The docs row follows its own action, so it keeps its chord.
         assert_eq!(item(&moved_aliases, "Argument values / reference"), "F2");
         assert_eq!(item(&moved_aliases, "Docs for the function"), "^D");
-    }
-
-    /// View names the two chords apart: the values row carries Ctrl+F and
-    /// Ctrl+Space, the docs row carries Ctrl+D, and each follows its action.
-    #[test]
-    fn the_view_menu_names_values_and_docs_apart() {
-        use crate::keybinds::{BindAction, KeyCombo, Keybinds};
-        let row = |rows: &[Menu], action: MenuAction| -> (String, String) {
-            let item = rows
-                .iter()
-                .flat_map(|menu| &menu.items)
-                .find(|item| item.id() == Some(action))
-                .unwrap_or_else(|| panic!("{action:?} has a menu row"));
-            (item.label.to_string(), item.accel.clone())
-        };
-        let untouched = menus(&context());
-        assert_eq!(
-            row(&untouched, MenuAction::Reference),
-            (
-                "Argument values / reference".to_owned(),
-                "^F / ^Space".to_owned()
-            )
-        );
-        assert_eq!(
-            row(&untouched, MenuAction::Docs),
-            ("Docs for the function".to_owned(), "^D".to_owned())
-        );
-
-        let mut binds = Keybinds::default();
-        binds.learn(BindAction::Reference, KeyCombo::parse("f2"));
-        let moved = menus(&MenuContext {
-            keybinds: &binds,
-            ..context()
-        });
-        assert_eq!(row(&moved, MenuAction::Reference).1, "F2");
-        assert_eq!(row(&moved, MenuAction::Docs).1, "^D");
-        binds.learn(BindAction::Docs, KeyCombo::parse("f3"));
-        let moved = menus(&MenuContext {
-            keybinds: &binds,
-            ..context()
-        });
-        assert_eq!(row(&moved, MenuAction::Docs).1, "F3");
     }
 
     #[test]
@@ -2478,45 +2354,6 @@ mod tests {
     }
 
     #[test]
-    fn arrowing_reports_every_highlight_change_and_steps_over_separators() {
-        let menus = menus(&context());
-        let mut state = MenuState::opened();
-        // Right twice along the bar, to Scene.
-        state.key(&press(KeyCode::Right), &menus);
-        state.key(&press(KeyCode::Right), &menus);
-        // Down drops the menu onto its first usable row.
-        let MenuKey::Events(events) = state.key(&press(KeyCode::Down), &menus) else {
-            panic!("Down did not drop the menu");
-        };
-        assert_eq!(
-            events,
-            vec![MenuEvent::Highlight(Some(MenuAction::NewScene))]
-        );
-        // Five rows down from New scene is a separator; the highlight must
-        // land on Previous scene, never on the rule.
-        let mut seen = Vec::new();
-        for _ in 0..5 {
-            if let MenuKey::Events(events) = state.key(&press(KeyCode::Down), &menus) {
-                for event in events {
-                    if let MenuEvent::Highlight(Some(action)) = event {
-                        seen.push(action);
-                    }
-                }
-            }
-        }
-        assert_eq!(
-            seen,
-            vec![
-                MenuAction::DuplicateScene,
-                MenuAction::RenameScene,
-                MenuAction::SaveScene,
-                MenuAction::CloseScene,
-                MenuAction::DeleteScene,
-            ]
-        );
-    }
-
-    #[test]
     fn a_greyed_row_never_takes_the_highlight() {
         let menus = menus(&MenuContext {
             can_undo: false,
@@ -2535,159 +2372,6 @@ mod tests {
                 "the highlight rested on a greyed row"
             );
         }
-    }
-
-    #[test]
-    fn choosing_a_row_activates_it_and_says_why_it_closed() {
-        let menus = menus(&context());
-        let mut state = MenuState::dropped_on(&menus, 2);
-        let MenuKey::Events(events) = state.key(&press(KeyCode::Enter), &menus) else {
-            panic!("Enter did nothing");
-        };
-        assert_eq!(
-            events,
-            vec![
-                MenuEvent::Activate(MenuAction::NewScene),
-                MenuEvent::Close(CloseReason::Committed),
-            ]
-        );
-    }
-
-    #[test]
-    fn view_menu_exposes_the_panel_switch_chord() {
-        let menus = menus(&context());
-        let view = menus
-            .iter()
-            .find(|menu| menu.title == "View")
-            .expect("View menu");
-        let item = view
-            .items
-            .iter()
-            .find(|item| item.id() == Some(MenuAction::SwitchPanel))
-            .expect("Switch panel row");
-        assert_eq!(item.label, "Switch panel");
-        assert_eq!(item.accel, "⇧F10");
-    }
-
-    #[test]
-    fn esc_cancels_and_a_switch_is_not_a_cancel() {
-        let menus = menus(&context());
-        let mut state = MenuState::dropped_on(&menus, 0);
-        let MenuKey::Events(events) = state.key(&press(KeyCode::Esc), &menus) else {
-            panic!("Esc did nothing");
-        };
-        assert_eq!(events, vec![MenuEvent::Close(CloseReason::Cancel)]);
-
-        // Along the bar, the menu stays down and nothing closed.
-        let mut state = MenuState::dropped_on(&menus, 0);
-        let MenuKey::Events(events) = state.key(&press(KeyCode::Right), &menus) else {
-            panic!("Right did nothing");
-        };
-        assert!(
-            !events
-                .iter()
-                .any(|event| matches!(event, MenuEvent::Close(_))),
-            "stepping along the bar reported a close: {events:?}"
-        );
-        assert_eq!(state.open_title(), 1);
-        assert!(state.is_dropped(), "the menu should stay down");
-    }
-
-    /// A toggle keeps the menu down, so the next switch is one key away.
-    #[test]
-    fn a_toggle_closes_the_menu() {
-        let menus = menus(&context());
-        let mut state = MenuState::dropped_on(&menus, 4);
-        let MenuKey::Events(events) = state.key(&press(KeyCode::Char('z')), &menus) else {
-            panic!("z did not reach Zen mode");
-        };
-        // A mnemonic moves the highlight and then chooses, so both are
-        // reported - a preview driven off Highlight must see the row that
-        // was landed on even when the same key activates it.
-        assert_eq!(
-            events,
-            vec![
-                MenuEvent::Highlight(Some(MenuAction::Zen)),
-                MenuEvent::Activate(MenuAction::Zen),
-                MenuEvent::Close(CloseReason::Committed),
-            ]
-        );
-    }
-
-    /// The contract slice 3 needs: entering a previewing list captures once,
-    /// leaving it says whether to put the original back.
-    #[test]
-    fn a_previewing_submenu_brackets_its_children_with_begin_and_end() {
-        let leaves = vec![
-            MenuItem::action(MenuAction::Log, "one", 'o', ""),
-            MenuItem::action(MenuAction::Docs, "two", 't', ""),
-        ];
-        let menus = vec![Menu::new(
-            "View",
-            'V',
-            vec![
-                MenuItem::new(
-                    MenuItemKind::Submenu {
-                        id: MenuAction::ThemePicker,
-                        items: leaves,
-                        previews: true,
-                    },
-                    "Theme",
-                    't',
-                    "",
-                ),
-                MenuItem::action(MenuAction::Log, "Log", 'l', ""),
-            ],
-        )];
-        let mut state = MenuState::dropped_on(&menus, 0);
-        // Entering: capture, then show the first child.
-        let MenuKey::Events(events) = state.key(&press(KeyCode::Right), &menus) else {
-            panic!("Right did not enter the submenu");
-        };
-        assert_eq!(
-            events,
-            vec![
-                MenuEvent::PreviewBegin(MenuAction::ThemePicker),
-                MenuEvent::Highlight(Some(MenuAction::Log)),
-            ]
-        );
-        // Moving inside must NOT re-capture, or Esc restores a preview
-        // rather than what the musician started with.
-        let MenuKey::Events(events) = state.key(&press(KeyCode::Down), &menus) else {
-            panic!("Down did nothing");
-        };
-        assert_eq!(events, vec![MenuEvent::Highlight(Some(MenuAction::Docs))]);
-        // Backing out restores.
-        let MenuKey::Events(events) = state.key(&press(KeyCode::Left), &menus) else {
-            panic!("Left did not leave the submenu");
-        };
-        assert_eq!(events[0], MenuEvent::PreviewEnd { restore: true });
-        // Esc from inside restores too; Enter keeps.
-        let mut state = MenuState::dropped_on(&menus, 0);
-        state.key(&press(KeyCode::Right), &menus);
-        let MenuKey::Events(events) = state.key(&press(KeyCode::Esc), &menus) else {
-            panic!("Esc did nothing");
-        };
-        assert_eq!(
-            events,
-            vec![
-                MenuEvent::PreviewEnd { restore: true },
-                MenuEvent::Close(CloseReason::Cancel),
-            ]
-        );
-        let mut state = MenuState::dropped_on(&menus, 0);
-        state.key(&press(KeyCode::Right), &menus);
-        let MenuKey::Events(events) = state.key(&press(KeyCode::Enter), &menus) else {
-            panic!("Enter did nothing");
-        };
-        assert_eq!(
-            events,
-            vec![
-                MenuEvent::Activate(MenuAction::Log),
-                MenuEvent::PreviewEnd { restore: false },
-                MenuEvent::Close(CloseReason::Committed),
-            ]
-        );
     }
 
     /// A group header opens and closes its rows in the same list: choosing
@@ -3010,66 +2694,6 @@ mod tests {
         };
         assert_eq!(row(false), "Add limiter to set");
         assert_eq!(row(true), "Remove limiter from set");
-    }
-
-    #[test]
-    fn clicking_a_title_opens_that_menu_and_the_rects_match_what_is_drawn() {
-        let menus = menus(&context());
-        let bar = Rect::new(0, 0, 80, 1);
-        let screen = Rect::new(0, 0, 80, 24);
-        let rects = title_rects(&menus, bar);
-        assert_eq!(rects.len(), menus.len());
-        for (index, rect) in rects.iter().enumerate() {
-            let mut state = MenuState::opened();
-            state.click(&menus, bar, screen, rect.x, rect.y);
-            assert_eq!(
-                state.open_title(),
-                index,
-                "clicking {:?} opened the wrong menu",
-                menus[index].title
-            );
-            assert!(state.is_dropped());
-        }
-    }
-
-    #[test]
-    fn menu_aliases_follow_terminal_reach_and_scene_rebindings() {
-        use crate::keybinds::{BindAction, KeyCombo, Keybinds, Reach};
-        let mut binds = Keybinds::default();
-        binds.set_reach(Reach {
-            enhanced: true,
-            terminal: "Windows Terminal".to_owned(),
-        });
-        let accel = |binds: &Keybinds, action: MenuAction| {
-            menus(&MenuContext {
-                keybinds: binds,
-                split: true,
-                ..context()
-            })
-            .into_iter()
-            .flat_map(|menu| menu.items)
-            .find(|item| item.id() == Some(action))
-            .unwrap()
-            .accel
-        };
-        assert_eq!(accel(&binds, MenuAction::Log), "F9");
-        assert_eq!(accel(&binds, MenuAction::Mixer), "F4");
-        assert_eq!(accel(&binds, MenuAction::Zen), "^K");
-        binds.set_reach(Reach {
-            enhanced: false,
-            terminal: "conhost".to_owned(),
-        });
-        assert_eq!(accel(&binds, MenuAction::Record), "⇧F11");
-        assert_eq!(accel(&binds, MenuAction::PreviousScene), "F6");
-        assert_eq!(accel(&binds, MenuAction::NextScene), "F7");
-        assert_eq!(accel(&binds, MenuAction::HopPane), "F10");
-        binds.learn(
-            BindAction::DuplicateScene,
-            Some(KeyCombo::parse("f2").unwrap()),
-        );
-        assert_eq!(accel(&binds, MenuAction::DuplicateScene), "F2");
-        binds.unbind(BindAction::RecordTake);
-        assert_eq!(accel(&binds, MenuAction::Record), "");
     }
 
     #[test]

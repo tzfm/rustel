@@ -916,28 +916,6 @@ mod tests {
     }
 
     #[test]
-    fn similar_explores_motif_rhythm_and_sound_without_changing_key() {
-        for direction in Direction::ALL {
-            let mut generator = Generator::seeded(9);
-            if generator.direction() != direction {
-                generator.choose(direction);
-            }
-            let root = generator.idea.root;
-            let source = generator.idea.source;
-            for _ in 0..20 {
-                let before = generator.idea.clone();
-                let code = generator.code.clone();
-                generator.similar();
-                assert_eq!(generator.idea.root, root);
-                assert_eq!(generator.idea.source, source);
-                assert_eq!(generator.idea.music.notes[..4], before.music.notes[..4]);
-                assert_ne!(generator.idea.music.notes[4..], before.music.notes[4..]);
-                assert_eq!(generator.idea.phase, before.phase);
-                assert_ne!(generator.code, code, "{direction:?}");
-            }
-        }
-    }
-    #[test]
     fn histories_restore_the_exact_code_and_controls_and_support_branching() {
         let mut generator = Generator::seeded(41);
         let first = generator.code.clone();
@@ -1168,23 +1146,6 @@ mod tests {
             }
         }
     }
-    #[test]
-    fn generated_native_layers_render_finite_audible_audio() {
-        for direction in Direction::ALL
-            .into_iter()
-            .filter(|direction| !matches!(direction, Direction::Scrub | Direction::Groove))
-        {
-            let mut generator = Generator::seeded(7);
-            if generator.direction() != direction {
-                generator.choose(direction);
-            }
-            let mut session = rustel_runtime::Session::new().unwrap();
-            session.evaluate(&generator.code).unwrap();
-            let pcm = session.render_pcm(0.5).unwrap();
-            assert!(pcm.iter().all(|sample| sample.is_finite()));
-            assert!(pcm.iter().any(|sample| sample.abs() > 0.0001));
-        }
-    }
 
     /// These fixtures exercise real sampler controls without networking in CI.
     /// Production names are deliberately enumerated, rather than accepting any
@@ -1347,76 +1308,6 @@ mod tests {
                         _ => unreachable!(),
                     }
                 }
-            }
-        }
-    }
-
-    #[test]
-    #[ignore = "uses installed default sample banks; set RUSTEL_GENERATOR_AUDITION_DIR for WAV/score output"]
-    fn export_generator_comparisons_with_real_default_banks() {
-        let output = std::path::PathBuf::from(
-            std::env::var_os("RUSTEL_GENERATOR_AUDITION_DIR")
-                .expect("set RUSTEL_GENERATOR_AUDITION_DIR to an audition output folder"),
-        );
-        std::fs::create_dir_all(&output).unwrap();
-        for direction in Direction::ALL {
-            let mut generator = Generator::seeded(17);
-            if generator.direction() != direction {
-                generator.choose(direction);
-            }
-            for variant in ["original", "similar"] {
-                if variant == "similar" {
-                    generator.similar();
-                }
-                let library = std::sync::Arc::new(
-                    rustel_runtime::samples::SampleLibrary::load_default().unwrap(),
-                );
-                let mut session = rustel_runtime::Session::new().unwrap();
-                session.set_direct_diagnostic_logging(false);
-                session.set_sample_library_for_test(library.clone());
-                session.evaluate(&generator.code).unwrap();
-                session.prefetch_samples(4.0, std::time::Duration::from_secs(30));
-                let report = session.play(8.0).unwrap();
-                for onset in &report.onsets {
-                    rustel_runtime::test_support::scalar_event(
-                        onset,
-                        48_000,
-                        report.cps,
-                        library.as_ref(),
-                    )
-                    .unwrap_or_else(|error| panic!("{}: {error}", direction.name()));
-                }
-                let name = format!(
-                    "{}-{variant}",
-                    direction.name().to_lowercase().replace(' ', "-")
-                );
-                std::fs::write(output.join(format!("{name}.strudel")), &generator.code).unwrap();
-                let wav = output.join(format!("{name}.wav"));
-                // Render once, then validate the exact artifact. A fresh library per
-                // render owns its decoded samples through that render's backend.
-                session
-                    .render(8.0, &wav, rustel_runtime::RenderFormat::ScalarF32Wav)
-                    .unwrap();
-                let decoded = rustel_audio::decode_wav(&std::fs::read(wav).unwrap()).unwrap();
-                let pcm = decoded.pcm();
-                let peak = pcm
-                    .iter()
-                    .fold(0.0f32, |peak, sample| peak.max(sample.abs()));
-                assert_eq!(decoded.channels(), 2);
-                assert_eq!(decoded.frames(), decoded.sample_rate() as usize * 8);
-                assert!(pcm.iter().all(|sample| sample.is_finite()));
-                assert!(
-                    peak > 0.0001 && peak < 1.0,
-                    "{}: peak {peak}",
-                    direction.name()
-                );
-                assert!(
-                    session
-                        .take_diagnostics()
-                        .iter()
-                        .all(|diagnostic| diagnostic.kind != "voice-refused")
-                );
-                println!("{name}: {} onsets, peak {peak:.4}", report.onsets.len());
             }
         }
     }

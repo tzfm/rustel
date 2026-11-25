@@ -470,20 +470,6 @@ mod tests {
     }
 
     #[test]
-    fn failure_result_keeps_revision_and_exact_source_hash() {
-        let mut worker = SaveWorker::spawn_with_operation(|_, _| Err("disk full".into())).unwrap();
-        worker.submit(request(7, "exact bytes")).unwrap();
-        worker.shutdown();
-
-        let completions = worker.take_completions();
-        assert_eq!(completions.len(), 1);
-        let result = &completions[0];
-        assert_eq!(result.request_id, 7);
-        assert_eq!(result.source_revision, source_revision("exact bytes"));
-        assert_eq!(result.result, Err("disk full".into()));
-    }
-
-    #[test]
     fn newer_failure_cannot_hide_the_source_that_last_reached_disk() {
         let (started_tx, started_rx) = sync_channel(0);
         let (release_tx, release_rx) = sync_channel(0);

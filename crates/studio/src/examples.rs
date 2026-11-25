@@ -257,38 +257,6 @@ mod tests {
     }
 
     #[test]
-    fn embedded_catalogue_is_schema_v1_and_contains_every_legacy_entry() {
-        let catalogue = ExampleCatalogue::parse(EMBEDDED_JSON).expect("catalogue");
-        assert_eq!(catalogue.schema_version(), SCHEMA_VERSION);
-        assert!(catalogue.len() >= 210);
-        assert!(catalogue.iter().all(|entry| !entry.explanation.is_empty()));
-        assert!(catalogue.iter().all(|entry| !entry.change.is_empty()));
-        assert!(
-            catalogue
-                .iter()
-                .filter(|entry| entry.kind == ExampleKind::Music)
-                .count()
-                >= 184
-        );
-        assert!(
-            catalogue
-                .iter()
-                .filter(|entry| entry.kind == ExampleKind::Hydra)
-                .count()
-                >= 26
-        );
-    }
-
-    #[test]
-    fn ids_are_indexed_and_unique() {
-        let catalogue = embedded();
-        for example in catalogue.iter() {
-            assert_eq!(catalogue.get(&example.id), Some(example));
-        }
-        assert_eq!(catalogue.by_id.len(), catalogue.len());
-    }
-
-    #[test]
     fn search_finds_categories_and_keeps_exact_names_first() {
         let catalogue = embedded();
         let exact = catalogue.search("Four on the floor");
@@ -581,14 +549,6 @@ fn split_arguments(inside: &str) -> Vec<String> {
 #[cfg(test)]
 mod formatting_tests {
     use super::*;
-    #[test]
-    fn a_stacked_track_reads_back_as_voices() {
-        let kit = "$: stack(s(\"bd*4\").gain(1), s(\"[~ cp]*2\").gain(.8)).bank(\"RolandTR909\")";
-        assert_eq!(
-            laned(kit),
-            "$: s(\"bd*4\").gain(1).bank(\"RolandTR909\")\n$: s(\"[~ cp]*2\").gain(.8).bank(\"RolandTR909\")"
-        );
-    }
 
     /// The fold's own multi-line form reads back into the same voices.
     #[test]

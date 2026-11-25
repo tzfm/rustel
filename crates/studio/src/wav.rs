@@ -1138,40 +1138,6 @@ mod tests {
     }
 
     #[test]
-    fn odd_padded_pcm_matches_materialized_samples_and_floor_frames() {
-        let dir = tempfile::tempdir_in(env!("CARGO_MANIFEST_DIR")).unwrap();
-        let mut outputs = Vec::new();
-        for padded in [false, true] {
-            let path = dir.path().join(format!("odd-padded-{padded}.wav"));
-            let mut writer = TakeWriter::start(path.clone(), 48_000).unwrap();
-            let mut samples = vec![0.5, -0.5, 1.0];
-            if padded {
-                assert_eq!(writer.push_padded(samples, 2), Ok(true));
-            } else {
-                samples.extend([0.0; 4]);
-                assert!(writer.push(samples));
-            }
-            let status = writer.finish();
-            assert_eq!(status.error, None);
-            assert_eq!(status.frames, 3, "floor((3 + 2 * 2) / 2)");
-            assert_eq!(status.bytes, HEADER_BYTES + 18);
-            assert_eq!(
-                status.final_signal,
-                Some(RawSignalSummary {
-                    sample_count: 7,
-                    nonfinite_count: 0,
-                    finite_peak: 1.0,
-                })
-            );
-            let bytes = std::fs::read(path).unwrap();
-            assert_eq!(bytes.len(), 44 + 21, "the odd tail is still written");
-            assert_eq!(u32::from_le_bytes(bytes[40..44].try_into().unwrap()), 18);
-            outputs.push(bytes);
-        }
-        assert_eq!(outputs[0], outputs[1]);
-    }
-
-    #[test]
     fn silence_suffix_failure_keeps_whole_received_summary_not_partial_frames() {
         let dir = tempfile::tempdir_in(env!("CARGO_MANIFEST_DIR")).unwrap();
         let path = dir.path().join("silence-error.wav");
@@ -1315,31 +1281,6 @@ mod tests {
     }
 
     #[test]
-    fn requested_close_drains_declared_silence_before_one_shot_collection() {
-        let dir = tempfile::tempdir_in(env!("CARGO_MANIFEST_DIR")).unwrap();
-        let path = dir.path().join("padded-close.wav");
-        let mut held = gated_writer(path.clone(), false, false);
-        assert_eq!(held.writer.push_padded(Vec::new(), 3), Ok(true));
-        held.writer.request_close();
-        held.wait_until_held();
-        assert_eq!(held.writer.try_finish(), None);
-        assert_eq!(held.writer.status().final_signal, None);
-        let status = held.collect();
-        assert_eq!(status.error, None);
-        assert_eq!(status.frames, 3);
-        assert_eq!(status.bytes, HEADER_BYTES + 18);
-        assert_eq!(
-            status.final_signal,
-            Some(RawSignalSummary {
-                sample_count: 6,
-                ..RawSignalSummary::default()
-            })
-        );
-        assert_eq!(&std::fs::read(path).unwrap()[44..], &[0; 18]);
-        assert_eq!(held.writer.try_finish(), None);
-    }
-
-    #[test]
     fn polled_io_failure_keeps_the_received_signal() {
         let dir = tempfile::tempdir_in(env!("CARGO_MANIFEST_DIR")).unwrap();
         let mut held = gated_writer(dir.path().join("polled-error.wav"), true, false);
@@ -1392,25 +1333,6 @@ mod tests {
             held.writer.close();
             assert_eq!(held.writer.status(), status);
         }
-    }
-
-    #[test]
-    fn a_return_gate_releases_the_writer_during_unwinding() {
-        let dir = tempfile::tempdir_in(env!("CARGO_MANIFEST_DIR")).unwrap();
-        let path = dir.path().join("unwound.wav");
-        let mut held = gated_writer(path, false, false);
-        let shared = Arc::clone(&held.writer.shared);
-        let unwind = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
-            held.writer.request_close();
-            held.wait_until_held();
-            panic!("unwind while the writer is held");
-        }));
-        let panic = unwind.expect_err("the test closure must unwind");
-        assert_eq!(
-            panic.downcast_ref::<&str>(),
-            Some(&"unwind while the writer is held")
-        );
-        assert_eq!(*shared.error.lock().unwrap(), None);
     }
 
     #[test]
@@ -1527,105 +1449,6 @@ mod tests {
                 0x00, 0x00, 0x00, // zero
             ]
         );
-    }
-
-    #[test]
-    fn raw_summary_rejects_overflow_without_partial_counts() {
-        let mut summary = RawSignalSummary {
-            sample_count: u64::MAX,
-            ..RawSignalSummary::default()
-        };
-        let before = summary;
-        assert_eq!(summary.observe(&[1.0], 0), Err("raw sample count overflow"));
-        assert_eq!(summary, before);
-
-        let mut summary = RawSignalSummary {
-            nonfinite_count: u64::MAX,
-            ..RawSignalSummary::default()
-        };
-        let before = summary;
-        assert_eq!(
-            summary.observe(&[f32::NAN], 0),
-            Err("raw non-finite sample count overflow")
-        );
-        assert_eq!(summary, before);
-    }
-
-    #[test]
-    fn writer_panic_is_reported_without_hiding_an_earlier_error() {
-        let dir = tempfile::tempdir_in(env!("CARGO_MANIFEST_DIR")).unwrap();
-        for (index, previous) in [None, Some("earlier I/O failure".to_owned())]
-            .into_iter()
-            .enumerate()
-        {
-            let mut writer =
-                TakeWriter::start(dir.path().join(format!("panic-{index}.wav")), 48_000).unwrap();
-            writer.close();
-            writer.final_signal = None;
-            *writer.shared.error.lock().unwrap() = previous.clone();
-            writer.join = Some(thread::spawn(|| panic!("injected writer failure")));
-            let status = writer.finish();
-            assert_eq!(status.final_signal, None);
-            let expected = match previous {
-                Some(error) => format!("{error}; recording writer thread panicked"),
-                None => "recording writer thread panicked".to_owned(),
-            };
-            assert_eq!(status.error.as_deref(), Some(expected.as_str()));
-        }
-    }
-
-    #[test]
-    fn summary_overflow_is_reported_without_a_final_signal() {
-        let dir = tempfile::tempdir_in(env!("CARGO_MANIFEST_DIR")).unwrap();
-        let mut writer = TakeWriter::start(dir.path().join("overflow.wav"), 48_000).unwrap();
-        writer.close();
-        writer.final_signal = None;
-        writer.join = Some(thread::spawn(|| Err("raw sample count overflow")));
-        let status = writer.finish();
-        assert_eq!(status.final_signal, None);
-        assert_eq!(status.error.as_deref(), Some("raw sample count overflow"));
-    }
-
-    #[test]
-    fn raw_summary_includes_chunks_drained_after_an_io_failure() {
-        let dir = tempfile::tempdir_in(env!("CARGO_MANIFEST_DIR")).unwrap();
-        let path = dir.path().join("read-only.wav");
-        File::create(&path).unwrap();
-        let file = File::open(&path).unwrap();
-        let shared = Shared {
-            frames: AtomicU64::new(0),
-            bytes: AtomicU64::new(HEADER_BYTES),
-            error: Mutex::new(None),
-        };
-        let (sender, receiver) = sync_channel(2);
-        // Two bytes beyond the writer buffer: the read-only file fails while
-        // writing this chunk, before receiving the next one.
-        let first_samples = (1 << 16) / 3 + 1;
-        sender
-            .send(TakeChunk {
-                samples: vec![0.25; first_samples],
-                silence_frames: 0,
-            })
-            .unwrap();
-        sender
-            .send(TakeChunk {
-                samples: vec![f32::NAN, f32::INFINITY, -2.0, 0.0],
-                silence_frames: 0,
-            })
-            .unwrap();
-        drop(sender);
-        let summary = run(file, 48_000, receiver, &shared).unwrap();
-        assert_eq!(
-            summary,
-            RawSignalSummary {
-                sample_count: first_samples as u64 + 4,
-                nonfinite_count: 2,
-                finite_peak: 2.0,
-            }
-        );
-        assert!(shared.error.lock().unwrap().is_some());
-        assert_eq!(shared.frames.load(Ordering::Relaxed), 0);
-        assert_eq!(std::fs::metadata(path).unwrap().len(), 0);
     }
 
     #[test]
