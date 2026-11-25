@@ -148,7 +148,8 @@ a helper it defines is not reported as an unknown function.
 
 `doc --all` lists every reference entry and `doc --all --json` exports the full
 catalogue for editor tooling. `lsp --stdio` runs the built-in language server
-for completion, hover, and live diagnostics without starting audio. See
+for completion, hover, and live diagnostics without starting audio. The
+[rustel-vscode](https://github.com/tzfm/rustel-vscode) extension uses it. See
 [Integrations](integrations.md) for LSP setup and live `--ui-events` telemetry
 and control commands.
 
