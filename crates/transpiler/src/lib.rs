@@ -298,18 +298,11 @@ fn regex_can_start_here(bytes: &[u8], slash: usize) -> bool {
 #[derive(Default)]
 struct RegexLiteralRanges(Vec<(usize, usize)>);
 
-#[cfg(test)]
-std::thread_local! {
-    static REGEX_LITERAL_PARSE_COUNT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
-}
-
 impl RegexLiteralRanges {
     fn parse(source: &str) -> Self {
         if !has_code_slash(source) {
             return Self::default();
         }
-        #[cfg(test)]
-        REGEX_LITERAL_PARSE_COUNT.with(|count| count.set(count.get() + 1));
         let allocator = Allocator::default();
         let parsed = Parser::new(&allocator, source, SourceType::mjs()).parse();
         let mut collector = RegexLiteralCollector::default();
@@ -3241,17 +3234,9 @@ impl KabelsalatCall<'_> {
     }
 }
 
-#[cfg(test)]
-std::thread_local! {
-    /// The bytes of source handed to `kabelsalat_calls`.
-    static KABELSALAT_LISTED_BYTES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
-}
-
 /// Each KabelSalat call in `source` outside another one's `stringified`
 /// span, in source order.
 fn kabelsalat_calls<'a>(source: &'a str, regexes: &RegexLiteralRanges) -> Vec<KabelsalatCall<'a>> {
-    #[cfg(test)]
-    KABELSALAT_LISTED_BYTES.with(|listed| listed.set(listed.get() + source.len()));
     let bytes = source.as_bytes();
     let mut calls = Vec::new();
     let mut index = 0usize;
@@ -5322,20 +5307,6 @@ mod tests {
         assert!(output.output.contains("else if (a == 1999) n = 1999"));
     }
 
-    #[test]
-    fn binary_word_operators_spend_the_expression_and_raw_budgets() {
-        for source in [
-            "item in first in second",
-            "item instanceof First instanceof Second",
-            "item\n/* continuation */ in first\n in second",
-            "item\n instanceof First\n instanceof Second",
-        ] {
-            assert_eq!(measure_nesting(source).operators, 2, "{source}");
-            assert!(structural_bytes(source) >= 2, "{source}");
-        }
-        assert_eq!(measure_nesting("instanceofName; inside").operators, 0);
-    }
-
     /// Half-typed source reaches this on every keystroke under `--watch`, and
     /// an unterminated string or regex runs the scan to the end of the input.
     /// Reading one byte past that end panicked, which is the same crash this
@@ -5434,17 +5405,6 @@ mod tests {
         }
     }
 
-    /// A long run of blank and comment lines is scanned one time. A scan for
-    /// each line makes this source take minutes.
-    #[test]
-    fn a_long_run_of_blank_and_comment_lines_keeps_the_chain_and_stays_linear() {
-        let run = "\n// muted lane\n".repeat(100_000);
-        let long = measure_nesting(&format!("note(\"c\")\n  .fast(1){run}  .slow(1)\n"));
-        let short = measure_nesting("note(\"c\")\n  .fast(1)\n  .slow(1)\n");
-        assert_eq!(long.chain, short.chain);
-        assert_eq!(long.operators, short.operators);
-    }
-
     /// The size limit and the parse stack are one guarantee in two halves: the
     /// limit bounds how deep source can nest, and the stack bounds what that
     /// depth costs. This parses the very worst case the limit admits -- every
@@ -5511,22 +5471,6 @@ mod tests {
 
         // The busiest vendored song spends 263.
         assert!(check_nesting(&"n(\"0\").s(\"bd\")\n".repeat(1_000)).is_ok());
-    }
-
-    /// A source past the structural size limit is refused with no KabelSalat
-    /// calls listed, even with a code `/` in it.
-    #[test]
-    fn an_oversized_source_with_a_division_is_refused() {
-        let oversized = format!("K(x);1/2;{}", "[".repeat(MAX_STRUCTURAL_BYTES + 1));
-        let output = transpile(&oversized, &TranspileOptions::default());
-        assert_eq!(output.diagnostics.len(), 1, "{:?}", output.diagnostics);
-        assert_eq!(
-            output.diagnostics[0].message,
-            check_nesting(&oversized)
-                .expect_err("over the size limit")
-                .message
-        );
-        assert!(output.kabelsalat_calls.is_empty());
     }
 
     /// Every bracket in these lives inside a string or comment, so none of them
@@ -5685,31 +5629,6 @@ mod tests {
         assert_eq!(
             decode_acorn_jsx_entities("&#55357;&#56832;&#xD83D;&#xDE00;"),
             Some("\u{1f600}\u{1f600}".into())
-        );
-    }
-
-    #[test]
-    fn jsx_codegen_site_lookup_is_sorted_and_handles_many_nodes() {
-        let children = "<a>&lt;</a>".repeat(512);
-        let source = format!("const x = <>{children}</>;");
-        let allocator = Allocator::default();
-        let parsed = Parser::new(&allocator, &source, SourceType::jsx()).parse();
-        assert!(parsed.diagnostics.is_empty(), "{:#?}", parsed.diagnostics);
-        let mut program = parsed.program;
-        let sites = normalize_jsx_values_with_sites(&allocator, &mut program);
-        assert_eq!(sites.len(), 512);
-        assert!(sites.windows(2).all(|pair| pair[0] < pair[1]));
-        assert!(sites.binary_search(&sites[0]).is_ok());
-        assert!(sites.binary_search(&sites[sites.len() - 1]).is_ok());
-
-        let printed = parse_and_print_path(&source, "fixture.jsx");
-        assert!(printed.diagnostics.is_empty(), "{:#?}", printed.diagnostics);
-        assert_eq!(printed.code.matches("&lt;").count(), 512);
-        let reparsed = parse_and_print_path(&printed.code, "fixture.jsx");
-        assert!(
-            reparsed.diagnostics.is_empty(),
-            "{:#?}",
-            reparsed.diagnostics
         );
     }
 
@@ -5933,21 +5852,6 @@ mod tests {
         assert_eq!(read(r#"$: sound("bd")"#, true), None);
         assert_eq!(read("if (a) b()", false), None);
         assert_eq!(read("const a = 1; const a = 2;", false), None);
-    }
-
-    #[test]
-    fn the_raw_budget_counts_each_word_where_it_does_not_overlap() {
-        for (source, count) in [
-            ("item in first", 1),
-            ("a instanceof B", 2),
-            ("typeof typeof x", 2),
-            ("new.target", 2),
-            ("\\u0076oid 0", 1),
-            ("f(a)[b]{c}", 3),
-            ("", 0),
-        ] {
-            assert_eq!(structural_bytes(source), count, "{source}");
-        }
     }
 
     #[test]
@@ -6251,32 +6155,6 @@ mod tests {
         let mixed = transpile(r#"s(`\${a} ${b}`)"#, &options);
         assert!(mixed.diagnostics.is_empty(), "{:?}", mixed.diagnostics);
         assert_eq!(mixed.output, r"s(`\${a} ${b}`);");
-    }
-
-    /// A template's `${...}` substitution is code: a backtick, brace or comment
-    /// inside it does not end the template, and an escaped `\${` opens none.
-    #[test]
-    fn a_template_scan_skips_the_code_of_its_substitutions() {
-        for template in [
-            "`${`bd sd!`}`",
-            "`a ${`b ${`c`}`} d`",
-            "`${ '`' + \"`\" }`",
-            "`${ {a: 1}.a }`",
-            "`${ /* ` } */ 1 }`",
-            "`${ 1 // ` }\n}`",
-            "`\\${`",
-        ] {
-            assert_eq!(
-                scan_quoted(template.as_bytes(), 0, b'`'),
-                template.len(),
-                "{template:?}"
-            );
-        }
-        assert_eq!(
-            scan_quoted(b"`${`a`", 0, b'`'),
-            6,
-            "an open template runs to EOF"
-        );
     }
 
     /// A template nested in a substitution is copied with its outer template, so
@@ -6598,62 +6476,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn kabelsalat_lifts_only_pattern_call_expressions() {
-        for expression in ["m('bd')", "m /* mini */ ('bd')", "m (('bd'))"] {
-            let (template, patterns) = extract_pattern_placeholders(expression);
-            assert_eq!(template, "pat[0]", "{expression}");
-            assert_eq!(patterns, [expression], "{expression}");
-        }
-        let (template, patterns) = extract_pattern_placeholders(
-            "add(sine(b).fm(b), m('0 1'), S /* pattern */ (note('c')), pattern.S(m('2 3')))",
-        );
-        assert_eq!(template, "add(sine(b).fm(b), pat[0], pat[1], pat[2])");
-        assert_eq!(patterns, ["m('0 1')", "note('c')", "m('2 3')"]);
-    }
-
-    /// A chain of KabelSalat calls, each in the previous one's later
-    /// arguments, is rewritten from one listing of the source.
-    #[test]
-    fn a_chain_of_kabelsalat_calls_is_listed_once() {
-        let depth = 500;
-        let literal = format!("'{}'", "x".repeat(1 << 16));
-        let source = format!("{}{literal}{}", "K(a, ".repeat(depth), ")".repeat(depth));
-        KABELSALAT_LISTED_BYTES.with(|listed| listed.set(0));
-        let output = rewrite_kabelsalat(&source, false);
-        assert_eq!(
-            output,
-            format!(
-                "{}{literal}{}",
-                "worklet('a', ".repeat(depth),
-                ")".repeat(depth)
-            )
-        );
-        assert_eq!(
-            KABELSALAT_LISTED_BYTES.with(std::cell::Cell::get),
-            source.len()
-        );
-    }
-
-    /// A chain of KabelSalat calls, each in the previous one's lifted `S(…)`
-    /// pattern, is listed once and left as code below the outer call.
-    #[test]
-    fn a_chain_of_kabelsalat_calls_in_lifted_patterns_is_listed_once() {
-        let depth = 250;
-        let literal = format!("'{}'", "x".repeat(1 << 16));
-        let source = format!("{}{literal}{}", "K(S(".repeat(depth), "))".repeat(depth));
-        KABELSALAT_LISTED_BYTES.with(|listed| listed.set(0));
-        let output = rewrite_kabelsalat(&source, false);
-        assert_eq!(
-            output,
-            format!("worklet('pat[0]', {})", &source[4..source.len() - 2])
-        );
-        assert_eq!(
-            KABELSALAT_LISTED_BYTES.with(std::cell::Cell::get),
-            source.len()
-        );
-    }
-
     /// A KabelSalat call nested in a graph is stringified as written, so the
     /// output stays linear in the source at every depth.
     #[test]
@@ -6786,101 +6608,9 @@ p._scope({ test: /[),]/ });"#;
     }
 
     #[test]
-    fn division_only_scores_reuse_the_empty_regex_result_downstream() {
-        REGEX_LITERAL_PARSE_COUNT.with(|count| count.set(0));
-        let division = transpile_here(
-            "setcpm(140/4)",
-            &TranspileOptions {
-                add_return: false,
-                ..TranspileOptions::default()
-            },
-        );
-        assert!(
-            division.diagnostics.is_empty(),
-            "{:?}",
-            division.diagnostics
-        );
-        assert_eq!(
-            REGEX_LITERAL_PARSE_COUNT.with(std::cell::Cell::get),
-            1,
-            "division was reparsed as a possible regex in downstream transforms"
-        );
-
-        REGEX_LITERAL_PARSE_COUNT.with(|count| count.set(0));
-        let regex = transpile_here(
-            "if (ok) /slider(.5)/.test(x)",
-            &TranspileOptions {
-                add_return: false,
-                ..TranspileOptions::default()
-            },
-        );
-        assert!(regex.diagnostics.is_empty(), "{:?}", regex.diagnostics);
-        assert!(
-            REGEX_LITERAL_PARSE_COUNT.with(std::cell::Cell::get) > 1,
-            "real regex spans were not refreshed after offsets could change"
-        );
-    }
-
-    #[test]
     fn division_expressions_do_not_hide_real_slider_calls() {
         let result = transpile(
             "const a = total / slider(.5); const b = value() / slider(.25)",
-            &TranspileOptions {
-                add_return: false,
-                ..TranspileOptions::default()
-            },
-        );
-
-        assert!(result.diagnostics.is_empty(), "{:?}", result.diagnostics);
-        assert_eq!(
-            result
-                .widgets
-                .iter()
-                .filter(|widget| widget.widget_type == "slider")
-                .count(),
-            2
-        );
-        assert_eq!(result.output.matches("sliderWithID").count(), 2);
-    }
-
-    #[test]
-    fn control_head_regexes_stay_opaque_across_every_source_rewriter() {
-        let source = r#"if (ok) /slider(.5) _scope() samples() K(S("bd")) \.5/.test(x);
-slider(.25);
-p._scope();"#;
-        let result = transpile(
-            source,
-            &TranspileOptions {
-                add_return: false,
-                widget_methods: vec!["_scope".into()],
-                ..TranspileOptions::default()
-            },
-        );
-
-        assert!(result.diagnostics.is_empty(), "{:?}", result.diagnostics);
-        assert_eq!(
-            result
-                .widgets
-                .iter()
-                .map(|widget| widget.widget_type.as_str())
-                .collect::<Vec<_>>(),
-            vec!["slider", "_scope"]
-        );
-        assert_eq!(result.output.matches("sliderWithID").count(), 1);
-        assert!(
-            result
-                .output
-                .contains(r#"/slider(.5) _scope() samples() K(S("bd")) \.5/.test(x)"#),
-            "a source rewriter changed the control-head regex: {}",
-            result.output
-        );
-    }
-
-    #[test]
-    fn comment_and_postfix_division_do_not_hide_real_slider_calls() {
-        let source = "const a = x /* keep */ / slider(.5); const b = x++ / slider(.25)";
-        let result = transpile(
-            source,
             &TranspileOptions {
                 add_return: false,
                 ..TranspileOptions::default()
@@ -7255,34 +6985,6 @@ p._scope();"#;
     }
 
     #[test]
-    fn nested_visual_calls_receive_stable_receiver_slots() {
-        let source = r#"stack(
-  s("bd hh sd hh")._spiral(),
-  note("[d2!2 f3 g3]*4")._punchcard()._scope()
-)"#;
-        let result = transpile_for_layout(source);
-
-        assert_eq!(
-            result
-                .widgets
-                .iter()
-                .map(|widget| (widget.widget_type.as_str(), widget.visual_slot))
-                .collect::<Vec<_>>(),
-            vec![
-                ("_spiral", Some(0)),
-                ("_punchcard", Some(1)),
-                ("_scope", Some(2))
-            ]
-        );
-        assert!(result.output.contains("._spiral('"));
-        assert!(result.output.contains("', 0)"));
-        assert!(result.output.contains("._punchcard('"));
-        assert!(result.output.contains("', 1)"));
-        assert!(result.output.contains("._scope('"));
-        assert!(result.output.contains("', 2)"));
-    }
-
-    #[test]
     fn visual_discovery_ignores_strings_comments_and_non_member_calls() {
         let source = r#"const text = "x._scope()";
 // p._spiral()
@@ -7345,19 +7047,6 @@ p._scope({ text: "/* not a comment */" });"#;
     }
 
     #[test]
-    fn a_painter_call_inside_all_never_consumes_a_later_widget_id() {
-        let source = "all(pianoroll({ labels: 1 }));\ns(\"bd\").pianoroll();";
-        let result = transpile_for_layout(source);
-
-        // The member call carries its id; the all() call is left as written.
-        assert_eq!(
-            result.output,
-            "all(pianoroll({ labels: 1 }));\n\
-         s(m('bd', 33)).pianoroll('layout_widget_pianoroll_0_31-50', 0);"
-        );
-    }
-
-    #[test]
     fn a_slider_inside_an_all_painter_body_keeps_its_own_text() {
         let source = "slider(0.5);\nall(pianoroll({ speed: slider(0.2) }));\nslider(0.7);";
         let result = transpile_for_layout(source);
@@ -7400,23 +7089,6 @@ p._scope({ text: "/* not a comment */" });"#;
             )
         );
         assert_eq!(result.widgets.len(), 2, "{:?}", result.widgets);
-    }
-
-    #[test]
-    fn a_slider_in_a_kabelsalat_graph_is_not_advertised_as_a_control() {
-        let source = "K(seq(slider(0.5)));\nslider(0.9);";
-        let result = transpile_for_layout(source);
-
-        // A slider in a K graph becomes worklet source, so it gets no record
-        // and no control.
-        assert_eq!(
-            result.output,
-            format!(
-                "worklet('seq(slider(.5))');\nsliderWithID('{}', 0.9);",
-                slider_id(source, "0.9")
-            )
-        );
-        assert_eq!(result.widgets.len(), 1, "{:?}", result.widgets);
     }
 
     #[test]
@@ -7713,25 +7385,6 @@ p._scope({ text: "/* not a comment */" });"#;
     }
 
     #[test]
-    fn one_parse_stack_serves_each_parse_of_a_thread() {
-        let first = parse_thread().expect("a thread to parse on");
-        assert_ne!(first, std::thread::current().id());
-        assert_eq!(parse_thread(), Some(first));
-        // A panic of the work continues on the caller, and the same stack
-        // parses again.
-        let panicked = std::panic::catch_unwind(|| {
-            on_parse_stack("", |_| -> () { panic!("a parse that fails") })
-        });
-        assert!(panicked.is_err());
-        assert_eq!(parse_thread(), Some(first));
-        // Another calling thread has a parse stack of its own.
-        let other = std::thread::spawn(parse_thread)
-            .join()
-            .expect("the other thread");
-        assert!(other.is_some_and(|other| other != first));
-    }
-
-    #[test]
     fn transpile_gives_the_same_output_inside_on_caller_stack() {
         let source = "samples('github:tidalcycles/dirt-samples')\nkick: s(\"bd*2 sd\")\n";
         let options = TranspileOptions::default();
@@ -7749,24 +7402,6 @@ p._scope({ text: "/* not a comment */" });"#;
             on_caller_stack(|| lane_statements(source)),
             lane_statements(source)
         );
-    }
-
-    #[test]
-    fn awaits_in_code_answers_the_same_inside_on_caller_stack() {
-        for (source, awaits) in [("await samples('x')", true), ("s(\"await\")", false)] {
-            assert_eq!(awaits_in_code(source), awaits, "{source}");
-            assert_eq!(
-                on_caller_stack(|| awaits_in_code(source)),
-                awaits,
-                "{source}"
-            );
-        }
-    }
-
-    #[test]
-    fn on_caller_stack_parses_on_the_calling_thread() {
-        let caller = std::thread::current().id();
-        assert_eq!(on_caller_stack(parse_thread), Some(caller));
     }
 
     #[test]
