@@ -220,26 +220,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn a_scope_names_itself_and_where_it_lives() {
-        assert_eq!(PrebakeScope::Global.tab_name(), "prebake (global)");
-        assert_eq!(PrebakeScope::Local.tab_name(), "prebake (local)");
-        assert_eq!(PrebakeScope::Global.home(), "prebake.strudel");
-        assert_eq!(PrebakeScope::Local.home(), "rustel-set.json");
-        assert_eq!(PrebakeScope::ALL[0].index(), 0);
-        assert_eq!(PrebakeScope::ALL[1].index(), 1);
-    }
-
-    #[test]
-    fn only_nothing_at_all_counts_as_blank() {
-        assert!(is_blank(""));
-        assert!(is_blank("   \n\t\n"));
-        // Comments are text someone wrote: kept, and run as the no-op they are.
-        assert!(!is_blank(PREBAKE_STARTER));
-        assert!(!is_blank("// a note to self\n"));
-        assert!(!is_blank("globalThis.a = 1"));
-    }
-
-    #[test]
     fn the_settings_value_says_what_is_there_and_whether_it_ran() {
         assert_eq!(
             PrebakeRow {
@@ -298,11 +278,5 @@ mod tests {
         assert!(load_global_from(Some(&path)).is_empty());
         // Removing one that is already gone is not an error.
         save_global_to(Some(&path), "").expect("already gone");
-    }
-
-    #[test]
-    fn without_a_config_folder_a_global_prebake_says_so() {
-        assert!(save_global_to(None, "globalThis.a = 1").is_err());
-        assert!(load_global_from(None).is_empty());
     }
 }

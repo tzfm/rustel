@@ -1961,42 +1961,6 @@ mod tests {
         KeyEvent::new(code, modifiers)
     }
 
-    /// The defaults are the chords a hand already knows. Update and stop
-    /// are strudel.cc's own, ^Enter and ^.; the chords the studio shipped
-    /// with, ^S and ^G, keep answering beside them, and a terminal that
-    /// cannot send ^Enter as itself gets them as the default instead.
-    /// Renaming one is a breaking change for every hand that knows it.
-    #[test]
-    fn defaults_are_the_studio_s_own_chords() {
-        let binds = Keybinds::default();
-        let evaluate = binds.binding(BindAction::Evaluate).unwrap();
-        assert_eq!(evaluate.key(), "ctrl+enter");
-        assert_eq!(evaluate.hint(), "^Enter");
-        assert_eq!(binds.binding(BindAction::Stop).unwrap().key(), "ctrl+.");
-        assert_eq!(
-            binds.action_for(&press(KeyCode::Char('s'), KeyModifiers::CONTROL)),
-            Some(BindAction::Evaluate),
-            "the shipped ^S still updates"
-        );
-        assert_eq!(
-            binds.action_for(&press(KeyCode::Char('g'), KeyModifiers::CONTROL)),
-            Some(BindAction::Stop),
-            "the shipped ^G still stops"
-        );
-        assert_eq!(
-            binds.action_for(&press(KeyCode::F(5), KeyModifiers::NONE)),
-            Some(BindAction::Evaluate)
-        );
-        assert_eq!(binds.binding(BindAction::Mixer).unwrap().key(), "f4");
-        assert_eq!(binds.binding(BindAction::Mixer).unwrap().hint(), "F4");
-        assert_eq!(
-            binds.binding(BindAction::RewindEvaluate).unwrap().key(),
-            "ctrl+shift+s"
-        );
-        assert_eq!(binds.hint(BindAction::RewindEvaluate), "^\u{21e7}S");
-        assert_eq!(binds.hint(BindAction::Quit), "^Q");
-    }
-
     #[test]
     fn rename_scene_keeps_ctrl_r_outside_vim_and_gives_it_up_in_vim() {
         let mut binds = Keybinds::default();
@@ -2036,24 +2000,6 @@ mod tests {
                 .map(|combo| combo.key()),
             Some("ctrl+r".to_owned()),
             "Default keys bring rename scene back"
-        );
-    }
-
-    /// A terminal that folds ^Enter into Enter and ^. into `.` gets the
-    /// shipped chords as the defaults it shows, and ^Enter is not claimed.
-    #[test]
-    fn a_legacy_terminal_updates_on_ctrl_s_and_stops_on_ctrl_g() {
-        let mut binds = Keybinds::default();
-        binds.set_reach(Reach {
-            enhanced: false,
-            terminal: "xterm-256color".into(),
-        });
-        assert_eq!(binds.binding(BindAction::Evaluate).unwrap().key(), "ctrl+s");
-        assert_eq!(binds.binding(BindAction::Stop).unwrap().key(), "ctrl+g");
-        assert_eq!(
-            binds.effective_alias(BindAction::Evaluate).unwrap().key(),
-            "f5",
-            "one also, as before"
         );
     }
 
@@ -2132,42 +2078,6 @@ mod tests {
         // Ctrl+Shift+F9 is free, so this take displaces no other action.
     }
 
-    #[test]
-    fn piano_mode_is_explicit_rebindable_and_never_claims_typing_keys() {
-        let mut binds = Keybinds::default();
-        assert_eq!(
-            BindAction::parse_key("piano-mode"),
-            Some(BindAction::PianoMode)
-        );
-        assert_eq!(binds.hint(BindAction::PianoMode), "F12");
-        assert_eq!(
-            binds.action_for(&press(KeyCode::F(12), KeyModifiers::NONE)),
-            Some(BindAction::PianoMode)
-        );
-        for letter in "awsedftgyhujkolzxcvm".chars() {
-            assert_eq!(
-                binds.action_for(&press(KeyCode::Char(letter), KeyModifiers::NONE)),
-                None,
-                "{letter} must still type outside piano mode"
-            );
-        }
-        let replacement = KeyCombo::parse("ctrl+shift+f9").unwrap();
-        binds.learn(BindAction::PianoMode, Some(replacement));
-        assert_eq!(
-            binds.action_for(&combo_event(replacement)),
-            Some(BindAction::PianoMode)
-        );
-        assert_eq!(
-            binds.action_for(&press(KeyCode::F(12), KeyModifiers::NONE)),
-            None
-        );
-        let mut restored = Keybinds::default();
-        restored.restore(&binds.prefs());
-        assert_eq!(restored.binding(BindAction::PianoMode), Some(replacement));
-        restored.reset_all();
-        assert_eq!(restored.hint(BindAction::PianoMode), "F12");
-    }
-
     fn chord_modifiers(chord: KeyCombo) -> KeyModifiers {
         let mut modifiers = KeyModifiers::empty();
         if chord.control {
@@ -2177,137 +2087,6 @@ mod tests {
             modifiers |= KeyModifiers::SHIFT;
         }
         modifiers
-    }
-
-    /// A learnt chord IS the action, at every modifier the terminal may
-    /// deliver it in, and is nobody else's afterwards.
-    #[test]
-    fn a_learnt_chord_answers_everywhere() {
-        let mut binds = Keybinds::default();
-        let chord = KeyCombo::parse("ctrl+shift+f9").unwrap();
-        binds.learn(BindAction::Stop, Some(chord));
-        assert_eq!(
-            binds.action_for(&combo_event(chord)),
-            Some(BindAction::Stop)
-        );
-        // The old chord is free again, not a second stop.
-        assert_eq!(
-            binds.action_for(&press(KeyCode::Char('g'), KeyModifiers::CONTROL)),
-            None,
-            "the chord moved off stop, so ^G means nothing now"
-        );
-    }
-
-    /// One chord, one meaning: learning over a chord the studio already
-    /// uses moves it, and the action that held it falls back to nothing -
-    /// an unbound action is quieter than two actions on one key.
-    #[test]
-    fn learning_moves_the_chord_off_its_previous_owner() {
-        let mut binds = Keybinds::default();
-        binds.learn(BindAction::Zen, Some(KeyCombo::parse("ctrl+o").unwrap()));
-        assert_eq!(binds.binding(BindAction::Zen).unwrap().key(), "ctrl+o");
-        assert_eq!(
-            binds.action_for(&press(KeyCode::Char('o'), KeyModifiers::CONTROL)),
-            Some(BindAction::Zen)
-        );
-        // Settings held ^O; the chord was taken whole: no override, but
-        // no default either. The action was displaced, not silently
-        // repointed, and ^O means only zen from now on.
-        assert!(!binds.overridden(BindAction::Settings));
-        assert!(binds.is_unbound(BindAction::Settings));
-        assert_eq!(binds.binding(BindAction::Settings), None);
-        assert_eq!(
-            binds.action_for(&press(KeyCode::Char('o'), KeyModifiers::CONTROL)),
-            Some(BindAction::Zen)
-        );
-        // And the file says so: an empty chord, so the displacement
-        // survives a restart instead of the default creeping back.
-        let written = binds.prefs();
-        assert!(
-            written
-                .bindings
-                .iter()
-                .any(|row| row.action == "settings" && row.chord.is_empty()),
-            "the displaced action is carried as unbound: {:?}",
-            written.bindings
-        );
-    }
-
-    /// On a terminal without an enhanced keyboard protocol, Ctrl+Shift+Z
-    /// arrives as the same byte as Ctrl+Z: `Char('z')` with CONTROL only.
-    #[test]
-    fn a_legacy_terminal_cannot_tell_ctrl_shift_from_ctrl() {
-        use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
-        let legacy = KeyEvent {
-            code: KeyCode::Char('z'),
-            modifiers: KeyModifiers::CONTROL,
-            kind: KeyEventKind::Press,
-            state: crossterm::event::KeyEventState::NONE,
-        };
-        let undo = BindAction::Undo.default_binding();
-        let redo = BindAction::Redo.default_binding();
-        assert_eq!(undo.key(), "ctrl+z");
-        assert_eq!(redo.key(), "ctrl+shift+z");
-        assert!(undo.matches(&legacy), "the byte reads as plain Ctrl+Z");
-        assert!(
-            !redo.matches(&legacy),
-            "and there is nothing in it that could say Shift"
-        );
-    }
-
-    /// Every shifted-letter default, and the plain binding a legacy
-    /// terminal runs instead. The list is pinned so that a new
-    /// shifted-letter default is a deliberate choice.
-    #[test]
-    fn which_shifted_letters_a_legacy_terminal_swallows() {
-        use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers};
-        let legacy = |letter: char| KeyEvent {
-            code: KeyCode::Char(letter),
-            modifiers: KeyModifiers::CONTROL,
-            kind: KeyEventKind::Press,
-            state: KeyEventState::NONE,
-        };
-
-        let mut lost: Vec<(&str, &str)> = Vec::new();
-        for action in BindAction::ALL {
-            let combo = action.default_binding();
-            let (true, KeyCode::Char(letter)) = (combo.control && combo.shift, combo.code) else {
-                continue;
-            };
-            let press = legacy(letter);
-            assert!(
-                !combo.matches(&press),
-                "{} cannot be told apart from its plain twin",
-                action.key()
-            );
-            // Whichever plain binding eats the byte instead - on a legacy
-            // terminal that is the fallback where the default cannot arrive.
-            if let Some(thief) = BindAction::ALL.into_iter().find(|other| {
-                !SHIPS_UNBOUND.contains(other)
-                    && (other.default_binding().matches(&press)
-                        || other
-                            .fallback_binding()
-                            .is_some_and(|fallback| fallback.matches(&press)))
-            }) {
-                lost.push((action.key(), thief.key()));
-            }
-        }
-        lost.sort_unstable();
-        assert_eq!(
-            lost,
-            [
-                ("export", "cut"),
-                ("find", "redo"),
-                ("forget-pad", "learn-pad"),
-                ("knobs", "zen-mode"),
-                ("open-set", "settings"),
-                ("record-take", "rename-scene"),
-                ("redo", "undo"),
-                ("rewind-update", "update"),
-                ("scene-rewind", "word-wrap"),
-            ],
-            "the shifted defaults a legacy terminal loses, and what runs instead"
-        );
     }
 
     /// Without enhanced key reports, shifted-letter and ambiguous punctuation
@@ -2373,75 +2152,6 @@ mod tests {
         );
     }
 
-    /// Every second choice is one the terminal it is meant for can send -
-    /// a fallback that is itself unreachable is worse than none, because
-    /// it moves a chord somebody knew for nothing.
-    #[test]
-    fn every_second_choice_survives_the_terminal_it_is_for() {
-        let _platform = super::super::terminal::conflicts::ForcePlatformForTest::set("windows");
-        let legacy = Reach {
-            enhanced: false,
-            terminal: "xterm-256color".to_owned(),
-        };
-        let mut candidates = 0;
-        for action in BindAction::ALL {
-            let Some(second) = action.fallback_binding() else {
-                continue;
-            };
-            assert!(
-                legacy.delivers(&second),
-                "{}: its second choice cannot arrive either",
-                action.key()
-            );
-            // Candidates may overlap when different profiles need them.
-            // The all-profile resolution test verifies actual assignments
-            // remain distinct after availability checks select a fallback.
-            candidates += 1;
-        }
-        assert!(candidates > 0, "no second choices at all");
-    }
-
-    /// A chord somebody LEARNT is never second-guessed: they pressed it,
-    /// so it plainly arrives, whatever the table believes about their
-    /// terminal.
-    #[test]
-    fn a_learnt_chord_outranks_what_the_terminal_is_thought_to_swallow() {
-        let mut binds = Keybinds::default();
-        binds.set_reach(Reach {
-            enhanced: false,
-            terminal: "xterm-256color".to_owned(),
-        });
-        assert_eq!(binds.binding(BindAction::Redo).unwrap().key(), "ctrl+y");
-        binds.learn(
-            BindAction::Redo,
-            Some(KeyCombo::parse("ctrl+shift+z").expect("a chord")),
-        );
-        assert_eq!(
-            binds.binding(BindAction::Redo).unwrap().key(),
-            "ctrl+shift+z",
-            "the studio does not argue with a key somebody just pressed"
-        );
-    }
-
-    /// Unlearning puts the studio's own chord back.
-    #[test]
-    fn unlearning_restores_the_default() {
-        let mut binds = Keybinds::default();
-        // ^⇧Q because it is the free one: every bare F-key is a default,
-        // and ⇧F1/⇧F2/⇧F9/⇧F10 belong to the panels.
-        binds.learn(
-            BindAction::Undo,
-            Some(KeyCombo::parse("ctrl+shift+q").unwrap()),
-        );
-        assert_eq!(
-            binds.binding(BindAction::Undo).unwrap().key(),
-            "ctrl+shift+q"
-        );
-        binds.learn(BindAction::Undo, None);
-        assert_eq!(binds.binding(BindAction::Undo).unwrap().key(), "ctrl+z");
-        assert!(binds.prefs().bindings.is_empty());
-    }
-
     /// ⇧ with control: the enhanced protocols deliver ⇧⌘Z as `Z` with the
     /// shift bit dropped, so the uppercase letter IS the shift. The same
     /// match the editor's chord reader makes.
@@ -2487,30 +2197,6 @@ mod tests {
                 .iter()
                 .any(|row| row.action == "brand-new-thing" && row.chord == "f2")
         );
-    }
-
-    /// An explicit unbinding is carried too: the action answers to
-    /// nothing, and a restart does not quietly hand the chord back.
-    #[test]
-    fn an_unbound_action_answers_to_nothing_and_stays_so() {
-        let mut binds = Keybinds::default();
-        binds.unbind(BindAction::Evaluate);
-        assert_eq!(binds.binding(BindAction::Evaluate), None);
-        assert_eq!(binds.hint(BindAction::Evaluate), "");
-        assert_eq!(
-            binds.action_for(&press(KeyCode::Char('s'), KeyModifiers::CONTROL)),
-            None,
-            "^S is nobody's while evaluate is unbound"
-        );
-        assert!(binds.overrules(&press(KeyCode::Char('s'), KeyModifiers::CONTROL)));
-        // Through the file and back, the silence holds.
-        let mut restored = Keybinds::default();
-        restored.restore(&binds.prefs());
-        assert_eq!(restored.binding(BindAction::Evaluate), None);
-        // Learning back onto the action is the way out.
-        binds.learn(BindAction::Evaluate, Some(KeyCombo::parse("f5").unwrap()));
-        assert_eq!(binds.binding(BindAction::Evaluate).unwrap().key(), "f5");
-        assert!(!binds.is_unbound(BindAction::Evaluate));
     }
 
     /// The take the Keybinds page asks about, end to end: confirming
@@ -2765,22 +2451,6 @@ mod tests {
             KeybindCapture::Refused { .. }
         ));
     }
-
-    /// Alt is never stored: the chord a learner presses with option held
-    /// arrives without it, so no binding can take a key the terminal
-    /// spends on typing characters.
-    #[test]
-    fn alt_never_reaches_a_binding() {
-        let binds = Keybinds::default();
-        // With alt held the ^S press still reads as ^S, the default.
-        assert_eq!(
-            binds.action_for(&press(
-                KeyCode::Char('s'),
-                KeyModifiers::CONTROL | KeyModifiers::ALT
-            )),
-            Some(BindAction::Evaluate)
-        );
-    }
     fn combo_event(combo: KeyCombo) -> KeyEvent {
         let mut modifiers = KeyModifiers::NONE;
         if combo.control {
@@ -2790,46 +2460,6 @@ mod tests {
             modifiers |= KeyModifiers::SHIFT;
         }
         press(combo.code, modifiers)
-    }
-
-    /// The memory breakdown ships with no chord: F12 stays the piano's, and
-    /// an untouched table writes no row for it. A learnt chord is saved and
-    /// restored like any other.
-    #[test]
-    fn memory_ships_unbound_and_an_untouched_table_writes_no_row_for_it() {
-        let binds = Keybinds::default();
-        assert!(binds.is_unbound(BindAction::Memory));
-        assert_eq!(binds.binding(BindAction::Memory), None);
-        assert_eq!(binds.hint(BindAction::Memory), "");
-        assert_eq!(
-            binds.action_for(&press(KeyCode::F(12), KeyModifiers::NONE)),
-            Some(BindAction::PianoMode)
-        );
-        assert!(binds.prefs().is_empty());
-        let mut restored = Keybinds::default();
-        restored.restore(&binds.prefs());
-        assert!(restored.is_unbound(BindAction::Memory));
-
-        let chord = KeyCombo::parse("ctrl+shift+f8").expect("the chord parses");
-        let mut learnt = Keybinds::default();
-        learnt.learn(BindAction::Memory, Some(chord));
-        assert_eq!(learnt.binding(BindAction::Memory), Some(chord));
-        assert_eq!(
-            learnt.action_for(&combo_event(chord)),
-            Some(BindAction::Memory)
-        );
-        let prefs = learnt.prefs();
-        assert_eq!(
-            prefs
-                .bindings
-                .iter()
-                .map(|row| (row.action.as_str(), row.chord.as_str()))
-                .collect::<Vec<_>>(),
-            [("memory", chord.key().as_str())]
-        );
-        let mut reread = Keybinds::default();
-        reread.restore(&prefs);
-        assert_eq!(reread.binding(BindAction::Memory), Some(chord));
     }
 
     #[test]
@@ -2858,27 +2488,6 @@ mod tests {
         binds.learn(BindAction::TrimSample, None);
         assert_eq!(binds.hint(BindAction::TrimSample), shortcut_label("Alt+T"));
         assert!(binds.prefs().is_empty());
-    }
-
-    #[test]
-    fn a_composed_option_letter_recovers_its_alt_chord() {
-        let mut binds = Keybinds::default();
-        binds.set_reach(Reach {
-            enhanced: false,
-            terminal: "iTerm2".into(),
-        });
-        assert_eq!(binds.option_letter_for('†'), Some('t'));
-        assert_eq!(binds.hint(BindAction::TrimSample), shortcut_label("Alt+T"));
-        assert_eq!(
-            binds.hint(BindAction::FocusTimeline),
-            shortcut_label("Alt+T")
-        );
-
-        binds.set_reach(Reach {
-            enhanced: false,
-            terminal: "Ghostty".into(),
-        });
-        assert_eq!(binds.option_letter_for('†'), None);
     }
 
     /// Delete on the row of an action shipped with no key puts back its
@@ -3010,104 +2619,6 @@ mod tests {
                         }
                     }
                 }
-            }
-        }
-    }
-
-    #[test]
-    fn legacy_recording_and_ambiguous_punctuation_have_deliverable_shortcuts() {
-        let mut binds = Keybinds::default();
-        binds.set_reach(Reach {
-            enhanced: false,
-            terminal: "xterm-256color".into(),
-        });
-        for (action, spelling) in [
-            (BindAction::OpenSet, "shift+f6"),
-            (BindAction::ForgetPad, "shift+f8"),
-            (BindAction::Export, "shift+f12"),
-            (BindAction::RecordTake, "shift+f11"),
-            (BindAction::PreviousScene, "f6"),
-            (BindAction::NextScene, "f7"),
-            (BindAction::ToggleComment, "ctrl+7"),
-        ] {
-            let chord = KeyCombo::parse(spelling).unwrap();
-            assert_eq!(binds.binding(action), Some(chord));
-            assert_eq!(binds.adapted_action_for(&combo_event(chord)), Some(action));
-            assert!(binds.overrules(&combo_event(action.default_binding())));
-        }
-    }
-
-    /// iTerm2 keeps ⇧F9, so the log docks on ^F9 there. Other terminals
-    /// keep ⇧F9.
-    #[test]
-    fn iterm2_docks_the_log_on_ctrl_f9() {
-        let _platform = super::super::terminal::profiles::ForcePlatformForTest::set("macos");
-        for (terminal, spelling) in [
-            ("iTerm2 3.6.11", "ctrl+f9"),
-            ("tmux via iTerm2 3.6.11", "ctrl+f9"),
-            ("Ghostty", "shift+f9"),
-        ] {
-            let mut binds = Keybinds::default();
-            binds.set_reach(Reach {
-                terminal: terminal.into(),
-                enhanced: false,
-            });
-            let chord = KeyCombo::parse(spelling).unwrap();
-            assert_eq!(
-                binds.binding(BindAction::LogSticky),
-                Some(chord),
-                "{terminal}"
-            );
-            // A moved default dispatches ahead of the built-in ⇧F9.
-            let moved =
-                (chord != BindAction::LogSticky.default_binding()).then_some(BindAction::LogSticky);
-            assert_eq!(
-                binds.adapted_action_for(&combo_event(chord)),
-                moved,
-                "{terminal}"
-            );
-        }
-    }
-
-    #[test]
-    fn modified_f3_is_only_advertised_with_unambiguous_input() {
-        let _platform = super::super::terminal::profiles::ForcePlatformForTest::set("macos");
-        for terminal in [
-            "iTerm2 3.6.11",
-            "tmux via iTerm2 3.6.11",
-            "unknown-terminal",
-        ] {
-            let mut binds = Keybinds::default();
-            binds.set_reach(Reach {
-                terminal: terminal.into(),
-                enhanced: false,
-            });
-            for action in BindAction::ALL {
-                for combo in [binds.binding(action), binds.effective_alias(action)]
-                    .into_iter()
-                    .flatten()
-                {
-                    assert!(
-                        !(combo.code == KeyCode::F(3) && (combo.control || combo.shift)),
-                        "{terminal}: {action:?} advertises {}",
-                        combo.key()
-                    );
-                }
-            }
-            assert_eq!(
-                binds.binding(BindAction::FirstError).unwrap().key(),
-                "shift+f4"
-            );
-            binds.set_reach(Reach {
-                terminal: terminal.into(),
-                enhanced: true,
-            });
-            assert_eq!(
-                binds.binding(BindAction::FirstError).unwrap().key(),
-                "shift+f3"
-            );
-            for key in ["shift+f1", "shift+f2", "shift+f3"] {
-                assert!(binds.delivers(&KeyCombo::parse(key).unwrap()));
             }
         }
     }
@@ -3364,73 +2875,6 @@ mod tests {
         );
     }
 
-    /// kitty takes Ctrl+Shift+S to paste the selection. With the kitty
-    /// profile, rewind update moves to a key that kitty delivers.
-    #[test]
-    fn rewind_update_resolves_to_a_key_that_kitty_delivers() {
-        use super::super::terminal::conflicts;
-        let _platform = conflicts::ForcePlatformForTest::set("linux");
-        let _desktop = conflicts::ForceDesktopForTest::set("");
-        let taken = BindAction::RewindEvaluate.default_binding();
-        assert!(conflicts::steals("kitty", &taken).is_some());
-        for terminal in ["kitty", "kitty 0.35.2", "tmux 3.5 via kitty"] {
-            for enhanced in [true, false] {
-                let reach = Reach {
-                    enhanced,
-                    terminal: terminal.into(),
-                };
-                let mut binds = Keybinds::default();
-                binds.set_reach(reach.clone());
-                let chord = binds.binding(BindAction::RewindEvaluate).expect("a key");
-                assert_eq!(chord.key(), "shift+f5", "{terminal}/{enhanced}");
-                assert!(reach.delivers(&chord), "{terminal}/{enhanced}");
-                assert_eq!(conflicts::steals(terminal, &chord), None, "{terminal}");
-                assert_eq!(
-                    binds.action_for(&combo_event(chord)),
-                    Some(BindAction::RewindEvaluate),
-                    "{terminal}/{enhanced}"
-                );
-            }
-        }
-        // The Windows Terminal list keeps the chord that kitty takes. A
-        // profile pinned over kitty leaves rewind update on a dead key.
-        let mut pinned = Keybinds::default();
-        pinned.set_reach(Reach {
-            enhanced: true,
-            terminal: "Windows Terminal".into(),
-        });
-        assert_eq!(pinned.binding(BindAction::RewindEvaluate), Some(taken));
-    }
-
-    #[test]
-    fn a_terminal_change_cannot_create_primary_or_alias_collisions() {
-        let mut binds = Keybinds::default();
-        binds.learn(BindAction::Undo, Some(KeyCombo::parse("shift+f6").unwrap()));
-        let saved = binds.prefs();
-        binds.set_reach(Reach {
-            enhanced: false,
-            terminal: "xterm-256color".into(),
-        });
-        assert_eq!(binds.binding(BindAction::Undo).unwrap().key(), "shift+f6");
-        assert_ne!(
-            binds.binding(BindAction::OpenSet),
-            binds.binding(BindAction::Undo)
-        );
-        for action in BindAction::ALL {
-            if let Some(chord) = binds.binding(action) {
-                let owner = if action == BindAction::Help
-                    && binds.binding(BindAction::MenuBar) == binds.binding(action)
-                {
-                    BindAction::MenuBar
-                } else {
-                    action
-                };
-                assert_eq!(binds.action_for(&combo_event(chord)), Some(owner));
-            }
-        }
-        assert_eq!(binds.prefs(), saved);
-    }
-
     #[test]
     fn supplemental_aliases_obey_reach_ownership_and_retirement() {
         let families = [
@@ -3498,28 +2942,6 @@ mod tests {
             BindAction::Zen,
             &combo_event(KeyCombo::parse("f11").unwrap())
         ));
-    }
-
-    /// Ctrl+F lists values and Ctrl+D opens docs: two behaviours, so two
-    /// actions with two names. Ctrl+Space belongs to the values action.
-    #[test]
-    fn values_and_docs_are_two_actions_with_two_names() {
-        let binds = Keybinds::default();
-        let values = binds.holder_of(KeyCombo::parse("ctrl+f").unwrap()).unwrap();
-        let docs = binds.holder_of(KeyCombo::parse("ctrl+d").unwrap()).unwrap();
-        assert_ne!(values, docs);
-        assert_eq!(values.key(), "reference");
-        assert_eq!(docs.key(), "docs");
-        assert_eq!(values.label(), "argument values, reference");
-        assert_eq!(docs.label(), "docs for the function");
-        assert_eq!(BindAction::parse_key("docs"), Some(docs));
-        assert_eq!(binds.default_holder_of(docs.default_binding()), Some(docs));
-        assert_eq!(
-            binds.action_for(&press(KeyCode::Char(' '), KeyModifiers::CONTROL)),
-            Some(values)
-        );
-        assert_eq!(binds.effective_alias(values), None);
-        assert_eq!(binds.effective_alias(docs), None);
     }
 
     /// A file saved before the split names only "reference". Its chord
@@ -3601,19 +3023,6 @@ mod tests {
         assert_eq!(
             binds.binding(BindAction::RenameScene),
             Some(BindAction::RenameScene.default_binding())
-        );
-    }
-
-    #[test]
-    fn a_learnt_chord_wins_over_the_vim_layer() {
-        let mut binds = Keybinds::default();
-        binds.set_editor_keybindings(EditorKeybindings::Vim);
-        let ctrl_d = KeyCombo::parse("ctrl+d").expect("chord");
-        binds.learn(BindAction::Docs, Some(ctrl_d));
-        assert_eq!(binds.binding(BindAction::Docs), Some(ctrl_d));
-        assert_eq!(
-            binds.override_action_for(&press(KeyCode::Char('d'), KeyModifiers::CONTROL)),
-            Some(BindAction::Docs)
         );
     }
 

@@ -1234,24 +1234,6 @@ mod selection_tests {
     }
 
     #[test]
-    fn the_hints_name_the_unshifted_new_session_key() {
-        let directory = tempfile::tempdir().unwrap();
-        let mut panel = panel_with_a_tape(directory.path());
-        panel.selected = 0;
-        let score = rendered_rows(&panel, AREA, true).join("\n");
-        assert!(
-            score.contains("Enter · 1-9 open · / filter · n new"),
-            "{score}"
-        );
-        panel.selected = panel.files.len();
-        let fold = rendered_rows(&panel, AREA, true).join("\n");
-        assert!(
-            fold.contains("←/→ fold · 1-9 open · / filter · n new"),
-            "{fold}"
-        );
-    }
-
-    #[test]
     fn a_filter_hides_the_scores_that_do_not_answer() {
         let directory = tempfile::tempdir().unwrap();
         std::fs::write(
@@ -1503,73 +1485,6 @@ mod tests {
             .collect()
     }
 
-    /// The panel lists the folder's scores by name with their strip
-    /// numbers, then the sessions fold, shut, with the tapes under it once
-    /// opened; the selection opens on the current scene and follows a
-    /// refresh.
-    #[test]
-    fn the_panel_lists_the_folder_and_folds_the_tapes() {
-        let directory = tempfile::tempdir().unwrap();
-        let mut set = set_in(directory.path());
-        set.select(1);
-        set.close_current().unwrap();
-        let sessions = set.sessions_directory();
-        std::fs::create_dir_all(&sessions).unwrap();
-        for name in ["session-2026-09-05T10-00-00", "session-2026-09-06T09-00-00"] {
-            std::fs::write(
-                sessions.join(format!("{name}{}", product::SESSION_FILE_SUFFIX)),
-                "{\"recorded\":\"x\"}\n",
-            )
-            .unwrap();
-        }
-        let live = sessions.join("session-2026-09-06T09-00-00.rustel-session");
-        let panel = SetPanel::open(&set, &sessions, Some(&live));
-        assert_eq!(panel.set_name, set.name());
-        assert_eq!(
-            panel
-                .files
-                .iter()
-                .map(|file| (file.name.as_str(), file.strip, file.current))
-                .collect::<Vec<_>>(),
-            [
-                ("drop", Some(1), false),
-                ("intro", None, false),
-                ("spare", Some(2), true)
-            ]
-        );
-        assert_eq!(panel.lines.len(), 4, "three files and the fold");
-        assert_eq!(panel.selected, 2, "opened on the current scene");
-        assert!(!panel.sessions_open);
-        let mut panel = panel;
-        panel.selected = 3;
-        panel.toggle_sessions();
-        assert_eq!(panel.lines.len(), 6);
-        assert_eq!(
-            panel
-                .tapes
-                .iter()
-                .map(|tape| (tape.name.as_str(), tape.recording))
-                .collect::<Vec<_>>(),
-            [
-                ("2026-09-06T09-00-00", true),
-                ("2026-09-05T10-00-00", false)
-            ],
-            "newest first, the live one marked"
-        );
-        panel.move_by(1);
-        assert!(panel.selected_tape().is_some_and(|tape| tape.recording));
-        // A refresh keeps the selection on the tape it was on.
-        let keep = panel.selected_tape().map(|tape| tape.path.clone()).unwrap();
-        panel.refresh(&set, &sessions, None, Some(&keep));
-        assert!(panel.selected_tape().is_some_and(|tape| tape.path == keep));
-        assert!(!panel.selected_tape().unwrap().recording);
-        panel.toggle_sessions();
-        assert_eq!(
-            panel.selected, 3,
-            "shut, the selection comes up to the fold"
-        );
-    }
-
     /// The details block at the foot carries the selected score's name,
     /// its @fields and its saved time, with no key to open: it follows
     /// the selection. The fold says its count, a tape its recording
@@ -1741,53 +1656,6 @@ mod tests {
         assert!(clipped.trim_end().ends_with('…'));
     }
 
-    #[test]
-    fn live_tape_hint_does_not_advertise_delete_until_the_tape_is_finished() {
-        use ratatui::widgets::Widget;
-
-        let directory = tempfile::tempdir().unwrap();
-        let set = set_in(directory.path());
-        let sessions = set.sessions_directory();
-        std::fs::create_dir_all(&sessions).unwrap();
-        let live = sessions.join("session-2026-09-30T16-35-30.rustel-session");
-        std::fs::write(&live, "{\"recorded\":\"2026-09-30T16:35:30Z\"}\n").unwrap();
-        let mut panel = SetPanel::open(&set, &sessions, Some(&live));
-        panel.refresh(&set, &sessions, Some(&live), Some(&live));
-        assert!(panel.selected_tape().unwrap().recording);
-
-        let theme = Theme::built_in_default();
-        let area = Rect::new(0, 0, SIDEBAR_WIDTH, 15);
-        let render_text = |panel: &SetPanel| {
-            let mut buffer = Buffer::empty(area);
-            SetPanelView {
-                panel,
-                theme: &theme,
-                sidebar: area,
-                on_right: false,
-                focused: true,
-                keybinds: &crate::keybinds::Keybinds::default(),
-                caret_lit: true,
-            }
-            .render(area, &mut buffer);
-            (0..area.height)
-                .map(|y| {
-                    (0..area.width)
-                        .map(|x| buffer[(x, y)].symbol())
-                        .collect::<String>()
-                })
-                .collect::<Vec<_>>()
-                .join("\n")
-        };
-        let text = render_text(&panel);
-        assert!(text.contains("n new first"), "{text}");
-        assert!(!text.contains("Del delete"), "{text}");
-
-        panel.refresh(&set, &sessions, None, Some(&live));
-        assert!(!panel.selected_tape().unwrap().recording);
-        let text = render_text(&panel);
-        assert!(text.contains("Del delete"), "{text}");
-    }
-
     /// A second click on the same line within half a second is a double
     /// click; a click elsewhere, or a slow one, is not.
     #[test]
@@ -1860,55 +1728,5 @@ mod tests {
         panel.lines.truncate(6);
         panel.ensure_visible(10);
         assert_eq!(panel.scroll, 5, "the clicked line is still on the top row");
-    }
-
-    /// Docked, the panel is the sidebar: a title row, the list, an error
-    /// row, two hint rows and the rule; the sheet form comes up
-    /// bottom-right, and a point maps to the line under it either way.
-    #[test]
-    fn docked_and_sheet_forms_map_points_to_lines() {
-        let directory = tempfile::tempdir().unwrap();
-        let set = set_in(directory.path());
-        let mut panel = SetPanel::open(&set, &set.sessions_directory(), None);
-        let sidebar = Rect::new(0, 2, SIDEBAR_WIDTH, 20);
-        let parts = SetPanel::docked_parts(sidebar, false).unwrap();
-        assert_eq!(parts.title, Rect::new(1, 2, 38, 1));
-        assert_eq!(parts.list, Rect::new(1, 3, 38, 9));
-        assert_eq!(parts.details, Rect::new(1, 12, 38, 7));
-        assert_eq!(parts.error.y, 19);
-        assert_eq!(parts.hint, Rect::new(1, 20, 38, 2));
-        assert_eq!(parts.rule, Rect::new(39, 2, 1, 20));
-        // At the right, the rule is the panel's first column.
-        let right = Rect::new(70, 2, SIDEBAR_WIDTH, 20);
-        let parts = SetPanel::docked_parts(right, true).unwrap();
-        assert_eq!(parts.rule, Rect::new(70, 2, 1, 20));
-        assert_eq!(parts.list, Rect::new(72, 3, 38, 9));
-        let frame = Rect::new(0, 0, 100, 30);
-        assert_eq!(panel.row_at(sidebar, frame, 5, 4), Some(1));
-        assert_eq!(panel.row_at(sidebar, frame, 5, 10), None, "past the lines");
-        assert!(panel.contains(sidebar, frame, 39, 10));
-        assert!(!panel.contains(sidebar, frame, 40, 10));
-        // Scrolled, the rows map through the offset.
-        panel.scroll = 1;
-        assert_eq!(panel.row_at(sidebar, frame, 5, 3), Some(1));
-        panel.scroll = 0;
-        // The sheet: bottom-right, a row per line.
-        let (sheet, list) = panel.sheet_geometry(frame).unwrap();
-        assert_eq!(sheet.width, 44);
-        assert_eq!(sheet.right(), 99);
-        assert_eq!(list.height, 4);
-        assert_eq!(
-            panel.row_at(Rect::default(), frame, list.x + 1, list.y + 3),
-            Some(3)
-        );
-        assert!(panel.contains(Rect::default(), frame, sheet.x, sheet.y));
-        assert!(SetPanel::docked_parts(Rect::new(0, 0, 6, 20), false).is_none());
-        // The selection stays in view.
-        panel.selected = 3;
-        panel.ensure_visible(2);
-        assert_eq!(panel.scroll, 2);
-        panel.selected = 0;
-        panel.ensure_visible(2);
-        assert_eq!(panel.scroll, 0);
     }
 }

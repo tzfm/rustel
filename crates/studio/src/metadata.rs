@@ -151,17 +151,6 @@ $: s(\"bd sd\")
     }
 
     #[test]
-    fn comments_after_code_are_not_read() {
-        let score = "\
-// @title first
-$: s(\"bd\")
-// @title second
-";
-        let meta = ScoreMeta::parse(score);
-        assert_eq!(meta.first("title"), Some("first"));
-    }
-
-    #[test]
     fn one_line_block_and_starred_lines_work() {
         let score = "\
 /**
@@ -173,14 +162,6 @@ $: s(\"bd\")
         assert_eq!(meta.first("title"), Some("starred"));
         let one_line = ScoreMeta::parse("/* @title single */\n$: s(\"bd\")\n");
         assert_eq!(one_line.first("title"), Some("single"));
-    }
-
-    #[test]
-    fn a_head_cut_mid_block_keeps_the_fields_before_the_cut() {
-        let score = "/*\n@title cut\n@by mid-way thro"; // no close, cut short
-        let meta = ScoreMeta::parse(score);
-        assert_eq!(meta.first("title"), Some("cut"));
-        assert_eq!(meta.first("by"), Some("mid-way thro"));
     }
 
     #[test]

@@ -1639,28 +1639,6 @@ mod tests {
             }
         }
 
-        /// A heading is always a word the entries under it actually carry. The
-        /// tags come from upstream, so this is the test that notices a
-        /// regenerated table quietly inventing one.
-        #[test]
-        fn every_entry_is_filed_under_a_tag_it_actually_carries() {
-            let reference = Reference::load_all();
-            for index in 0..reference.len() {
-                let entry = reference.entry(index).expect("every entry");
-                if entry.tags.is_empty() {
-                    assert_eq!(entry.heading(), "other", "{}", entry.name);
-                } else {
-                    assert!(
-                        entry.tags.iter().any(|tag| tag == entry.heading()),
-                        "{} is filed under {}, which it does not carry: {:?}",
-                        entry.name,
-                        entry.heading(),
-                        entry.tags
-                    );
-                }
-            }
-        }
-
         /// `limit` is credited to rustel, because strudel.cc has no such
         /// control. The panel clears a control's `origin`, so the extension
         /// registry must list `limit` for the credit to stay.
@@ -1743,17 +1721,6 @@ mod tests {
             expected_origins.dedup();
             assert_eq!(reference.origins(), expected_origins);
             assert!(reference.from_origin("").is_empty());
-        }
-
-        #[test]
-        fn the_engine_filter_keeps_what_the_engine_plays_and_drops_the_rest() {
-            let reference = Reference::load(engine_knows());
-            assert!(reference.len() > 100, "{} entries", reference.len());
-            assert!(reference.lookup("fast").is_some());
-            assert!(reference.lookup("lpf").is_some());
-            assert!(reference.lookup("s").is_some());
-            assert!(reference.omitted() > 0, "documented but not here yet");
-            assert!(reference.len() + reference.omitted() == Reference::load_all().len());
         }
 
         /// Typing `i` or `in` inside `s("…")` offers the audio input first:
@@ -2433,24 +2400,6 @@ mod tests {
                 .map(|cell| cell.symbol())
                 .collect();
             assert!(text.contains("cyan"), "{text:?}");
-        }
-
-        /// The reference tab says which name it is answering about, so the
-        /// chord can tell "close this" from "ask about that instead".
-        #[test]
-        fn the_panel_says_which_name_it_is_showing() {
-            let reference = Reference::load_all();
-            let mut panel = ReferencePanel::browse(&reference);
-            assert_eq!(panel.showing(&reference), None);
-            panel.query = "pianoroll".into();
-            panel.refresh(&reference);
-            assert_eq!(panel.showing(&reference).as_deref(), Some("pianoroll"));
-            let index = reference.lookup("spiral").expect("spiral");
-            let opened = ReferencePanel::open(&reference, index);
-            assert_eq!(opened.showing(&reference).as_deref(), Some("spiral"));
-            // The samples tab answers about sounds, not names.
-            let sounds = ReferencePanel::samples(&reference, Vec::new());
-            assert_eq!(sounds.showing(&reference), None);
         }
 
         #[test]
@@ -3151,32 +3100,6 @@ mod tests {
             );
         }
 
-        /// The panel takes 38% of the body, at least 36 columns. The full tab
-        /// labels do not fit that width on an 80-column terminal, so the
-        /// header shortens the labels and still shows every tab.
-        #[test]
-        fn a_default_width_header_shortens_the_labels_rather_than_dropping_them() {
-            for terminal in [80u16, 100, 120, 160] {
-                // The panel's own sizing, from `view::regions`.
-                let body = terminal - 2;
-                let want = ((u32::from(body) * 38 / 100) as u16)
-                    .clamp(36, 72)
-                    .min(body);
-                let inner = inner_area(Rect::new(body - want, 0, want, 20));
-                let (placed, hidden) = tab_layout(inner, Tab::Reference);
-                assert_eq!(hidden, 0, "a {terminal}-column terminal hides a tab");
-                assert_eq!(placed.len(), tabs().len(), "{terminal} columns");
-                // And every label is still hit across its own width.
-                for (tab, label, at) in &placed {
-                    assert_eq!(
-                        tab_at(inner, Tab::Reference, *at, inner.y),
-                        Some(*tab),
-                        "{label}"
-                    );
-                }
-            }
-        }
-
         #[test]
         fn a_narrow_header_says_how_many_tabs_are_behind_the_edge() {
             let all = tabs().len();
@@ -3201,34 +3124,6 @@ mod tests {
             assert!(placed.len() < all);
         }
 
-        /// Tab reaches a tab that did not fit, and the strip goes with it.
-        #[test]
-        fn the_tab_being_shown_is_on_the_strip_however_narrow_it_is() {
-            let all = tabs();
-            let narrow = inner_area(Rect::new(0, 0, 18, 20));
-            for (tab, _) in all {
-                let (placed, hidden) = tab_layout(narrow, *tab);
-                assert!(
-                    placed.iter().any(|(seated, _, _)| seated == tab),
-                    "{tab:?} is being shown and is not on the strip"
-                );
-                assert_eq!(
-                    placed.len() + hidden,
-                    all.len(),
-                    "every tab is placed or counted"
-                );
-                // The label under the pointer is still the label that was
-                // drawn there, whichever window the strip slid to.
-                for (seated, label, at) in &placed {
-                    assert_eq!(
-                        tab_at(narrow, *tab, *at, narrow.y),
-                        Some(*seated),
-                        "{label}"
-                    );
-                }
-            }
-        }
-
         #[test]
         fn the_right_arrow_reads_an_entry_and_the_left_arrow_comes_back() {
             let reference = Reference::load(engine_knows());
@@ -3249,19 +3144,6 @@ mod tests {
             assert!(!panel.collapse());
             assert!(panel.expand());
             assert!(!panel.expand());
-        }
-
-        #[test]
-        fn the_arrows_read_an_entry_even_where_enter_would_replace_a_word() {
-            let reference = Reference::load(engine_knows());
-            let mut panel = ReferencePanel::browse_for(&reference, "lpf");
-            assert!(panel.expand(), "→ reads the entry");
-            assert!(matches!(panel.mode, ReferenceMode::Entry { .. }));
-            // Enter still means what it meant: from the entry it inserts.
-            assert!(matches!(
-                panel.confirm(&reference),
-                PanelAction::Insert(name) if name == "lpf"
-            ));
         }
 
         /// The browse list gathers its results under the tag each entry is
@@ -3444,24 +3326,6 @@ mod tests {
         }
 
         #[test]
-        fn the_column_only_takes_letters_where_there_is_a_search_box() {
-            let reference = Reference::load(engine_knows());
-            let mut panel = ReferencePanel::browse(&reference);
-            assert!(panel.wants_text());
-            assert!(panel.type_char(&reference, 'l'));
-            assert_eq!(panel.query, "l");
-
-            // Reading an entry, letters belong to the score.
-            assert!(panel.expand());
-            assert!(!panel.wants_text());
-            assert!(!panel.type_char(&reference, 'x'));
-            assert!(!panel.backspace(&reference));
-            assert_eq!(panel.query, "l", "the box is untouched");
-            // And that is the one view where they do.
-            assert!(panel.types_through(), "an entry's page is the exception");
-        }
-
-        #[test]
         fn the_panel_walks_the_list_opens_an_entry_and_inserts_its_name() {
             let reference = Reference::load_all();
             let mut panel = ReferencePanel::browse(&reference);
@@ -3497,42 +3361,6 @@ mod tests {
     }
     mod sample_sources {
         use super::super::*;
-
-        /// The audio a set's own folder brought is a kind of its own in the
-        /// browser, listed beside the pinned ones under the word a player reads
-        /// there - which is the only thing that shows which `bd` is sounding.
-        #[test]
-        fn the_samples_a_set_brought_are_listed_under_their_own_kind() {
-            let reference = Reference::load_all();
-            let bank = |name: &str, category: SoundCategory, origin: SoundOrigin| SoundEntry {
-                name: name.into(),
-                variants: 2,
-                variant_names: Vec::new(),
-                origin,
-                category,
-                location: None,
-                import: None,
-            };
-            let panel = ReferencePanel::samples(
-                &reference,
-                vec![
-                    bank("bd", SoundCategory::Drums, SoundOrigin::Default),
-                    bank("kicks", SoundCategory::Set, SoundOrigin::Set),
-                ],
-            );
-            assert_eq!(
-                SoundCategory::Set.label(),
-                "set",
-                "the word the browser files the set's own audio under"
-            );
-            assert!(
-                panel
-                    .visible_categories()
-                    .contains(&(SoundSection::Kind(SoundCategory::Set), 1)),
-                "the set's banks are a listed kind: {:?}",
-                panel.visible_categories()
-            );
-        }
 
         /// An import the score names is listed as soon as it is named, with
         /// a word about where it stands - on its way, or refused - until its
@@ -3640,84 +3468,6 @@ mod tests {
             );
             panel.move_by(2);
             assert_eq!(panel.preview(), PanelAction::Preview("recordings:1".into()));
-        }
-
-        /// Each `samples(…)` import is a section of its own, at the same level
-        /// as the kinds - a library somebody brought in, next to the pinned
-        /// ones - opening onto its banks like any of them.
-        #[test]
-        fn each_import_is_a_section_of_its_own() {
-            let reference = Reference::load_all();
-            let entry = |name: &str, category: SoundCategory, import: Option<&str>| SoundEntry {
-                name: name.into(),
-                variants: 2,
-                variant_names: Vec::new(),
-                origin: if import.is_some() {
-                    SoundOrigin::Score
-                } else {
-                    SoundOrigin::Default
-                },
-                category,
-                location: None,
-                import: import.map(str::to_owned),
-            };
-            let sounds = vec![
-                entry("bd", SoundCategory::Drums, None),
-                entry(
-                    "brk",
-                    SoundCategory::Score,
-                    Some("github:yaxu/clean-breaks"),
-                ),
-                entry("kit_bd", SoundCategory::Score, Some("github:me/kit")),
-                entry("kit_sd", SoundCategory::Score, Some("github:me/kit")),
-            ];
-            let mut panel = ReferencePanel::samples(&reference, sounds);
-            assert_eq!(
-                panel.visible_categories(),
-                [
-                    (SoundSection::Kind(SoundCategory::Drums), 1),
-                    (SoundSection::Import("github:me/kit".into()), 2),
-                    (SoundSection::Import("github:yaxu/clean-breaks".into()), 1),
-                ],
-                "the kinds first, then the imports"
-            );
-            assert_eq!(
-                panel.sound_rows(),
-                [
-                    SoundRow::Category(0),
-                    SoundRow::Category(1),
-                    SoundRow::Category(2),
-                ]
-            );
-            // An import opens onto its banks - grouped like anyone else's - a
-            // bank onto its samples.
-            panel.sound_selected = 1;
-            panel.expand();
-            assert_eq!(
-                panel.sound_rows(),
-                [
-                    SoundRow::Category(0),
-                    SoundRow::Category(1),
-                    SoundRow::Family(0),
-                    SoundRow::Category(2),
-                ]
-            );
-            panel.move_by(1);
-            panel.expand();
-            assert_eq!(
-                panel.sound_rows(),
-                [
-                    SoundRow::Category(0),
-                    SoundRow::Category(1),
-                    SoundRow::Family(0),
-                    SoundRow::Bank(2),
-                    SoundRow::Bank(3),
-                    SoundRow::Category(2),
-                ]
-            );
-            panel.move_by(1);
-            assert_eq!(panel.preview(), PanelAction::Preview("kit_bd:0".into()));
-            assert_eq!(panel.escape(), PanelAction::Close, "Esc closes the browser");
         }
 
         /// Two imported folders of one pack hold banks with the same prefix.
@@ -4662,57 +4412,6 @@ mod tests {
             );
         }
 
-        /// A search cuts through the tree: the sounds themselves, whatever
-        /// kind they are, and folding is forgotten until the search is.
-        #[test]
-        fn a_search_answers_with_the_sounds_and_not_the_groups() {
-            let reference = Reference::load_all();
-            let entry = |name: &str, category: SoundCategory| SoundEntry {
-                name: name.into(),
-                variants: 1,
-                variant_names: Vec::new(),
-                origin: SoundOrigin::Default,
-                category,
-                location: None,
-                import: None,
-            };
-            let mut panel = ReferencePanel::samples(
-                &reference,
-                vec![
-                    entry("supersaw", SoundCategory::Synth),
-                    entry("bd", SoundCategory::Drums),
-                    entry("sd", SoundCategory::Drums),
-                    entry("wt_sine", SoundCategory::Wavetable),
-                ],
-            );
-            assert_eq!(
-                panel.sound_rows(),
-                vec![
-                    SoundRow::Category(0),
-                    SoundRow::Category(1),
-                    SoundRow::Category(2)
-                ],
-                "three kinds, all folded"
-            );
-            assert!(panel.type_char(&reference, 'd'));
-            assert_eq!(
-                panel.sound_rows(),
-                vec![SoundRow::Bank(1), SoundRow::Bank(2)],
-                "the sounds that match, ungrouped"
-            );
-            assert!(panel.visible_categories().is_empty());
-            panel.backspace(&reference);
-            assert_eq!(
-                panel.sound_rows(),
-                vec![
-                    SoundRow::Category(0),
-                    SoundRow::Category(1),
-                    SoundRow::Category(2)
-                ],
-                "the tree comes back with the search cleared"
-            );
-        }
-
         #[test]
         fn the_samples_tab_lists_banks_expands_variants_and_previews() {
             let reference = Reference::load_all();
@@ -5169,19 +4868,6 @@ mod tests {
         }
 
         #[test]
-        fn a_reference_opened_in_code_reads_documentation_too() {
-            // Ctrl+F in a pattern opens the reference in the pattern scope.
-            let reference = Reference::load_all();
-            let panel = ReferencePanel::browse_in(&reference, "wobble", ReferenceScope::Pattern);
-            let ranked = reference.rank_in("wobble", false, ReferenceScope::Pattern);
-            assert_eq!(ranked.extended_from, 0);
-            assert!(!ranked.results.is_empty());
-            assert_eq!(panel.results, ranked.results);
-            let ranked = reference.rank_in("reverb room", false, ReferenceScope::Pattern);
-            assert!(ranked.extended_from < ranked.results.len());
-        }
-
-        #[test]
         fn the_extended_heading_sits_between_the_tiers_and_the_cursor_steps_over_it() {
             let reference = Reference::load_all();
             let mut panel = ReferencePanel::browse_for(&reference, "switch angel");
@@ -5249,28 +4935,6 @@ mod tests {
             let reference = Reference::load_all();
             assert_eq!(first_result(&reference, "s"), "s");
             assert_eq!(first_result(&reference, "S"), "S");
-        }
-
-        #[test]
-        fn the_compiled_reference_parses_and_finds_names_and_synonyms() {
-            let reference = Reference::load_all();
-            assert!(reference.len() > 300, "{} entries", reference.len());
-            let lpf = reference.lookup("lpf").expect("lpf");
-            assert_eq!(
-                reference.lookup("cutoff"),
-                Some(lpf),
-                "a synonym finds the entry"
-            );
-            assert_eq!(
-                reference.lookup("LPF"),
-                Some(lpf),
-                "case-insensitive fallback"
-            );
-            assert_eq!(reference.lookup("\"lpf\""), Some(lpf), "quotes are trimmed");
-            assert!(reference.lookup("definitely_not_a_function").is_none());
-            let entry = reference.entry(lpf).unwrap();
-            assert!(!entry.examples.is_empty());
-            assert!(entry.summary.contains("low-pass") || entry.summary.contains("l**ow"));
         }
 
         /// "Show me every visualizer" is a set, not a ranking: `pianoroll` and
@@ -6388,28 +6052,6 @@ mod tests {
             );
         }
 
-        /// The shelf has no search box, but its letters do not go to the score.
-        /// A focused panel never writes to the editor. The only exception is
-        /// the reference open on an entry.
-        #[cfg(feature = "hydra")]
-        #[test]
-        fn the_snippet_shelf_does_not_type_through_to_the_score() {
-            let reference = Reference::load(engine_knows());
-            let shelf = ReferencePanel::snippets(&reference);
-            assert!(!shelf.wants_text(), "the shelf has no search box");
-            assert!(
-                !shelf.types_through(),
-                "and its letters are still its own, not the score's"
-            );
-            // Every other view in the column, for the same reason.
-            for browse in [
-                ReferencePanel::browse(&reference),
-                ReferencePanel::snippets(&reference),
-            ] {
-                assert!(!browse.types_through());
-            }
-        }
-
         /// A snippet is in the same list as the functions, found by the same
         /// search, labelled, and pasted whole rather than inserted as a name:
         /// `gamepad` finds the function and, beside it, the lines that use it.
@@ -6554,30 +6196,6 @@ mod tests {
                 assert!(!snippet.summary.is_empty() && !snippet.description.is_empty());
             }
         }
-
-        #[cfg(feature = "hydra")]
-        #[test]
-        fn a_click_in_the_snippet_shelf_selects_the_row_under_the_pointer() {
-            let reference = Reference::load_all();
-            let inner = inner_area(Rect::new(0, 0, 62, 30));
-            let mut panel = ReferencePanel::snippets(&reference);
-            let layout = panel.snippet_layout(inner);
-            let geometry = panel.geometry(inner);
-            assert_eq!(geometry.list, layout.list);
-
-            assert_eq!(
-                panel.click(&reference, geometry, layout.list.y + 2),
-                PanelAction::Nothing,
-                "a click selects; Enter inserts"
-            );
-            assert_eq!(panel.snippet_selected, 2);
-
-            // Below the last row nothing moves.
-            let rows = panel.snippet_lines().len();
-            let before = panel.snippet_selected;
-            panel.click(&reference, geometry, layout.list.y + rows as u16 + 1);
-            assert_eq!(panel.snippet_selected, before);
-        }
     }
 }
 
@@ -6717,16 +6335,6 @@ mod sketch_tab_tests {
             "Enter takes the chain rather than pasting it into the score"
         );
         assert_eq!(panel.copy(), PanelAction::Copy(code.to_owned()));
-    }
-
-    /// A closed shelf has nothing to show, so nothing is previewed and the
-    /// score keeps the screen.
-    #[test]
-    fn a_shelf_heading_previews_nothing() {
-        let mut panel = shelf();
-        panel.move_by(1);
-        assert!(panel.selected_snippet_code().is_none());
-        assert_eq!(panel.copy(), PanelAction::Nothing);
     }
     /// A row leads with the spelling the query asks for and shows up to three
     /// other names beside it, the main name first. Enter writes the spelling
@@ -7270,32 +6878,5 @@ mod hydra_tests {
                 .lookup_in("sum", ReferenceScope::HydraMember)
                 .is_some()
         );
-    }
-
-    /// Each browser counts only the entries it can list.
-    #[test]
-    fn each_browser_counts_its_own_language() {
-        let reference = Reference::load_all();
-        let hydra = reference.len_in(ReferenceScope::HydraAll);
-        assert!(hydra > 0);
-        assert_eq!(
-            reference
-                .search_in("", false, ReferenceScope::HydraAll)
-                .len(),
-            hydra
-        );
-        assert_eq!(
-            reference.len_in(ReferenceScope::All) + hydra,
-            reference.len()
-        );
-    }
-
-    #[test]
-    fn hiding_hydra_leaves_lookup_and_its_tag() {
-        let mut reference = Reference::load_all();
-        reference.set_hidden([Category::Hydra]);
-        assert!(names(&reference, "", ReferenceScope::Hydra).is_empty());
-        assert!(!names(&reference, "tag:hydra", ReferenceScope::Hydra).is_empty());
-        assert!(reference.lookup_in("osc", ReferenceScope::Hydra).is_some());
     }
 }

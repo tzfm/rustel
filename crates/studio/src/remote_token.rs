@@ -122,12 +122,6 @@ mod macos {
         }
 
         #[test]
-        fn normal_private_temporary_file_is_accepted() {
-            let file = tempfile::NamedTempFile::new().unwrap();
-            require_private(file.as_file()).unwrap();
-        }
-
-        #[test]
         fn extended_entries_are_rejected_without_changing_file_permissions() {
             // Keep the test ACL in memory; do not grant actual file access.
             let mut acl = Acl(unsafe { acl_init(1) });

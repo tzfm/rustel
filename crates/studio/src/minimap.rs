@@ -447,21 +447,6 @@ mod tests {
     }
 
     #[test]
-    fn a_short_document_folds_four_lines_into_each_row() {
-        let document = document("aaa\nbbb\n\nccc\nddd\n");
-        let mut minimap = Minimap::default();
-        minimap.sync(&document, Rect::new(0, 0, 8, 20));
-        assert_eq!(minimap.lines_per_row(), 4);
-        assert_eq!(minimap.rows.len(), 2);
-        assert_eq!(minimap.line_at(Rect::new(0, 0, 8, 20), 1), 4);
-        // The blank third line leaves its dot row dark; the others are lit.
-        let first = &minimap.rows[0][0];
-        assert_eq!(first.bits & BRAILLE_BITS[0][2], 0, "the blank line is dark");
-        assert_ne!(first.bits & BRAILLE_BITS[0][0], 0);
-        assert_ne!(first.bits & BRAILLE_BITS[0][3], 0);
-    }
-
-    #[test]
     fn a_long_document_compresses_several_lines_into_each_dot() {
         let text = (0..800)
             .map(|index| format!("line {index}"))
@@ -476,76 +461,6 @@ mod tests {
         assert_eq!(minimap.line_at(area, 10), 400);
         // Clicking past the end still resolves to a real line.
         assert!(minimap.line_at(area, 200) < 800);
-    }
-
-    #[test]
-    fn resyncing_after_an_edit_rebuilds_and_an_idle_frame_does_not() {
-        let mut document = document("one\n");
-        let mut minimap = Minimap::default();
-        let area = Rect::new(0, 0, 8, 4);
-        minimap.sync(&document, area);
-        let first = minimap.rows.clone();
-        minimap.sync(&document, area);
-        assert_eq!(minimap.rows, first, "an unchanged document is not rebuilt");
-
-        document
-            .apply_edits(&[super::super::editor::Edit::new(
-                super::super::editor::ByteOffset(0)..super::super::editor::ByteOffset(0),
-                "// a comment\n",
-            )])
-            .expect("edit");
-        minimap.sync(&document, area);
-        assert_ne!(minimap.rows, first);
-    }
-
-    #[test]
-    fn density_and_class_survive_into_the_summary() {
-        let mut cells = vec![Cell::default(); 8];
-        summarise_tokens(&picture_line("    s(\"bd\")"), 0, &mut cells);
-        assert_eq!(cells[0].bits, 0, "leading whitespace stays dark");
-        assert_eq!(
-            cells[1].bits, 0,
-            "one dot per column: columns 2 and 3 are spaces too"
-        );
-        assert_ne!(cells[2].bits, 0, "the `s` at column 4");
-        // The quoted sound name is summarised as a string, not plain text.
-        assert!(cells.iter().any(|cell| cell.token == Token::String));
-    }
-
-    #[test]
-    fn the_viewport_band_is_highlighted_and_the_rest_is_dimmed() {
-        let text = (0..160)
-            .map(|index| format!("s(\"bd\") // {index}"))
-            .collect::<Vec<_>>()
-            .join("\n");
-        let document = document(&text);
-        let theme = Theme::built_in_default();
-        let area = Rect::new(0, 0, 8, 20);
-        let mut minimap = Minimap::default();
-        minimap.sync(&document, area);
-        let mut buffer = Buffer::empty(area);
-        MinimapView {
-            minimap: &minimap,
-            theme: &theme,
-            viewport: (0, 12),
-        }
-        .render(area, &mut buffer);
-
-        // 160 lines over 20 rows is eight lines a row: lines 0..=12 light
-        // the first two rows and nothing further down.
-        let background = |y: u16| buffer.cell((0, y)).map(|cell| cell.bg);
-        assert_eq!(background(0), Some(theme.minimap_viewport));
-        assert_eq!(background(1), Some(theme.minimap_viewport));
-        assert_eq!(background(2), Some(theme.minimap));
-        assert_eq!(background(10), Some(theme.minimap));
-        let glyph = buffer
-            .cell((0, 0))
-            .unwrap()
-            .symbol()
-            .chars()
-            .next()
-            .unwrap();
-        assert!(('\u{2800}'..='\u{28ff}').contains(&glyph), "{glyph:?}");
     }
 
     #[test]

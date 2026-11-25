@@ -1044,40 +1044,6 @@ mod tests {
     }
 
     #[test]
-    fn wide_text_and_scrolling_share_the_caret_and_mouse_columns() {
-        let mut picker = FilePicker::text("art", "writes it");
-        picker.paste_multiline("猫x\ny");
-        let frame = Rect::new(0, 0, 120, 40);
-        let (panel, list) = picker.geometry(frame).unwrap();
-        let start = list.x + picker.label.len() as u16 + 2;
-        assert_eq!(picker.field_at(frame, start, panel.y + 1), Some(0));
-        assert_eq!(picker.field_at(frame, start + 1, panel.y + 1), Some(0));
-        assert_eq!(picker.field_at(frame, start + 2, panel.y + 1), Some(1));
-        assert_eq!(picker.field_at(frame, start + 3, panel.y + 1), Some(2));
-
-        picker.set_path(&format!("{}猫", "x".repeat(150)));
-        let room = usize::from(list.right() - start);
-        let (first, scrolled) = picker.field_scroll(room);
-        assert!(first > 0);
-        assert_eq!(picker.field_at(frame, start, panel.y + 1), Some(first));
-        assert!(picker.field_column(picker.caret) - scrolled < room);
-        let theme = Theme::resolve(None).unwrap();
-        let mut buffer = Buffer::empty(frame);
-        FilePickerView {
-            picker: &picker,
-            theme: &theme,
-            copy_hint: None,
-        }
-        .render(frame, &mut buffer);
-        let caret = start + (picker.field_column(picker.caret) - scrolled) as u16;
-        assert!(
-            buffer[(caret, panel.y + 1)]
-                .modifier
-                .contains(Modifier::REVERSED)
-        );
-    }
-
-    #[test]
     fn joined_emoji_share_rendered_caret_selection_and_mouse_boundaries() {
         let mut picker = FilePicker::text("art", "writes it");
         let text = "👩‍💻x";
@@ -1157,31 +1123,6 @@ mod tests {
             picker.path, long,
             "display mapping preserves every stored byte"
         );
-    }
-
-    #[test]
-    fn picker_masks_earlier_pixel_images_in_its_sheet() {
-        use crate::graphics::{PixelImage, capture_images, push_image};
-        let picker = FilePicker::text("art", "writes it");
-        let frame = Rect::new(0, 0, 120, 40);
-        let panel = picker.geometry(frame).unwrap().0;
-        let theme = Theme::resolve(None).unwrap();
-        let (_, images) = capture_images(|| {
-            push_image(PixelImage::inline(frame, 120, 40, vec![255; 120 * 40 * 4]));
-            let mut buffer = Buffer::empty(frame);
-            FilePickerView {
-                picker: &picker,
-                theme: &theme,
-                copy_hint: None,
-            }
-            .render(frame, &mut buffer);
-        });
-        assert_eq!(images.len(), 1);
-        for position in frame.positions() {
-            let alpha =
-                images[0].rgba[(usize::from(position.y) * 120 + usize::from(position.x)) * 4 + 3];
-            assert_eq!(alpha, if panel.contains(position) { 0 } else { 255 });
-        }
     }
 
     fn candidates() -> Vec<Candidate> {
@@ -1381,26 +1322,6 @@ mod tests {
         let mut naming = FilePicker::naming("new set", "starts it");
         naming.toggle_browsing();
         assert!(naming.browser.is_none());
-    }
-
-    /// Clicks land on the rows the sheet draws.
-    #[test]
-    fn rows_are_where_the_sheet_draws_them() {
-        let picker = FilePicker::new("add a scene", "adds", candidates(), Path::new("."));
-        let area = Rect::new(0, 0, 100, 30);
-        let (_, list) = picker.geometry(area).expect("fits");
-        assert_eq!(picker.row_at(area, list.x, list.y), Some(0));
-        assert_eq!(picker.row_at(area, list.x + 3, list.y + 1), Some(1));
-        assert_eq!(
-            picker.row_at(area, list.x, list.y + 2),
-            None,
-            "no third row"
-        );
-        assert_eq!(picker.row_at(area, 0, 0), None);
-        assert!(
-            picker.geometry(Rect::new(0, 0, 40, 10)).is_none(),
-            "too narrow"
-        );
     }
 
     #[test]

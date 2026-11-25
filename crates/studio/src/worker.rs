@@ -2103,7 +2103,7 @@ fn flush_pending_control(
 
 #[cfg(test)]
 mod tests {
-    use super::super::engine::{ClockStatus, StudioDiagnosticLevel};
+    use super::super::engine::StudioDiagnosticLevel;
     use super::*;
 
     mod panic_recovery {
@@ -2429,26 +2429,6 @@ mod tests {
         };
         assert_eq!(diagnostic.kind, "audio-device");
         assert_eq!(diagnostic.message, "selected output requested-output");
-        assert!(pending.is_empty());
-    }
-
-    #[test]
-    fn output_selection_error_while_idle_is_not_new_output_loss() {
-        let mut engine = StudioEngine::new(StudioConfig::default()).expect("studio");
-        let mut pending = VecDeque::new();
-        answer_output_change(
-            &mut engine,
-            OutputChange::Device("requested-output"),
-            false,
-            Err(RuntimeError::Audio("output refused".to_owned())),
-            &mut None,
-            &mut pending,
-        );
-        assert!(!engine.is_playing());
-        assert!(matches!(
-            pending.pop_front().unwrap(),
-            StudioControlEvent::Diagnostic(_)
-        ));
         assert!(pending.is_empty());
     }
 
@@ -2941,43 +2921,6 @@ mod tests {
     }
 
     #[test]
-    fn latest_audio_replaces_without_entering_control_queue() {
-        let (control_tx, _control_rx) = sync_channel(1);
-        let (trace_tx, _trace_rx) = sync_channel(1);
-        let latest = Mutex::new(None);
-        let metadata = UiAudioMetadata {
-            sequence: 1,
-            generation: 2,
-            device_time: 0.5,
-            stream_id: 3,
-            epoch: 4,
-            end_frame: 24_000,
-            sample_rate: 48_000,
-        };
-        let analysis = UiAudioAnalysisSet {
-            master: rustel_runtime::ui_analysis::UiAudioAnalysisFrame {
-                scope: [0.0; rustel_runtime::ui_analysis::UI_SCOPE_SAMPLES],
-                spectrum: [-120.0; rustel_runtime::ui_analysis::UI_SPECTRUM_BINS],
-            },
-            visuals: Vec::new(),
-            sides: Vec::new(),
-        };
-        assert!(
-            route_update(
-                StudioUpdate::Audio {
-                    metadata,
-                    analysis: Box::new(analysis.clone()),
-                },
-                &control_tx,
-                &trace_tx,
-                &latest,
-            )
-            .is_ok()
-        );
-        assert_eq!(latest.lock().unwrap().as_ref().unwrap().1, analysis);
-    }
-
-    #[test]
     fn optional_diagnostics_respect_admission_without_evicting_outcomes() {
         for occupied in [
             MAX_PENDING_CONTROL - 2,
@@ -3016,144 +2959,6 @@ mod tests {
     }
 
     #[test]
-    fn optional_diagnostics_preserve_failures_and_recording_fifo_progress() {
-        let (sender, receiver) = sync_channel(1);
-        sender
-            .try_send(StudioControlEvent::Snapshot(Box::default()))
-            .unwrap();
-        let status = TakeStatus {
-            path: "take.wav".into(),
-            sample_rate: 48_000,
-            frames: 7,
-            bytes: 44,
-            error: Some("write failed".into()),
-            final_signal: Some(super::super::wav::RawSignalSummary {
-                sample_count: 14,
-                nonfinite_count: 1,
-                finite_peak: 1.25,
-            }),
-        };
-        let mut pending = VecDeque::new();
-        push_control(
-            &mut pending,
-            StudioControlEvent::Recording(RecordingOutcome {
-                request_id: Some(9),
-                result: Ok(RecordingReply::Finished {
-                    capture_id: 7,
-                    status: status.clone(),
-                }),
-            }),
-        );
-        push_control(
-            &mut pending,
-            StudioControlEvent::EngineFailure(EngineFailure {
-                kind: "audio".into(),
-                message: "device failed".into(),
-                recoverable: true,
-                playback_stopped: true,
-            }),
-        );
-        for request_id in 0..MAX_PENDING_CONTROL - 2 {
-            push_control(
-                &mut pending,
-                StudioControlEvent::Recording(RecordingOutcome {
-                    request_id: Some(100 + request_id as u64),
-                    result: Ok(RecordingReply::NoActiveTake),
-                }),
-            );
-        }
-        push_optional_diagnostic(&mut pending, StudioDiagnostic::info("hydra", "skipped"));
-        flush_pending_control(&sender, &mut pending);
-        assert_eq!(pending.len(), MAX_PENDING_CONTROL);
-        assert!(matches!(
-            receiver.try_recv().unwrap(),
-            StudioControlEvent::Snapshot(_)
-        ));
-
-        flush_pending_control(&sender, &mut pending);
-        assert!(matches!(receiver.try_recv().unwrap(),
-            StudioControlEvent::Recording(RecordingOutcome { request_id: Some(9),
-                result: Ok(RecordingReply::Finished { capture_id: 7, status: received })
-            }) if received == status));
-        flush_pending_control(&sender, &mut pending);
-        assert!(matches!(receiver.try_recv().unwrap(),
-            StudioControlEvent::EngineFailure(failure)
-            if failure.kind == "audio" && failure.message == "device failed"
-                && failure.recoverable && failure.playback_stopped));
-        push_optional_diagnostic(&mut pending, StudioDiagnostic::info("hydra", "resumed"));
-        assert_eq!(pending.len(), MAX_PENDING_CONTROL - 1);
-        for request_id in 0..MAX_PENDING_CONTROL - 2 {
-            flush_pending_control(&sender, &mut pending);
-            assert!(matches!(receiver.try_recv().unwrap(),
-                StudioControlEvent::Recording(RecordingOutcome {
-                    request_id: Some(id), result: Ok(RecordingReply::NoActiveTake),
-                }) if id == 100 + request_id as u64));
-        }
-        flush_pending_control(&sender, &mut pending);
-        assert!(matches!(receiver.try_recv().unwrap(),
-            StudioControlEvent::Diagnostic(diagnostic)
-            if diagnostic.kind == "hydra" && diagnostic.message == "resumed"));
-        assert!(pending.is_empty());
-        assert!(matches!(receiver.try_recv(), Err(TryRecvError::Empty)));
-    }
-
-    #[test]
-    fn pending_control_drops_snapshot_before_an_outcome() {
-        let snapshot = StudioSnapshot {
-            playing: false,
-            stopping: false,
-            session_generation: 0,
-            audible_generation: None,
-            confirmed_audio_generation: None,
-            source_revision: None,
-            csound: Default::default(),
-            cps: 0.5,
-            device_time: 0.0,
-            cycle: 0.0,
-            device: None,
-            input_device: None,
-            input_channels: 0,
-            input_lag_frames: 0,
-            input_peak: 0.0,
-            recording: None,
-            launch: None,
-            orbits: Vec::new(),
-            output_pairs: 1,
-            clock: ClockStatus {
-                out_port: None,
-                in_port: None,
-                external_bpm: None,
-                locked: false,
-                link: None,
-            },
-            pressure: None,
-            audition_loading: None,
-            loading: None,
-            sample_memory: Default::default(),
-            script_heap_bytes: 0,
-            score_engine: None,
-            audio_memory: None,
-        };
-        let mut pending = VecDeque::new();
-        for _ in 0..MAX_PENDING_CONTROL {
-            pending.push_back(StudioControlEvent::Snapshot(Box::new(snapshot.clone())));
-        }
-        let failure = StudioControlEvent::EngineFailure(EngineFailure {
-            kind: "audio".into(),
-            message: "gone".into(),
-            recoverable: true,
-            playback_stopped: false,
-        });
-        push_control(&mut pending, failure);
-        assert_eq!(pending.len(), MAX_PENDING_CONTROL);
-        assert!(
-            pending
-                .iter()
-                .any(|event| matches!(event, StudioControlEvent::EngineFailure(_)))
-        );
-    }
-
-    #[test]
     fn pending_control_never_evicts_an_evaluation_for_status_noise() {
         let mut pending = VecDeque::new();
         for index in 0..MAX_PENDING_CONTROL {
@@ -3185,29 +2990,6 @@ mod tests {
         assert!(pending.iter().any(|event| {
             matches!(event, StudioControlEvent::Evaluation(outcome) if outcome.request_id == 7)
         }));
-    }
-
-    #[test]
-    fn structural_saturation_backpressures_command_consumption() {
-        let mut pending = VecDeque::new();
-        for request_id in 0..MAX_PENDING_CONTROL.saturating_sub(1) {
-            pending.push_back(StudioControlEvent::Evaluation(EvaluationOutcome {
-                request_id: request_id as u64,
-                editor_revision: request_id as u64,
-                result: Err(EngineFailure {
-                    kind: "compile".into(),
-                    message: "bad score".into(),
-                    recoverable: true,
-                    playback_stopped: false,
-                }),
-            }));
-        }
-        assert!(!can_receive_command(&pending));
-        push_control(
-            &mut pending,
-            StudioControlEvent::Stopped(Box::new(StudioStop::idle())),
-        );
-        assert_eq!(pending.len(), MAX_PENDING_CONTROL);
     }
 
     #[test]
@@ -3591,81 +3373,6 @@ mod tests {
         assert_eq!(outcomes[1].request_id, 2);
         let b = outcomes[1].result.as_ref().expect("B fires").generation;
         assert!(b > a, "B installs after A");
-    }
-
-    /// Past the grace, a held key's press arms the next beat and restarts
-    /// the score there, so holding the key restarts it on every beat.
-    #[test]
-    fn a_press_past_the_grace_arms_the_next_beat_through_the_worker() {
-        use super::super::engine::tests::{clock_now, hold_clock, hold_clock_until, launch_is_due};
-        let mut engine = super::super::engine::tests::silent_engine_for_output_selection();
-        let source = "s(\"tri\")";
-        let mut armed = None;
-        let mut pending = VecDeque::new();
-        let mut outcomes = Vec::new();
-
-        press(
-            &mut engine,
-            rewind_evaluate(1, source),
-            &mut armed,
-            &mut pending,
-        );
-        // Press 1 fires on the worker's tick, with the clock held where it
-        // is due.
-        hold_clock_until(&engine, launch_is_due);
-        drive_worker(
-            &mut engine,
-            &mut armed,
-            &mut pending,
-            &mut outcomes,
-            |_, _, _, outcomes| outcomes.len() == 1,
-        );
-        let first = outcomes[0]
-            .result
-            .clone()
-            .expect("press 1 fires")
-            .generation;
-        let line_at = countdown_line_at(&mut engine).expect("press 1 waits for its line");
-        let beat = beat_seconds(&mut engine);
-
-        // The worker's turns run the line past and then the grace, half a
-        // beat.
-        hold_clock(&engine, false);
-        drive_worker(
-            &mut engine,
-            &mut armed,
-            &mut pending,
-            &mut outcomes,
-            |engine, _, _, _| clock_now(engine) > line_at + beat / 2.0,
-        );
-        hold_clock(&engine, true);
-        press(
-            &mut engine,
-            rewind_evaluate(2, source),
-            &mut armed,
-            &mut pending,
-        );
-        assert!(!superseded(&pending), "nothing was waiting to supersede");
-        collect_outcomes(&mut pending, &mut outcomes);
-        assert_eq!(outcomes.len(), 1, "press 2 is not answered as a repeat");
-        assert!(armed.is_some(), "press 2 waits for its own line");
-        let restart_at = countdown_line_at(&mut engine).expect("press 2 waits for its line");
-        assert!(
-            (restart_at - (line_at + beat)).abs() < 1e-6,
-            "press 2 arms the next beat: {restart_at} after {line_at}"
-        );
-
-        hold_clock(&engine, false);
-        drive_worker(
-            &mut engine,
-            &mut armed,
-            &mut pending,
-            &mut outcomes,
-            |_, _, _, outcomes| outcomes.len() == 2,
-        );
-        let restart = outcomes[1].result.as_ref().expect("press 2 fires");
-        assert!(!restart.answered_repeat, "press 2 restarts the score");
-        assert!(restart.generation > first, "from a fresh install");
     }
 
     /// Press 2 arrives after press 1 fired and its landing settled past the

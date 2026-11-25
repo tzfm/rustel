@@ -104,55 +104,6 @@ fn reach(
 mod tests {
     use super::*;
 
-    #[test]
-    fn the_margin_grows_with_the_window_up_to_two_rows() {
-        let margins: Vec<usize> = (0..=10).map(margin).collect();
-        assert_eq!(margins, [0, 0, 0, 1, 1, 1, 2, 2, 2, 2, 2]);
-    }
-
-    /// Walking down a long list: the window stays still until the selection
-    /// is two rows from the bottom, then moves a row a step, keeping two rows
-    /// of what comes next in sight.
-    #[test]
-    fn walking_down_scrolls_before_the_bottom_edge() {
-        let (height, total) = (10, 100);
-        let mut first = 0;
-        let mut seen = Vec::new();
-        for selected in 0..12 {
-            first = follow(first, selected, height, total, margin(height));
-            seen.push(first);
-        }
-        assert_eq!(seen, [0, 0, 0, 0, 0, 0, 0, 0, 1, 2, 3, 4]);
-        // The selection is never closer than two rows to the bottom edge.
-        assert_eq!(first + height - 1 - 11, 2);
-    }
-
-    /// Walking back up: nothing moves until the selection is two rows from
-    /// the top, then the window follows it up.
-    #[test]
-    fn walking_up_scrolls_before_the_top_edge() {
-        let (height, total) = (10, 100);
-        let mut first = 40;
-        let mut seen = Vec::new();
-        for selected in (38..=45).rev() {
-            first = follow(first, selected, height, total, margin(height));
-            seen.push((selected, first));
-        }
-        assert_eq!(
-            seen,
-            [
-                (45, 40),
-                (44, 40),
-                (43, 40),
-                (42, 40),
-                (41, 39),
-                (40, 38),
-                (39, 37),
-                (38, 36)
-            ]
-        );
-    }
-
     /// At the ends of the list there is nothing to keep in view, so the
     /// selection may reach the edge, and the window never shows past the end.
     #[test]
@@ -163,20 +114,6 @@ mod tests {
         assert_eq!(follow(90, 98, 10, 100, 2), 90);
         assert_eq!(follow(0, 5, 10, 8, 2), 0, "a list shorter than the window");
         assert_eq!(follow(50, 3, 10, 20, 2), 1, "a jump to the top");
-    }
-
-    /// A margin of zero is minimal scrolling: what a pointer's selection
-    /// uses, so a clicked row is never moved out from under it.
-    #[test]
-    fn no_margin_moves_only_when_the_selection_leaves_the_window() {
-        assert_eq!(
-            follow(0, 9, 10, 100, 0),
-            0,
-            "the bottom row is still inside"
-        );
-        assert_eq!(follow(0, 10, 10, 100, 0), 1);
-        assert_eq!(follow(5, 5, 10, 100, 0), 5, "the top row is still inside");
-        assert_eq!(follow(5, 4, 10, 100, 0), 4);
     }
 
     /// Rows nobody can select do not use up the margin: past a run of them

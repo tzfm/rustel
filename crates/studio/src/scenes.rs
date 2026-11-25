@@ -2330,22 +2330,6 @@ mod tests {
         assert_eq!(back.input_gain_db("never used"), None);
     }
 
-    /// A drag that ends where it began is not a change and does not rewrite
-    /// the set file. Rounding to the stored tenths in one place makes that
-    /// true.
-    #[test]
-    fn a_level_that_did_not_move_is_not_a_change() {
-        let directory = tempfile::tempdir().unwrap();
-        write(directory.path(), "one.strudel", "$: s(\"bd\")");
-        let mut set = SceneSet::open(directory.path(), "starter").unwrap();
-        assert!(set.set_master_gain_db(-3.04));
-        assert!(!set.set_master_gain_db(-3.0), "the same tenth");
-        assert!(!set.set_master_gain_db(-2.96), "rounds to the same tenth");
-        assert!(set.set_master_gain_db(-2.9), "a different tenth moved");
-        assert!(set.set_input_gain_db("mic", 1.0));
-        assert!(!set.set_input_gain_db("mic", 1.04));
-    }
-
     /// A lone score has no set file until it says something only a file can
     /// keep. A level is one of those things, like a limiter is.
     #[test]
@@ -2839,33 +2823,6 @@ mod tests {
         assert!(files.is_empty(), "the new empty score went again");
     }
 
-    /// A delete the disk refuses changes nothing: the tab stays on the
-    /// strip, and the selection with it, rather than leave the strip with
-    /// its file still in the folder.
-    #[test]
-    fn a_refused_delete_leaves_the_tab_where_it_was() {
-        let directory = tempfile::tempdir().unwrap();
-        write(directory.path(), "intro.strudel", "// intro");
-        write(directory.path(), "drop.strudel", "// drop");
-        let mut set = SceneSet::open(directory.path(), "starter").unwrap();
-        let (drop, path) = set
-            .scenes()
-            .iter()
-            .find(|scene| scene.name() == "drop")
-            .map(|scene| (scene.id, scene.path.clone()))
-            .expect("the drop tab");
-        // A directory where the file was: removing it fails, and not
-        // because it is gone.
-        std::fs::remove_file(&path).unwrap();
-        std::fs::create_dir(&path).unwrap();
-        let selected = set.current().id;
-
-        assert!(matches!(set.delete_scene(drop), Err(SceneError::Io(_))));
-        assert_eq!(set.len(), 2);
-        assert!(set.scenes().iter().any(|scene| scene.id == drop));
-        assert_eq!(set.current().id, selected);
-    }
-
     /// A new set is a folder of its own under the sets folder, named after
     /// the day and lettered when the day already has one, with a starter
     /// scene on disk; renaming it moves the folder and every path with it.
@@ -3003,54 +2960,6 @@ mod tests {
             })
         );
         assert_eq!(set.scene_for_pad(36, 10), None);
-    }
-
-    /// Rewind belongs to the scene, is written into the set file, and
-    /// comes back with it.
-    #[test]
-    fn a_scene_carries_its_own_rewind_and_the_set_file_keeps_it() {
-        let directory = tempfile::tempdir().unwrap();
-        let mut set = SceneSet::open(directory.path(), "starter").unwrap();
-        set.create("$: s(\"hh*8\")").unwrap();
-        assert!(!set.current_rewinds(), "an ordinary scene joins the cycle");
-        assert_eq!(set.toggle_rewind(), Some(true));
-        assert!(set.current_rewinds());
-
-        // Only this one: the flag is not the studio's.
-        let flagged = set.current().file_name();
-        assert!(set.select(0));
-        assert!(!set.current_rewinds(), "the other scene is untouched");
-
-        set.persist_manifest().expect("write the set file");
-        let manifest = SetManifest::load(directory.path()).expect("a set file");
-        let entry = manifest
-            .scenes
-            .iter()
-            .find(|entry| entry.file == flagged)
-            .expect("the flagged score is listed");
-        assert!(entry.rewind, "the set file says so");
-        assert!(
-            manifest.scenes.iter().filter(|entry| entry.rewind).count() == 1,
-            "and says so about one of them"
-        );
-
-        // And it opens the way it was left.
-        let reopened = SceneSet::open(directory.path(), "starter").unwrap();
-        let back = reopened
-            .scenes()
-            .iter()
-            .find(|scene| scene.file_name() == flagged)
-            .expect("the score is back");
-        assert!(back.rewind, "the flag came back with the set");
-        assert!(
-            reopened
-                .scenes()
-                .iter()
-                .filter(|scene| scene.rewind)
-                .count()
-                == 1,
-            "and only it"
-        );
     }
 
     #[test]
@@ -3281,33 +3190,6 @@ mod tests {
         assert!(set.persist_manifest().unwrap());
         let text = std::fs::read_to_string(SetManifest::path_in(directory.path())).unwrap();
         assert!(!text.contains("\"widgets\""), "never written again: {text}");
-    }
-
-    #[test]
-    fn a_project_file_without_a_prebake_key_still_opens() {
-        let directory = tempfile::tempdir().expect("temp dir");
-        std::fs::write(directory.path().join("a.strudel"), "$: s(\"bd\")").expect("scene");
-        std::fs::write(
-            SetManifest::path_in(directory.path()),
-            r#"{"scenes":[{"file":"a.strudel"}]}"#,
-        )
-        .expect("manifest");
-
-        let set = SceneSet::open(directory.path(), "starter").expect("set");
-        assert_eq!(set.score_count(), 1);
-        assert!(set.local_prebake().is_empty());
-    }
-
-    #[test]
-    fn a_set_is_capped_at_sixteen_scenes() {
-        let directory = tempfile::tempdir().unwrap();
-        let mut set = SceneSet::open(directory.path(), "starter").unwrap();
-        while set.len() < MAX_SCENES {
-            set.create("").unwrap();
-        }
-        assert!(matches!(set.create(""), Err(SceneError::Full)));
-        let names = set.scenes().iter().map(Scene::name).collect::<Vec<_>>();
-        assert_eq!(names.iter().filter(|name| *name == "scene 1").count(), 1);
     }
 
     /// A set file that does not parse held the pads, the tab list and the

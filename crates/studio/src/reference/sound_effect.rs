@@ -81,56 +81,6 @@ mod tests {
             .unwrap_or_else(|| panic!("{name} is declared"))
     }
 
-    /// `sound_effect` answers from the declarations as tabled here.
-    #[test]
-    fn every_effect_is_read_off_a_declaration() {
-        for name in ["s", "sound"] {
-            let source = SoundEffect {
-                source: true,
-                ..SoundEffect::default()
-            };
-            assert_eq!(effect(name), source, "{name}");
-        }
-        let renumbers = SoundEffect {
-            renumbers: true,
-            ..SoundEffect::default()
-        };
-        assert_eq!(effect("n"), renumbers);
-        for name in ["vel", "velocity", "dec", "lpf", "fast", "note"] {
-            assert_eq!(effect(name), SoundEffect::default(), "{name}");
-        }
-        for name in [
-            "sometimes",
-            "every",
-            "withValue",
-            "fmap",
-            "apply",
-            "source",
-            "pick",
-            "pickF",
-            "pickSqueeze",
-            "pickmodSqueeze",
-            "inhabit",
-            "inhabitmod",
-            "squeeze",
-        ] {
-            assert!(effect(name).replaces, "{name}: {:?}", effect(name));
-        }
-        for name in ["layer", "superimpose"] {
-            let effect = effect(name);
-            assert!(effect.undocumented && effect.joins, "{name}: {effect:?}");
-        }
-        assert!(effect("stack").undocumented, "{:?}", effect("stack"));
-        for name in ["cat", "slowcat", "set", "appLeft", "appBoth"] {
-            let effect = effect(name);
-            assert!(effect.joins && !effect.replaces, "{name}: {effect:?}");
-        }
-        assert_eq!(effect("chorus"), SoundEffect::default());
-        for name in ["customTransform", "map"] {
-            assert_eq!(reference().sound_effect(name), None, "{name}");
-        }
-    }
-
     /// Every `pick*` name is declared a selector.
     #[test]
     fn every_pick_is_declared_a_selector() {

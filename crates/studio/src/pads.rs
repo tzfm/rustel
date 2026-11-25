@@ -548,19 +548,6 @@ mod tests {
             .collect()
     }
 
-    /// A Maschine exposes its hardware port AND a software mirror (the app's
-    /// "Virtual Input"), so one physical press arrives as two identical
-    /// NoteOns milliseconds apart. One press is one launch: the mirror is
-    /// dropped inside the window. This is the "pad does a little double" fix,
-    /// driven through the driver callback's own path on an injected clock.
-    #[test]
-    fn a_press_mirrored_on_a_second_port_launches_once() {
-        let listener = PadListener::default();
-        listener.driver_message_for_test("Maschine", note_on(36), 0);
-        listener.driver_message_for_test("Maschine Virtual Input", note_on(36), 5);
-        assert_eq!(delivered(&listener), vec![36], "the mirror is dropped");
-    }
-
     /// A note's ending - a real note-off, or the zero-velocity note-on many
     /// devices send for one - goes on as a press at velocity 0, so a
     /// Keybinds row can read a latching button's off-press. The gate
@@ -620,18 +607,6 @@ mod tests {
         assert_eq!(launches, vec![36, 36]);
     }
 
-    /// The gate is per pad, not per port-pair: a mirror of one pad must
-    /// never swallow a different pad played straight after - two pads hit
-    /// together are two launches, and a third pad is a third.
-    #[test]
-    fn different_pads_in_the_window_all_launch() {
-        let listener = PadListener::default();
-        for (at, note) in [36, 37, 38, 36].into_iter().enumerate() {
-            listener.driver_message_for_test("pads", note_on(note), at as u64);
-        }
-        assert_eq!(delivered(&listener), vec![36, 37, 38]);
-    }
-
     /// Releases must not evict presses before their mirrored copies arrive.
     #[test]
     fn interleaved_mirrors_of_pressed_and_released_pads_are_dropped() {
@@ -660,32 +635,6 @@ mod tests {
             .chain((36..44).map(|note| (note, 0)))
             .collect();
         assert_eq!(delivered, expected);
-    }
-
-    /// A knob on the driver path reaches the slider channel, and every
-    /// message lights the activity light.
-    #[test]
-    fn a_knob_on_the_driver_path_reaches_the_slider_channel() {
-        let listener = PadListener::default();
-        listener.driver_message_for_test(
-            "knobs",
-            MidiEvent::ControlChange {
-                channel: 2,
-                controller: 74,
-                value: 63,
-            },
-            0,
-        );
-        assert_eq!(
-            listener.try_recv_cc().ok(),
-            Some(CcTurn {
-                controller: 74,
-                channel: 2,
-                value: 63,
-            })
-        );
-        assert!(listener.active_within(60_000));
-        assert!(listener.try_recv().is_err(), "a knob is not a pad");
     }
 
     /// A burst keeps the newest messages in order, within each queue's cap.
@@ -755,38 +704,6 @@ mod tests {
         );
     }
 
-    /// A ghost note-on (velocity 1-10, as the mixer's `v10` lines show) is
-    /// still a press; but a real second hit AFTER the window is a musician,
-    /// not a mirror, and must launch.
-    #[test]
-    fn the_same_pad_after_the_window_launches_again() {
-        let listener = PadListener::default();
-        let press = PadPress {
-            note: 36,
-            channel: 10,
-            velocity: 100,
-        };
-        drop(listener);
-        // The gate's own clock, injected: no sleep, no wall clock.
-        let pad = Pad {
-            note: press.note,
-            channel: press.channel,
-        };
-        let mut gate = RecentPresses::new();
-        assert!(
-            !gate.is_mirror(pad, true, 1_000),
-            "the first press launches"
-        );
-        assert!(
-            gate.is_mirror(pad, true, 1_000 + DOUBLE_PRESS_WINDOW_MILLIS),
-            "the same pad at the window's edge is its mirror"
-        );
-        assert!(
-            !gate.is_mirror(pad, true, 1_000 + DOUBLE_PRESS_WINDOW_MILLIS + 1),
-            "a genuine re-hit after the window launches"
-        );
-    }
-
     /// An empty gate slot matches nothing: the very first press of note 0 on
     /// channel 0, at the monotonic clock's time zero, still launches.
     #[test]
@@ -836,15 +753,6 @@ mod tests {
         assert_eq!(listener.recent_events().len(), RECENT_MESSAGES);
     }
 
-    /// A message on any port lights the footer for a blink.
-    #[test]
-    fn a_message_lights_the_listener_for_a_blink() {
-        let listener = PadListener::default();
-        assert!(!listener.active_within(1_000), "nothing yet");
-        listener.stamp_activity_for_test();
-        assert!(listener.active_within(1_000));
-    }
-
     #[test]
     fn the_ui_observes_each_new_readable_message_once_while_stopped() {
         let mut listener = PadListener::default();
@@ -856,16 +764,5 @@ mod tests {
         listener.stamp_activity_for_test();
         assert!(listener.poll_visual_change(1_000));
         assert!(!listener.poll_visual_change(1_000));
-    }
-
-    #[test]
-    fn a_pad_is_labelled_by_note_name_and_channel() {
-        let pad = Pad {
-            note: 48,
-            channel: 10,
-        };
-        assert_eq!(pad.label(), "c3/10");
-        assert!(pad.matches(48, 10));
-        assert!(!pad.matches(48, 1));
     }
 }

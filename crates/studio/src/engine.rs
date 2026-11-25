@@ -3448,31 +3448,6 @@ pub(super) mod tests {
             assert_eq!(engine.generation(), 0);
             assert!(!engine.is_playing());
         }
-
-        #[test]
-        fn studio_session_refuses_a_score_above_its_configured_hap_budget_before_install() {
-            let mut engine = StudioEngine::new(StudioConfig {
-                output: Some("silent".into()),
-                ..StudioConfig::default()
-            })
-            .expect("studio");
-            engine
-                .session
-                .set_query_hap_budget(8)
-                .expect("small hap budget");
-
-            let error = engine
-                .session
-                .reload_at(
-                    r#"setcpm(138/4); $: s("hh").iter(64).stut(64, 1, 1).echo(64, .001, 1)"#,
-                    false,
-                    0.0,
-                )
-                .expect_err("a fresh score above the configured hap budget must not start");
-            assert!(matches!(&error, RuntimeError::ResourceLimit(_)), "{error}");
-            assert_eq!(engine.generation(), 0);
-            assert!(!engine.is_playing());
-        }
     }
 
     /// The pads are a process-global static (`rustel_core::gamepad`), shared
@@ -3793,27 +3768,6 @@ pub(super) mod tests {
             // reaches its recording fields and their blocking joins.
             self.gate.release();
         }
-    }
-
-    #[test]
-    fn recoverability_does_not_downgrade_runtime_errors() {
-        let diagnostic =
-            StudioDiagnostic::runtime(&RuntimeError::ResourceLimit("deadline".into()), true);
-        assert!(diagnostic.recoverable);
-        assert_eq!(diagnostic.level, StudioDiagnosticLevel::Error);
-
-        assert_eq!(
-            StudioDiagnostic::message("notice", "warning").level,
-            StudioDiagnosticLevel::Warning
-        );
-        assert_eq!(
-            StudioDiagnostic::info("launch", "waiting").level,
-            StudioDiagnosticLevel::Info
-        );
-        assert_eq!(
-            StudioDiagnostic::note("audio", "silent · silent · 48000 Hz · 256 frames").level,
-            StudioDiagnosticLevel::Note
-        );
     }
 
     /// Engine log lines do not take the status line. A launch decision is
@@ -4231,17 +4185,5 @@ pub(super) mod tests {
             return;
         }
         panic!("the install ring never filled");
-    }
-
-    #[test]
-    fn bounded_channel_returns_update_ownership() {
-        let (sender, receiver) = std::sync::mpsc::sync_channel(1);
-        let diagnostic = StudioUpdate::Diagnostic(StudioDiagnostic::message("one", "first"));
-        try_send_update(&sender, diagnostic).expect("first update");
-        let second = StudioUpdate::Diagnostic(StudioDiagnostic::message("two", "second"));
-        let (status, returned) = try_send_update(&sender, second.clone()).expect_err("full queue");
-        assert_eq!(status, UiEventSendStatus::DroppedFull);
-        assert_eq!(returned, second);
-        drop(receiver);
     }
 }

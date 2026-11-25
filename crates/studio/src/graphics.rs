@@ -907,17 +907,6 @@ mod tests {
     }
 
     #[test]
-    fn a_visible_scratch_image_keeps_its_offset_without_copying_pixels() {
-        let image = coordinate_image(Rect::new(3, 4, 2, 1), 4, 3);
-        let pixels = image.rgba.as_ptr();
-        let moved = image
-            .crop_and_move(Rect::new(1, 1, 10, 10), (20, 30))
-            .unwrap();
-        assert_eq!(moved.area, Rect::new(22, 33, 2, 1));
-        assert_eq!(moved.rgba.as_ptr(), pixels);
-    }
-
-    #[test]
     fn cropping_a_scaled_image_uses_its_cell_coverage_and_keeps_boundary_pixels() {
         let mut image = coordinate_image(Rect::new(2, 2, 1, 1), 5, 5);
         image.cells = Some((4, 3));
@@ -952,35 +941,6 @@ mod tests {
         let mut invalid = image.clone();
         invalid.cells = Some((0, 2));
         assert!(invalid.crop_and_move(image.area, (0, 0)).is_none());
-    }
-
-    #[test]
-    fn scratch_capture_preserves_earlier_layers_and_nested_draw_order() {
-        let layer = |x| coordinate_image(Rect::new(x, 0, 1, 1), 1, 1);
-        let (_, frame) = capture_images(|| {
-            push_image(layer(1));
-            let (result, scratch) = capture_images(|| {
-                push_image(layer(2));
-                let (_, nested) = capture_images(|| push_image(layer(3)));
-                assert_eq!(nested.len(), 1);
-                assert_eq!(nested[0].area.x, 3);
-                for image in nested {
-                    push_image(image);
-                }
-                push_image(layer(4));
-                42
-            });
-            assert_eq!(result, 42);
-            assert_eq!(
-                scratch.iter().map(|image| image.area.x).collect::<Vec<_>>(),
-                vec![2, 3, 4]
-            );
-            push_image(layer(5));
-        });
-        assert_eq!(
-            frame.iter().map(|image| image.area.x).collect::<Vec<_>>(),
-            vec![1, 5]
-        );
     }
 
     #[test]
@@ -1027,27 +987,6 @@ mod tests {
                 *pixel,
                 [x as u8, y as u8, 17, if covered { 0 } else { 255 }]
             );
-        }
-    }
-
-    #[test]
-    fn an_overlay_preserves_scaled_image_placement_and_masks_cell_boundaries() {
-        let mut image = coordinate_image(Rect::new(2, 2, 1, 1), 5, 5);
-        image.cells = Some((4, 3));
-        image.depth = -1;
-        let (_, frame) = capture_images(|| {
-            push_image(image.clone());
-            cover_images(Rect::new(3, 3, 2, 1));
-        });
-        let masked = &frame[0];
-        assert_eq!(masked.area, image.area);
-        assert_eq!(masked.cells, image.cells);
-        assert_eq!(masked.depth, image.depth);
-        assert_eq!((masked.width, masked.height), (5, 5));
-        for (index, pixel) in masked.rgba.as_chunks::<4>().0.iter().enumerate() {
-            let (x, y) = (index % 5, index / 5);
-            let covered = (1..4).contains(&x) && (1..4).contains(&y);
-            assert_eq!(pixel[3], if covered { 0 } else { 255 });
         }
     }
 

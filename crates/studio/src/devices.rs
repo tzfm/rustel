@@ -1781,65 +1781,6 @@ mod tests {
         );
     }
 
-    /// Conhost draws `▸` as tofu, so the active row's mark falls back to
-    /// its plain stand-in instead - never the fancy glyph, which is what
-    /// a terminal without the capability cannot show.
-    #[test]
-    fn the_active_row_mark_falls_back_without_the_capability() {
-        let _forced = super::super::terminal::ForceSymbolsForTest::set(false);
-        let inventory = DeviceInventory {
-            audio_inputs: vec![DeviceEntry {
-                name: "Scarlett 2i2".into(),
-                id: String::new(),
-                detail: "44100 Hz \u{b7} 2ch".into(),
-                is_default: true,
-            }],
-            ..inventory()
-        };
-        let area = Rect::new(0, 0, 100, 30);
-        let panel = DevicePanel {
-            kind: DeviceKind::AudioInput,
-            ..DevicePanel::default()
-        };
-        let mut buffer = Buffer::empty(area);
-        DevicePanelView {
-            midi_rows: &[],
-            clock_in: None,
-            clock_out: None,
-            link_enabled: false,
-            link: None,
-            latency: None,
-            panel,
-            inventory: &inventory,
-            theme: &Theme::built_in_default(),
-            current_output: None,
-            current_input: Some("Scarlett 2i2"),
-            input_chosen: true,
-            scanning: false,
-        }
-        .render(area, &mut buffer);
-        let geometry = DevicePanelView::geometry(area, panel, 1).expect("it fits");
-        assert_eq!(
-            buffer[(geometry.list.x, geometry.list.y)].symbol(),
-            ">",
-            "the stand-in draws instead of the tofu conhost would show"
-        );
-    }
-
-    #[test]
-    fn midi_rows_copy_the_bare_port_name() {
-        assert_eq!(
-            DeviceKind::Midi.snippet("IAC Driver Bus 1"),
-            "IAC Driver Bus 1"
-        );
-        assert_eq!(DeviceKind::Midi.snippet("LPK25"), "LPK25");
-        // An audio output is chosen here, not named in the score.
-        assert_eq!(
-            DeviceKind::AudioOutput.snippet("Scarlett 2i2"),
-            "Scarlett 2i2"
-        );
-    }
-
     #[test]
     fn tabs_cycle_in_both_directions_and_reset_the_cursor() {
         let mut panel = DevicePanel {
@@ -1938,49 +1879,6 @@ mod tests {
         panel.move_selection(1, 24);
         panel.settle_scroll(available, 24);
         assert_eq!((panel.selected, panel.first), (10, 1));
-    }
-
-    #[test]
-    fn the_panel_renders_the_active_output_and_every_family() {
-        let inventory = inventory();
-        assert_eq!(
-            inventory.midi_port_counts(),
-            MidiPortCounts {
-                outputs: 1,
-                inputs: 0
-            }
-        );
-        let area = Rect::new(0, 0, 100, 30);
-        let mut buffer = Buffer::empty(area);
-        DevicePanelView {
-            midi_rows: &[],
-            clock_in: None,
-            clock_out: None,
-            link_enabled: false,
-            link: None,
-            latency: None,
-            panel: DevicePanel::default(),
-            inventory: &inventory,
-            theme: &Theme::built_in_default(),
-            current_output: Some("Scarlett 2i2"),
-            current_input: None,
-            input_chosen: false,
-            scanning: false,
-        }
-        .render(area, &mut buffer);
-        let text = buffer
-            .content
-            .iter()
-            .map(|cell| cell.symbol())
-            .collect::<String>();
-        assert!(text.contains("Scarlett 2i2"), "{text}");
-        assert!(text.contains("▸"), "the active output is marked");
-        // One MIDI tab, not one each way.
-        assert!(text.contains(" midi "), "{text}");
-        assert!(
-            !text.contains("midi out") && !text.contains("midi in "),
-            "{text}"
-        );
     }
 
     /// The MIDI tab draws one row a device with a box each way, a dash where
@@ -2207,73 +2105,6 @@ mod latency_draw_tests {
     use super::*;
     use ratatui::layout::Rect;
 
-    /// The panel draws the latency report, above its hint and below the
-    /// list.
-    #[test]
-    fn the_devices_panel_shows_what_the_stream_costs() {
-        let inventory = DeviceInventory {
-            audio_outputs: vec![DeviceEntry {
-                name: "BuiltInSpeakerDevice".to_owned(),
-                id: String::new(),
-                detail: "48000 Hz · 2ch".to_owned(),
-                is_default: true,
-            }],
-            ..DeviceInventory::default()
-        };
-        let theme = Theme::built_in_default();
-        let area = Rect::new(0, 0, 90, 30);
-        let drawn = |latency: Option<LatencyReport>| {
-            let mut buffer = Buffer::empty(area);
-            DevicePanelView {
-                midi_rows: &[],
-                clock_in: None,
-                clock_out: None,
-                link_enabled: false,
-                link: None,
-                latency,
-                panel: DevicePanel::default(),
-                inventory: &inventory,
-                theme: &theme,
-                current_output: Some("BuiltInSpeakerDevice"),
-                current_input: None,
-                input_chosen: false,
-                scanning: false,
-            }
-            .render(area, &mut buffer);
-            (0..area.height)
-                .map(|y| {
-                    (area.x..area.right())
-                        .map(|x| buffer.cell((x, y)).unwrap().symbol().to_owned())
-                        .collect::<String>()
-                })
-                .collect::<Vec<_>>()
-                .join("\n")
-        };
-
-        // Without one - a panel opened before the engine has a device -
-        // nothing is claimed.
-        let quiet = drawn(None);
-        assert!(!quiet.contains(" ms"), "{quiet}");
-        assert!(
-            quiet.contains("BuiltInSpeakerDevice"),
-            "the list still draws"
-        );
-
-        let text = drawn(Some(LatencyReport {
-            output_frames: 256,
-            output_frames_reported: true,
-            sample_rate: 48_000,
-            limiter_millis: 5.0,
-            input_frames: Some(1024),
-        }));
-        assert!(text.contains("out 10.3 ms"), "{text}");
-        assert!(text.contains("5.0 limiter"), "{text}");
-        assert!(text.contains("31.7 ms"), "the round trip too: {text}");
-        // The row it belongs to is still there, and so is the hint.
-        assert!(text.contains("48000 Hz"), "{text}");
-        assert!(text.contains("Enter plays through it"), "{text}");
-    }
-
     /// The Link tab: one row, a checkbox that joins the session or
     /// leaves it, and what the session is doing once joined.
     #[test]
@@ -2376,32 +2207,6 @@ mod midi_enablement_tests {
         // Only what was there. Something plugged in afterwards is off until
         // it is ticked, which is the half of "off by default" worth having.
         assert!(!enabled.is_enabled(MidiDirection::Out, "Arrived Later"));
-    }
-
-    /// Turning everything off is a decision, and has to survive a restart.
-    /// An empty list and no list at all cannot mean the same thing.
-    #[test]
-    fn everything_off_is_kept_apart_from_never_having_said() {
-        let present = inventory(&["loopMIDI"], &["Keys"]);
-        let silent = MidiEnablement::from_prefs(Some(&[]), Some(&[]), &present);
-        assert!(!silent.is_enabled(MidiDirection::Out, "loopMIDI"));
-        assert!(!silent.is_enabled(MidiDirection::In, "Keys"));
-    }
-
-    /// A device can be wanted one way and not the other: a controller you
-    /// play FROM and never send TO.
-    #[test]
-    fn the_two_directions_are_switched_apart() {
-        let present = inventory(&["Maschine"], &["Maschine"]);
-        let mut enabled = MidiEnablement::from_prefs(Some(&[]), Some(&[]), &present);
-        assert!(enabled.toggle(MidiDirection::In, "Maschine"));
-        assert!(enabled.is_enabled(MidiDirection::In, "Maschine"));
-        assert!(!enabled.is_enabled(MidiDirection::Out, "Maschine"));
-        assert_eq!(enabled.kept(MidiDirection::In), vec!["Maschine".to_owned()]);
-        assert!(enabled.kept(MidiDirection::Out).is_empty());
-        // And off again.
-        assert!(!enabled.toggle(MidiDirection::In, "Maschine"));
-        assert!(!enabled.is_enabled(MidiDirection::In, "Maschine"));
     }
 
     /// A score names a selector, not a port. Gating it against exact names

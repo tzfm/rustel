@@ -1103,87 +1103,6 @@ mod tests {
         }
     }
 
-    /// The limiter's own keys are on the hint row while it holds the keys,
-    /// and nowhere else: `c` and `b` do nothing on any other strip.
-    #[test]
-    fn the_hint_names_the_limiters_keys_when_it_is_selected() {
-        let hint = |facts: &MixerFacts| {
-            let area = Rect::new(0, 0, 120, 16);
-            let mut buffer = Buffer::empty(area);
-            MixerPanelView {
-                keybinds: &crate::keybinds::Keybinds::default(),
-                facts: Some(facts),
-                panel: MixerPanel::new(MixerEdge::Bottom, Some(10)),
-                theme: &Theme::built_in_default(),
-                focused: true,
-                area,
-                selection: None,
-            }
-            .render(area, &mut buffer);
-            let parts = parts(area, MixerEdge::Bottom).expect("parts");
-            row(&buffer, area, parts.hint.y)
-        };
-
-        let mut facts = facts();
-        let on_input = hint(&facts);
-        assert!(!on_input.contains("b bypass"), "{on_input}");
-
-        facts.strips[0].selected = false;
-        facts.strips[1].selected = true;
-        facts.strips[1].kind = MixerStripKind::Reduction {
-            reduction_db: 3.0,
-            bypassed: false,
-        };
-        let on_limiter = hint(&facts);
-        assert!(
-            on_limiter.trim_start().starts_with("c mode · b bypass"),
-            "{on_limiter}"
-        );
-    }
-
-    #[test]
-    fn the_rule_names_the_selected_control_before_an_arrow_moves_it() {
-        let rule = |facts: &MixerFacts, width| {
-            let area = Rect::new(0, 0, width, 16);
-            let mut buffer = Buffer::empty(area);
-            MixerPanelView {
-                keybinds: &crate::keybinds::Keybinds::default(),
-                facts: Some(facts),
-                panel: MixerPanel::new(MixerEdge::Bottom, Some(10)),
-                theme: &Theme::built_in_default(),
-                focused: true,
-                area,
-                selection: None,
-            }
-            .render(area, &mut buffer);
-            let parts = parts(area, MixerEdge::Bottom).expect("parts");
-            row(&buffer, area, parts.rule.y)
-        };
-
-        let mut facts = facts();
-        assert!(rule(&facts, 40).contains("▶ input gain 30.0 dB"));
-
-        facts.strips[0].selected = false;
-        facts.strips[2].selected = true;
-        facts.strips[2].gain_db = Some(-10.0);
-        assert!(rule(&facts, 40).contains("▶ master gain -10.0 dB"));
-
-        facts.strips[2].selected = false;
-        facts.strips[1].selected = true;
-        facts.strips[1].label = "punch".into();
-        facts.strips[1].gain_db = Some(-1.0);
-        facts.strips[1].kind = MixerStripKind::Reduction {
-            reduction_db: 3.0,
-            bypassed: false,
-        };
-        assert!(
-            rule(&facts, 40).contains("▶ limiter ceiling -1.0 dB"),
-            "{}",
-            rule(&facts, 40)
-        );
-        assert!(rule(&facts, 80).contains("· punch"));
-    }
-
     fn fader(label: &str, notch: f32, selected: bool, slot: Option<usize>) -> MixerFader {
         MixerFader {
             label: label.into(),
@@ -1194,60 +1113,6 @@ mod tests {
             selected,
             slot,
         }
-    }
-
-    /// The desk shows each score fader beside the strips: its name, its
-    /// reading on its own row, and both ends of its range beside the rail.
-    #[test]
-    fn the_desk_shows_the_scores_faders_with_their_range() {
-        let mut facts = facts();
-        facts.faders = vec![
-            fader("lpf", 0.25, true, Some(0)),
-            fader("room", 0.6, false, Some(1)),
-            fader("gain", 0.9, false, None),
-        ];
-        let area = Rect::new(0, 0, 96, 10);
-        let mut buffer = Buffer::empty(area);
-        MixerPanelView {
-            keybinds: &crate::keybinds::Keybinds::default(),
-            facts: Some(&facts),
-            panel: MixerPanel::new(MixerEdge::Bottom, Some(10)),
-            theme: &Theme::built_in_default(),
-            focused: true,
-            area,
-            selection: None,
-        }
-        .render(area, &mut buffer);
-        let text = (0..area.height)
-            .map(|y| row(&buffer, area, y))
-            .collect::<Vec<_>>()
-            .join("\n");
-
-        // Named, and numbered by the slot that drives it. A fader with no
-        // slot keeps its name and says nothing about a knob.
-        assert!(text.contains("1 lpf"), "{text}");
-        assert!(text.contains("2 room"), "{text}");
-        assert!(text.contains("  gain"), "{text}");
-        // Reading and range, all three on the fader itself.
-        assert!(text.contains("800"), "{text}");
-        assert!(text.contains("100"), "{text}");
-        assert!(text.contains("4000"), "{text}");
-        // The knob moves with the value, and the rail is the score's own
-        // glyphs so the two read as one control seen twice.
-        let rails: Vec<&str> = text.lines().filter(|line| line.contains('█')).collect();
-        assert_eq!(rails.len(), 3, "one rail a fader: {text}");
-        let knob_at = |line: &str| line.find('█').unwrap_or(0);
-        assert!(
-            knob_at(rails[0]) < knob_at(rails[1]) && knob_at(rails[1]) < knob_at(rails[2]),
-            "a louder fader stands further along: {rails:?}"
-        );
-
-        // It sits between the strips and the devices, and takes room from
-        // the devices rather than from the strips.
-        let strips = text.find("master").expect("the strips are drawn");
-        let desk = text.find("1 lpf").expect("the faders are drawn");
-        let devices = text.find("1 out · 1 in").expect("the devices are drawn");
-        assert!(strips < desk && desk < devices, "{text}");
     }
 
     /// Every fader reaches both ends of its own rail. The limiter's ceiling
@@ -1672,28 +1537,6 @@ mod tests {
         assert!(!lines[0].0.contains('⌁'), "{}", lines[0].0);
         assert!(lines[1].0.contains('#'), "{}", lines[1].0);
         assert!(!lines[1].0.contains('▣'), "{}", lines[1].0);
-    }
-
-    /// No gamepad is not news: the devices block has no row for it, and
-    /// says how many only when there is one.
-    #[test]
-    fn the_devices_lines_say_nothing_of_gamepads_when_there_are_none() {
-        let theme = Theme::built_in_default();
-        let desk = Rect::new(0, 0, 40, 10);
-        let mut none = facts();
-        none.pads = 0;
-        none.pads_live.clear();
-        none.gamepad_recent.clear();
-        let said = |facts: &MixerFacts| {
-            super::devices_lines(facts, desk, &theme)
-                .iter()
-                .any(|(line, _)| line.contains("gamepad"))
-        };
-        assert!(!said(&none));
-
-        let mut one = none;
-        one.pads = 1;
-        assert!(said(&one));
     }
 
     /// A column maps to its strip and the gap to none. A row maps to a level

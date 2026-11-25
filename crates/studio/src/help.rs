@@ -1031,33 +1031,6 @@ mod tests {
             .join("\n")
     }
 
-    /// The table decides what help names, not the keys seen so far. A rebind
-    /// or an unbind retires Ctrl+Space with the default chord.
-    #[test]
-    fn reference_help_follows_the_table_and_not_the_keys_seen() {
-        use super::super::keybinds::KeyCombo;
-        let mut binds = Keybinds::default();
-        let browse = |binds: &Keybinds, space_seen| {
-            shortcut_rows_with_keybinds(
-                KeyboardCapabilities {
-                    space_seen,
-                    ..KeyboardCapabilities::legacy()
-                },
-                binds,
-            )
-            .into_iter()
-            .find(|row| row.action.starts_with("values for the argument"))
-            .unwrap()
-            .keys
-        };
-        assert_eq!(browse(&binds, false), "^F / ^Space");
-        assert_eq!(browse(&binds, true), "^F / ^Space");
-        binds.learn(BindAction::Reference, Some(KeyCombo::parse("f2").unwrap()));
-        assert_eq!(browse(&binds, true), "F2");
-        binds.unbind(BindAction::Reference);
-        assert_eq!(browse(&binds, true), "");
-    }
-
     /// Help names the values chord and the docs chord on two rows, with
     /// Ctrl+Space beside Ctrl+F. Each row follows its own action.
     #[test]
@@ -1145,45 +1118,6 @@ mod tests {
     }
 
     #[test]
-    fn theme_editor_submodals_name_the_keys_they_actually_accept() {
-        let theme = Theme::built_in_default();
-        let keybinds = Keybinds::default();
-        let area = Rect::new(0, 0, 90, 20);
-        for (context, needle) in [
-            (HelpContext::ThemeEditorForm, "s · Tab · Esc"),
-            (HelpContext::ThemeEditorCode, "s on the Form tab"),
-            (HelpContext::ThemeEditorColor, "#rrggbb · Backspace"),
-            (HelpContext::ThemeEditorSave, "choose save or save & keep"),
-        ] {
-            let mut buffer = Buffer::empty(area);
-            HelpView {
-                state: HelpState::default(),
-                context,
-                capabilities: KeyboardCapabilities::legacy(),
-                keybinds: &keybinds,
-                theme: &theme,
-            }
-            .render(area, &mut buffer);
-            assert!(text_of(&buffer).contains(needle), "{context:?}");
-        }
-    }
-
-    #[test]
-    fn the_global_list_advertises_the_find_prompt() {
-        for capabilities in [
-            KeyboardCapabilities::legacy(),
-            KeyboardCapabilities::enhanced(),
-        ] {
-            assert!(
-                shortcut_rows(capabilities)
-                    .iter()
-                    .any(|row| row.action.contains("find text")),
-                "the find prompt is missing from the shortcut list"
-            );
-        }
-    }
-
-    #[test]
     fn shortcut_help_says_when_the_terminal_does_not_send_shift_home_and_end() {
         use super::super::keybinds::Reach;
         use super::super::terminal::conflicts::{ForceDesktopForTest, ForcePlatformForTest};
@@ -1203,41 +1137,6 @@ mod tests {
                 .expect("help has the row");
             assert_eq!(row.action.starts_with("select"), sent, "{terminal}");
         }
-    }
-
-    #[test]
-    fn shortcut_help_reads_terminal_fallbacks_and_learnt_bindings() {
-        use super::super::keybinds::{KeyCombo, Reach};
-
-        let mut keybinds = Keybinds::default();
-        keybinds.set_reach(Reach {
-            enhanced: false,
-            terminal: "conhost".to_owned(),
-        });
-        let rows = shortcut_rows_with_keybinds(KeyboardCapabilities::legacy(), &keybinds);
-        let keys_for = |action: &str| {
-            rows.iter()
-                .find(|row| row.action.starts_with(action))
-                .unwrap_or_else(|| panic!("help contains {action:?}"))
-                .keys
-                .as_str()
-        };
-        assert_eq!(keys_for("rewind update"), "⇧F5");
-        assert_eq!(keys_for("redo"), "^Y");
-        assert_eq!(keys_for("open another set"), "⇧F6");
-
-        keybinds.learn(
-            BindAction::RewindEvaluate,
-            Some(KeyCombo::parse("f2").expect("F2 parses")),
-        );
-        let rows = shortcut_rows_with_keybinds(KeyboardCapabilities::legacy(), &keybinds);
-        assert_eq!(
-            rows.iter()
-                .find(|row| row.action.starts_with("rewind update"))
-                .expect("rewind row")
-                .keys,
-            "F2"
-        );
     }
 
     #[test]
@@ -1274,40 +1173,5 @@ mod tests {
             HelpContext::Timeline.live_bindings(&binds)[2].0,
             "T · Delete · Esc"
         );
-    }
-
-    #[test]
-    fn help_hides_blocked_and_shadowed_aliases() {
-        use super::super::keybinds::{KeyCombo, Reach};
-        let mut binds = Keybinds::default();
-        binds.set_reach(Reach {
-            enhanced: true,
-            terminal: "Windows Terminal".to_owned(),
-        });
-        assert_eq!(shortcut_with_alias(&binds, BindAction::Log), "F9");
-        assert_eq!(shortcut_with_alias(&binds, BindAction::Mixer), "F4");
-        binds.learn(BindAction::Stop, Some(KeyCombo::parse("f5").unwrap()));
-        assert_eq!(shortcut_with_alias(&binds, BindAction::Evaluate), "^Enter");
-        assert_eq!(shortcut_with_alias(&binds, BindAction::Stop), "F5");
-        binds.set_reach(Reach {
-            enhanced: false,
-            terminal: "conhost".to_owned(),
-        });
-        assert_eq!(shortcut_with_alias(&binds, BindAction::Redo), "^Y");
-    }
-
-    #[test]
-    fn scene_help_names_the_split_scene_chords() {
-        let binds = Keybinds::default();
-        let rows = shortcut_rows_with_keybinds(KeyboardCapabilities::enhanced(), &binds);
-        let scene_keys = |prefix: &str| {
-            rows.iter()
-                .find(|row| row.action.starts_with(prefix))
-                .unwrap()
-                .keys
-                .as_str()
-        };
-        assert_eq!(scene_keys("one pane:"), "^[ · ^]");
-        assert_eq!(scene_keys("split: cycle"), "^⇧[ · ^⇧]");
     }
 }

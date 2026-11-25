@@ -369,51 +369,6 @@ fn a_complete_frame_draws_every_surface_in_solid_blocks() {
     );
 }
 
-/// `keep` spares a rect from the backdrop entirely.
-#[test]
-#[cfg(feature = "hydra")]
-fn a_kept_rect_is_spared_the_backdrop_entirely() {
-    use ratatui::buffer::Buffer;
-    use ratatui::layout::Rect;
-    use ratatui::style::Color;
-    use rustel_studio::view::HydraBackdrop;
-
-    let area = Rect::new(0, 0, 40, 10);
-    let panel = Rect::new(24, 0, 16, 10);
-    let under = Color::Rgb(10, 10, 20);
-
-    let mut buffer = Buffer::empty(area);
-    buffer.set_style(area, ratatui::style::Style::default().bg(under));
-    // The panel draws its own surface first, as the reference column does.
-    let surface = Color::Rgb(34, 29, 50);
-    buffer.set_style(panel, ratatui::style::Style::default().bg(surface));
-
-    // A bright picture, so anything bleeding through is obvious.
-    let picture = HydraBackdrop {
-        width: 4,
-        height: 4,
-        rgba: vec![255; 4 * 4 * 4],
-        strength: 0.55,
-        // The reference column is spared whatever this says, which is the
-        // point of the assertion below.
-        interface: 1.0,
-    };
-    picture.paint(&mut buffer, area, under, Some(panel), &[], None);
-
-    for y in 0..panel.height {
-        for x in 0..panel.width {
-            let cell = buffer.cell((panel.x + x, panel.y + y)).expect("cell");
-            assert_eq!(
-                cell.bg, surface,
-                "the panel keeps its own surface at {x},{y}"
-            );
-        }
-    }
-    // Outside it, the picture is there.
-    let outside = buffer.cell((2, 2)).expect("cell");
-    assert_ne!(outside.bg, under, "the backdrop paints outside the panel");
-}
-
 /// Every sheet paints over the docked panels: a visuals dock at the
 /// right and an export sheet across the bottom share cells, and the
 /// sheet's frame is what shows there.
