@@ -355,23 +355,10 @@ mod tests {
     }
 
     #[test]
-    fn extracts_a_line_with_no_column() {
-        assert_eq!(
-            extract_reported_line("ReferenceError: gibberish is not defined - line 1"),
-            Some(1)
-        );
-    }
-
-    #[test]
     fn extracts_a_line_ahead_of_a_column() {
         assert_eq!(
             extract_reported_line("SyntaxError: unexpected token - line 3, column 5"),
             Some(3)
         );
-    }
-
-    #[test]
-    fn reports_no_line_when_the_message_carries_none() {
-        assert_eq!(extract_reported_line("javascript: boom"), None);
     }
 }

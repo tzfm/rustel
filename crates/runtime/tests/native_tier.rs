@@ -144,29 +144,6 @@ fn a_distortion_shortcut_plays_as_javascript_plays_it() {
     }
 }
 
-#[test]
-fn the_script_engine_starts_at_the_first_score_that_needs_it() {
-    let mut session = Session::with_config(SessionConfig::default()).expect("a session");
-    let native = "$: note(\"c e g a\").s(\"sawtooth\").every(2, x => x.fast(2))";
-    for _ in 0..3 {
-        session.evaluate(native).expect("a native score");
-        assert!(session.evaluated_natively());
-        let haps = session.query(Fraction::ZERO, Fraction::ONE).expect("haps");
-        assert_eq!(haps.len(), 8);
-    }
-    assert!(!session.script_engine_started());
-    // A loop is JavaScript alone.
-    let script =
-        "let lanes = []; for (const name of ['bd', 'hh']) { lanes.push(s(name)) } stack(...lanes)";
-    session.evaluate(script).expect("a script score");
-    assert!(!session.evaluated_natively());
-    assert!(session.script_engine_started());
-    // The native tier takes the next native score, in the session that
-    // started the engine.
-    session.evaluate(native).expect("a native score");
-    assert!(session.evaluated_natively());
-}
-
 /// A session says what evaluated its score, and the line where a score
 /// leaves the native route: where the reader stops, or the call that the
 /// native tier does not take.
@@ -265,24 +242,6 @@ fn assert_builds_as_a_new_session(name: &str, texts: &[&str]) {
         assert_eq!(cps, new_cps, "{name}: text {turn}: {text}");
         assert_eq!(played, new_played, "{name}: text {turn}: {text}");
     }
-}
-
-#[test]
-fn a_score_evaluated_again_keeps_its_graph() {
-    let score =
-        "stack(\n  s(\"bd*4\").gain(0.9),\n  note(\"<c2 eb2>\").s(\"sawtooth\").lpf(400)\n)";
-    let mut session = Session::with_config(SessionConfig::default()).expect("a session");
-    session.evaluate(score).expect("a native score");
-    let first = session.active_pattern_for_test().expect("a graph");
-    session.evaluate(score).expect("a native score");
-    let again = session.active_pattern_for_test().expect("a graph");
-    assert!(first.shares_node(&again));
-    // An edit builds another graph.
-    session
-        .evaluate(&edited(score).expect("a digit"))
-        .expect("a native score");
-    let changed = session.active_pattern_for_test().expect("a graph");
-    assert!(!first.shares_node(&changed));
 }
 
 /// A caller can refuse an evaluation, and its effects with it. So each

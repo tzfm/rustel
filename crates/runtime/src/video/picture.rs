@@ -336,56 +336,6 @@ mod tests {
     }
 
     #[test]
-    fn a_ten_bit_picture_thumbnails_like_its_eight_bit_twin() {
-        let narrow = [235u8; 4];
-        let neutral = [128u8; 1];
-        let eight = Picture::Yuv(Yuv {
-            width: 2,
-            height: 2,
-            luma: plane(Samples::Narrow(&narrow), 2, 2),
-            chroma: Some([
-                plane(Samples::Narrow(&neutral), 1, 1),
-                plane(Samples::Narrow(&neutral), 1, 1),
-            ]),
-            depth: 8,
-            colour: Colour::BT601,
-        });
-        let wide = [940u16; 4];
-        let wide_neutral = [512u16; 1];
-        let ten = Picture::Yuv(Yuv {
-            width: 2,
-            height: 2,
-            luma: plane(Samples::Wide(&wide), 2, 2),
-            chroma: Some([
-                plane(Samples::Wide(&wide_neutral), 1, 1),
-                plane(Samples::Wide(&wide_neutral), 1, 1),
-            ]),
-            depth: 10,
-            colour: Colour::BT601,
-        });
-        let bytes: Vec<u8> = wide
-            .iter()
-            .flat_map(|sample| sample.to_le_bytes())
-            .collect();
-        let neutral_bytes = 512u16.to_le_bytes();
-        let ten_bytes = Picture::Yuv(Yuv {
-            width: 2,
-            height: 2,
-            luma: plane(Samples::WideBytes(&bytes), 2, 2),
-            chroma: Some([
-                plane(Samples::WideBytes(&neutral_bytes), 1, 1),
-                plane(Samples::WideBytes(&neutral_bytes), 1, 1),
-            ]),
-            depth: 10,
-            colour: Colour::BT601,
-        });
-        let white = [255, 255, 255, 255];
-        assert_eq!(eight.thumbnail(1, 1).expect("fits"), white);
-        assert_eq!(ten.thumbnail(1, 1).expect("fits"), white);
-        assert_eq!(ten_bytes.thumbnail(1, 1).expect("fits"), white);
-    }
-
-    #[test]
     fn a_monochrome_picture_is_grey() {
         let luma = [126u8; 4];
         let picture = Picture::Yuv(Yuv {

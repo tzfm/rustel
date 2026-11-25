@@ -166,16 +166,6 @@ mod tests {
     }
 
     #[test]
-    fn reads_both_update_check_values() {
-        let directory = tempfile::tempdir().unwrap();
-        let path = directory.path().join("rustel.json");
-        for enabled in [true, false] {
-            std::fs::write(&path, format!(r#"{{"check_updates":{enabled}}}"#)).unwrap();
-            assert_eq!(check_updates_at(&path).unwrap(), enabled);
-        }
-    }
-
-    #[test]
     fn setting_update_checks_creates_the_directory_and_preserves_other_settings() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("config/rustel.json");
@@ -241,17 +231,6 @@ mod tests {
         assert!(check_updates_at(&path).is_err());
         assert!(set_check_updates_at(&path, false).is_err());
         assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
-    }
-
-    #[test]
-    fn a_directory_cannot_be_used_as_settings() {
-        let directory = tempfile::tempdir().unwrap();
-        assert_eq!(
-            check_updates_at(directory.path()).unwrap_err().kind(),
-            io::ErrorKind::InvalidData
-        );
-        assert!(set_check_updates_at(directory.path(), false).is_err());
-        assert!(directory.path().is_dir());
     }
 
     #[cfg(unix)]

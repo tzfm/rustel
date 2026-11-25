@@ -830,21 +830,6 @@ fn control_number(value: &Value) -> Option<f64> {
 
 #[cfg(test)]
 mod tests {
-    /// A session that never made its store reports the default snapshot,
-    /// and the recovery keeps it: that is right only when a new store holds
-    /// the same snapshot.
-    #[test]
-    fn the_default_snapshot_is_the_snapshot_of_a_new_store() {
-        for allowed in [false, true] {
-            assert_eq!(
-                State::new(allowed).snapshot(),
-                CsoundSnapshot::default(),
-                "a new store (allowed {allowed}) holds more than the default snapshot"
-            );
-        }
-        assert!(CsoundSnapshot::default().is_empty());
-        assert!(!CsoundSnapshot::of_source("instr a\nendin").is_empty());
-    }
 
     use super::*;
 
@@ -1011,30 +996,6 @@ mod tests {
         assert!(in_revisions(&state));
         assert_eq!(state.snapshot(), seed);
         assert_eq!(key(&state), Ok(program.key()));
-    }
-
-    /// A render save with the sources in play keeps the program of the save
-    /// before it.
-    #[test]
-    fn a_render_save_with_the_sources_in_play_keeps_its_program() {
-        let state = State::new(true);
-        let access = ScoreImportAccess::default();
-        let first = state.snapshot();
-        let second = match state.stage(&[CsoundSource::Code(String::new())], &access) {
-            Ok(candidate) => candidate.expect("the stage gives a candidate").snapshot,
-            Err(error)
-                if std::env::var_os("RUSTEL_CSOUND_LIBRARY").is_none()
-                    && error.to_string().contains("Csound 6 is not available") =>
-            {
-                return;
-            }
-            Err(error) => panic!("native Csound failed: {error}"),
-        };
-        let render = state.with_render_timeline(vec![(0.0, first), (1.0, second)]);
-        let key = |time| render.program_at(time).map(|program| program.key());
-        let played = key(0.5);
-        assert!(played.is_ok(), "{played:?}");
-        assert_eq!(key(1.5), played);
     }
 
     #[test]

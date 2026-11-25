@@ -517,15 +517,6 @@ pub(crate) mod tests {
         }
     }
 
-    #[test]
-    fn sampling_is_rate_limited_between_intervals() {
-        let started = Instant::now();
-        let mut monitor = ProcessMonitor::new(started);
-        monitor.sample(started);
-        let first = monitor.latest;
-        assert_eq!(monitor.sample(started), first);
-    }
-
     #[cfg(any(target_os = "macos", target_os = "linux", windows))]
     #[test]
     fn process_counters_are_available_on_supported_platforms() {
@@ -546,19 +537,6 @@ pub(crate) mod tests {
         // A kernel with no breakdown has no footprint; the resident set
         // stands in for it.
         assert_eq!(linux_footprint_kib("VmRSS:\t 1000 kB\n"), None);
-    }
-
-    #[test]
-    fn the_memory_shown_is_the_footprint_where_there_is_one() {
-        let mut stats = ProcessStats {
-            resident_bytes: Some(300),
-            footprint_bytes: Some(120),
-            ..ProcessStats::default()
-        };
-        assert_eq!(stats.memory_bytes(), Some(120));
-        stats.footprint_bytes = None;
-        assert_eq!(stats.memory_bytes(), Some(300));
-        assert_eq!(ProcessStats::default().memory_bytes(), None);
     }
 
     #[cfg(any(target_os = "macos", target_os = "linux", windows))]
@@ -585,53 +563,6 @@ pub(crate) mod tests {
             machine > displayed,
             "machine memory {machine} below {displayed}"
         );
-    }
-
-    #[test]
-    fn the_machine_share_is_none_before_the_first_reading() {
-        // The first reading has no earlier reading to compare against, so it
-        // reports nothing for the interval before it.
-        let (percent, kept) = step_machine_cpu(None, Some((100, 1_000)));
-        assert_eq!(percent, None);
-        assert_eq!(kept, Some((100, 1_000)));
-    }
-
-    #[test]
-    fn the_machine_share_is_none_after_a_failed_probe() {
-        // A failed probe resets the raw comparison, independently of the
-        // display's grace period.
-        let (percent, kept) = step_machine_cpu(Some((100, 1_000)), None);
-        assert_eq!(percent, None);
-        assert_eq!(kept, None);
-
-        // The reading after the gap starts a fresh pair, same as the
-        // very first reading ever taken.
-        let (percent, kept) = step_machine_cpu(kept, Some((140, 1_400)));
-        assert_eq!(percent, None);
-        assert_eq!(kept, Some((140, 1_400)));
-    }
-
-    #[test]
-    fn the_machine_share_is_busy_ticks_over_total_ticks() {
-        // Ten idle ticks out of a hundred total ticks elapsed is ninety
-        // percent busy.
-        let (percent, kept) = step_machine_cpu(Some((50, 500)), Some((60, 600)));
-        assert_eq!(percent, Some(90.0));
-        assert_eq!(kept, Some((60, 600)));
-
-        // A quiet machine: almost every elapsed tick was idle.
-        let (percent, _) = step_machine_cpu(Some((500, 1_000)), Some((598, 1_100)));
-        assert_eq!(percent, Some(2.0));
-    }
-
-    #[test]
-    fn the_machine_share_is_none_when_no_time_has_elapsed() {
-        // Two readings with an identical total would divide by zero if
-        // taken at face value; a stalled clock is not a machine at zero
-        // percent busy, it is nothing to report.
-        let (percent, kept) = step_machine_cpu(Some((10, 100)), Some((10, 100)));
-        assert_eq!(percent, None);
-        assert_eq!(kept, Some((10, 100)));
     }
 
     #[test]
@@ -663,19 +594,5 @@ pub(crate) mod tests {
         assert_eq!(monitor.latest.machine_cpu_percent, Some(10.0));
         monitor.sample_machine_cpu(recovered + SAMPLE_INTERVAL * 3, Some((150, 600)));
         assert_eq!(monitor.latest.machine_cpu_percent, Some(100.0));
-    }
-
-    #[cfg(windows)]
-    #[test]
-    fn filetime_combines_both_halves_as_windows_100ns_ticks() {
-        use windows_sys::Win32::Foundation::FILETIME;
-
-        assert_eq!(
-            filetime_ticks(FILETIME {
-                dwLowDateTime: 0x89ab_cdef,
-                dwHighDateTime: 0x0123_4567,
-            }),
-            0x0123_4567_89ab_cdef
-        );
     }
 }

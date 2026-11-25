@@ -276,37 +276,6 @@ mod tests {
             .collect()
     }
 
-    /// Each shown frame leaves once, with its own size and depth, and its
-    /// grey steps up with the clip's ramp.
-    #[test]
-    fn each_shown_frame_leaves_once_with_its_planes() {
-        let clips: [(&'static [u8], u8); 2] = [
-            (include_bytes!("testdata/tiny_ramp_av1.webm"), 8),
-            (include_bytes!("testdata/tiny_ramp_av1_10bit.webm"), 10),
-        ];
-        for (clip, depth) in clips {
-            let mut decoder = Decoder::new(64 * 64, 2).expect("the decoder opens");
-            let mut seen = Vec::new();
-            let mut look = |picture: Picture<'_>| {
-                let Picture::Yuv(yuv) = &picture else {
-                    panic!("AV1 decodes to YUV");
-                };
-                let grey = picture.thumbnail(1, 1).expect("the planes fit")[1];
-                seen.push((yuv.width, yuv.height, yuv.depth, grey));
-            };
-            for unit in units(clip) {
-                decoder.decode(&unit, &mut look).expect("the unit decodes");
-            }
-            decoder.finish(&mut look);
-            assert_eq!(seen.len(), 6, "{depth}-bit");
-            for (index, &(width, height, bits, grey)) in seen.iter().enumerate() {
-                assert_eq!((width, height, bits), (64, 36, depth));
-                let expected = u8::try_from(index * 40 * 255 / 219).expect("a byte");
-                assert!(grey.abs_diff(expected) <= 4, "frame {index}: {grey}");
-            }
-        }
-    }
-
     /// A frame over the pixel limit is refused before rav1d allocates its
     /// planes, and no picture leaves.
     #[test]

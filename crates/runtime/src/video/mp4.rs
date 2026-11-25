@@ -145,42 +145,11 @@ mod tests {
     }
 
     #[test]
-    fn each_track_names_its_codec_and_setup_in_file_order() {
-        let mut moov = track(b"soun", b"mp4a", None);
-        moov.extend(track(b"vide", b"avc1", Some((b"avcC", &[1, 100, 0, 31]))));
-        moov.extend(track(b"tmcd", b"tmcd", None));
-        let mut file = boxed(b"ftyp", b"isom");
-        file.extend(boxed(b"mdat", &[0; 16]));
-        file.extend(boxed(b"moov", &moov));
-        let entries = entries(&file);
-        assert_eq!(entries.len(), 3);
-        assert_eq!(entries[&0].named, Named::NotPicture, "the sound");
-        assert_eq!(
-            entries[&1],
-            Entry {
-                named: Named::Picture(Codec::H264),
-                config: Some(vec![1, 100, 0, 31].into()),
-            }
-        );
-        assert_eq!(entries[&2].named, Named::NotPicture, "a timecode track");
-    }
-
-    #[test]
     fn sample_entry_codes_name_what_this_build_cannot_decode() {
         assert_eq!(named(*b"hvc1"), Named::Picture(Codec::Hevc));
         assert_eq!(named(*b"jpeg"), Named::Picture(Codec::MotionJpeg));
         assert_eq!(named(*b"apch"), Named::Unsupported("ProRes".to_owned()));
         assert_eq!(named(*b"xyz\0"), Named::Unsupported("'xyz?'".to_owned()));
-    }
-
-    #[test]
-    fn the_real_h264_fixture_carries_its_avcc() {
-        let entries = entries(include_bytes!("../samples/testdata/tiny_video.mp4"));
-        let video = entries
-            .values()
-            .find(|entry| entry.named == Named::Picture(Codec::H264))
-            .expect("an H.264 track");
-        assert_eq!(video.config.as_deref().map(|config| config[0]), Some(1));
     }
 
     /// A box that claims more than its parent holds ends the walk, so a

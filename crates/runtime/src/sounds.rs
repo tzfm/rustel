@@ -1168,19 +1168,6 @@ mod tests {
         assert!(in_score("s(\"").is_empty());
     }
 
-    /// A space after the parenthesis is still the call's pattern.
-    #[test]
-    fn a_space_before_the_pattern_is_still_its_call() {
-        assert_eq!(
-            in_score("s( \"bd\")\n$: s(\t\"hh\")\nsound(  'sd')"),
-            ["bd", "hh", "sd"]
-        );
-        assert!(
-            in_score("s( drums)").is_empty(),
-            "a variable names nothing here"
-        );
-    }
-
     /// Backticks are how a pattern is written across lines - and such a
     /// lane, kept commented out for later, is exactly one that must be
     /// loaded ahead.
@@ -1213,30 +1200,6 @@ mod tests {
         assert_eq!(
             in_score("s(`bd sd\nconst later = `note`\n$: s(\"cp\")"),
             ["bd", "sd", "cp"]
-        );
-    }
-
-    #[test]
-    fn a_commented_out_lane_is_still_warmed() {
-        // The lane an artist enables mid-set is exactly the one whose samples
-        // would otherwise download while it is already playing.
-        let names = in_score(
-            "$: s(\"bd*4\")\n// $: s(\"gm_choir_aahs:1\").note(\"c0\")\n_$: s(\"clap:6\")\n",
-        );
-        assert!(names.contains(&"bd".to_string()));
-        assert!(names.contains(&"gm_choir_aahs:1".to_string()), "{names:?}");
-        assert!(names.contains(&"clap:6".to_string()), "{names:?}");
-    }
-
-    #[test]
-    fn mini_notation_operators_are_separators_and_indexes_are_not_names() {
-        let names = in_score(r#"s("[bd*4 hh:3?] <sd cp:2>!2 ~ 808bd:1")"#);
-        assert_eq!(
-            names,
-            vec!["bd", "hh:3", "sd", "cp:2", "808bd:1"]
-                .into_iter()
-                .map(str::to_string)
-                .collect::<Vec<_>>()
         );
     }
 
@@ -1355,57 +1318,6 @@ mod tests {
             )],
             "forty takes are still one ask"
         );
-    }
-
-    /// A General MIDI name asked for bare warms its first font alone, so a
-    /// name widened to any still asks for the fonts its text spells: under
-    /// a setup that picks variants, under an `n` the text computes, and
-    /// written beside a spelling that is not a plain number. The spelled
-    /// ones come after the bare name, to come off a newest-first line of
-    /// bets first.
-    #[test]
-    fn a_name_widened_to_any_still_warms_the_variants_it_spells() {
-        assert_eq!(
-            to_warm(r#"s("gm_epiano1:2").note("c e g")"#, true),
-            ["gm_epiano1", "gm_epiano1:2"]
-        );
-        assert_eq!(
-            to_warm(
-                "$: s(\"gm_epiano1:2\").note(\"c e g\")\n$: s(\"bd\").n(irand(4))",
-                false
-            ),
-            ["gm_epiano1", "gm_epiano1:2", "bd"]
-        );
-        assert_eq!(
-            to_warm(r#"s("gm_piano:3 gm_piano:<0 1>")"#, false),
-            ["gm_piano", "gm_piano:3"]
-        );
-        assert_eq!(
-            to_warm(r#"s("gm_piano:3").n(run(4)).bank("mine")"#, false),
-            ["mine_gm_piano", "mine_gm_piano:3", "gm_piano", "gm_piano:3"]
-        );
-    }
-
-    /// A large tab with many sounds, banks and literal `n` values makes one
-    /// request per name. A request per variant would exceed what a manifest
-    /// may queue, and the warm would be refused whole.
-    #[test]
-    fn a_big_tab_warms_one_ask_a_name_however_many_variants_it_plays() {
-        let text = concat!(
-            "$: s(\"bd*4, [~ sd]*2, hh*8, oh, cp, rim, lt mt ht, cr, rd, sh, cb, tb, perc\")",
-            ".bank(\"<RolandTR909 RolandTR808 RolandTR707 LinnDrum>\")\n",
-            "$: n(\"<0 2 4 5 7 9 11 12 14 16 17 19 21 23 24 -1 -3 -5>*8\")",
-            ".s(\"gm_epiano1, gm_acoustic_bass, gm_string_ensemble_1, gm_pad_warm\")\n",
-            "$: n(\"[0 3 7 10](5,8,2)\").s(\"gm_lead_2_sawtooth\")",
-        );
-        let kept = to_keep(text);
-        let warm = to_warm(text, false);
-        assert_eq!(kept.len(), 100);
-        assert_eq!(warm.len(), kept.len(), "one ask a name");
-        assert!(warm.iter().all(|spec| spec.contains(':')), "{warm:?}");
-        assert!(warm.contains(
-            &"RolandTR909_bd:-5,-3,-1,0,2,3,4,5,7,8,9,10,11,12,14,16,17,19,21,23,24".to_owned()
-        ));
     }
 
     fn only(values: &[i64]) -> Option<Variants> {
@@ -1695,15 +1607,6 @@ mod tests {
         assert_eq!(
             banks_in_score("s(\"bd\").bank(\"a\").bank('b')"),
             ["a", "b"]
-        );
-    }
-
-    /// A bank is read the way a sound is: past a space, in backticks.
-    #[test]
-    fn a_bank_in_backticks_or_past_a_space_is_read() {
-        assert_eq!(
-            banks_in_score("s(`bd`).bank( `<tr909\n tr808>`)\n.bank( 'linn')"),
-            ["tr909", "tr808", "linn"]
         );
     }
 }

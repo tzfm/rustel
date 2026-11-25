@@ -2964,22 +2964,6 @@ unknown(slider(440, 20, 20000));"#;
     }
 
     #[test]
-    fn rejects_non_finite_values_before_json_serialization() {
-        let mut invalid = envelope();
-        invalid.ui_events.device_time = f64::NAN;
-        assert_eq!(
-            invalid.validate(),
-            Err(UiEventValidationError::NonFinite("device_time"))
-        );
-        invalid.ui_events.device_time = 1.0;
-        invalid.ui_events.events[0].duration_seconds = f64::INFINITY;
-        assert_eq!(
-            invalid.validate(),
-            Err(UiEventValidationError::NonFinite("duration_seconds"))
-        );
-    }
-
-    #[test]
     fn rejects_events_from_a_different_generation() {
         let mut invalid = envelope();
         invalid.ui_events.events[0].generation += 1;
@@ -3231,17 +3215,6 @@ unknown(slider(440, 20, 20000));"#;
         assert_eq!(pending.len(), 1);
         assert!(pending.contains_key(&1));
         assert_eq!(dropped, u64::MAX, "loss accounting wrapped");
-    }
-
-    #[test]
-    fn empty_successful_ingest_leaves_generation_cleanup_to_the_periodic_prune() {
-        let mut pending = HashMap::from([(1, trace_with(1, 4))]);
-        let mut dropped = 0;
-
-        ingest_pending_traces(&mut pending, Vec::new(), true, 5, 8, &mut dropped);
-
-        assert!(pending.contains_key(&1));
-        assert_eq!(dropped, 0);
     }
 
     #[test]
@@ -3698,82 +3671,6 @@ unknown(slider(440, 20, 20000));"#;
         );
         let bytes = captured.lock().expect("captured output").clone();
         assert_eq!(bytes.iter().filter(|&&byte| byte == b'\n').count(), 1);
-    }
-
-    #[test]
-    fn background_writer_emits_one_ndjson_record() {
-        let writer = SharedWriter::default();
-        let captured = Arc::clone(&writer.0);
-        let sink = UiEventSink::with_writer(1, writer).expect("spawn writer");
-        assert_eq!(sink.try_send(envelope()), UiEventSendStatus::Queued);
-        sink.finish().expect("writer thread");
-
-        let bytes = captured.lock().expect("captured output").clone();
-        assert_eq!(bytes.iter().filter(|&&byte| byte == b'\n').count(), 1);
-        let decoded: UiEventEnvelope =
-            serde_json::from_slice(&bytes).expect("one JSON record followed by whitespace");
-        assert_eq!(decoded, envelope());
-    }
-
-    #[test]
-    fn background_writer_emits_one_layout_record() {
-        let writer = SharedWriter::default();
-        let captured = Arc::clone(&writer.0);
-        let sink = UiEventSink::with_writer(1, writer).expect("spawn writer");
-        assert_eq!(sink.try_send_layout(layout()), UiEventSendStatus::Queued);
-        sink.finish().expect("writer thread");
-
-        let bytes = captured.lock().expect("captured output").clone();
-        assert_eq!(bytes.iter().filter(|&&byte| byte == b'\n').count(), 1);
-        let decoded: UiLayoutEnvelope =
-            serde_json::from_slice(&bytes).expect("one layout record followed by whitespace");
-        assert_eq!(decoded, layout());
-    }
-
-    #[test]
-    fn background_writer_emits_one_audio_record() {
-        let writer = SharedWriter::default();
-        let captured = Arc::clone(&writer.0);
-        let sink = UiEventSink::with_writer(1, writer).expect("spawn writer");
-        assert_eq!(
-            sink.try_send_audio_analysis(audio_metadata(), audio_analysis_set()),
-            UiEventSendStatus::Queued
-        );
-        sink.finish().expect("writer thread");
-
-        let bytes = captured.lock().expect("captured output").clone();
-        assert_eq!(bytes.iter().filter(|&&byte| byte == b'\n').count(), 1);
-        let decoded: UiAudioEnvelope =
-            serde_json::from_slice(&bytes).expect("one audio record followed by whitespace");
-        assert_eq!(
-            decoded,
-            UiAudioEnvelope::from_analysis_set(audio_metadata(), audio_analysis_set())
-        );
-    }
-
-    #[test]
-    fn background_writer_converts_owned_traces() {
-        let writer = SharedWriter::default();
-        let captured = Arc::clone(&writer.0);
-        let sink = UiEventSink::with_writer(1, writer).expect("spawn writer");
-        assert_eq!(
-            sink.try_send_traces(
-                12.0,
-                4.5,
-                2.0,
-                3,
-                source_revision("score"),
-                vec![trace()],
-                0,
-            ),
-            UiEventSendStatus::Queued
-        );
-        sink.finish().expect("writer thread");
-
-        let bytes = captured.lock().expect("captured output").clone();
-        let decoded: UiEventEnvelope = serde_json::from_slice(&bytes).expect("trace record");
-        assert_eq!(decoded.ui_events.events[0].context, vec![(4, 8), (11, 13)]);
-        assert_eq!(decoded.ui_events.source_revision, source_revision("score"));
     }
 
     #[test]

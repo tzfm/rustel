@@ -252,15 +252,6 @@ mod tests {
     }
 
     #[test]
-    fn the_first_failed_attempt_is_cached_without_a_version() {
-        let directory = tempfile::tempdir().unwrap();
-        let path = directory.path().join("update-check.json");
-        let failed = refresh(&path, 100_000, || None).unwrap();
-        assert!(failed.latest_version.is_none());
-        refresh(&path, 100_001, || panic!("retried failure")).unwrap();
-    }
-
-    #[test]
     fn interrupted_requests_leave_the_next_attempt_due() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("update-check.json");

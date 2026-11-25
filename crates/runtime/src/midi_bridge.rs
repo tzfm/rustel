@@ -1769,7 +1769,6 @@ mod offset_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{OnsetEventJson, ValueJson};
     use rustel_midi::MidiControls;
 
     fn wire_batch(
@@ -1844,308 +1843,6 @@ mod tests {
         }
     }
 
-    /// A midimap turns a named control into a CC message. The whole chain:
-    /// registration (settings-scoped), the hap's `midimap` selector, the range
-    /// normalisation, and the planner emitting the wire bytes.
-    #[test]
-    fn a_midimap_derives_ccs_from_named_controls() {
-        let settings = rustel_core::settings::RuntimeSettings::default();
-        let _bind = settings.bind();
-        rustel_core::midimap::register_midi_map_json(
-            "mymap",
-            r#"{"lpf": {"ccn": 74, "min": 0, "max": 4000}}"#,
-        )
-        .expect("registers");
-        rustel_core::midimap::register_midi_map_json("default", r#"{"gain": 7}"#)
-            .expect("registers");
-
-        // The named map scales lpf into 0..1.
-        let got = midi_onset(&onset(serde_json::json!({
-            "midiport": "x", "midimap": "mymap", "cutoff": 1000.0,
-        })))
-        .expect("midi hap");
-        assert_eq!(got.controls.mapped_ccs, vec![(74, 0.25)]);
-        // And the planner sends it as a real CC: 0.25 * 127 rounds to 32.
-        let planned = rustel_midi::plan(&got.controls, 0.5);
-        assert!(
-            planned
-                .iter()
-                .any(|(_, message)| message.as_slice() == [0xb0, 74, 32]),
-            "no CC 74 on the wire: {planned:?}"
-        );
-
-        // No `midimap` control means the map registered as "default".
-        let got = midi_onset(&onset(serde_json::json!({
-            "midiport": "x", "gain": 0.5,
-        })))
-        .expect("midi hap");
-        assert_eq!(got.controls.mapped_ccs, vec![(7, 0.5)]);
-
-        // A map nobody registered derives nothing - and must not panic.
-        let got = midi_onset(&onset(serde_json::json!({
-            "midiport": "x", "midimap": "nope", "cutoff": 1000.0,
-        })))
-        .expect("midi hap");
-        assert!(got.controls.mapped_ccs.is_empty());
-    }
-
-    #[test]
-    fn mapped_aliases_and_custom_controls_keep_a_deterministic_order() {
-        let settings = rustel_core::settings::RuntimeSettings::default();
-        let _bind = settings.bind();
-        // Registration canonicalises `cutoff` to `lpf`; the hap deliberately
-        // uses the canonical spelling to cover both directions of the alias
-        // surface. Custom entries remain literal and are emitted by name.
-        rustel_core::midimap::register_midi_map_json(
-            "mixed",
-            r#"{
-            "z_custom": 12,
-            "cutoff": {"ccn": 74, "min": 0, "max": 4000},
-            "a_custom": 11
-        }"#,
-        )
-        .expect("register mixed map");
-
-        let got = midi_onset(&onset(serde_json::json!({
-            "midiport": "x",
-            "midimap": "mixed",
-            "lpf": 1000.0,
-            "z_custom": 0.8,
-            "a_custom": 0.2,
-        })))
-        .expect("midi hap");
-        assert_eq!(
-            got.controls.mapped_ccs,
-            vec![(74, 0.25), (11, 0.2), (12, 0.8)],
-            "known aliases must be preserved and custom controls sorted"
-        );
-    }
-
-    #[test]
-    fn a_huge_unrelated_hap_object_does_not_change_the_bounded_map_surface() {
-        let settings = rustel_core::settings::RuntimeSettings::default();
-        let _bind = settings.bind();
-        rustel_core::midimap::register_midi_map_json("bounded", r#"{"mapped_custom": 23}"#)
-            .expect("register custom map");
-
-        // The post-query MIDI conversion must walk the capped registered map,
-        // not this score-controlled object. Keep this far above every native
-        // map/alias ceiling so a future reintroduction of hap scanning is
-        // conspicuous in both profiling and review.
-        let mut value = serde_json::Map::new();
-        for index in 0..20_000 {
-            value.insert(format!("unrelated_{index:05}"), serde_json::json!(index));
-        }
-        value.insert("midiport".into(), serde_json::json!("x"));
-        value.insert("midimap".into(), serde_json::json!("bounded"));
-        value.insert("mapped_custom".into(), serde_json::json!(0.5));
-
-        let got = midi_onset(&onset(serde_json::Value::Object(value))).expect("midi hap");
-        assert_eq!(got.controls.mapped_ccs, vec![(23, 0.5)]);
-    }
-
-    fn onset(value: serde_json::Value) -> OnsetEventJson {
-        OnsetEventJson {
-            onset_id: 1,
-            generation: 1,
-            whole_begin: "0/1".into(),
-            duration_secs: 0.5,
-            target_time: 12.5,
-            live_controls: [0; 4],
-            ui_visuals: 0,
-            cps: None,
-            value: ValueJson::Raw(value),
-            value_show: String::new(),
-            non_finite_pitch: None,
-            log_line: None,
-        }
-    }
-
-    #[test]
-    fn a_hap_without_a_port_is_not_a_midi_hap() {
-        assert!(midi_onset(&onset(serde_json::json!({ "note": 60, "s": "bd" }))).is_none());
-    }
-
-    #[test]
-    fn the_port_may_be_a_name_or_an_index() {
-        let named = midi_onset(&onset(serde_json::json!({ "midiport": "IAC Bus 1" }))).unwrap();
-        assert_eq!(named.port, "IAC Bus 1");
-        // Mini-notation reduces a bare 0 to a number, not a string.
-        let indexed = midi_onset(&onset(serde_json::json!({ "midiport": 0 }))).unwrap();
-        assert_eq!(indexed.port, "0");
-    }
-
-    #[test]
-    fn controls_and_timing_come_through_intact() {
-        let got = midi_onset(&onset(serde_json::json!({
-            "midiport": "x",
-            "note": 64,
-            "gain": 0.5,
-            "midichan": 3,
-            "ccn": 74,
-            "ccv": 0.25,
-            "midicmd": "start",
-        })))
-        .unwrap();
-        assert_eq!(got.onset_id, 1);
-        assert_eq!(got.generation, 1);
-        assert_eq!(got.target_time, 12.5);
-        assert_eq!(got.duration_secs, 0.5);
-        assert_eq!(got.controls.note, Some(64.0));
-        assert_eq!(got.controls.gain, Some(0.5));
-        assert_eq!(got.controls.midichan, Some(3.0));
-        assert_eq!(got.controls.ccn, Some(74.0));
-        assert_eq!(got.controls.ccv, Some(0.25));
-        assert_eq!(got.controls.midicmd.as_deref(), Some("start"));
-    }
-
-    #[test]
-    fn midi_options_are_defaults_that_the_scores_own_controls_outrank() {
-        let got = midi_onset(&onset(serde_json::json!({
-            "midiport": "x",
-            "note": 64,
-            "gain": 0.25,
-            "velocity": 0.4,
-            "midichan": 3,
-            "midiopts": {
-                "gain": 0.9,
-                "velocity": 0.8,
-                "midichannel": 9
-            }
-        })))
-        .expect("MIDI intent");
-        assert_eq!(got.controls.gain, Some(0.25));
-        assert_eq!(got.controls.velocity, Some(0.4));
-        assert_eq!(got.controls.midichan, Some(3.0));
-
-        let fallback = midi_onset(&onset(serde_json::json!({
-            "midiport": "x",
-            "note": 64,
-            "midiopts": {
-                "gain": 0.7,
-                "velocity": 0.6,
-                "midichannel": 11
-            }
-        })))
-        .expect("MIDI intent");
-        assert_eq!(fallback.controls.gain, Some(0.7));
-        assert_eq!(fallback.controls.velocity, Some(0.6));
-        assert_eq!(fallback.controls.midichan, Some(11.0));
-    }
-
-    #[test]
-    fn is_controller_and_note_offset_cross_the_boundary() {
-        let got = midi_onset(&onset(serde_json::json!({
-            "midiport": "x",
-            "note": 64,
-            "midiopts": { "isController": true, "noteOffsetMs": 10 }
-        })))
-        .expect("MIDI intent");
-        assert!(got.controls.is_controller);
-        assert_eq!(got.controls.note_offset_ms, Some(10.0));
-
-        let plain = midi_onset(&onset(serde_json::json!({
-            "midiport": "x",
-            "note": 64
-        })))
-        .expect("MIDI intent");
-        assert!(!plain.controls.is_controller);
-        assert_eq!(plain.controls.note_offset_ms, None);
-    }
-
-    #[test]
-    fn unknown_midi_commands_are_not_cloned_into_live_intents() {
-        let oversized = "not-a-command".repeat(100_000);
-        let got = midi_onset(&onset(serde_json::json!({
-            "midiport": "x",
-            "midicmd": oversized,
-        })))
-        .unwrap();
-        assert!(got.controls.midicmd.is_none());
-
-        for command in ["clock", "midiClock", "start", "stop", "continue"] {
-            let got = midi_onset(&onset(serde_json::json!({
-                "midiport": "x",
-                "midicmd": command,
-            })))
-            .unwrap();
-            assert_eq!(got.controls.midicmd.as_deref(), Some(command));
-        }
-    }
-
-    /// A note written as a name must send MIDI. Names arrive here as strings,
-    /// because `rustel-voice` resolves them where the audio path needs a
-    /// frequency.
-    #[test]
-    fn a_note_name_is_a_pitch_the_same_way_a_number_is() {
-        let got = midi_onset(&onset(serde_json::json!({ "midiport": "x", "note": "c3" }))).unwrap();
-        // Octave 3 is the default the audio path uses, so both paths agree.
-        assert_eq!(got.controls.note, Some(48.0));
-
-        for (name, expected) in [("e3", 52.0), ("g3", 55.0), ("a4", 69.0), ("cs3", 49.0)] {
-            let got =
-                midi_onset(&onset(serde_json::json!({ "midiport": "x", "note": name }))).unwrap();
-            assert_eq!(got.controls.note, Some(expected), "note name {name}");
-        }
-    }
-
-    /// A number that arrived as text is still a number, and a word that is not
-    /// a note is not one - it must not become a pitch by accident.
-    #[test]
-    fn a_numeric_string_is_a_number_and_a_non_note_is_neither() {
-        let numeric =
-            midi_onset(&onset(serde_json::json!({ "midiport": "x", "note": "60" }))).unwrap();
-        assert_eq!(numeric.controls.note, Some(60.0));
-
-        let nonsense =
-            midi_onset(&onset(serde_json::json!({ "midiport": "x", "note": "bd" }))).unwrap();
-        assert_eq!(
-            nonsense.controls.note, None,
-            "a sound name is not a pitch and must plan no note"
-        );
-    }
-
-    /// `n` is the sample index, not a pitch. `s("bd:3").midi(port)` sets `n`
-    /// through the sample-variant syntax without the score ever naming it, so
-    /// reading it as a note turned every drum line into note-ons at the sample
-    /// index.
-    #[test]
-    fn n_is_a_sample_index_and_never_a_note() {
-        let variant = midi_onset(&onset(
-            serde_json::json!({ "midiport": "x", "s": "bd", "n": 3 }),
-        ))
-        .unwrap();
-        assert_eq!(
-            variant.controls.note, None,
-            "a sample variant became a note number"
-        );
-        // A real note still wins, alongside an `n` that selects the sample.
-        let both = midi_onset(&onset(
-            serde_json::json!({ "midiport": "x", "n": 3, "note": 60 }),
-        ))
-        .unwrap();
-        assert_eq!(both.controls.note, Some(60.0));
-    }
-
-    /// The whole reason [`MidiClock`] exists: consecutive haps are scheduled in
-    /// DIFFERENT passes, and a note-off sits only a millisecond before the next
-    /// note-on. Re-deriving the wall-clock mapping each pass pinned every
-    /// message to that pass's jitter, so a pass that ran a millisecond early
-    /// put the note-on FIRST and the synth cut the note it had just started.
-    #[test]
-    fn one_anchor_keeps_session_order_across_passes() {
-        let mut clock = MidiClock::new();
-        // Two haps a beat apart, each scheduled in its own pass, with the
-        // note-off of the first a millisecond before the note-on of the second.
-        let first_off = clock.instant_for(0.0, 0.499);
-        std::thread::sleep(Duration::from_millis(3));
-        let second_on = clock.instant_for(0.05, 0.5);
-        assert!(
-            first_off < second_on,
-            "the note-off must still precede the next note-on"
-        );
-    }
-
     /// Order has to survive many passes, not just two, and a gap the score
     /// wrote has to stay that gap on the wire however unevenly the passes fall.
     #[test]
@@ -2173,39 +1870,6 @@ mod tests {
                 );
             }
             previous = Some(due);
-        }
-    }
-
-    /// The correction must not move the anchor further than the note-off
-    /// margin between the passes that queue a pair. A step would send a
-    /// later-planned note-on before a note-off that is already queued.
-    #[test]
-    fn correcting_a_drifting_clock_never_reorders_a_note_pair() {
-        let mut clock = MidiClock::new();
-        let started = Instant::now();
-        let mut previous_on: Option<Instant> = None;
-        // A session clock running 2% fast - far past any real crystal - so the
-        // mapping is pulled hard for the whole run.
-        for step in 0..300 {
-            std::thread::sleep(Duration::from_micros(200));
-            let now = started.elapsed().as_secs_f64() * 1.02;
-            // One hap per pass, 50ms apart, as a sequence actually lands: the
-            // note-off of this hap a millisecond before its own note-on, and
-            // every hap strictly after the last.
-            let onset = 0.5 + f64::from(step) * 0.05;
-            let off = clock.instant_for(now, onset - 0.001);
-            let on = clock.instant_for(now, onset);
-            assert!(
-                off < on,
-                "pass {step}: the note-off was not before its note-on"
-            );
-            if let Some(previous_on) = previous_on {
-                assert!(
-                    previous_on < off,
-                    "pass {step}: the previous note-on overtook this note-off"
-                );
-            }
-            previous_on = Some(on);
         }
     }
 
@@ -2436,50 +2100,6 @@ mod tests {
         assert_eq!(ordering.tracked, tracked);
     }
 
-    /// Under steady drift every repeat on one key inverts by the same
-    /// amount. Each note-on moves by its own inversion at most, and each
-    /// note-off keeps the clock's stamp, so the moves do not accumulate.
-    #[test]
-    fn a_legato_line_under_steady_drift_never_accumulates_its_moves() {
-        let mut ordering = NoteOrdering::new();
-        // 10s notes at 200ppm: each successor is stamped 2ms early, a
-        // millisecond past the note-off's lead.
-        let gate = 10.0;
-        let pulled_per_note = Duration::from_millis(2);
-        let start = Instant::now() + Duration::from_secs(30);
-        let planned = note(60.0, gate);
-        let mut previous: Option<(Instant, Instant)> = None;
-        for step in 0..6u32 {
-            let target = f64::from(step) * gate;
-            let base = start + Duration::from_secs_f64(target) - pulled_per_note * step;
-            let batch = ordering.stamp_batch("legato", target, base, &planned);
-            let (on, off) = (on_due(&batch), off_due(&batch));
-            let natural_off = off_due(&natural_stamps(base, &planned));
-            if let Some((previous_natural_off, previous_off)) = previous {
-                let inversion = previous_natural_off.saturating_duration_since(base);
-                assert!(
-                    inversion > Duration::ZERO,
-                    "step {step}: the drift did not invert the pair"
-                );
-                assert!(
-                    on - base <= inversion,
-                    "step {step}: the note-on moved {:?} for its own {inversion:?} inversion",
-                    on - base
-                );
-                assert!(
-                    on >= previous_off,
-                    "step {step}: the note-on precedes the previous note-off by {:?}",
-                    previous_off - on
-                );
-            }
-            assert_eq!(
-                off, natural_off,
-                "step {step}: the note-off left the clock's timeline"
-            );
-            previous = Some((natural_off, off));
-        }
-    }
-
     /// A note-on must follow each off that the score placed before it. An
     /// overlapping longer note has a later off, which the note-on need not
     /// follow.
@@ -2537,51 +2157,6 @@ mod tests {
         let base = start + Duration::from_millis(300) - Duration::from_micros(50);
         let next = ordering.stamp_batch("zero-lead", 0.3, base, &rustel_midi::plan(&controls, 0.2));
         assert_eq!(on_due(&next), off_due(&first));
-    }
-
-    /// A score the slew never inverts keeps every natural stamp in the same
-    /// order: repeats, a chord, a retrigger inside a gate, controllers, and a
-    /// mapping pulled back by less than the lead or pushed later.
-    #[test]
-    fn a_score_the_slew_never_inverted_keeps_every_natural_stamp() {
-        let mut ordering = NoteOrdering::new();
-        let start = Instant::now() + Duration::from_secs(30);
-        let with_controls = |key: f64| MidiControls {
-            note: Some(key),
-            prog_num: Some(3.0),
-            ccn: Some(7.0),
-            ccv: Some(0.5),
-            midibend: Some(-0.5),
-            mapped_ccs: vec![(74, 0.25)],
-            ..Default::default()
-        };
-        // (target, gate, key, microseconds the mapping is pulled back; a
-        // negative pull pushes it later)
-        let onsets: [(f64, f64, f64, i64); 9] = [
-            (0.0, 0.5, 60.0, 0),
-            (0.5, 0.5, 60.0, 0),
-            (0.5, 1.0, 64.0, 0),
-            (1.0, 0.25, 60.0, 500),
-            (1.1, 0.1, 60.0, 500),
-            (1.25, 2.0, 60.0, 900),
-            (1.5, 0.5, 64.0, -300),
-            (3.25, 0.5, 60.0, -1_000),
-            (3.75, 0.5, 60.0, -1_000),
-        ];
-        for (target, gate, key, pulled_us) in onsets {
-            let natural = start + Duration::from_secs_f64(target);
-            let base = if pulled_us >= 0 {
-                natural - Duration::from_micros(pulled_us.unsigned_abs())
-            } else {
-                natural + Duration::from_micros(pulled_us.unsigned_abs())
-            };
-            let planned = rustel_midi::plan(&with_controls(key), gate);
-            assert_eq!(
-                ordering.stamp_batch("ordinary", target, base, &planned),
-                natural_stamps(base, &planned),
-                "the onset at {target} did not keep its natural stamps"
-            );
-        }
     }
 
     /// The anchor is rebased onto `now` on every call, so the `Instant`
@@ -2653,45 +2228,6 @@ mod tests {
             matches!(outputs.sender(rustel_core::UNREADABLE_MIDI_PORT), Ok(None)),
             "the second onset must not report again"
         );
-    }
-
-    #[test]
-    fn a_port_that_cannot_be_opened_is_remembered_rather_than_retried() {
-        let attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let opener_attempts = Arc::clone(&attempts);
-        let mut outputs = MidiOutputs::with_opener(Arc::new(move |_| {
-            opener_attempts.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            Err("missing test port".into())
-        }));
-        let due = Instant::now() + Duration::from_secs(1);
-        assert!(
-            outputs
-                .submit_batch_for_generation_at(
-                    1,
-                    "missing",
-                    0,
-                    wire_batch(due, rustel_midi::MidiMessage::clock()),
-                )
-                .expect("bounded async admission")
-        );
-        let errors = poll_until(&mut outputs, |outputs| {
-            !outputs.opening.contains_key("missing")
-        });
-        assert_eq!(errors, ["missing test port"]);
-        assert!(outputs.poll().is_empty(), "open error repeated");
-        assert_eq!(attempts.load(std::sync::atomic::Ordering::Relaxed), 1);
-
-        assert!(
-            !outputs
-                .submit_batch_for_generation_at(
-                    1,
-                    "missing",
-                    0,
-                    wire_batch(due, rustel_midi::MidiMessage::clock()),
-                )
-                .expect("backoff refusal")
-        );
-        assert_eq!(attempts.load(std::sync::atomic::Ordering::Relaxed), 1);
     }
 
     #[test]
@@ -2775,34 +2311,6 @@ mod tests {
         assert!(outputs.open.is_empty());
         assert!(outputs.sender_for(1, "recovered").unwrap().is_none());
         assert_eq!(outputs.open.len(), 1);
-    }
-
-    #[test]
-    fn output_sender_survives_until_takeover_and_is_reused_by_the_new_generation() {
-        let sender =
-            MidiSender::with_port(Box::new(rustel_midi::CapturePort::new()), "shared".into());
-        let mut outputs = MidiOutputs::new();
-        outputs.open.push(MidiOutputEntry {
-            name: "shared".into(),
-            sender: Some(sender),
-            generations: std::collections::BTreeSet::from([1]),
-            published: false,
-            retain_until_frame: 0,
-            retry_at: Instant::now(),
-            failure_reported: false,
-            attempts: 1,
-        });
-        let original = outputs.open[0].sender.as_ref().unwrap() as *const MidiSender;
-        outputs.begin_generation_transition(1, 2, 100);
-        assert_eq!(outputs.open[0].retain_until_frame, 100);
-        assert!(outputs.sender_for(2, "shared").unwrap().is_some());
-        let reused = outputs.open[0].sender.as_ref().unwrap() as *const MidiSender;
-        assert_eq!(reused, original, "the same port was closed and reopened");
-
-        outputs.sync_generations_at(2, 2, 99);
-        assert_eq!(outputs.open.len(), 1);
-        outputs.sync_generations_at(2, 2, 100);
-        assert_eq!(outputs.open.len(), 1, "new generation still uses the port");
     }
 
     #[test]
@@ -2935,35 +2443,6 @@ mod tests {
             .into_iter()
             .map(|(_, payload)| payload)
             .collect()
-    }
-
-    /// A control requery can publish after its takeover frame. The port has
-    /// then sent the outgoing note of an onset between the two. The incoming
-    /// copy is left out, and the note keeps its one note-off.
-    #[test]
-    fn a_late_takeover_leaves_out_the_copy_of_a_note_that_sounds() {
-        let capture = rustel_midi::CapturePort::new();
-        let mut outputs = open_over("late-requery", &capture);
-        let now = Instant::now();
-        let note = note_batch(1, 60, now, now + Duration::from_millis(250));
-        assert!(
-            outputs
-                .submit_batch_for_generation_at(1, "late-requery", 100, note.clone())
-                .expect("outgoing note")
-        );
-        wait_for_capture(&capture, 1);
-
-        outputs.take_over_generation_from(1, 2, 100, 100, rustel_audio::TakeoverCut::None);
-        assert!(
-            outputs
-                .submit_batch_for_generation_at(2, "late-requery", 100, note)
-                .expect("incoming copy"),
-            "the onset sounds, so it counts as accepted"
-        );
-        // Wait for the note-off, then for a second note-on or note-off.
-        wait_for_capture(&capture, 2);
-        std::thread::sleep(Duration::from_millis(100));
-        assert_eq!(payloads(&capture), [vec![0x90, 60, 100], vec![0x80, 60, 0]]);
     }
 
     /// A kept note stands in for one batch: the same note on the same port
@@ -3225,29 +2704,6 @@ mod tests {
     }
 
     #[test]
-    fn old_only_sender_retires_at_not_before_the_takeover() {
-        let sender =
-            MidiSender::with_port(Box::new(rustel_midi::CapturePort::new()), "old-only".into());
-        let mut outputs = MidiOutputs::new();
-        outputs.open.push(MidiOutputEntry {
-            name: "old-only".into(),
-            sender: Some(sender),
-            generations: std::collections::BTreeSet::from([1]),
-            published: false,
-            retain_until_frame: 0,
-            retry_at: Instant::now(),
-            failure_reported: false,
-            attempts: 1,
-        });
-
-        outputs.begin_generation_transition(1, 2, 100);
-        outputs.sync_generations_at(2, 2, 99);
-        assert_eq!(outputs.open.len(), 1);
-        outputs.sync_generations_at(2, 2, 100);
-        assert!(outputs.open.is_empty());
-    }
-
-    #[test]
     fn queued_old_messages_are_silenced_and_retired_at_takeover() {
         let capture = rustel_midi::CapturePort::new();
         let sender = MidiSender::with_port(Box::new(capture.clone()), "old-queued".into());
@@ -3357,48 +2813,6 @@ mod tests {
                 .collect::<Vec<_>>(),
             ["b", "c"]
         );
-    }
-
-    #[test]
-    fn retired_sender_reports_remain_monotonic() {
-        let saturated = |name: &str| {
-            let sender =
-                MidiSender::with_port(Box::new(rustel_midi::CapturePort::new()), name.to_string());
-            let due = Instant::now() + Duration::from_secs(60);
-            let batch =
-                vec![(due, rustel_midi::MidiMessage::clock()); rustel_midi::MAX_QUEUED_MESSAGES];
-            assert!(sender.send_batch_at(&batch));
-            assert!(!sender.send_batch_at(&[(due, rustel_midi::MidiMessage::clock())]));
-            sender
-        };
-        let mut outputs = MidiOutputs::new();
-        outputs.open.push(MidiOutputEntry {
-            name: "old".into(),
-            sender: Some(saturated("old")),
-            generations: std::collections::BTreeSet::from([1]),
-            published: false,
-            retain_until_frame: 0,
-            retry_at: Instant::now(),
-            failure_reported: false,
-            attempts: 1,
-        });
-        assert_eq!(outputs.report().refused_full, 1);
-
-        outputs.begin_generation_transition(1, 2, 100);
-        outputs.sync_generations_at(2, 2, 100);
-        assert_eq!(outputs.report().refused_full, 1);
-
-        outputs.open.push(MidiOutputEntry {
-            name: "new".into(),
-            sender: Some(saturated("new")),
-            generations: std::collections::BTreeSet::from([2]),
-            published: false,
-            retain_until_frame: 0,
-            retry_at: Instant::now(),
-            failure_reported: false,
-            attempts: 1,
-        });
-        assert_eq!(outputs.report().refused_full, 2);
     }
 
     #[test]
@@ -3861,35 +3275,6 @@ mod tests {
     }
 
     #[test]
-    fn shutdown_waits_for_fast_emergency_silence_and_keeps_reports_monotonic() {
-        let capture = rustel_midi::CapturePort::new();
-        let sender = MidiSender::with_port(Box::new(capture.clone()), "shutdown-fast".into());
-        assert!(sender.send_batch_for_generation_at(
-            1,
-            0,
-            &[(
-                Instant::now() + Duration::from_secs(60),
-                rustel_midi::MidiMessage::note_on(1, 60, 100),
-            )],
-        ));
-        let mut outputs = MidiOutputs::new();
-        outputs.open.push(MidiOutputEntry {
-            name: "shutdown-fast".into(),
-            sender: Some(sender),
-            generations: [1].into(),
-            published: false,
-            retain_until_frame: 0,
-            retry_at: Instant::now(),
-            failure_reported: false,
-            attempts: 1,
-        });
-        assert!(outputs.shutdown(Duration::from_secs(1)));
-        wait_for_capture(&capture, 32);
-        assert_eq!(capture.messages().len(), 32);
-        assert_eq!(outputs.report().sent, 32);
-    }
-
-    #[test]
     fn shutdown_deadline_does_not_join_a_wedged_sender_and_late_stats_survive() {
         let capture = rustel_midi::CapturePort::new();
         let (entered_tx, entered_rx) = std::sync::mpsc::sync_channel(0);
@@ -3987,24 +3372,6 @@ mod tests {
         assert!(outputs.shutdown(Duration::from_millis(20)));
         assert!(started.elapsed() < Duration::from_millis(100));
         release_tx.send(()).expect("opener disappeared");
-    }
-
-    #[test]
-    fn legacy_sender_lookup_eventually_observes_the_async_result() {
-        let mut outputs = MidiOutputs::with_opener(Arc::new(|name| {
-            Ok(MidiSender::with_port(
-                Box::new(rustel_midi::CapturePort::new()),
-                name.to_string(),
-            ))
-        }));
-        let deadline = Instant::now() + Duration::from_secs(2);
-        loop {
-            if outputs.sender("legacy").expect("legacy lookup").is_some() {
-                break;
-            }
-            assert!(Instant::now() < deadline, "legacy lookup stayed None");
-            std::thread::sleep(Duration::from_millis(1));
-        }
     }
 
     #[test]

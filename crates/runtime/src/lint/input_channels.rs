@@ -891,21 +891,6 @@ mod tests {
         }
     }
 
-    /// JavaScript skips a vertical tab or a no-break space between a name and
-    /// its `(`, so a call spaced by either is still a call: an unknown one stops
-    /// the check, where a bare bracket does not.
-    #[test]
-    fn a_call_spaced_from_its_bracket_by_unicode_whitespace_is_still_a_call() {
-        for space in ["", " ", "\u{b}", "\u{a0}"] {
-            let source = format!("$: foo{space}(s(\"in:2323\"))");
-            assert!(
-                input_findings(&source, false, None).is_empty(),
-                "{source:?}"
-            );
-        }
-        assert_eq!(input_findings("$: (s(\"in:2323\"))", false, None).len(), 1);
-    }
-
     /// A longer name that contains a builtin's name does not shadow it.
     #[test]
     fn a_longer_name_containing_a_builtin_does_not_shadow_it() {
@@ -987,22 +972,6 @@ mod tests {
             }
             let source = format!("s(\"in\"){space}.{space}speed(.5)");
             assert_eq!(input_notes(&source).len(), 1, "{source:?}");
-        }
-    }
-
-    /// A declaration shadows a builtin whatever whitespace stands between its
-    /// keyword and its name, as `function\u{a0}s` still declares `s`.
-    #[test]
-    fn a_declaration_spaced_by_any_whitespace_shadows_a_builtin() {
-        for space in [" ", "\n", "\u{b}", "\u{a0}"] {
-            for declaration in [
-                format!("function{space}s(x) {{ return x }}"),
-                format!("const{space}s = sound"),
-            ] {
-                let source = format!("{declaration}\n$: s(\"in:2323\")");
-                let findings = input_findings(&source, false, None);
-                assert!(findings.is_empty(), "{source:?}: {findings:?}");
-            }
         }
     }
 

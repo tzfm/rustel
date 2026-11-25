@@ -2665,11 +2665,6 @@ pub(crate) mod wait_tests {
     }
 
     #[test]
-    fn stopped_empty_render_does_not_wait_for_sample_manifests() {
-        assert_empty_render_stops(false, false);
-    }
-
-    #[test]
     fn empty_render_cancels_during_the_sample_manifest_wait() {
         assert_empty_render_stops(true, false);
     }

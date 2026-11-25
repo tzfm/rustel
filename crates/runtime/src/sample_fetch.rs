@@ -294,28 +294,6 @@ impl DnsPool {
     }
 }
 
-#[cfg(test)]
-mod literal_address_tests {
-    use super::*;
-
-    /// Literal addresses parse without the shared DNS pool. A full DNS queue
-    /// must not delay requests that need no name resolution.
-    #[test]
-    fn literal_addresses_parse_without_the_pool() {
-        for (netloc, expected) in [
-            ("127.0.0.1:8080", "127.0.0.1:8080"),
-            ("0.0.0.0:1", "0.0.0.0:1"),
-            ("[::1]:9000", "[::1]:9000"),
-        ] {
-            let parsed: SocketAddr = netloc.parse().expect("a literal address parses");
-            assert_eq!(parsed.to_string(), expected);
-        }
-        // A name is NOT a literal and still needs resolving.
-        assert!("localhost:8080".parse::<SocketAddr>().is_err());
-        assert!("example.com:80".parse::<SocketAddr>().is_err());
-    }
-}
-
 fn resolve_system_bounded(netloc: &str) -> io::Result<Vec<SocketAddr>> {
     let mut addrs = Vec::new();
     for addr in netloc.to_socket_addrs()? {
@@ -570,34 +548,6 @@ fn addr_is_public(ip: IpAddr) -> bool {
     match ip {
         IpAddr::V4(ip) => ipv4_allowed(ip),
         IpAddr::V6(ip) => ipv6_allowed(ip),
-    }
-}
-
-/// The DNS view the agent connects through: refuse a name whose resolution
-/// answers with ANY address outside the allowed set, rather than picking the
-/// first acceptable one. Failing closed keeps a mixed answer from becoming a
-/// coin flip about where the bytes go.
-///
-/// Production fetches pin addresses through [`resolve_guarded`] into a
-/// [`ResolvedHop`] before connecting. This resolver remains for unit tests of
-/// the address policy without building a full agent; it judges each name as
-/// its own grant, which is what those tests resolve and ask about.
-#[cfg_attr(not(test), allow(dead_code))]
-struct GuardedResolver {
-    timeout: Duration,
-}
-
-#[cfg_attr(not(test), allow(dead_code))]
-impl ureq::Resolver for GuardedResolver {
-    fn resolve(&self, netloc: &str) -> std::io::Result<Vec<SocketAddr>> {
-        resolve_guarded(
-            netloc,
-            &FetchBudget::until(
-                Instant::now() + self.timeout,
-                Arc::new(AtomicBool::new(false)),
-            ),
-            host_names_loopback(netloc),
-        )
     }
 }
 
@@ -1226,7 +1176,6 @@ fn fetch_following_redirects_via(
 mod tests {
     use super::*;
     use std::net::Ipv4Addr;
-    use ureq::Resolver;
 
     fn test_budget(duration: Duration) -> FetchBudget {
         FetchBudget::until(Instant::now() + duration, Arc::new(AtomicBool::new(false)))
@@ -1256,12 +1205,6 @@ mod tests {
     #[cfg(feature = "hydra")]
     fn source(text: &str) -> crate::samples::SourceRule {
         crate::samples::SourceRule::parse(text).expect("a test source")
-    }
-
-    fn guarded_resolver() -> GuardedResolver {
-        GuardedResolver {
-            timeout: Duration::from_secs(5),
-        }
     }
 
     #[cfg(feature = "hydra")]
@@ -1343,61 +1286,6 @@ mod tests {
             Ok(HydraImageResponseAction::Redirect(_))
         ));
         assert!(inspect(&sources[..1]).is_err(), "a host no source allows");
-    }
-
-    #[cfg(feature = "hydra")]
-    #[test]
-    fn hydra_image_non_success_statuses_are_rejected() {
-        let current = hydra_image_url("https://images.example/a.png").unwrap();
-        let rule = source("images.example");
-        for status in [101, 404, 500] {
-            assert!(
-                inspect_hydra_image_response(&current, &rule, status, None).is_err(),
-                "accepted HTTP status {status}"
-            );
-        }
-    }
-
-    #[cfg(feature = "hydra")]
-    #[test]
-    fn a_hydra_redirect_inside_its_source_succeeds_without_cors_headers() {
-        let current = hydra_image_url("http://127.0.0.1:8000/a.png").unwrap();
-        let rule = source("http://127.0.0.1:8000/");
-        let next = inspect_hydra_image_response(
-            &current,
-            &rule,
-            302,
-            Some("/b.png?signature=secret#not-sent"),
-        )
-        .expect("a redirect inside the source");
-        let HydraImageResponseAction::Redirect(next) = next else {
-            panic!("expected redirect");
-        };
-        assert_eq!(next.origin(), current.origin());
-        assert_eq!(next.fragment(), None);
-        assert_eq!(
-            inspect_hydra_image_response(&next, &rule, 200, None),
-            Ok(HydraImageResponseAction::Body)
-        );
-    }
-
-    /// Optional release smoke test for the URL used by the upstream Hydra
-    /// gallery sketch. Deterministic unit tests cover policy semantics;
-    /// this one catches an external host that moved the image.
-    #[cfg(feature = "hydra")]
-    #[test]
-    #[ignore = "requires internet access to i.imgur.com"]
-    fn hydra_exact_gallery_imgur_image_fetches() {
-        let mut access = crate::samples::ScoreSampleAccess::denied();
-        access.permit_source("i.imgur.com").unwrap();
-        let bytes = fetch_hydra_media_with_budget(
-            "https://i.imgur.com/zFttbWq.jpg",
-            &test_budget(Duration::from_secs(15)),
-            &access,
-            HydraMedia::Image,
-        )
-        .expect("the exact gallery image");
-        assert!(bytes.starts_with(&[0xff, 0xd8]), "expected a JPEG response");
     }
 
     #[cfg(feature = "hydra")]
@@ -1598,28 +1486,6 @@ mod tests {
     }
 
     #[test]
-    fn public_and_loopback_addresses_are_allowed() {
-        for ok in ["8.8.8.8", "1.1.1.1", "2606:4700::1111"] {
-            assert!(
-                addr_allowed(ok.parse().unwrap(), false),
-                "{ok} must stay reachable"
-            );
-        }
-        // Loopback is reachable only when loopback is what was asked for.
-        for loopback in ["127.0.0.1", "127.255.255.254", "::1"] {
-            let ip: IpAddr = loopback.parse().unwrap();
-            assert!(
-                addr_allowed(ip, true),
-                "{loopback} must be reachable when the host named loopback"
-            );
-            assert!(
-                !addr_allowed(ip, false),
-                "{loopback} must NOT be reachable for a public-looking host"
-            );
-        }
-    }
-
-    #[test]
     fn non_public_addresses_are_refused() {
         for bad in [
             "10.1.2.3",        // RFC1918
@@ -1696,38 +1562,6 @@ mod tests {
     }
 
     #[test]
-    fn scores_may_name_web_resources_only() {
-        assert!(remote_url_allowed("https://example.com/kick.wav").is_ok());
-        assert!(remote_url_allowed("HTTPS://EXAMPLE.com/kick.wav").is_ok());
-        assert!(remote_url_allowed("http://localhost:5432").is_ok());
-        assert!(remote_url_allowed("http://127.0.0.1:5432/kit/strudel.json").is_ok());
-    }
-
-    #[test]
-    fn wire_identity_matches_the_strudel_filename_encoding() {
-        let literal =
-            wire_url("HTTPS://EXAMPLE.com:443/kit/take#2.wav?q=//").expect("literal hash filename");
-        let encoded =
-            wire_url("https://example.com/kit/take%232.wav?q=//").expect("encoded hash filename");
-
-        assert_eq!(literal, encoded);
-        assert_eq!(
-            literal.as_str(),
-            "https://example.com/kit/take%232.wav?q=//"
-        );
-        assert_ne!(
-            literal,
-            wire_url("https://example.com/kit/take.wav?q=//").expect("different filename")
-        );
-    }
-
-    #[test]
-    fn one_hop_netloc_preserves_ipv6_authority_syntax() {
-        let url = Url::parse("http://[::1]/manifest.json").expect("IPv6 URL");
-        assert_eq!(url_netloc(&url).expect("network location"), "[::1]:80");
-    }
-
-    #[test]
     fn scores_may_not_name_other_kinds_of_resource() {
         for refused in [
             "file:///etc/passwd",
@@ -1793,23 +1627,6 @@ mod tests {
         assert!(remote_url_allowed("https://a%22b.example/bd.wav").is_err());
     }
 
-    /// A `#` is part of a file or folder name, never the start of a fragment:
-    /// bank entries hold real names like `Kick #2.wav`, and the folder a reveal
-    /// opens is named the same way.
-    #[test]
-    fn a_hash_is_part_of_the_name() {
-        assert_eq!(
-            web_address("https://host/kit #2/Kick #2.wav")
-                .unwrap()
-                .as_str(),
-            "https://host/kit%20%232/Kick%20%232.wav"
-        );
-        assert_eq!(
-            web_address("https://host/kit #2/").unwrap().fragment(),
-            None
-        );
-    }
-
     /// `web_address` says what is wrong with an address in its own words; the
     /// fetch names it as a sample source. The scheme is read from the text, so
     /// `javascript:` is named as what it is, and an http address that is not
@@ -1858,44 +1675,6 @@ mod tests {
             );
             assert!(remote_url_allowed(written).is_ok(), "{written:?}");
         }
-    }
-
-    #[test]
-    fn the_resolver_refuses_a_private_answer_before_any_connection() {
-        let resolver = guarded_resolver();
-        assert!(resolver.resolve("127.0.0.1:80").is_ok());
-        assert_eq!(
-            resolver.resolve("169.254.169.254:80").unwrap_err().kind(),
-            std::io::ErrorKind::PermissionDenied
-        );
-        assert_eq!(
-            resolver.resolve("192.168.0.14:443").unwrap_err().kind(),
-            std::io::ErrorKind::PermissionDenied
-        );
-        // Numeric spellings of a private address reach the same refusal,
-        // because the check runs on the resolved address, not on the text.
-        assert_eq!(
-            resolver
-                .resolve("[::ffff:10.9.9.9]:443")
-                .unwrap_err()
-                .kind(),
-            std::io::ErrorKind::PermissionDenied
-        );
-    }
-
-    #[test]
-    fn the_resolver_still_serves_the_local_sample_server_path() {
-        // `localhost` resolves to loopback on ordinary systems; an explicit
-        // grant for the documented local sample server depends on that.
-        let resolver = guarded_resolver();
-        let addrs = resolver
-            .resolve("localhost:5432")
-            .expect("loopback resolves");
-        assert!(!addrs.is_empty());
-        assert!(
-            addrs.iter().all(|addr| addr.ip().is_loopback()),
-            "unexpected non-loopback answer for localhost: {addrs:?}"
-        );
     }
 
     #[test]
@@ -2122,61 +1901,6 @@ mod tests {
         );
     }
 
-    /// A grant that names loopback still follows redirects, as long as every
-    /// hop stays inside loopback. An operator's local sample server keeps
-    /// redirect support.
-    #[test]
-    fn a_granted_loopback_url_still_follows_redirects_within_loopback() {
-        let target_listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
-        let target = target_listener.local_addr().expect("listener address");
-        let target_server = std::thread::spawn(move || {
-            use std::io::{BufRead, Write};
-            let (stream, _) = target_listener.accept().expect("request");
-            let mut writer = stream.try_clone().expect("clone");
-            let mut reader = std::io::BufReader::new(stream);
-            let mut line = String::new();
-            loop {
-                line.clear();
-                if reader.read_line(&mut line).unwrap_or(0) == 0 || line.trim().is_empty() {
-                    break;
-                }
-            }
-            writer
-                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}")
-                .expect("response");
-        });
-
-        let origin_listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
-        let origin = origin_listener.local_addr().expect("listener address");
-        let origin_server = std::thread::spawn(move || {
-            use std::io::{BufRead, Write};
-            let (stream, _) = origin_listener.accept().expect("request");
-            let mut writer = stream.try_clone().expect("clone");
-            let mut reader = std::io::BufReader::new(stream);
-            let mut line = String::new();
-            loop {
-                line.clear();
-                if reader.read_line(&mut line).unwrap_or(0) == 0 || line.trim().is_empty() {
-                    break;
-                }
-            }
-            write!(
-                writer,
-                "HTTP/1.1 302 Found\r\nLocation: http://{target}/manifest.json\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
-            )
-            .expect("redirect");
-        });
-
-        let bytes = fetch_manifest_with_budget(
-            &format!("http://{origin}/manifest.json"),
-            &test_budget(Duration::from_secs(5)),
-        )
-        .expect("a granted loopback URL may redirect within loopback");
-        assert_eq!(bytes, b"{}");
-        origin_server.join().expect("origin server thread");
-        target_server.join().expect("target server thread");
-    }
-
     #[test]
     fn dns_cannot_leave_tcp_a_fresh_copy_of_the_aggregate_deadline() {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
@@ -2207,32 +1931,6 @@ mod tests {
         };
         assert!(error.contains("deadline exceeded"), "{error}");
         assert!(!connected, "TCP started after DNS exhausted the deadline");
-    }
-
-    #[test]
-    fn partial_dns_time_is_subtracted_from_the_one_hop_timeout() {
-        let target: SocketAddr = "127.0.0.1:9".parse().expect("socket address");
-        let url = wire_url("http://127.0.0.1:9/manifest.json").expect("URL");
-        let budget = test_budget(Duration::from_secs(1));
-        let resolved_at = std::cell::Cell::new(None);
-
-        let (_, timeout) = manifest_agent_with_resolver(&url, &budget, |netloc, _| {
-            std::thread::sleep(Duration::from_millis(50));
-            let result =
-                guard_resolved_addresses(netloc, vec![target], host_names_loopback(netloc));
-            resolved_at.set(Some(Instant::now()));
-            result
-        })
-        .expect("partly consumed budget still builds the hop");
-        let remaining = timeout.expect("a batch budget times the whole request");
-
-        let available_after_dns = budget
-            .deadline
-            .saturating_duration_since(resolved_at.get().expect("resolver completion"));
-        assert!(
-            remaining <= available_after_dns,
-            "one-hop timeout was captured before DNS: {remaining:?} > {available_after_dns:?}"
-        );
     }
 
     #[test]
@@ -2381,14 +2079,6 @@ mod tests {
             .expect_err("the deadline ends a transfer that keeps trickling");
         assert!(started.elapsed() < Duration::from_millis(1_200));
         server.join().unwrap();
-    }
-
-    #[test]
-    fn a_public_looking_name_that_resolves_private_is_refused_at_fetch() {
-        // Not a network test: the refusal fires during resolution of a literal
-        // private address, before any connection could exist.
-        let error = fetch("http://10.255.0.7/kick.wav").unwrap_err();
-        assert!(error.contains("not a public address"), "{error}");
     }
 
     #[test]

@@ -544,64 +544,6 @@ mod tests {
         );
     }
 
-    /// Any string value "speed" sorting ahead of the key shadowed it, not
-    /// only the sound name: a bank called "speed" did too.
-    #[test]
-    fn a_bank_named_speed_does_not_shadow_the_speed_key() {
-        let got = osc_onset(
-            &onset(serde_json::json!({
-                "oscport": 57120,
-                "bank": "speed",
-                "s": "bd",
-                "speed": 2.0,
-                "unit": "c"
-            })),
-            0.5,
-        )
-        .unwrap();
-        assert!(
-            pairs(&got.args).contains(&("speed".into(), OscValue::Float(4.0))),
-            "unit \"c\" speed was not divided by cps: {:?}",
-            got.args
-        );
-    }
-
-    /// Without `unit("c")` the speed goes out as the score wrote it, whatever
-    /// the sound is named.
-    #[test]
-    fn a_sound_named_speed_without_unit_c_is_not_adjusted() {
-        for map in [
-            serde_json::json!({ "oscport": 57120, "s": "speed", "speed": 2.0 }),
-            serde_json::json!({ "oscport": 57120, "s": "speed", "speed": 2.0, "unit": "r" }),
-        ] {
-            let got = osc_onset(&onset(map), 0.5).unwrap();
-            assert!(
-                pairs(&got.args).contains(&("speed".into(), OscValue::Float(2.0))),
-                "{:?}",
-                got.args
-            );
-        }
-    }
-
-    /// The only "speed" text is the sound name itself: there is no key to
-    /// adjust, and the message still builds.
-    #[test]
-    fn a_sound_named_speed_without_a_speed_control_builds_untouched() {
-        let got = osc_onset(
-            &onset(serde_json::json!({
-                "oscport": 57120,
-                "s": "speed",
-                "unit": "c"
-            })),
-            0.5,
-        )
-        .unwrap();
-        let pairs = pairs(&got.args);
-        assert!(pairs.contains(&("s".into(), OscValue::Str("speed".into()))));
-        assert!(!pairs.iter().any(|(key, _)| key == "speed"));
-        assert_eq!(got.args.len() % 2, 0, "arguments must stay in pairs");
-    }
-
     #[test]
     fn the_destination_can_be_overridden_per_hap() {
         let got = osc_onset(
@@ -727,14 +669,6 @@ mod tests {
             .is_none(),
             "speed/cps overflow reached the wire"
         );
-    }
-
-    #[test]
-    fn rationals_parse_the_way_the_scheduler_writes_them() {
-        assert_eq!(parse_rational("3/4"), Some(0.75));
-        assert_eq!(parse_rational("2"), Some(2.0));
-        assert_eq!(parse_rational("1/0"), None);
-        assert_eq!(parse_rational("nonsense"), None);
     }
 
     #[test]

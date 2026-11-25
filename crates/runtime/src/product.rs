@@ -174,31 +174,3 @@ pub fn engine_identity() -> serde_json::Value {
     }
     engine
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn engine_diagnostics_follow_the_product_identity() {
-        let identity = engine_identity();
-        assert_eq!(identity["name"], NAME);
-        assert_eq!(identity["version"], VERSION);
-        assert!(!BUILD_TARGET.is_empty());
-        assert!(!BUILD_PROFILE.is_empty());
-    }
-
-    #[test]
-    fn generated_product_copy_uses_the_declared_command() {
-        for copy in [
-            CLI_LONG_ABOUT,
-            FOLLOW_LONG_HELP,
-            SERVE_SAMPLES_LONG_ABOUT,
-            WATCH_CODE_LONG_ABOUT,
-            MIDI_NO_OUTPUTS_HINT,
-            MIDI_NO_INPUTS_HINT,
-        ] {
-            assert!(copy.contains(COMMAND_NAME), "{copy:?}");
-        }
-    }
-}

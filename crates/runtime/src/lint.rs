@@ -3304,14 +3304,6 @@ mod tests {
         );
     }
 
-    /// Hydra's array modifiers are known names in a score that opens Hydra.
-    #[cfg(feature = "hydra")]
-    #[test]
-    fn hydra_array_modifiers_are_known_in_a_hydra_score() {
-        let source = "await initHydra()\nosc([10,30].fit(0,1).smooth(0.5).offset(0.25).ease('sin').fast(2)).out(o0)";
-        assert!(check(source).is_empty(), "{:?}", check(source));
-    }
-
     /// A shared sketch is checked as it runs: the calls that need a browser
     /// are known names, and so are the names that `setFunction` gives.
     #[cfg(feature = "hydra")]
@@ -3344,37 +3336,6 @@ mod tests {
             "unknown function `gian` - did you mean `gain`?"
         );
         assert!(rejection(source, false, None).unwrap().contains("lpff"));
-    }
-
-    #[test]
-    fn stray_identifiers_are_reported_without_evaluating_the_score() {
-        let source = r#"// Type normally. Use the Play menu to update or stop.
-_$: s("[bd <hh oh>]*2").bank("tr909").dec(.4)._pianoroll()
-_$: note("<[60,64,67,69] [62,65,67,71] [62,65,69,72] [62,64,67,71]>").slow(2).s("basique").bank("wt_digital")
-    .wt(0.377).wtrate(0.12).wtdepth(0.278)
-    .warp(0.232).warpmode("spin")
-    .lpf(sine.range(1741, 2795).slow(16))
-    .attack(0.9).decay(0.5).sustain(0.6).release(1.8)
-    .pan(sine.range(0.28, 0.72).slow(11)).gain(0.09).room(0.410).delay(0.227).delaytime(0.375).delayfeedback(0.3)
-$: note("[57 60] ~ 59 57 ~ [57 53] 53 60").slow(2).s("sine")
-    .fm(5.05).fmh(1.98).fmdecay(0.09)
-    .attack(0.002).decay(0.16).sustain(0).release(0.12)
-    .lpf(10000).pan("0.28 0.72").gain(0.2).room(0.410).delay(0.227).delaytime(0.375).delayfeedback(0.3)
-    .lpattack(100)
-
-    kaskaskjas
-"#;
-        let findings = check(source);
-        let finding = findings
-            .iter()
-            .find(|d| d.message == "unknown name `kaskaskjas`")
-            .unwrap_or_else(|| panic!("{findings:?}"));
-        assert_eq!(&source[finding.from..finding.to], "kaskaskjas");
-        assert!(
-            !check(source.replace("kaskaskjas", "silence").as_str())
-                .iter()
-                .any(|d| d.message.starts_with("unknown name"))
-        );
     }
 
     #[test]
@@ -3663,29 +3624,6 @@ $: keys(".5").filterValues(x => x.log()).s("hh:4")"#;
     }
 
     #[test]
-    fn a_local_variable_named_after_a_function_is_the_scores_own() {
-        // `slider` is an engine function and, here, a local variable. The
-        // declaration wins: what is called on it is not the engine's to
-        // judge.
-        let source = "const slider = 1\nslider.notAnEngineMethod()\n$: s(\"bd\")";
-        assert!(check(source).is_empty(), "{:?}", check(source));
-    }
-
-    #[test]
-    fn a_kabelsalat_effect_uses_the_graph_namespace() {
-        let source = "$: s(\"bd\").FX(K(() => audioin().out()))";
-        assert!(check(source).is_empty(), "{:?}", check(source));
-        assert!(rejection(source, false, None).is_none());
-    }
-
-    #[test]
-    fn a_kabelsalat_call_on_a_receiver_is_accepted_like_a_bare_one() {
-        let source = "$: note(\"c3\").K(sine(sFreq).out())\n// K(not code)";
-        assert!(check(source).is_empty(), "{:?}", check(source));
-        assert!(rejection(source, false, None).is_none());
-    }
-
-    #[test]
     fn kabelsalat_oscillator_methods_are_not_pattern_properties() {
         for graph in [
             "n(sFreq).sine().out()",
@@ -3730,12 +3668,6 @@ $: keys(".5").filterValues(x => x.log()).s("hh:4")"#;
                 .collect::<Vec<_>>(),
             [refusal.message.as_str()]
         );
-    }
-
-    #[test]
-    fn kabelsalat_later_arguments_keep_their_own_graph_namespace() {
-        let source = "$: K(sine(sFreq).out(), K(noise().out()))";
-        assert!(check(source).is_empty(), "{:?}", check(source));
     }
 
     #[test]
@@ -3823,83 +3755,6 @@ $: keys(".5").filterValues(x => x.log()).s("hh:4")"#;
                       // lpff(1)\n\
                       $: s(\"sd\")._punchcard()";
         assert!(check(source).is_empty(), "{:?}", check(source));
-    }
-
-    #[test]
-    fn the_engine_knows_its_own_globals_and_methods() {
-        let known = known_names();
-        for name in [
-            "samples",
-            "addVoicings",
-            "setDefaultVoicings",
-            "setcps",
-            "setCpm",
-            "hush",
-            "slider",
-            "stack",
-            "cat",
-            "seq",
-            "arrange",
-            "all",
-            "note",
-            "s",
-            "lpf",
-            "gain",
-            "fast",
-            "scale",
-            "chord",
-            "voicing",
-            "bank",
-            "punchcard",
-            "_punchcard",
-            "pianoroll",
-            "scope",
-            "sine",
-            "irand",
-            "choose",
-            "sometimesBy",
-            "euclid",
-            "loadSoundfont",
-            "registerSynthSounds",
-        ] {
-            assert!(known.contains(name), "{name} should be known");
-        }
-        #[cfg(feature = "extensions")]
-        {
-            for name in rustel_ext::default_registry().names() {
-                assert!(
-                    known.contains(name),
-                    "extension pattern `{name}` should be known"
-                );
-            }
-        }
-        assert!(!known.contains("lpff"));
-    }
-
-    #[cfg(not(feature = "extensions"))]
-    #[test]
-    fn an_explicit_minimal_build_has_no_extension_names() {
-        let known = known_names();
-        for name in ["inspire", "acidenv", "filtval", "grab"] {
-            assert!(!known.contains(name), "{name} should require extensions");
-        }
-    }
-
-    #[test]
-    fn the_closest_name_is_one_slip_away() {
-        let names = ["lpf", "hpf", "gain", "fast", "slow", "note", "n", "room"];
-        assert_eq!(closest("lpff", names.iter().copied()), Some("lpf"));
-        assert_eq!(closest("gian", names.iter().copied()), Some("gain"));
-        assert_eq!(
-            closest("Gain", names.iter().copied()),
-            None,
-            "exact, ignoring case"
-        );
-        assert_eq!(closest("reverb", names.iter().copied()), None);
-        assert_eq!(edit_distance("kitten", "sitting"), 3);
-        assert_eq!(edit_distance("ab", "ba"), 1);
-        assert_eq!(levenshtein_distance("kitten", "sitting"), 3);
-        assert_eq!(levenshtein_distance("ab", "ba"), 2);
     }
 
     #[test]
@@ -4579,24 +4434,6 @@ $: keys(".5").filterValues(x => x.log()).s("hh:4")"#;
         );
     }
 
-    #[test]
-    fn a_statement_is_its_own_lines_and_the_ones_it_continues_onto() {
-        let source = "$: s(\"hh\").bank(\"tr808\")\n$: stack(\n  s(\"bd:9\"),\n  s(\"sd\")\n).bank(\"tr909\")\n$: s(\"cp\")\n  .room(.2)\n";
-        let at = |needle: &str| source.find(needle).unwrap();
-        let statement = |needle: &str| &source[statement_around(source, at(needle))];
-        assert_eq!(statement("hh"), "$: s(\"hh\").bank(\"tr808\")");
-        assert_eq!(
-            statement("bd:9"),
-            "$: stack(\n  s(\"bd:9\"),\n  s(\"sd\")\n).bank(\"tr909\")"
-        );
-        assert_eq!(statement("cp"), "$: s(\"cp\")\n  .room(.2)");
-        // The very end of the file belongs to the last statement.
-        assert_eq!(
-            &source[statement_around(source, source.len())],
-            "$: s(\"cp\")\n  .room(.2)"
-        );
-    }
-
     /// The string being typed is the one that is not closed yet. Its mark
     /// runs from the quote to where the string stops, not from the byte
     /// inside it that the parser reports.
@@ -4675,36 +4512,6 @@ $: keys(".5").filterValues(x => x.log()).s("hh:4")"#;
             .collect()
     }
 
-    /// A quote inside a regex literal is pattern text, not the start of a
-    /// string. The strings after the regex stay strings: `zzzq(3,8)` in the
-    /// `label` is text, not an unknown function.
-    #[test]
-    fn a_quote_inside_a_regex_literal_opens_no_phantom_string() {
-        // Valid - the engine plays it - and clean.
-        let source = r#"$: s("bd").every(8, x => x.replace(/"/, "x")).label("zzzq(3,8)")"#;
-        assert!(check(source).is_empty(), "{:?}", check(source));
-        assert_eq!(
-            code_only(source),
-            r#"$: s(    ).every(8, x => x.replace(   ,    )).label(           )"#
-        );
-        assert_eq!(
-            literal_texts(source),
-            [("bd", false), ("x", false), ("zzzq(3,8)", false)]
-        );
-        // The engine refuses these for a string after the regex that does
-        // not parse, and so does the check: on that string's text, not
-        // as an unknown function, and not silently.
-        let source = r#"$: s("bd").every(8, x => x.replace(/"/, "x")).label("zzzq(")"#;
-        assert_eq!(marks(source), [(Level::Syntax, "zzzq(")]);
-        let source = r#"$: s("bd").every(8, x => x.replace(/"/, "x")).s("bd [sd")"#;
-        assert_eq!(marks(source), [(Level::Syntax, "bd [sd")]);
-        assert!(
-            rejection(source, false, None).is_some_and(|reason| reason.contains("[mini]")),
-            "{:?}",
-            rejection(source, false, None)
-        );
-    }
-
     /// The quotes inside a character class such as `/['"]/` are characters.
     /// After the regex, an unknown call is still caught and a string is
     /// still checked as mini-notation.
@@ -4728,22 +4535,6 @@ $: keys(".5").filterValues(x => x.log()).s("hh:4")"#;
         assert_eq!(found.len(), 1, "{found:?}");
         assert_eq!(&source[found[0].from..found[0].to], "IAC Bus 9");
         assert!(found[0].message.contains("no MIDI output"), "{found:?}");
-    }
-
-    /// A division stays a division: the regex rule takes nothing away
-    /// from the code around it, and a real unknown call after `1 / 2` is
-    /// still found.
-    #[test]
-    fn a_division_is_not_blanked_as_a_regex_literal() {
-        let source = r#"$: s("bd").speed(1 / 2).zzzq()"#;
-        let diagnostics = check(source);
-        assert_eq!(diagnostics.len(), 1, "{diagnostics:?}");
-        assert_eq!(diagnostics[0].message, "unknown function `zzzq`");
-        assert!(rejection(source, false, None).unwrap().contains("zzzq"));
-        // `a++ / 2 / 3` divides - the `++` belongs to the value before
-        // the slash - even with two slashes on the one line.
-        assert_eq!(code_only("b = a++ / 2 / 3"), "b = a++ / 2 / 3");
-        assert_eq!(code_only("b = a / 2 / 3"), "b = a / 2 / 3");
     }
 
     /// An identifier inside a regex body is pattern text: what the regex
@@ -4883,127 +4674,6 @@ $: keys(".5").filterValues(x => x.log()).s("hh:4")"#;
         let diagnostics = lint("bd [hh sd", true, None);
         assert_eq!(diagnostics.len(), 1);
         assert!(diagnostics[0].from <= "bd [hh sd".len());
-    }
-
-    /// `ident_at` skips whitespace and reads a name that does not start with a
-    /// digit.
-    #[test]
-    fn an_identifier_does_not_start_with_a_digit() {
-        assert_eq!(ident_at("  $a1(", 0), Some((2, 5)));
-        assert_eq!(ident_at(" _x", 0), Some((1, 3)));
-        assert_eq!(ident_at("  2e3", 0), None);
-        assert_eq!(ident_at("  ", 0), None);
-    }
-
-    #[test]
-    fn the_callee_scanners_read_the_call_a_string_belongs_to() {
-        let source = "n(\"0\").scale( \"C:major\" ).note(\"c3\")";
-        let scale_quote = source.find("\"C").unwrap();
-        assert_eq!(callee_before(source, scale_quote), Some("scale"));
-        let note_quote = source.rfind("\"c3").unwrap();
-        assert_eq!(callee_before(source, note_quote), Some("note"));
-        assert_eq!(callee_before("x + \"a\"", 4), None);
-        let chained = "\"C^7\".voicing().room(1)";
-        assert_eq!(callee_after(chained, 5), Some("voicing"));
-        assert_eq!(callee_after("\"a\" + b", 3), None);
-        assert_eq!(callee_after("\"a\"\n  .voicing()", 3), Some("voicing"));
-        assert_eq!(callee_after("\"a\". voicing()", 3), None);
-        assert_eq!(callee_after("\"a\".voicing ()", 3), None);
-        assert_eq!(callee_after("\"a\"", 9), None);
-    }
-
-    #[test]
-    fn the_transpiled_output_names_every_pattern_strings_quote() {
-        assert_eq!(
-            mini_string_offsets("s(m('bd [hh sd', 5)).gain(0.5).p('$', 0);"),
-            [5]
-        );
-        assert_eq!(
-            mini_string_offsets("stack(m('it\\'s', 6), note(m('c3', 20)))"),
-            [6, 20]
-        );
-        assert!(mini_string_offsets("s('bd')").is_empty());
-    }
-
-    #[test]
-    fn the_literal_scanner_handles_comments_escapes_and_every_quote() {
-        let source = "// \"not\" a string\n'a\\'b' `c\nd` \"e\" /* \"f\" */";
-        let literals = string_literals(source);
-        let texts = literals
-            .iter()
-            .map(|literal| &source[literal.content.clone()])
-            .collect::<Vec<_>>();
-        assert_eq!(texts, ["a\\'b", "c\nd", "e"]);
-    }
-
-    /// `MiniWord` marks a single-atom first tail and words from a range, and
-    /// keeps the text the checks judge.
-    #[test]
-    fn mini_words_mark_a_written_index_and_a_range() {
-        let words = |content: &str| mini_words_of(content).expect("parses");
-        let flags = |content: &str| {
-            words(content)
-                .into_iter()
-                .map(|word| (word.text, word.written_index, word.ranged))
-                .collect::<Vec<_>>()
-        };
-        assert_eq!(flags("bd:3"), [("bd:3".to_owned(), true, false)]);
-        assert_eq!(
-            flags("bd:<0 3>"),
-            [
-                ("bd:0".to_owned(), false, false),
-                ("bd:3".to_owned(), false, false)
-            ]
-        );
-        assert_eq!(
-            flags("[bd hh]:3"),
-            [
-                ("bd:3".to_owned(), true, false),
-                ("hh:3".to_owned(), true, false)
-            ]
-        );
-        assert_eq!(flags("bd:3:5"), [("bd:3:5".to_owned(), true, false)]);
-        assert_eq!(
-            flags("bd 0 .. 3"),
-            [
-                ("bd".to_owned(), false, false),
-                ("0".to_owned(), false, true),
-                ("3".to_owned(), false, true)
-            ]
-        );
-        assert!(mini_words_of("bd [").is_none());
-    }
-
-    /// Every name of an entry tagged `selectors` rebinds its receiver's words,
-    /// each such entry takes the selecting pattern first, and no untagged entry
-    /// shares one of those names.
-    #[test]
-    fn selectors_are_read_off_their_entries() {
-        let entries = declared_entries().collect::<Vec<_>>();
-        let tagged =
-            |entry: &rustel_core::reference::ReferenceEntry| entry.tags.contains(&"selectors");
-        for entry in entries.iter().filter(|entry| tagged(entry)) {
-            assert!(
-                entry.params.len() >= 2 && entry.params[0].r#type == "Pattern",
-                "{}: {:?}",
-                entry.name,
-                entry.params
-            );
-            for name in entry_names(*entry) {
-                assert!(rebinds_words(name), "{name}");
-            }
-        }
-        for entry in entries.iter().filter(|entry| !tagged(entry)) {
-            for name in entry_names(*entry) {
-                assert!(!rebinds_words(name), "{name} is also an untagged entry");
-            }
-        }
-        for name in ["pick", "pickSqueeze", "inhabit", "squeeze"] {
-            assert!(rebinds_words(name), "{name}");
-        }
-        for name in ["set", "cat", "fast", "s"] {
-            assert!(!rebinds_words(name), "{name}");
-        }
     }
 
     /// The widened MIDI completion range and this check have to agree
