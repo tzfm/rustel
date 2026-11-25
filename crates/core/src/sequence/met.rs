@@ -861,12 +861,6 @@ impl Layer {
 /// it lies in one of those `q` parts of a cycle: `q` times the part lies
 /// in one cycle. Whole numbers compare, with no fraction made. `false`
 /// also for a time that leaves their range: a cut then settles it.
-#[cfg(test)]
-pub(super) fn lie_in_cycles(period: Fraction, places: &[Place]) -> bool {
-    lie_in_spans(period, places.iter().map(Place::part))
-}
-
-/// [`lie_in_cycles`] for the parts of the steps.
 pub(super) fn lie_in_spans(period: Fraction, parts: impl IntoIterator<Item = TimeSpan>) -> bool {
     let turns = period.denom();
     // The whole cycles in `numer / denom`, with a machine-word division

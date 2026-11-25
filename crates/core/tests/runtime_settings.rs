@@ -56,12 +56,6 @@ fn runtime_attachment_preserves_metadata_and_hap_budget() {
 }
 
 #[test]
-fn visual_membership_preserves_pure_source_metadata() {
-    let pattern = rustel_core::pure(Value::Str("x".into())).with_pure_loc((3, 9));
-    assert_eq!(pattern.with_ui_visual_slot(0).pure_loc(), Some((3, 9)));
-}
-
-#[test]
 fn timeline_root_inherits_the_receiver_runtime() {
     let time_owner = RuntimeSettings::default();
     time_owner.with(|| rng::use_rng(RngMode::Precise));

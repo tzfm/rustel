@@ -1442,16 +1442,6 @@ impl<'a> ValueSide<'a> {
     /// their own queries serve, for parts that leave most of the time
     /// between them free, for a part of no width, and for a side that a
     /// reading or its own queries answer.
-    #[cfg(test)]
-    pub(crate) fn met_in_one_query(
-        &self,
-        functions: &mut Vec<Hap>,
-        state: &State,
-        out: &mut Vec<Hap>,
-    ) -> bool {
-        QUERY_THREAD.with(|thread| self.met_in_one_query_on(thread, functions, state, out))
-    }
-
     pub(crate) fn met_in_one_query_on(
         &self,
         thread: &QueryThread,
@@ -1909,19 +1899,6 @@ impl<'a> ValueSide<'a> {
     /// Meet the function hap `hf` with the value side and push what they
     /// make after the haps of `out`, which held `from` haps of other nodes
     /// before this application wrote. `false` when the query stops.
-    /// [`Self::meet_on`] for a test, which has no thread in hand.
-    #[cfg(test)]
-    pub(crate) fn meet(
-        &self,
-        hf: Hap,
-        meetings: &mut Meetings<'a>,
-        state: &State,
-        from: usize,
-        out: &mut Vec<Hap>,
-    ) -> bool {
-        QUERY_THREAD.with(|thread| self.meet_on(thread, hf, meetings, state, from, out))
-    }
-
     fn meet_on(
         &self,
         thread: &QueryThread,

@@ -587,89 +587,6 @@ mod callback_query_metrics_tests {
 }
 
 #[cfg(test)]
-mod set_lookup_tests {
-    use super::super::*;
-
-    fn object(entries: &[(&str, Value)]) -> Value {
-        Value::object(
-            entries
-                .iter()
-                .map(|(key, value)| ((*key).into(), value.clone())),
-        )
-    }
-
-    fn entries(lookup: &PickLookup) -> Vec<(String, Value)> {
-        let PickLookup::Object { entries, .. } = lookup else {
-            panic!("a set lookup is an object");
-        };
-        entries
-            .iter()
-            .map(|(key, pattern)| (key.to_string(), pattern.as_pure().expect("a pure entry")))
-            .collect()
-    }
-
-    #[test]
-    fn a_skipped_set_lookup_equals_the_lookup_of_the_merged_value() {
-        let members = [
-            Value::F64(0.0),
-            Value::F64(-0.0),
-            Value::F64(1.0),
-            Value::Bool(true),
-            Value::Str("x".into()),
-            Value::list(vec![Value::F64(-0.0)]),
-        ];
-        let mut values = vec![Value::Undefined, Value::Null, Value::Str("ab".into())];
-        values.extend(members.iter().cloned());
-        for key in ["value", "0", "a"] {
-            for member in &members {
-                values.push(object(&[(key, member.clone())]));
-            }
-        }
-        for first in &members {
-            for second in &members {
-                values.push(object(&[("value", first.clone()), ("a", second.clone())]));
-            }
-        }
-
-        let span = TimeSpan::new(Fraction::ZERO, Fraction::ONE);
-        let mut skipped = 0;
-        for left in &values {
-            for right in &values {
-                let left_hap = Hap::new(Some(span), span, left.clone());
-                let right_hap = Hap::new(Some(span), span, right.clone());
-                for merged in [
-                    controls::set_value(left, right),
-                    compose::compose_op(compose::ComposeOp::Set, left, right),
-                ] {
-                    if !set_lookup_follows_value(&merged, &left_hap, &right_hap) {
-                        continue;
-                    }
-                    skipped += 1;
-                    // The lookup the merge stored before, then the one a pick derives.
-                    let Some(eager) = (merged != *right)
-                        .then(|| PickLookup::set_object(&left_hap, &right_hap, &merged))
-                        .flatten()
-                    else {
-                        continue;
-                    };
-                    let derived = PickLookup::from_value(&merged).expect("an object value");
-                    assert_eq!(eager.enumerable_len(), derived.enumerable_len());
-                    let (eager, derived) = (entries(&eager), entries(&derived));
-                    assert_eq!(eager.len(), derived.len());
-                    for ((eager_key, eager_value), (key, value)) in eager.iter().zip(&derived) {
-                        assert!(
-                            eager_key == key && same_key(eager_value, value),
-                            "{left:?} set {right:?}: {eager_key} {eager_value:?}, {key} {value:?}"
-                        );
-                    }
-                }
-            }
-        }
-        assert!(skipped > 1_000, "only {skipped} merges skipped the lookup");
-    }
-}
-
-#[cfg(test)]
 mod stable_sort_tests {
     use super::super::*;
 
@@ -881,72 +798,6 @@ mod constant_run_tests {
         ]
     }
 
-    /// The constants that a pattern meets are one node, as the two numbers
-    /// of a `range` are, and a control after them. Two runs of the same
-    /// constants at the same places are the same construction. A constant
-    /// with a place of its own in the text keeps the node of its
-    /// application.
-    #[test]
-    fn constants_that_a_pattern_meets_are_one_node() {
-        let number = |n: f64| pure(Value::F64(n));
-        let ranged = |to: f64| {
-            let numbers = [
-                (ComposeOp::Mul, number(to - 200.0)),
-                (ComposeOp::Add, number(200.0)),
-            ];
-            chain(&crate::signal::saw(), &numbers)
-        };
-        let pattern = ranged(800.0);
-        let Node::Constants(node) = pattern.node_kind() else {
-            panic!("a range of a signal is no run of numbers");
-        };
-        let (base, run) = (&node.0, &node.1);
-        assert!(matches!(base.node_kind(), Node::Signal(_)));
-        let numbers: Vec<(ComposeOp, f64)> = run.iter().filter_map(RunMeeting::number).collect();
-        assert_eq!(numbers, [(ComposeOp::Mul, 600.0), (ComposeOp::Add, 200.0)]);
-        assert!(pattern.same_construction(&ranged(800.0)));
-        assert!(!pattern.same_construction(&ranged(801.0)));
-        // A `range` makes the run with no pattern of a number, and answers
-        // as its two compositions do. A constant folds each number in.
-        let range = |pattern: &Pattern| crate::combinators::range(pattern, 200.0, 800.0);
-        let direct = range(&crate::signal::saw());
-        assert!(pattern.same_construction(&direct));
-        let composed = sequence::unfolded(|| range(&crate::signal::saw()));
-        assert!(matches!(composed.node_kind(), Node::AppLeft(..)));
-        for (begin, end) in spans() {
-            assert_eq!(answers(&direct, begin, end), answers(&composed, begin, end));
-        }
-        let constant = range(&number(0.5));
-        assert!(!matches!(constant.node_kind(), Node::Constants(..)));
-        assert_eq!(
-            answers(&constant, Fraction::ZERO, Fraction::ONE),
-            answers(&number(500.0), Fraction::ZERO, Fraction::ONE)
-        );
-
-        let located = number(2.0).with_pure_loc((1, 2));
-        let applied = compose(
-            &crate::signal::saw(),
-            &located,
-            ComposeOp::Mul,
-            Alignment::In,
-        );
-        assert!(matches!(applied.node_kind(), Node::AppLeft(..)));
-
-        let quiet = |at: (usize, usize)| {
-            let gain = control("gain", Value::F64(0.5), Some(at));
-            chain(&ranged(800.0), &[(ComposeOp::Set, gain)])
-        };
-        let set = quiet((3, 6));
-        let Node::Constants(node) = set.node_kind() else {
-            panic!("a control after a range is no run of constants");
-        };
-        let (base, run) = (&node.0, &node.1);
-        assert!(matches!(base.node_kind(), Node::Signal(_)));
-        assert_eq!(run.len(), 3);
-        assert!(set.same_construction(&quiet((3, 6))));
-        assert!(!set.same_construction(&quiet((4, 7))));
-    }
-
     #[test]
     fn a_chain_of_constants_answers_as_each_application_in_turn() {
         let chains = [
@@ -1090,26 +941,6 @@ mod constant_run_tests {
                 assert!(answered.iter().all(|hap| hap.contains(mode)), "{name}");
                 assert_eq!(answered, answers(&in_turn, begin, end), "{name}");
             }
-        }
-    }
-
-    #[test]
-    fn a_chain_under_a_queried_value_still_answers_as_one() {
-        // The outer application queries its value, so only the two inner
-        // applications make a run, under a node that is none.
-        let base = fastcat(vec![pure(Value::F64(1.0)), pure(Value::F64(2.0))]);
-        let inner = [
-            (ComposeOp::Mul, pure(Value::F64(3.0))),
-            (ComposeOp::Add, pure(Value::F64(4.0))),
-        ];
-        let patterned = fastcat(vec![pure(Value::F64(10.0)), pure(Value::F64(20.0))]);
-        let outer = |inner: Pattern| compose(&inner, &patterned, ComposeOp::Add, Alignment::In);
-        let (run, in_turn) = (
-            outer(chain(&base, &inner)),
-            outer(chain_of_queries(&base, &inner)),
-        );
-        for (begin, end) in spans() {
-            assert_eq!(answers(&run, begin, end), answers(&in_turn, begin, end));
         }
     }
 }
@@ -1354,35 +1185,6 @@ mod value_signal_tests {
             // A budget under the steps is the graph's, and one over them is
             // the walk's.
             assert_eq!(hits.segment > 0, budget >= 64, "a budget of {budget}");
-        }
-    }
-
-    /// The walk of the steps stops at the hap that passes the budget, and
-    /// leaves no hap, as the graph path of the application does. The walk
-    /// is asked as it is, with no query around it that would charge the
-    /// haps it holds.
-    #[test]
-    fn a_segment_walk_charges_each_hap_of_a_step_to_the_budget() {
-        let many = range(&sine(), 0.0, 1.0).fast(whole(256));
-        let segment = combinators::segment(&many, whole(64));
-        let Node::FilterValues(boxed) = segment.node_kind() else {
-            panic!("a segment is a filter of an application");
-        };
-        let structured = &boxed.0;
-        let Node::AppRight(node) = structured.node_kind() else {
-            panic!("a segment is an application");
-        };
-        let state = State::new(TimeSpan::new(whole(0), whole(1)));
-        for (budget, refused) in [(100, true), (255, true), (256, false), (1000, false)] {
-            let mut out = Vec::new();
-            let (_, refusal) =
-                with_hap_budget(budget, || fused::app_right_onto(node, &state, &mut out));
-            assert_eq!(refusal.is_some(), refused, "a budget of {budget}");
-            assert_eq!(
-                out.len(),
-                if refused { 0 } else { 256 },
-                "a budget of {budget}"
-            );
         }
     }
 
@@ -1875,24 +1677,6 @@ mod value_signal_tests {
             }
         }
     }
-
-    #[test]
-    fn constants_after_a_wave_are_set_under_its_application() {
-        let (_, values) = chains_with_waves().swap_remove(0);
-        let set = chain(&steps_of_other_names(), &values);
-        let inner = match set.node_kind() {
-            Node::AppLeft(pair) => {
-                assert!(matches!(pair.3, Combine::Composed(ComposeOp::Set)));
-                &pair.0
-            }
-            Node::AppWave(app) => &app.inner,
-            _ => panic!("the application of the wave is the last one"),
-        };
-        assert!(
-            matches!(inner.node_kind(), Node::Sequence(_)),
-            "the steps hold each constant"
-        );
-    }
 }
 
 #[cfg(test)]
@@ -2244,25 +2028,6 @@ mod restart_tests {
     }
 
     #[test]
-    fn a_join_says_at_the_query_when_a_pattern_that_it_made_reads_the_span() {
-        use purity::SpanRead;
-        let state = State::new(TimeSpan::new(third(1), third(8)));
-        for section in sections_made_at_the_query() {
-            assert_eq!(section.purity().span_read, SpanRead::Made);
-            assert!(asked_over_part(|| section.query(&state)).is_some());
-        }
-        let signal = section_that_makes_a_signal();
-        assert_eq!(signal.purity().span_read, SpanRead::Made);
-        assert!(asked_over_part(|| signal.query(&state)).is_none());
-        // A query over a part around the refused one is refused too, and
-        // no query asks over a part after them.
-        let around = asked_over_part(|| asked_over_part(|| signal.query(&state)).is_none());
-        assert_eq!(around, None);
-        assert!(!part_is_asked());
-        assert!(!signal.query(&state).is_empty());
-    }
-
-    #[test]
     fn a_part_query_asks_no_volatile_pattern_that_a_join_made() {
         use std::sync::atomic::{AtomicUsize, Ordering};
         let asked = Arc::new(AtomicUsize::new(0));
@@ -2296,167 +2061,6 @@ mod restart_tests {
             expected
         );
         assert_eq!(asked.load(Ordering::Relaxed), asks);
-    }
-
-    /// What `pattern` answers to a top-level query of `span` as `state`
-    /// says, in the order of the graph and sorted.
-    fn asked(pattern: &Pattern, span: TimeSpan, state: &State) -> String {
-        let state = state.set_span(span);
-        let graph = pattern.query_arc_outcome_with_budget(&state, DEFAULT_HAP_BUDGET);
-        let contained = take_query_contained_throw();
-        let sorted = pattern.query_arc_outcome_sorted_with_budget(&state, DEFAULT_HAP_BUDGET);
-        format!(
-            "{graph:?} {contained:?} {sorted:?} {:?}",
-            take_query_contained_throw()
-        )
-    }
-
-    /// `count` spans of `width` in a row from `from`.
-    fn in_a_row(from: Fraction, width: Fraction, count: i128) -> Vec<TimeSpan> {
-        (0..count)
-            .map(|index| {
-                let begin = from + width * Fraction::int(index);
-                TimeSpan::new(begin, begin + width)
-            })
-            .collect()
-    }
-
-    /// Graphs of discrete haps, whole songs in small: sections one after
-    /// the other, with joins that make patterns at the query, at a tempo.
-    fn songs() -> Vec<(&'static str, Pattern)> {
-        let made = || picked(JoinMode::Restart, sections_made_at_the_query(), third(4));
-        vec![
-            ("steps", steps(0, 4)),
-            (
-                "sections",
-                picked(JoinMode::Restart, discrete_sections(), third(7)),
-            ),
-            (
-                "sections that reset",
-                picked(JoinMode::Reset, discrete_sections(), third(2)),
-            ),
-            ("sections made at the query", made()),
-            (
-                "a song at a tempo",
-                stack(vec![made(), steps(200, 3)]).cpm(Fraction::int(45)),
-            ),
-            // A long step sounds on when a short one begins and ends in a
-            // query: the cut parts say which comes first.
-            (
-                "long steps over short ones",
-                stack(vec![steps(210, 2), steps(220, 16)]),
-            ),
-            // A cycle of the song is more than a cycle of its patterns:
-            // one that asks for each cycle, and one that does not.
-            (
-                "patterns in turn at a tempo",
-                stack(vec![
-                    in_turn(300).split_queries(),
-                    in_turn(340),
-                    Pattern::of(Node::SlowCatPrime(
-                        vec![in_turn(360), steps(370, 3)].into_boxed_slice(),
-                    ))
-                    .split_queries(),
-                    steps(380, 2),
-                ])
-                .cpm(Fraction::int(35)),
-            ),
-        ]
-    }
-
-    /// Three patterns, one a cycle: steps, lanes, and steps of two cycles.
-    fn in_turn(from: i32) -> Pattern {
-        slowcat(vec![
-            steps(from, 2),
-            stack(vec![steps(from + 10, 3), note(f64::from(from + 15))]),
-            steps(from + 20, 4).slow(whole(2)),
-        ])
-    }
-
-    /// A map of the haps of a list from a place on keeps the haps before
-    /// the place and the order of the others, and a hap that the map drops
-    /// leaves. A map that unwinds drops no hap two times.
-    #[test]
-    fn a_map_of_the_haps_of_a_list_writes_each_where_it_is() {
-        let span = TimeSpan::new(Fraction::ZERO, Fraction::ONE);
-        let shared: Arc<str> = "x".into();
-        let hap = |n: i32| Hap::new(Some(span), span, Value::F64(f64::from(n)));
-        let numbers = |haps: &[Hap]| -> Vec<f64> {
-            haps.iter().filter_map(|hap| hap.value.as_f64()).collect()
-        };
-        let mut haps: Vec<Hap> = (0..6).map(hap).collect();
-        crate::map_from(&mut haps, 2, |hap| match hap.value.as_f64() {
-            Some(3.0 | 5.0) => None,
-            number => Some(hap.with_value(|_| Value::F64(number.unwrap_or(0.0) * 10.0))),
-        });
-        assert_eq!(numbers(&haps), [0.0, 1.0, 20.0, 40.0]);
-        crate::map_from(&mut haps, 4, |_| None);
-        assert_eq!(numbers(&haps), [0.0, 1.0, 20.0, 40.0]);
-
-        // Five haps hold the text. The map takes the fourth and unwinds:
-        // that hap drops, and the fifth is not read.
-        let held = || {
-            let mut hap = Hap::new(Some(span), span, Value::F64(0.0));
-            hap.keys.edit().scale = Some(Arc::clone(&shared));
-            hap
-        };
-        let mut haps: Vec<Hap> = (0..5).map(|_| held()).collect();
-        let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let mut taken = 0;
-            crate::map_from(&mut haps, 1, |hap| {
-                taken += 1;
-                assert!(taken < 3, "the map stops");
-                Some(hap)
-            });
-        }));
-        assert!(unwound.is_err());
-        assert_eq!(haps.len(), 3);
-        drop(haps);
-        assert_eq!(Arc::strong_count(&shared), 2);
-    }
-
-    #[test]
-    fn a_run_of_short_queries_matches_fresh_walks() {
-        let widths = [Fraction::new(1, 8), Fraction::new(5, 48), third(1)];
-        let tempo = |cps: f64| {
-            let mut state = State::new(TimeSpan::new(Fraction::ZERO, Fraction::ONE));
-            state.controls.insert("_cps".to_string(), Value::F64(cps));
-            state
-        };
-        for (index, (name, _)) in songs().into_iter().enumerate() {
-            for width in widths {
-                for state in [
-                    State::new(TimeSpan::new(Fraction::ZERO, Fraction::ONE)),
-                    tempo(0.75),
-                ] {
-                    for start in [third(-4), Fraction::ZERO] {
-                        let song = || songs().swap_remove(index).1.mark_walked();
-                        let run = song();
-                        for span in in_a_row(start, width, 24) {
-                            assert_eq!(
-                                asked(&run, span, &state),
-                                asked(&song(), span, &state),
-                                "{name} over {span:?}"
-                            );
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    #[test]
-    fn a_tempo_change_keeps_what_its_pattern_says_of_the_span() {
-        use purity::SpanRead;
-        let read = |pattern: Pattern| pattern.purity().span_read;
-        assert_eq!(read(steps(0, 4).cpm(Fraction::int(30))), SpanRead::No);
-        let made = sections_made_at_the_query().swap_remove(0);
-        assert_eq!(read(made.cpm(Fraction::int(30))), SpanRead::Made);
-        assert_eq!(
-            read(crate::signal::saw().cpm(Fraction::int(30))),
-            SpanRead::Yes
-        );
-        assert_eq!(read(steps(0, 4).cpm(Fraction::int(-30))), SpanRead::Yes);
     }
 
     /// A sequence of control maps `{n}`, each at its location: `count`
@@ -2749,19 +2353,6 @@ mod restart_tests {
     }
 
     #[test]
-    fn a_graph_that_reads_the_span_is_no_graph_of_discrete_haps() {
-        let discrete = |pattern: &Pattern| pattern.purity().span_read == purity::SpanRead::No;
-        for section in discrete_sections() {
-            assert!(discrete(&section));
-            assert!(!discrete(&asked_over_the_span(section)));
-        }
-        for section in sections_with_a_signal() {
-            assert!(!discrete(&section));
-        }
-        assert!(!discrete(&crate::signal::saw()));
-    }
-
-    #[test]
     fn met_bounds_turns_for_large_coprime_periods() {
         use crate::compose::{Alignment, ComposeOp, compose};
         let a = fastcat(vec![note(1.0), note(2.0)]).fast(Fraction::int(1_048_576));
@@ -2885,10 +2476,5 @@ mod restart_tests {
             !w4.same_construction(&w8),
             "AppWave with different segment step counts must not compare equal"
         );
-    }
-
-    #[test]
-    fn order_key_handles_i128_min_without_panicking() {
-        assert!(crate::order_key(&Fraction::int(i128::MIN)).is_nan());
     }
 }

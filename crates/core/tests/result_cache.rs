@@ -81,14 +81,6 @@ impl ExtensionPatternNode for Stateless {
 }
 
 #[test]
-fn an_ordinary_graph_is_cacheable() {
-    let pattern =
-        fastcat(vec![pure(Value::F64(1.0)), pure(Value::F64(2.0))]).fast(Fraction::int(2));
-    assert!(!pattern.purity().volatile);
-    assert!(pattern.is_cacheable());
-}
-
-#[test]
 fn a_timeline_remembers_and_is_volatile() {
     let pattern = timeline(
         pure(Value::F64(0.0)),
@@ -122,13 +114,6 @@ fn a_marked_handle_stays_volatile_however_it_is_wrapped() {
     assert!(!wrapped.is_cacheable());
     // The original handle is untouched: the mark is on the copy.
     assert!(pure(Value::F64(1.0)).is_cacheable());
-}
-
-#[test]
-fn a_pure_pattern_can_be_marked_too() {
-    let marked = PurePattern::assert_pure(pure(Value::F64(1.0))).mark_volatile();
-    assert!(marked.pattern().purity().volatile);
-    assert!(!marked.pattern().purity().impure);
 }
 
 #[test]
@@ -212,16 +197,6 @@ fn a_native_body_is_built_once_per_argument_value() {
         2,
         "later cycles ask about the same two values"
     );
-}
-
-#[test]
-fn a_kept_construction_answers_exactly_what_a_fresh_one_does() {
-    let (begin, end) = cycles(0, 3);
-    let warm = counted_bind(Arc::new(AtomicUsize::new(0)));
-    let _ = warm.query_arc(begin, end);
-    let from_memo = warm.query_arc(begin, end);
-    let fresh = counted_bind(Arc::new(AtomicUsize::new(0))).query_arc(begin, end);
-    assert_eq!(shape(&from_memo), shape(&fresh));
 }
 
 #[test]

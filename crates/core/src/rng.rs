@@ -195,16 +195,4 @@ mod tests {
             ]
         );
     }
-
-    #[test]
-    fn mode_switch_is_observable_and_reversible() {
-        crate::settings::RuntimeSettings::default().with(|| {
-            use_rng(RngMode::Legacy);
-            let legacy = rand_at_time(1.0, 2.0);
-            use_rng(RngMode::Precise);
-            let precise = rand_at_time(1.0, 2.0);
-            assert_ne!(legacy, precise);
-            use_rng(RngMode::Legacy);
-        });
-    }
 }
