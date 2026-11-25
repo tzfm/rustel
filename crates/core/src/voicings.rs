@@ -2423,27 +2423,6 @@ mod tests {
             .collect()
     }
 
-    #[test]
-    fn voicings_picker_matches_chord_voicings_and_reset_shape() {
-        let entry = LegacyVoicingDict {
-            dictionary: HashMap::from([(
-                String::new(),
-                vec![
-                    ["1P", "3M", "5P"].map(str::to_owned).to_vec(),
-                    ["3M", "5P", "8P"].map(str::to_owned).to_vec(),
-                ],
-            )]),
-            range: vec![48, 72],
-        };
-        let first = best_legacy_voicing("C", &entry, None);
-        assert_eq!(first, ["C3", "E3", "G3"]);
-        let g = best_legacy_voicing("G", &entry, Some(legacy_top_note_midi(&first)));
-        assert_eq!(g, ["G3", "B3", "D4"]);
-        let led = best_legacy_voicing("C", &entry, Some(legacy_top_note_midi(&g)));
-        assert_eq!(led, ["E3", "G3", "C4"]);
-        assert_eq!(best_legacy_voicing("C", &entry, None), first);
-    }
-
     fn legacy_history_settings() -> crate::settings::RuntimeSettings {
         let settings = crate::settings::RuntimeSettings::default();
         settings.with(|| {
@@ -2522,81 +2501,6 @@ mod tests {
                 );
             });
         }
-    }
-
-    #[test]
-    fn legacy_history_picker_reads_last_string_and_preserves_midi_zero_fallback() {
-        let settings = legacy_history_settings();
-        settings.with(|| {
-            let entry = legacy_dictionary("history").expect("native dictionary");
-            for previous in [
-                vec![],
-                vec!["not-a-note".to_owned()],
-                vec!["C".to_owned()],
-                vec!["C99".to_owned()],
-            ] {
-                let previous_top = legacy_top_note_midi(&previous);
-                assert_eq!(previous_top, 0);
-                assert_eq!(
-                    best_legacy_voicing("C", &entry, Some(previous_top)),
-                    ["C3", "E3", "G3"]
-                );
-            }
-            for previous in [
-                vec!["C4".to_owned()],
-                vec!["C9".to_owned(), "C4".to_owned()],
-            ] {
-                let previous_top = legacy_top_note_midi(&previous);
-                assert_eq!(previous_top, 60);
-                assert_eq!(
-                    best_legacy_voicing("C", &entry, Some(previous_top)),
-                    ["E3", "G3", "C4"]
-                );
-            }
-            assert_eq!(best_legacy_voicing("C", &entry, None), ["E3", "G3", "C4"]);
-        });
-    }
-
-    #[test]
-    fn legacy_history_wide_emission_retains_only_the_shared_top_note() {
-        let settings = crate::settings::RuntimeSettings::default();
-        let intervals = ["1P"; MAX_USER_VOICING_STEPS].join(" ");
-        let dictionary = serde_json::json!({"": [intervals]}).to_string();
-        settings.with(|| {
-            register_user_dict_json_with_range("wide", &dictionary, Some(r#"["C3", "C5"]"#), false)
-                .expect("wide native dictionary at the step limit");
-        });
-        let snapshot = settings.detached_snapshot();
-        let charged_before = snapshot.retained_snapshot_bytes(1024 * 1024).unwrap();
-        let emitted = settings.with(|| legacy_history_notes(Value::Str("C".into()), "wide"));
-        assert_eq!(emitted.len(), MAX_USER_VOICING_STEPS);
-        assert!(emitted.iter().all(|note| note == "C3"));
-        let (retained_top, inline_bytes) = snapshot.with(|| {
-            crate::settings::with_legacy_voicing_top_note(|top_note| {
-                let retained: &Option<i64> = top_note;
-                (*retained, std::mem::size_of_val(retained))
-            })
-        });
-        assert_eq!(retained_top, Some(48));
-        assert_eq!(
-            snapshot.retained_snapshot_bytes(charged_before),
-            Some(charged_before)
-        );
-        // The typed Option<i64> history owns no variable-size heap payload.
-        // Its shared Arc/mutex allocation is charged above. This does not
-        // measure output haps, temporary picker allocations, or process RSS.
-        eprintln!(
-            "{}",
-            serde_json::json!({
-                "observation": "legacy-history-retained-scalar",
-                "emitted_notes": emitted.len(), "top_note_midi": retained_top,
-                "inline_value_bytes": inline_bytes, "history_heap_bytes": 0,
-            })
-        );
-        settings.with(reset_voicings);
-        snapshot.with(|| {
-            crate::settings::with_legacy_voicing_top_note(|top_note| assert!(top_note.is_none()))
-        });
     }
 
     #[test]

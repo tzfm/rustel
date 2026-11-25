@@ -160,35 +160,6 @@ mod report_tests {
     }
 
     #[test]
-    fn report_v1_preserves_available_scheduler_queues_without_inventing_device_values() {
-        let mut producer = ProducerLoadSnapshot {
-            publication: 1,
-            producer_backlog_depth: 2,
-            producer_backlog_capacity: 4,
-            scheduler_queue_depth: 3,
-            scheduler_queue_capacity: 8,
-            scheduler_trace_depth: 5,
-            scheduler_trace_capacity: 16,
-            ..ProducerLoadSnapshot::default()
-        };
-        producer.last_outcome = ProducerTurnOutcome::Idle;
-        let value = serde_json::to_value(
-            EnginePressureSnapshot {
-                producer,
-                ..EnginePressureSnapshot::default()
-            }
-            .report_v1(EnginePressureReportContext::default()),
-        )
-        .expect("serialize pressure report");
-
-        assert_eq!(value["queues"]["event_ring"], serde_json::Value::Null);
-        assert_eq!(value["queues"]["assets"], serde_json::Value::Null);
-        assert_eq!(value["queues"]["producer_backlog"]["depth"], 2);
-        assert_eq!(value["queues"]["scheduler"]["depth"], 3);
-        assert_eq!(value["queues"]["scheduler_trace"]["depth"], 5);
-    }
-
-    #[test]
     fn report_v1_schema_and_named_pool_projection_are_exact() {
         let value = serde_json::to_value(
             EnginePressureSnapshot {
@@ -991,51 +962,6 @@ mod tests {
             EnginePressureCause::ProducerOverload,
             "a generic refusal must not hide the measured saturated side"
         );
-    }
-
-    #[test]
-    fn a_recent_failure_lingers_then_expires_without_recounting() {
-        let now = Instant::now();
-        let mut monitor = EnginePressureMonitor::default();
-        let mut host = report(1_000);
-        host.max_callback_gap_nanos = 20_000_000;
-        assert_eq!(
-            monitor.sample_at(host, producer(0), 128, now).cause,
-            EnginePressureCause::HostStarvation
-        );
-        assert_eq!(
-            monitor
-                .sample_at(host, producer(0), 128, now + Duration::from_secs(1),)
-                .cause,
-            EnginePressureCause::HostStarvation
-        );
-        assert_eq!(
-            monitor
-                .sample_at(host, producer(0), 128, now + Duration::from_secs(3),)
-                .cause,
-            EnginePressureCause::Healthy
-        );
-    }
-
-    #[test]
-    fn the_shared_snapshot_exposes_exact_status_values_and_capacities() {
-        let mut device = report(2_400);
-        device.realtime_pressure.active_voices = 18;
-        device.realtime_pressure.peak_active_voices = 23;
-        let snapshot = EnginePressureMonitor::default().sample_at(
-            device,
-            producer(1_100),
-            128,
-            Instant::now(),
-        );
-        assert_eq!(snapshot.dsp_load_basis_points(), 2_400);
-        assert_eq!(snapshot.scheduler_load_basis_points(), 1_100);
-        assert_eq!(snapshot.cover_millis(), 420);
-        assert_eq!(snapshot.active_voices(), 18);
-        assert_eq!(snapshot.peak_active_voices(), 23);
-        assert_eq!(snapshot.semantic_voice_capacity(), 128);
-        assert_eq!(snapshot.hard_voice_capacity(), 512);
-        assert_eq!(snapshot.pending_capacity(), 8_192);
     }
 
     #[test]

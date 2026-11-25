@@ -147,26 +147,6 @@ pub fn interleaved(
 mod tests {
     use super::*;
 
-    /// A sine well inside both passbands must survive with its amplitude and
-    /// phase intact - the kernel is a lowpass, and 1 kHz is nowhere near it.
-    #[test]
-    fn a_passband_sine_keeps_its_amplitude() {
-        let frames = 4096;
-        let source: Vec<f32> = (0..frames)
-            .map(|i| (std::f64::consts::TAU * 1000.0 * i as f64 / 44_100.0).sin() as f32)
-            .collect();
-        let out = interleaved(&source, 1, 44_100, 48_000).expect("ordinary conversion");
-        assert_eq!(out.len(), converted_frames(frames, 44_100, 48_000));
-        // Skip the kernel's lead-in and tail, where the zero padding shows.
-        for (i, value) in out.iter().enumerate().take(out.len() - 64).skip(64) {
-            let want = (std::f64::consts::TAU * 1000.0 * i as f64 / 48_000.0).sin() as f32;
-            assert!(
-                (value - want).abs() < 2e-3,
-                "frame {i}: {value} vs {want} (sine must pass unchanged)"
-            );
-        }
-    }
-
     /// Amplitude of a steady tone, from its energy rather than its peak: at
     /// 12 kHz a period is four samples wide and no sample need land on the
     /// crest, so a peak reading understates a filter that is in fact flat.

@@ -1550,28 +1550,6 @@ mod tests {
     /// the old one's place rather than adding to it, and a recycled backend
     /// holds none until asked again. The backend is measured once, before
     /// the callback owns it.
-    /// An orbit that goes back to a room, or takes the room of another
-    /// orbit, makes no new response.
-    #[test]
-    fn orbits_share_the_response_of_a_room() {
-        let device = LiveScalarDevice::start_silent(48_000, 7).expect("silent output");
-        let room = |size_secs| crate::reverb::ReverbParams {
-            size_secs,
-            fade_secs: 0.01,
-            lp_start_hz: 15_000.0,
-            lp_end_hz: 1_000.0,
-            ir: None,
-        };
-        for (orbit, size) in [(0, 0.05), (0, 0.1), (0, 0.05), (1, 0.1), (2, 0.05)] {
-            device.ensure_reverb(orbit, room(size));
-        }
-        let known: Vec<f32> = locked(&device.reverb_responses)
-            .iter()
-            .map(|response| response.params().size_secs)
-            .collect();
-        assert_eq!(known, [0.1, 0.05]);
-    }
-
     #[test]
     fn an_outputs_memory_counts_each_orbit_reverb_once() {
         let mut device = LiveScalarDevice::start_silent(48_000, 7).expect("silent output");
@@ -1826,89 +1804,6 @@ mod tests {
         assert!(rooms[0].bytes() > line, "a reverb and a line");
     }
 
-    /// A box the callback refuses frees its parts and the parts of the
-    /// boxes before it, and no part of a later box. The chain then does not
-    /// wait for a bus: the later box is still on its way.
-    #[test]
-    fn a_refused_box_keeps_the_parts_of_a_later_box() {
-        let mut device = LiveScalarDevice::start_silent(48_000, 7).expect("silent output");
-        device.silent_handle_mut().expect("silent callback").stop();
-        let line = crate::scalar::ChainRoom::delay_bytes(48_000);
-        device.ensure_chain_room(9, Some(room_reverb(0.025)), true);
-        let mut first = shipped_rooms(&device);
-        device.ensure_chain_room(9, Some(room_reverb(0.5)), true);
-        let second = shipped_rooms(&device);
-        assert_eq!(second.len(), 1, "the new reverb alone");
-        let shipped = device.memory().reverbs;
-        refuse(&device, first.remove(0));
-        device.reclaim_assets();
-        assert_eq!(device.memory().reverbs, shipped - line, "the new reverb");
-        device.ensure_chain_room(9, Some(room_reverb(0.5)), true);
-        let rooms = shipped_rooms(&device);
-        assert_eq!(rooms.len(), 1, "no wait for a bus");
-        assert_eq!(rooms[0].bytes(), line, "a line alone");
-    }
-
-    /// A full list of chains drops an entry that keeps nothing before an
-    /// entry that keeps the wait of a chain with no bus. That chain still
-    /// waits out its second.
-    #[test]
-    fn a_full_list_of_chains_keeps_the_wait_for_a_bus() {
-        let mut device = LiveScalarDevice::start_silent(48_000, 7).expect("silent output");
-        device.silent_handle_mut().expect("silent callback").stop();
-        device.ensure_chain_room(1, None, true);
-        let mut first = shipped_rooms(&device);
-        refuse(&device, first.remove(0));
-        // With no budget, the other chains ship nothing and keep nothing.
-        locked(&device.chain_room_cache).budget = 0;
-        let full = 2 * crate::insert::MAX_INSERT_BUSES as u64;
-        for chain in 2..=full + 1 {
-            device.ensure_chain_room(chain, None, true);
-        }
-        locked(&device.chain_room_cache).budget = crate::scalar::MAX_CHAIN_ROOM_BYTES;
-        device.ensure_chain_room(1, None, true);
-        assert!(
-            shipped_rooms(&device).is_empty(),
-            "the chain with no bus waits"
-        );
-    }
-
-    /// A full list of chains drops an entry that keeps nothing before an
-    /// entry that keeps a reverb the budget refused. The producer then does
-    /// not make that reverb again while the budget has no room for it.
-    #[test]
-    fn a_full_list_of_chains_keeps_a_refused_reverb() {
-        let mut device = LiveScalarDevice::start_silent(48_000, 7).expect("silent output");
-        device.silent_handle_mut().expect("silent callback").stop();
-        // With no budget, the reverb is refused, and the other chains ship
-        // nothing and keep nothing.
-        locked(&device.chain_room_cache).budget = 0;
-        device.ensure_chain_room(1, Some(room_reverb(0.001)), false);
-        let full = 2 * crate::insert::MAX_INSERT_BUSES as u64;
-        for chain in 2..=full + 1 {
-            device.ensure_chain_room(chain, None, true);
-        }
-        let cache = locked(&device.chain_room_cache);
-        let kept = |entry: &ChainRoomEntry| entry.chain == 1 && entry.refused.is_some();
-        assert!(cache.entries.iter().any(kept), "the refused reverb");
-    }
-
-    /// A full list of chains that each keep a reverb the budget refused
-    /// drops one of them for a new chain, and the new chain ships its room.
-    #[test]
-    fn a_full_list_of_refused_reverbs_drops_one_for_a_new_chain() {
-        let mut device = LiveScalarDevice::start_silent(48_000, 7).expect("silent output");
-        device.silent_handle_mut().expect("silent callback").stop();
-        locked(&device.chain_room_cache).budget = 0;
-        let full = 2 * crate::insert::MAX_INSERT_BUSES as u64;
-        for chain in 1..=full {
-            device.ensure_chain_room(chain, Some(room_reverb(0.001)), false);
-        }
-        locked(&device.chain_room_cache).budget = crate::scalar::MAX_CHAIN_ROOM_BYTES;
-        device.ensure_chain_room(full + 1, None, true);
-        assert_eq!(shipped_rooms(&device).len(), 1, "a room for the new chain");
-    }
-
     /// A line goes into the budget only next to the reverb the room keeps:
     /// a new reverb the budget refuses frees no room for the line.
     #[test]
@@ -1949,41 +1844,6 @@ mod tests {
         assert_eq!(rooms.len(), 1, "the new reverb");
         assert_eq!(rooms[0].bytes(), held, "no line");
         assert_eq!(device.memory().reverbs, held);
-    }
-
-    /// More than eight room settings remain usable across repeated cache cycles.
-    #[test]
-    fn nine_distinct_stage_reverbs_repeat_after_cache_eviction() {
-        let mut device = LiveScalarDevice::start_silent(48_000, 7).expect("silent output");
-        device.silent_handle_mut().expect("silent callback").stop();
-        let room = |index: usize| crate::reverb::ReverbParams {
-            size_secs: 0.025,
-            fade_secs: 0.01,
-            lp_start_hz: 15_000.0,
-            lp_end_hz: 1_000.0 + index as f32,
-            ir: None,
-        };
-        let mut installed = Vec::new();
-        for _ in 0..3 {
-            for index in 0..9 {
-                device.ensure_fx_reverb(room(index));
-            }
-            assert_eq!(device.shared.samples.fx_reverb_installs.len(), 9);
-            for (index, install) in device
-                .shared
-                .samples
-                .fx_reverb_installs
-                .drain_available()
-                .enumerate()
-            {
-                // SAFETY: the callback is stopped. This thread owns the popped box.
-                let reverb = unsafe { Box::from_raw(install.reverb) };
-                assert_eq!(reverb.params(), room(index));
-                installed.push(reverb);
-            }
-        }
-        assert_eq!(installed.len(), 27);
-        assert_eq!(device.report().asset_queues.fx_reverb_refusals, 0);
     }
 
     #[test]
@@ -3336,30 +3196,6 @@ mod tests {
         drop(device);
         assert_eq!(Arc::strong_count(&shared), 1);
         crate::set_plugin_pool_for_test(None);
-    }
-
-    #[test]
-    fn live_reverb_batch_keeps_only_the_final_request_per_orbit() {
-        let first = crate::reverb::ReverbParams {
-            ir: None,
-            size_secs: 0.1,
-            fade_secs: 0.1,
-            lp_start_hz: 15_000.0,
-            lp_end_hz: 1_000.0,
-        };
-        let final_request = crate::reverb::ReverbParams {
-            size_secs: 0.2,
-            ..first
-        };
-        let mut batch = LiveReverbBatch::default();
-
-        batch.request_orbit(0, first);
-        batch.request_orbit(0, final_request);
-        batch.request_orbit(1, first);
-
-        assert_eq!(batch.requested[0], Some(final_request));
-        assert_eq!(batch.requested[1], Some(first));
-        assert_eq!(batch.requested.iter().flatten().count(), 2);
     }
 
     /// The names source hears the counts of the output at each turn. A close

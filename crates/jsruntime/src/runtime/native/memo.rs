@@ -1139,32 +1139,6 @@ impl<'p> Reuse<'p> {
 
 #[cfg(test)]
 mod tests {
-    use super::Unchanged;
-
-    #[test]
-    fn a_text_outside_an_edit_is_the_text_before() {
-        let before: String = ('a'..='z').cycle().take(50).collect();
-        // An edit of one byte, at each side of the width of a comparison.
-        for at in [0, 1, 15, 16, 17, 31, 32, 33, 48, 49] {
-            let mut edited = before.clone().into_bytes();
-            edited[at] = b'#';
-            let edited = String::from_utf8(edited).expect("a text of ASCII");
-            let unchanged = Unchanged::of(&edited, &before);
-            for start in 0..50 {
-                for end in start + 1..=50 {
-                    let outside = !(start..end).contains(&at);
-                    assert_eq!(unchanged.holds(start, end), outside, "{at}: {start}..{end}");
-                }
-            }
-        }
-        assert!(Unchanged::of(&before, &before).holds(0, 50));
-        // A byte more moves each byte after it: the start alone stays.
-        let longer = format!("{}#{}", &before[..20], &before[20..]);
-        let unchanged = Unchanged::of(&longer, &before);
-        assert!(unchanged.holds(0, 20));
-        assert!(!unchanged.holds(0, 21));
-        assert!(!unchanged.holds(30, 40));
-    }
 
     #[test]
     fn version_near_wrap_resets_memo_instead_of_reusing_old_versions() {

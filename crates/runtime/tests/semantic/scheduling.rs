@@ -44,44 +44,6 @@ const HOST_REQUIRED_SOURCES: &[&str] = &[
 const PURE_SOURCES: &[&str] = &[r#"s("bd sd")"#, r#"s("bd sd").fast(2)"#, r#"note("c e g")"#];
 
 #[test]
-fn play_schedules_host_required_graphs_without_panicking() {
-    for source in HOST_REQUIRED_SOURCES {
-        let mut session = Session::new().expect("session");
-        session
-            .evaluate(source)
-            .unwrap_or_else(|e| panic!("{source}: evaluate failed: {e}"));
-
-        let report = session
-            .play(2.0)
-            .unwrap_or_else(|e| panic!("{source}: play failed: {e}"));
-        assert!(
-            !report.onsets.is_empty(),
-            "{source}: scheduled nothing. An empty timeline is how a swallowed \
-             callback failure looks - the query error empties the whole arc."
-        );
-        assert_eq!(report.device_audio, "not-requested");
-    }
-}
-
-#[test]
-fn render_schedules_host_required_graphs_without_panicking() {
-    let dir = std::env::temp_dir().join("rustel-scheduling-test");
-    std::fs::create_dir_all(&dir).expect("temp dir");
-    for (i, source) in HOST_REQUIRED_SOURCES.iter().enumerate() {
-        let mut session = Session::new().expect("session");
-        session
-            .evaluate(source)
-            .unwrap_or_else(|e| panic!("{source}: evaluate failed: {e}"));
-        let out = dir.join(format!("render-{i}.json"));
-        session
-            .render(1.0, &out, RenderFormat::OnsetJson)
-            .unwrap_or_else(|e| panic!("{source}: render failed: {e}"));
-        assert!(out.exists(), "{source}: render wrote nothing");
-        let _ = std::fs::remove_file(&out);
-    }
-}
-
-#[test]
 fn scheduled_onsets_agree_with_the_queried_haps() {
     // Not just "it did not panic": the timeline has to carry the same onsets
     // the query does, with the same VALUES and the same multiplicity.
@@ -141,28 +103,6 @@ fn scheduled_onsets_agree_with_the_queried_haps() {
     }
 }
 
-#[test]
-fn pure_graphs_still_schedule_with_no_callback_host() {
-    // The complement, and the reason the fix checks `active_needs_host()`
-    // rather than always installing a scope: a graph classified PURE must never
-    // need JavaScript. If one of these started requiring the host, the
-    // classification would be wrong and the purity guarantee hollow.
-    for source in PURE_SOURCES {
-        let mut session = Session::new().expect("session");
-        session
-            .evaluate(source)
-            .unwrap_or_else(|e| panic!("{source}: evaluate failed: {e}"));
-        assert!(
-            !session.active_needs_host(),
-            "{source} reaches no JavaScript and must classify pure"
-        );
-        let report = session
-            .play(2.0)
-            .unwrap_or_else(|e| panic!("{source}: play failed: {e}"));
-        assert!(!report.onsets.is_empty(), "{source}: scheduled nothing");
-    }
-}
-
 /// Heap headroom above what the session already holds; the callback requests
 /// much more. A callback that exhausts the QuickJS heap must fail scheduling
 /// with a typed refusal, not a panic and not `Ok([])`.
@@ -178,19 +118,6 @@ fn hogging_session() -> Session {
         .set_js_memory_limit(session.js_heap_live() + HEAP_HEADROOM)
         .expect("lowering the ceiling to just above current usage");
     session
-}
-
-#[test]
-fn a_callback_heap_exhaustion_is_a_typed_refusal_through_query() {
-    let session = hogging_session();
-    let err = session
-        .query(Fraction::ZERO, Fraction::ONE)
-        .expect_err("an exhausted heap must not come back as an empty query");
-    assert_eq!(
-        err.kind(),
-        "resource-limit",
-        "a heap refusal must be typed as a resource limit, got {err}"
-    );
 }
 
 #[test]

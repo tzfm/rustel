@@ -192,6 +192,52 @@ pub(crate) fn apply_control_method(
     }
 }
 
+/// The distortion shortcuts such as `diode`, each named for its algorithm.
+pub(crate) const DISTORTIONS: [&str; 8] = [
+    "soft",
+    "hard",
+    "cubic",
+    "diode",
+    "asym",
+    "fold",
+    "sinefold",
+    "chebyshev",
+];
+
+/// What `receiver.diode(amount, volume)` builds, for any algorithm of
+/// [`DISTORTIONS`]: `distort` with the algorithm after the amount (or an
+/// `amount:volume` pair), then `volume`, when given, as `distortvol` on each
+/// event, so a signal there is sampled per event.
+pub(crate) fn distort_with_algorithm(
+    receiver: Pattern,
+    amount: Pattern,
+    volume: Option<Pattern>,
+    algorithm: &'static str,
+) -> Pattern {
+    let amount = amount.fmap(
+        move |value| match rustel_core::materialize_js_value(value) {
+            Value::List(values) => {
+                let mut out = values.to_vec();
+                out.push(Value::Str(algorithm.into()));
+                Value::list(out)
+            }
+            value => Value::list(vec![value, Value::F64(1.0), Value::Str(algorithm.into())]),
+        },
+    );
+    let controls = control_registry();
+    let distorted = controls
+        .get("distort")
+        .expect("distort control")
+        .apply(&receiver, Some(amount));
+    match volume {
+        Some(volume) => controls
+            .get("distortvol")
+            .expect("distortvol control")
+            .apply(&distorted, Some(volume)),
+        None => distorted,
+    }
+}
+
 /// Refuse JavaScript callbacks at a registered combinator boundary unless the
 /// registration explicitly declares that it consumes a pattern transformer.
 ///
@@ -727,3 +773,14 @@ pub(crate) use builtin_methods::*;
 pub(crate) use effects::*;
 pub(crate) use patterns::*;
 pub(crate) use setup::*;
+
+/// Whether the native tier knows `name` as a method of a pattern. A call
+/// it knows can still go to the script engine for its arguments.
+pub fn native_method(name: &str) -> bool {
+    ListedNames.method(name).is_some()
+}
+
+/// Whether the native tier knows `name` as a global function or value.
+pub fn native_global(name: &str) -> bool {
+    ListedNames.global(name).is_some()
+}

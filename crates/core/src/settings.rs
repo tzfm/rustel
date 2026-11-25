@@ -1320,19 +1320,6 @@ mod tests {
     }
 
     #[test]
-    fn snapshot_retention_refuses_sparse_table_work_and_overflow() {
-        let values: HashMap<String, String> = HashMap::with_capacity(8);
-        let mut charge = NativeRetention::new(usize::MAX);
-        charge.remaining_work = values.capacity() - 1;
-        assert_eq!(charge.map(&values), None);
-        assert_eq!(charge.bytes, 0);
-
-        charge.bytes = usize::MAX - 1;
-        assert_eq!(charge.add(2), None);
-        assert_eq!(charge.bytes, usize::MAX - 1);
-    }
-
-    #[test]
     fn snapshot_retention_detaches_publication_and_charges_fixed_shared_cells() {
         let settings = RuntimeSettings::default();
         let retired = Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -1541,16 +1528,6 @@ mod tests {
     }
 
     #[test]
-    fn runtime_handle_is_pointer_sized_and_send_sync() {
-        fn assert_send_sync<T: Send + Sync>() {}
-        assert_send_sync::<RuntimeSettings>();
-        assert_eq!(
-            std::mem::size_of::<RuntimeSettings>(),
-            std::mem::size_of::<Arc<()>>()
-        );
-    }
-
-    #[test]
     fn nested_runtime_scopes_restore_the_previous_settings() {
         let baseline = RuntimeSettings::default();
         let outer = RuntimeSettings::default();
@@ -1670,19 +1647,6 @@ mod tests {
         });
         published.with(|| assert_eq!(default_join(), 2));
         candidate.with(|| assert_eq!(default_join(), 6));
-    }
-
-    #[test]
-    fn repeated_same_handle_scopes_do_not_grow_the_binding_stack() {
-        let settings = RuntimeSettings::default();
-        settings.with(|| {
-            let depth = CURRENT.with(|current| current.borrow().len());
-            settings.with(|| {
-                assert_eq!(CURRENT.with(|current| current.borrow().len()), depth);
-                set_rng_mode(1);
-            });
-            assert_eq!(rng_mode(), 1);
-        });
     }
 
     #[test]

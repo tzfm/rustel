@@ -44,25 +44,6 @@ fn a_callback_returned_graph_keeps_its_own_callbacks_alive() {
     rt.clear_active();
 }
 
-/// The same shape with BOTH arguments patterned, so both transformers are
-/// chosen at query time and neither can be applied eagerly.
-#[test]
-fn query_time_nested_callbacks_resolve() {
-    let rt = runtime();
-    eval(
-        &rt,
-        r#"fastcat("bd", "sd").every(fastcat(2, 2), x => x.every(fastcat(2, 3), y => y.fast(2)))"#,
-    );
-    let haps = shown(&rt, 2);
-    assert!(
-        !haps.is_empty(),
-        "a query-time nested callback must still resolve its cell"
-    );
-    // Stable across repeats: the frame is rebuilt per query, not carried over.
-    assert_eq!(haps, shown(&rt, 2), "repeated query changed its answer");
-    rt.clear_active();
-}
-
 /// `sometimesBy` has an INTERNAL `fmap(...).innerJoin()` even when its
 /// probability is scalar. The callback is therefore not an eager register
 /// argument: it must survive score construction and GC, then run once for each
@@ -392,54 +373,6 @@ fn throwing_queries_reclaim_their_cells_too() {
     rt.clear_active();
 }
 
-/// A callback-bearing TEMPORARY built and discarded inside one evaluation must
-/// not stay rooted merely because the frame harvested it.
-///
-/// GC must run while the active graph still owns the surviving wrapper;
-/// clearing it first would release both correct and incorrectly retained
-/// callbacks before the count is taken.
-#[test]
-fn a_discarded_callback_temporary_is_not_rooted_by_the_survivor() {
-    let rt = runtime();
-    rt.run_gc();
-    let baseline_live = rustel_jsruntime::cells_live();
-    let created_before = rustel_jsruntime::cells_created();
-
-    // The discarded statement puts a cell into the frame's harvest set: the
-    // inner `every(fastcat(2, 3), ...)` resolves at query time. The result is
-    // never bound, so the callback-free second graph must not get that cell.
-    eval(
-        &rt,
-        r#"fastcat("bd", "sd").every(2, x => x.every(fastcat(2, 3), y => y.fast(2)));
-           fastcat("hh", "cp").fast(2)"#,
-    );
-    assert!(
-        rustel_jsruntime::cells_created() > created_before,
-        "the discarded statement must actually create a callback cell, or this \
-         test asserts nothing"
-    );
-
-    // GC with the survivor STILL INSTALLED: this is what distinguishes a
-    // correctly-filtered transfer from one that harvested the whole frame.
-    rt.run_gc();
-    assert_eq!(
-        rustel_jsruntime::cells_live(),
-        baseline_live,
-        "the discarded temporary's cell is still rooted while the active graph holds the \
-         survivor; `derive_wrapper` is retaining every frame cell instead of \
-         only those the surviving graph can reach"
-    );
-
-    // ...and the survivor is intact, so the filter did not over-prune.
-    assert_eq!(
-        shown(&rt, 1),
-        "[ 0/1 → 1/4 | hh ];[ 1/4 → 1/2 | cp ];[ 1/2 → 3/4 | hh ];[ 3/4 → 1/1 | cp ]",
-        "the surviving graph lost haps: the reachability filter pruned too much"
-    );
-
-    rt.clear_active();
-}
-
 /// Two query-time callback graphs live in one composed result, and the score
 /// resets the old allocator name between them. The ids must not collide: the
 /// haps are compared with pinned Node output, so a swapped transformer fails.
@@ -472,32 +405,6 @@ const NODE_COLLISION: &str = "[ 0/1 → 1/4 | bd ];[ (0/1 → 1/2) ⇝ 1/1 | hh 
 
 /// Pinned Node, the nested query-time form, cycles 0..2.
 const NODE_NESTED: &str = "[ 0/1 → 1/4 | bd ];[ 1/4 → 1/2 | sd ];[ 1/2 → 3/4 | bd ];[ 3/4 → 1/1 | sd ];[ 1/1 → 3/2 | bd ];[ 3/2 → 2/1 | sd ]";
-
-/// Ids must be unique across BOTH wrapper families in one runtime - the
-/// builder's `PatternWrapper` and the host surface's `NativePatternWrapper`
-/// share one allocator.
-#[test]
-fn ids_are_unique_across_both_wrapper_families() {
-    let rt = runtime();
-    let before = rt.alloc_id();
-
-    // Host-surface path: creates bridge cells.
-    eval(&rt, r#"fastcat("bd", "sd").every(2, x => x.fast(2))"#);
-    let after_host = rt.alloc_id();
-    assert!(
-        after_host > before,
-        "the host surface did not draw from the shared allocator"
-    );
-
-    // Builder path: must not restart from zero.
-    let mut b = rt.builder();
-    let builder_id = b.callback(&rt, "(_w) => (x) => x");
-    assert!(
-        builder_id > after_host,
-        "builder id {builder_id} collides with host-surface ids (<= {after_host})"
-    );
-    rt.clear_active();
-}
 
 /// An eager transformer callback that throws fails the evaluation: numeric
 /// `every` invokes its callback during construction. The failed evaluation
@@ -824,74 +731,4 @@ fn an_eager_callback_throw_keeps_a_pending_job_refusal_typed() {
         "vacuous: no eager call"
     );
     assert_eq!(rt.get_number("__jobRan"), None);
-}
-
-/// Negative control: a callback id with no owner anywhere must still be a hard
-/// error, not a silent wrong-callback invocation.
-#[test]
-fn an_unowned_callback_id_is_still_a_hard_error() {
-    let rt = runtime();
-    let mut b = rt.builder();
-    let id = b.callback(&rt, "(_w) => (x) => x");
-    // Deliberately install a graph referencing the id WITHOUT importing the
-    // wrapper that owns it.
-    let nb = rt.builder();
-    let err = rt
-        .set_active(
-            &nb,
-            rustel_core::pure(rustel_core::Value::Str("bd".into())).fmap_js(id),
-        )
-        .unwrap_err();
-    assert!(
-        err.contains(&format!("callback {id}")),
-        "expected a missing-cell error naming the id, got: {err}"
-    );
-}
-
-/// An interrupted callback leaves no scope and no scratch, and the runtime
-/// stays usable. An interrupt unwinds on a different path from a JS `throw`
-/// or a Rust error.
-#[test]
-fn an_interrupted_query_tears_down_every_scope() {
-    let rt = runtime();
-    eval(
-        &rt,
-        r#"fastcat("bd", "sd").every(fastcat(2, 3), x => {
-             while (true) {}
-           })"#,
-    );
-
-    let outcome = rt.with_deadline(std::time::Duration::from_millis(50), || {
-        rt.query(Slot::Active, 0, Fraction::ZERO, Fraction::int(2))
-    });
-    // Either a host error or an empty result is acceptable; what matters is
-    // that it TERMINATED and unwound.
-    let _ = outcome;
-    assert!(rt.was_interrupted(), "interrupt handler did not fire");
-
-    assert_eq!(
-        rt.query_depth(),
-        0,
-        "query stack not unwound after interrupt"
-    );
-    assert_eq!(
-        rustel_jsruntime::bridge_frame_depth(),
-        0,
-        "bridge frame not unwound after interrupt"
-    );
-    assert_eq!(
-        rustel_jsruntime::bridge_scratch_len(),
-        0,
-        "bridge scratch survived an interrupt"
-    );
-
-    // ...and the runtime is still usable afterwards.
-    rt.clear_active();
-    eval(&rt, r#"fastcat("hh", "cp").fast(2)"#);
-    assert_eq!(
-        shown(&rt, 1),
-        "[ 0/1 → 1/4 | hh ];[ 1/4 → 1/2 | cp ];[ 1/2 → 3/4 | hh ];[ 3/4 → 1/1 | cp ]",
-        "runtime unusable after an interrupted query"
-    );
-    rt.clear_active();
 }

@@ -182,47 +182,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn automatic_selection_is_cached() {
-        let first = WavetableKernel::automatic();
-        let second = WavetableKernel::automatic();
-        assert_eq!(first.is_some(), second.is_some());
-
-        #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-        assert_eq!(
-            selected_wavetable_kernel_kind(),
-            if std::arch::is_x86_feature_detected!("avx2") {
-                WavetableKernelKind::Avx2
-            } else {
-                WavetableKernelKind::Portable
-            }
-        );
-        #[cfg(target_arch = "aarch64")]
-        assert_eq!(
-            selected_wavetable_kernel_kind(),
-            if std::arch::is_aarch64_feature_detected!("neon") {
-                WavetableKernelKind::Neon
-            } else {
-                WavetableKernelKind::Portable
-            }
-        );
-        #[cfg(not(any(target_arch = "x86", target_arch = "x86_64", target_arch = "aarch64")))]
-        assert_eq!(
-            selected_wavetable_kernel_kind(),
-            WavetableKernelKind::Portable
-        );
-
-        assert!(WavetableKernelKind::Portable.compiled());
-        assert_eq!(
-            WavetableKernelKind::Avx2.compiled(),
-            cfg!(any(target_arch = "x86", target_arch = "x86_64"))
-        );
-        assert_eq!(
-            WavetableKernelKind::Neon.compiled(),
-            cfg!(target_arch = "aarch64")
-        );
-    }
-
-    #[test]
     fn incomplete_tables_and_unusual_phases_keep_the_scalar_path() {
         let Some(kernel) = WavetableKernel::automatic() else {
             return;

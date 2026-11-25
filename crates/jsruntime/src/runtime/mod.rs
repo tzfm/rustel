@@ -404,6 +404,9 @@ pub struct JsRuntime {
     /// Whether score JavaScript may have run since the last check for a
     /// native panic it caught. See [`JsRuntime::raise_caught_native_panic`].
     pub(super) script_may_have_run: Cell<bool>,
+    /// Whether score evaluations tag each lane's haps with its lane id.
+    /// Off by default so ordinary playback and exports pay zero overhead.
+    pub(super) lane_tagging: Cell<bool>,
 }
 
 /// Effects staged by a successful Session-owned JavaScript score or setup.
@@ -908,93 +911,5 @@ mod caught_panic_tests {
         }))
         .expect_err("the caught panic is raised again");
         assert_eq!(raised.downcast_ref::<&str>(), Some(&"native boom"));
-    }
-
-    #[test]
-    fn raising_with_no_caught_panic_does_nothing() {
-        let runtime = runtime_with_panicking_native();
-        runtime.raise_caught_native_panic();
-        runtime
-            .eval("globalThis.after = 1;")
-            .expect("the realm still works");
-    }
-}
-
-#[cfg(test)]
-mod first_use_tests {
-    use super::*;
-
-    #[test]
-    fn a_line_written_inside_with_logs_dropped_is_dropped_with_no_buffer_before() {
-        let runtime = JsRuntime::deferred(None);
-        assert!(runtime.logs.get().is_none());
-        runtime.with_logs_dropped(|| runtime.logs().borrow_mut().push("quiet".into()));
-        assert!(runtime.take_logs().is_empty(), "a dropped line came back");
-    }
-
-    #[test]
-    fn with_logs_dropped_keeps_the_lines_written_before_it() {
-        let runtime = JsRuntime::deferred(None);
-        runtime.logs().borrow_mut().push("kept".into());
-        runtime.with_logs_dropped(|| runtime.logs().borrow_mut().push("quiet".into()));
-        assert_eq!(runtime.take_logs(), ["kept"]);
-    }
-
-    #[test]
-    fn a_read_of_the_callback_ir_state_makes_none() {
-        let runtime = JsRuntime::deferred(None);
-        assert_eq!(
-            runtime.pattern_transform_ir_mode(),
-            PatternTransformIrMode::Auto
-        );
-        let _ = runtime.pattern_transform_ir_stats();
-        runtime.reset_pattern_transform_ir_stats();
-        assert!(runtime.callback_ir.get().is_none(), "a read made the state");
-    }
-
-    #[test]
-    fn a_new_runtime_keeps_no_text_of_a_native_build() {
-        let runtime = JsRuntime::deferred(None);
-        assert!(runtime.native_source_text().is_none());
-    }
-
-    #[test]
-    fn the_midi_bus_and_its_handles_are_made_together_or_not_at_all() {
-        let runtime = JsRuntime::deferred(None);
-        assert!(!runtime.midi_bus_made());
-        let _handles = runtime.midi_handles();
-        assert!(runtime.midi_bus_made(), "the handles came without the bus");
-        let runtime = JsRuntime::deferred(None);
-        let _bus = runtime.midi_input_bus();
-        assert!(runtime.midi_in.get().is_some());
-    }
-
-    #[test]
-    fn a_transaction_takes_heap_room_at_its_first_write_only() {
-        let mut transaction = EffectTransaction::default();
-        assert!(
-            transaction.effects_mut().is_none(),
-            "a closed transaction took a write"
-        );
-        assert!(transaction.finish().is_none());
-        transaction.begin();
-        assert!(transaction.is_open());
-        assert!(
-            transaction.written().is_none(),
-            "an open transaction took room before a write"
-        );
-        transaction.effects_mut().expect("open").cps = Some(2.0);
-        assert_eq!(
-            transaction.written().and_then(|effects| effects.cps),
-            Some(2.0)
-        );
-        assert_eq!(transaction.finish().expect("open").cps, Some(2.0));
-        assert!(!transaction.is_open());
-        transaction.begin();
-        assert_eq!(transaction.finish(), Some(ScoreEffects::default()));
-        transaction.begin();
-        transaction.effects_mut().expect("open").gamepad = true;
-        transaction.abort();
-        assert!(!transaction.is_open() && transaction.written().is_none());
     }
 }

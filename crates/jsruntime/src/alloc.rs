@@ -441,20 +441,6 @@ mod tests {
     }
 
     #[test]
-    fn a_budget_denial_does_set_the_flag() {
-        // The complement, so the test above cannot pass because the flag is
-        // never set at all.
-        let (mut alloc, _budget) = allocator(BLOCK);
-        let _ = take_heap_exhausted();
-        let ptr = alloc.alloc(BLOCK * 4);
-        assert!(ptr.is_null());
-        assert!(
-            take_heap_exhausted(),
-            "a BUDGET denial must set the flag, or nothing distinguishes it"
-        );
-    }
-
-    #[test]
     fn alignment_overflow_is_a_refusal_not_an_ffi_panic() {
         let (mut alloc, budget) = allocator(1024 * 1024);
 

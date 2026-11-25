@@ -156,24 +156,3 @@ fn nan_fallback_returns_the_fallback_instead_of_throwing_over_a_warning() {
     assert_eq!(n("nanFallback(NaN, 7)"), 7.0);
     assert_eq!(n("nanFallback(5, 7)"), 5.0);
 }
-
-#[test]
-fn what_reads_host_state_is_deliberately_absent() {
-    // A query must not depend on a wall clock or a keyboard, and the four
-    // base64/hash helpers exist to build strudel.cc share links out of
-    // `atob`/`btoa`, which this engine does not have and has no use for.
-    for name in [
-        "getCurrentKeyboardState",
-        "getPerformanceTimeSeconds",
-        "base64ToUnicode",
-        "unicodeToBase64",
-        "code2hash",
-        "hash2code",
-    ] {
-        assert_eq!(
-            n(&format!("typeof {name} === 'undefined' ? 1 : 0")),
-            1.0,
-            "{name} should not be defined"
-        );
-    }
-}

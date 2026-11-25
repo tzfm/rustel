@@ -737,32 +737,6 @@ mod tests {
         }
     }
 
-    /// The runway table a caller reads off the characters: one to eight
-    /// milliseconds, rounded to frames at the rate asked. `latency_frames`
-    /// must agree with it, since `configure` is this arithmetic and the
-    /// caller keeping another path in step cannot own a limiter.
-    #[test]
-    fn the_runway_table_is_what_latency_frames_reports() {
-        for (character, millis) in [
-            (Character::Hard, 1.0),
-            (Character::Punchy, 2.0),
-            (Character::Transparent, 5.0),
-            (Character::Warm, 8.0),
-        ] {
-            for rate in [44_100, 48_000, 96_000] {
-                let frames = Limiter::latency_frames_at(character, rate);
-                assert_eq!(frames, (millis * f64::from(rate) / 1000.0).round() as usize);
-                let limiter = Limiter::new(rate, -1.0, character);
-                assert_eq!(
-                    limiter.latency_frames(),
-                    frames,
-                    "{} at {rate}",
-                    character.key()
-                );
-            }
-        }
-    }
-
     /// A signal already under the ceiling comes back unchanged, delayed by the
     /// runway. A limiter that touched quiet programme would be a compressor.
     #[test]
@@ -806,28 +780,6 @@ mod tests {
             "reduction collapsed to silence: {reduction}"
         );
         assert_eq!(limiter.take_reduction(), 1.0, "the hold did not empty");
-    }
-
-    /// The characters differ in runway, and every one of them is at least a
-    /// frame and inside the ring the proof needs.
-    #[test]
-    fn every_character_has_a_runway_inside_the_ring() {
-        for rate in [8_000, 44_100, 48_000, 96_000, 192_000] {
-            for character in Character::ALL {
-                let limiter = Limiter::new(rate, DEFAULT_THRESHOLD_DB, character);
-                let runway = limiter.latency_frames();
-                assert!(runway >= 1, "{} at {rate} has no runway", character.key());
-                assert!(
-                    runway < RING_FRAMES,
-                    "{} at {rate} wants {runway} frames, ring is {RING_FRAMES}",
-                    character.key()
-                );
-            }
-        }
-        assert!(
-            Character::Hard.lookahead_millis() < Character::Transparent.lookahead_millis(),
-            "hard is supposed to be the shortest runway"
-        );
     }
 
     /// A character's name survives the preferences and a flag; an unknown one

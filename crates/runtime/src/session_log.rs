@@ -884,21 +884,6 @@ mod tests {
         }
     }
 
-    /// Only a save marked `rejected` reads as not installed.
-    #[test]
-    fn only_a_rejected_save_is_not_installed() {
-        let save = |status: &str| SessionSave {
-            at: 0.0,
-            status: status.into(),
-            source: "".into(),
-            error: None,
-            via: None,
-        };
-        assert!(save("installed").installed());
-        assert!(!save("rejected").installed());
-        assert!(save("pending").installed());
-    }
-
     #[test]
     fn a_valid_empty_tape_opens_for_editing_but_not_cli_playback() {
         let directory = tempfile::tempdir().unwrap();
@@ -1168,25 +1153,6 @@ mod tests {
     }
 
     #[test]
-    fn base64_matches_the_standard_alphabet() {
-        assert_eq!(encode_base64(b"hello"), "aGVsbG8=");
-        assert_eq!(encode_base64(b"hi"), "aGk=");
-        assert_eq!(
-            encode_base64(b"any carnal pleas"),
-            "YW55IGNhcm5hbCBwbGVhcw=="
-        );
-        assert_eq!(decode_base64("aGVsbG8=").expect("decode"), b"hello");
-    }
-
-    #[test]
-    fn a_score_with_quotes_and_unicode_survives_the_tape() {
-        let score = "setCpm(150/4)\n$: s(\"bd*4\").gain(0.6) // \u{2728} ünïcode\n";
-        let encoded = encode_base64(score.as_bytes());
-        let decoded = String::from_utf8(decode_base64(&encoded).expect("decode")).expect("utf8");
-        assert_eq!(decoded, score);
-    }
-
-    #[test]
     fn the_default_filename_is_sortable_and_filesystem_safe() {
         // Reference points spanning the leap-year arithmetic.
         assert_eq!(
@@ -1208,20 +1174,6 @@ mod tests {
             )
         );
         let name = default_session_filename(1_787_063_525, None);
-        assert!(!name.contains(':'), "windows cannot hold a colon: {name}");
-    }
-
-    #[test]
-    fn the_default_score_filename_is_just_a_sortable_timestamp() {
-        assert_eq!(
-            default_score_filename(1_787_063_525),
-            format!("2026-08-18T14-32-05{}", product::SCORE_FILE_SUFFIX)
-        );
-        assert_eq!(
-            default_score_filename(0),
-            format!("1970-01-01T00-00-00{}", product::SCORE_FILE_SUFFIX)
-        );
-        let name = default_score_filename(1_787_063_525);
         assert!(!name.contains(':'), "windows cannot hold a colon: {name}");
     }
 

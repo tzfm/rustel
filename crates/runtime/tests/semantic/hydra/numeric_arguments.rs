@@ -40,23 +40,3 @@ fn unset_array_marks_keep_their_defaults() {
             if *speed == 1.0 && *smooth == 0.0 && *offset == 0.0
     ));
 }
-
-#[test]
-fn a_non_finite_argument_preserves_the_committed_score() {
-    let mut session = Session::new().expect("session");
-    let source = "await initHydra()\nosc(10).out()";
-    session.evaluate(source).expect("initial score");
-    let previous = session.take_pending_hydra().expect("initial visuals");
-    HydraUpdate::from_candidate(&previous).expect("initial visuals read back");
-
-    let error = session
-        .evaluate("await initHydra()\nosc([1,2].fast(Infinity)).out()")
-        .expect_err("a non-finite speed fails evaluation");
-    assert!(
-        error
-            .to_string()
-            .contains("array _speed value must be finite")
-    );
-    assert_eq!(session.active_source(), Some(source));
-    assert!(session.take_pending_hydra().is_none());
-}

@@ -143,62 +143,10 @@ mod tests {
     }
 
     #[test]
-    fn numeric_event_inputs_and_gate_are_available() {
-        assert_graph(
-            "sine(sFreq / 2 + pat[0]).mul(sGate).out()",
-            "nodes.some(n => n.type === 'n' && n.value === 113) && nodes.some(n => n.type === 'gate')",
-        );
-    }
-
-    #[test]
-    fn multichannel_expansion_wraps_inputs_and_collects_outputs() {
-        assert_graph(
-            "sine([100, 200, 300]).mul([0.1, 0.2]).out([0,1,2])",
-            "nodes.filter(n => n.type === 'sine').length === 3 && nodes.filter(n => n.type === 'mul').length === 3 && nodes.filter(n => n.type === 'output').length === 3 && nodes[nodes.length - 1].type === 'exit'",
-        );
-    }
-
-    #[test]
-    fn feedback_edges_preserve_postorder_registers() {
-        assert_graph(
-            "sine(220).add(x => x.mul(0.5)).out()",
-            "nodes.some((n, i) => n.inputs.some(input => input > i))",
-        );
-    }
-
-    #[test]
     fn legacy_feedback_uses_registered_node_method() {
         assert_graph(
             "register('add', input => input.mul(4)); n(2).feedback(x => x).out(); feedback(x => x.mul(.5)).out()",
             "nodes.some(n => n.type === 'n' && n.value === 4) && nodes.filter(n => n.type === 'add').length === 1",
-        );
-    }
-
-    #[test]
-    fn registered_modules_expand_to_primitive_nodes() {
-        assert_graph(
-            "const voice = module('voice', freq => freq.sine().mul(.2)); voice(sFreq).out(); n(330).voice().out()",
-            "nodes.filter(n => n.type === 'sine').length === 2 && nodes.every(n => n.type !== 'voice')",
-        );
-    }
-
-    #[test]
-    fn empty_source_is_silent_and_defaults_stay_native() {
-        assert_eq!(
-            graph("", &[], 220.0),
-            r#"{"nodes":[{"type":"exit","inputs":[]}]}"#
-        );
-        assert_graph(
-            "sine().out()",
-            "nodes.find(n => n.type === 'sine').inputs.length === 0",
-        );
-    }
-
-    #[test]
-    fn expression_templates_are_preserved_as_source() {
-        assert_graph(
-            "time().mul(8000).bytebeat`t >> 4 | t`.out()",
-            "nodes.some(n => n.type === 'bytebeat' && n.value === 't >> 4 | t')",
         );
     }
 

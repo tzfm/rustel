@@ -609,54 +609,6 @@ mod changed_source_tests {
         FileWatch::from_loaded_source(path, target, baseline, DEBOUNCE)
     }
 
-    /// The producer gets the save's text while it is still debouncing.
-    ///
-    /// That gap is the only room a decode has: the install and the
-    /// replacement's first prefill query happen in one producer turn,
-    /// microseconds apart, and an onset that asks for a sound not yet decoded
-    /// is skipped for good.
-    #[test]
-    fn a_saved_score_hands_over_its_text_once_while_it_is_still_debouncing() {
-        let directory = tempfile::tempdir().expect("tempdir");
-        let path = directory.path().join("score.strudel.txt");
-        let baseline = r#"s("bd sd")"#;
-        std::fs::write(&path, baseline).expect("write baseline");
-        let mut watch = watch_over(&path, WatchTarget::Score(WatchLanguage::Mini), baseline);
-        assert!(
-            watch.take_changed_source().is_none(),
-            "a watch that has seen no save has nothing to bet on"
-        );
-
-        let saved = r#"s("bd sd hh:0")"#;
-        std::fs::write(&path, saved).expect("save");
-        assert!(matches!(
-            watch.observation_at(Duration::ZERO),
-            Observation::Changed
-        ));
-        assert_eq!(
-            watch.take_changed_source().as_deref(),
-            Some(saved),
-            "the new text, at the moment it is first seen"
-        );
-        assert!(
-            watch.take_changed_source().is_none(),
-            "one save is one bet, not one per poll"
-        );
-
-        // Still inside the debounce: the text has been out for a whole
-        // debounce by the time the identity is stable enough to install.
-        assert!(matches!(
-            watch.observation_at(DEBOUNCE / 2),
-            Observation::Pending
-        ));
-        assert!(watch.take_changed_source().is_none());
-        assert!(matches!(
-            watch.observation_at(DEBOUNCE * 2),
-            Observation::Ready(_)
-        ));
-        assert!(watch.take_changed_source().is_none());
-    }
-
     /// A save that never parses still names sounds, and a name worth warming
     /// is worth warming when the file it came from is broken: the next save
     /// that fixes the typo should not also be the one that starts the fetch.

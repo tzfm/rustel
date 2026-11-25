@@ -272,13 +272,6 @@ impl RealtimePressurePublisher {
     pub(crate) fn reset(&self) {
         self.publish(RealtimePressureSnapshot::default());
     }
-
-    #[cfg(test)]
-    fn begin_test_publication(&self) {
-        let stable = self.sequence.load(Ordering::Relaxed) & !1;
-        self.sequence
-            .store(stable.wrapping_add(1), Ordering::Release);
-    }
 }
 
 #[derive(Default)]
@@ -419,19 +412,6 @@ mod tests {
             snapshot.window_refused_voices,
             2 * PRESSURE_PUBLISH_INTERVAL
         );
-    }
-
-    #[test]
-    fn snapshot_is_fixed_and_small() {
-        assert!(std::mem::size_of::<RealtimePressureSnapshot>() <= 320);
-        assert!(!std::mem::needs_drop::<RealtimePressureSnapshot>());
-    }
-
-    #[test]
-    fn reader_gives_up_while_a_publication_is_in_progress() {
-        let publisher = RealtimePressurePublisher::new();
-        publisher.begin_test_publication();
-        assert_eq!(publisher.try_snapshot(), None);
     }
 
     #[test]

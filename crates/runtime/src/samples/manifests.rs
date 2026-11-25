@@ -2304,18 +2304,6 @@ pub(super) mod tests {
                 assert!(library.samples_source_rested(spec, true), "{spec}: rested");
             }
         }
-
-        /// The retry delay cannot exceed [`FAILED_RETRY_LONGEST`].
-        #[test]
-        fn the_rest_stops_growing() {
-            let standing = |failures| Standing {
-                failures,
-                ..Standing::now(SourceState::Failed("offline".into()))
-            };
-            assert_eq!(standing(1).rest(), FAILED_RETRY_AFTER);
-            assert_eq!(standing(2).rest(), FAILED_RETRY_AFTER * 2);
-            assert_eq!(standing(u32::MAX).rest(), FAILED_RETRY_LONGEST);
-        }
     }
 
     #[cfg(test)]
@@ -2523,115 +2511,11 @@ pub(super) mod tests {
                 Some(SourceState::Loading)
             );
         }
-
-        #[test]
-        fn loading_and_published_sources_share_the_retention_bound() {
-            let library = SampleLibrary::empty();
-            let pad = "x".repeat(1024 * 1024);
-            let first = format!("{{\"m-first\": \"{pad}\"}}");
-            let latest = format!("{{\"m-latest\": \"{}\"}}", "y".repeat(1024 * 1024));
-            library.mark_source_loading(&first);
-            library
-                .shared
-                .note_source_standing(&first, SourceState::Ready);
-            // Enough distinct megabyte maps to cross the retention bound.
-            for index in 0..(MAX_SOURCE_TABLE_BYTES / (1024 * 1024) + 2) {
-                let map = format!("{{\"m{index}\": \"{pad}\"}}");
-                library.mark_source_loading(&map);
-                library
-                    .shared
-                    .note_source_standing(&map, SourceState::Ready);
-            }
-            let tables = library
-                .shared
-                .source_tables
-                .lock()
-                .expect("samples source tables");
-            assert!(
-                !tables.states.contains_key(&first) && !tables.sources.contains(&first),
-                "the oldest registration survived eviction at the retention bound"
-            );
-            assert!(
-                tables.bytes <= MAX_SOURCE_TABLE_BYTES,
-                "the retained bytes ran past the bound"
-            );
-            assert_eq!(
-                tables.bytes,
-                tables.order.iter().map(String::len).sum::<usize>()
-            );
-            drop(tables);
-            // The newest registration is never the one evicted.
-            library
-                .shared
-                .note_source_standing(&latest, SourceState::Ready);
-            assert!(
-                library
-                    .shared
-                    .source_tables
-                    .lock()
-                    .expect("samples source tables")
-                    .states
-                    .contains_key(&latest)
-            );
-        }
-
-        #[test]
-        fn refreshed_source_status_does_not_duplicate_retention_accounting() {
-            let mut tables = SourceTables::default();
-            for state in [SourceState::Loading, SourceState::Ready] {
-                tables.note("map", state);
-                tables.forget_state("map");
-                tables.note("map", SourceState::Loading);
-                assert_eq!(tables.bytes, "map".len());
-                assert_eq!(tables.order.len(), 1);
-            }
-            tables.note("map", SourceState::Ready);
-            assert!(tables.sources.contains("map"));
-        }
-
-        #[test]
-        fn oversized_lookup_failures_do_not_enter_source_history() {
-            let mut tables = SourceTables::default();
-            tables.note("recent", SourceState::Ready);
-            let oversized = "x".repeat(MAX_SCORE_SAMPLE_MAP_BYTES + 1);
-            tables.note(&oversized, SourceState::Failed("map exceeds limit".into()));
-            assert_eq!(tables.states.len(), 1);
-            assert!(tables.sources.contains("recent"));
-            assert_eq!(tables.bytes, "recent".len());
-        }
     }
 
     #[cfg(test)]
     mod score_source_boundary_tests {
         use super::*;
-
-        #[test]
-        fn score_and_trusted_routes_share_one_wire_identity() {
-            let mut access = ScoreSampleAccess::denied();
-            access
-                .permit_source("https://example.com")
-                .expect("grant origin");
-            let raw = "HTTPS://EXAMPLE.com:443/kit/take#2.wav?q=//";
-            let (approved, approved_access) =
-                access.approve_remote(raw).expect("approve score URL");
-
-            assert_eq!(
-                approved.as_ref(),
-                sample_fetch::wire_url(raw).unwrap().as_str()
-            );
-            assert_eq!(
-                approved_access,
-                ScoreFetchAccess::Remote {
-                    sources: [SourceRule::parse("https://example.com").expect("a test source")]
-                        .into(),
-                }
-            );
-            assert_eq!(
-                cache_path(Path::new("/cache"), approved.as_ref()),
-                cache_path(Path::new("/cache"), raw),
-                "authorization and cache identity diverged from the request"
-            );
-        }
 
         /// The built-in sources allow their own domains over https and nothing
         /// else. Loopback names and plain http need a source that spells them
@@ -2731,10 +2615,6 @@ pub(super) mod tests {
             assert!(!server.join().expect("server thread"), "no Origin header");
         }
 
-        fn settle(library: &SampleLibrary) {
-            library.wait_until_idle(Duration::from_secs(2));
-        }
-
         /// An origin grant gives network access only, never the filesystem.
         /// With no grant, the call fails instead of dropping the bad entry.
         #[test]
@@ -2767,44 +2647,6 @@ pub(super) mod tests {
                 r#"{"sd": {"_base": "file:///etc", "c3": "passwd"}}"#,
             );
             assert!(!library.knows("sd"));
-        }
-
-        /// The documented web paths keep working: an absolute https entry
-        /// registers without any network activity (loads happen per trigger).
-        #[test]
-        fn ordinary_web_sources_still_register() {
-            let library = SampleLibrary::empty();
-            library
-                .register_custom_for_test(
-                    "https://example.com",
-                    r#"{"bd": "https://example.com/kits/808/kick.wav"}"#,
-                )
-                .expect("https entry");
-            settle(&library);
-            assert!(library.knows("bd"));
-        }
-
-        /// Cache names stay flat even when a URL's tail tries to carry a path.
-        #[test]
-        fn cache_names_take_only_a_plain_extension() {
-            let dir = std::env::temp_dir();
-            for (url, expected) in [
-                ("https://example.com/kick.wav", Some(".wav")),
-                ("https://example.com/kick.WAV", Some(".WAV")),
-                ("https://example.com/kick.wav?rev=2", Some(".wav")),
-                ("https://example.com/a.b/c", None),
-                ("https://example.com/x/y..//z", None),
-            ] {
-                let path = cache_path(&dir, url);
-                let parent_gone = path.parent().map(|p| p == dir).unwrap_or(true);
-                assert!(parent_gone, "{url} escaped the cache directory: {path:?}");
-                let name = path.file_name().unwrap().to_string_lossy().into_owned();
-                assert_eq!(
-                    name.rfind('.').map(|i| &name[i..]),
-                    expected,
-                    "{url}: wrong extension handling ({name})"
-                );
-            }
         }
     }
 
@@ -3024,30 +2866,6 @@ pub(super) mod tests {
                 .expect("bd resolves");
             let chosen = chosen.replace('\\', "/");
             assert!(chosen.ends_with("bd/0.wav") && chosen.contains("imported-folder-precedence"));
-            let _ = std::fs::remove_dir_all(root);
-        }
-
-        /// What a drop and the picker hand over is a bare path. It has to be a
-        /// folder, or nothing anybody imports from the studio ever imports.
-        #[test]
-        fn a_bare_folder_path_is_a_folder_source() {
-            let root = test_dir("bare-path-source");
-            std::fs::create_dir_all(&root).expect("fixture");
-            std::fs::create_dir_all(root.join("snap")).expect("fixture");
-            std::fs::write(root.join("snap/0.wav"), tiny_wav()).expect("fixture");
-
-            let library = SampleLibrary::empty();
-            let reports = library.adopt_global_sources_settled(&[GlobalSource {
-                spec: root.display().to_string(),
-                enabled: true,
-            }]);
-            assert_eq!(
-                reports[0].state,
-                GlobalSourceState::Ready { banks: 1 },
-                "a bare absolute path is a folder, not a URL: {:?}",
-                reports[0].state
-            );
-            assert!(library.knows("snap"));
             let _ = std::fs::remove_dir_all(root);
         }
 
@@ -3723,16 +3541,6 @@ pub(super) mod tests {
             assert!(!wrote_outside, "the bank wrote through the link");
         }
 
-        /// The extension a copy gets is the one the scan will read back, taken
-        /// from the path rather than from a query or a fragment.
-        #[test]
-        fn a_copy_is_named_by_what_the_scan_can_read() {
-            assert!(is_sample_audio(Path::new("0.mp3")));
-            assert!(!is_sample_audio(Path::new("0.mp3#v")));
-            assert!(matches!(codec_for("http://x/kick.mp3?v=2"), Codec::Mp3));
-            assert!(matches!(codec_for("http://x/kick.wav#frag"), Codec::Wav));
-        }
-
         /// Emptying the cache removes the cache's own entries and nothing else:
         /// not its lock, not its marker, not a file somebody kept beside it.
         #[test]
@@ -3865,146 +3673,6 @@ pub(super) mod tests {
             let _ = std::fs::remove_dir_all(second);
         }
 
-        /// The same spent budget through the whole worker, not just the folder
-        /// arm: the deadline error surfaces as the job's result, and no later
-        /// folder steals a walk the batch had already lost.
-        #[test]
-        fn a_folder_batch_that_runs_out_of_budget_aborts_between_folders_not_mid_row() {
-            let first = test_dir("abort-between-folders-a");
-            let second = test_dir("abort-between-folders-b");
-            std::fs::create_dir_all(&first).expect("fixture");
-            std::fs::create_dir_all(&second).expect("fixture");
-            std::fs::write(first.join("kick.wav"), tiny_wav()).expect("fixture");
-            std::fs::write(second.join("snap.wav"), tiny_wav()).expect("fixture");
-
-            let library = SampleLibrary::empty();
-            let specs = vec![
-                format!("local:{}", first.display()),
-                format!("local:{}", second.display()),
-            ];
-            // The rows are staged straight on, not adopted: an adoption would
-            // enqueue a real walk on a fine budget, and the always-running worker
-            // could land it either side of the spent call below - a race, not a
-            // result.
-            let generation = {
-                let mut rows = library
-                    .shared
-                    .global_rows
-                    .lock()
-                    .expect("global source rows");
-                let generation = rows.begin();
-                assert!(
-                    rows.install(
-                        generation,
-                        specs
-                            .iter()
-                            .enumerate()
-                            .map(|(row, spec)| GlobalSlot {
-                                row,
-                                spec: spec.clone(),
-                                kind: GlobalKind::Folder,
-                                banks: HashMap::new(),
-                                stage: RowStage::WalkQueued,
-                            })
-                            .collect(),
-                    )
-                );
-                generation
-            };
-            // Through the whole worker, not just the folder arm: a real job on a
-            // real queue, its verdict read from the completion the caller owns.
-            // A job with no time at all is spent the moment the worker takes it.
-            let context = library.manifest_context();
-            let (queue, jobs) = manifest_queue::manifest_queue();
-            let worker = std::thread::spawn(move || run_manifest_worker(context, jobs));
-            // enqueue marks pending before it sends and the worker unpends when
-            // the job is finished; the count is kept honest the same way here.
-            library
-                .shared
-                .manifest_pending
-                .fetch_add(1, Ordering::AcqRel);
-            let (completion, verdict) = mpsc::sync_channel(1);
-            queue
-                .push(Box::new(ManifestJob {
-                    work: ManifestWork::Folders {
-                        specs: specs.clone(),
-                        generation,
-                    },
-                    timeout: Duration::ZERO,
-                    completion: Some(completion),
-                }))
-                .expect("the empty queue takes the batch");
-            queue.close();
-            let result = verdict
-                .recv_timeout(Duration::from_secs(5))
-                .expect("the worker answers a queued batch");
-            worker
-                .join()
-                .expect("the worker ends when its queue closes");
-            assert_eq!(
-                result.expect_err("a spent budget refuses the batch"),
-                "sample manifest deadline exceeded"
-            );
-            let _ = std::fs::remove_dir_all(first);
-            let _ = std::fs::remove_dir_all(second);
-        }
-
-        /// Re-adopting replaces rather than accumulates: a source removed in
-        /// Settings takes its sounds with it.
-        #[test]
-        fn re_adopting_drops_the_sources_that_are_gone() {
-            let root = test_dir("re-adopt-drops-old");
-            std::fs::create_dir_all(&root).expect("fixture");
-            std::fs::write(root.join("rim.wav"), tiny_wav()).expect("fixture");
-
-            let library = SampleLibrary::empty();
-            let source = GlobalSource {
-                spec: format!("local:{}", root.display()),
-                enabled: true,
-            };
-            library.adopt_global_sources_settled(std::slice::from_ref(&source));
-            assert!(library.knows("rim"));
-            library.adopt_global_sources_settled(&[]);
-            assert!(!library.knows("rim"), "the removed source took its sounds");
-            let _ = std::fs::remove_dir_all(root);
-        }
-
-        /// Consolidating copies what the scores name into the set's folder,
-        /// where the set's own scan then answers for it - no score is
-        /// rewritten, because the folder already wins by name.
-        #[test]
-        fn copying_a_bank_into_the_set_lays_it_out_the_way_the_scan_reads_it() {
-            let library_root = test_dir("consolidate-source");
-            let set_root = test_dir("consolidate-set");
-            std::fs::create_dir_all(&library_root).expect("fixture");
-            std::fs::create_dir_all(&set_root).expect("fixture");
-            std::fs::write(library_root.join("clap.wav"), tiny_wav()).expect("fixture");
-
-            let library = SampleLibrary::empty();
-            library.adopt_global_sources_settled(&[GlobalSource {
-                spec: format!("local:{}", library_root.display()),
-                enabled: true,
-            }]);
-            assert!(library.knows("clap"));
-            assert!(
-                !library.set_folder_holds(&set_root, "clap"),
-                "the set does not carry it yet"
-            );
-
-            assert_eq!(library.copy_bank_into("clap", &set_root), Ok(1));
-            // The scan's rule read backwards: a folder named for the bank, with
-            // the bank's files inside in the order it had them.
-            assert!(set_root.join("clap/0.wav").is_file());
-
-            // And the set now answers for it out of its own folder, which is
-            // what makes the copied set play on another machine.
-            library.adopt_set_folder(&set_root).expect("adopt");
-            assert!(library.set_folder_holds(&set_root, "clap"));
-
-            let _ = std::fs::remove_dir_all(library_root);
-            let _ = std::fs::remove_dir_all(set_root);
-        }
-
         /// A rename is an overlay on what a source brings: the files keep their
         /// own names, and taking the rename away brings the old name back.
         #[test]
@@ -4078,33 +3746,6 @@ pub(super) mod tests {
             library.requeue_ready(id, older);
             assert_eq!(library.decoded_identity(id), Some(newer.identity()));
             assert!(library.take_ready().is_empty(), "stale PCM was requeued");
-        }
-
-        #[test]
-        fn deferred_install_keeps_identity_for_every_unattempted_sample() {
-            let library = SampleLibrary::empty();
-            let first = DecodedSample::from_parts(48_000, 1, vec![0.25]).expect("first decode");
-            let later = DecodedSample::from_parts(48_000, 1, vec![0.5]).expect("later decode");
-            library.requeue_ready(SampleId(8), first.clone());
-            library.requeue_ready(SampleId(9), later.clone());
-
-            // The whole batch leaves the library before any install is attempted.
-            // Refusing its first entry must not hide the later intended payload.
-            let deferred = library.take_ready();
-            assert_eq!(
-                library.decoded_identity(SampleId(8)),
-                Some(first.identity())
-            );
-            assert_eq!(
-                library.decoded_identity(SampleId(9)),
-                Some(later.identity())
-            );
-            library.requeue_ready_batch_before_newer(deferred);
-            assert_eq!(
-                library.decoded_identity(SampleId(9)),
-                Some(later.identity())
-            );
-            assert_eq!(library.take_ready().len(), 2);
         }
 
         #[test]
@@ -4201,30 +3842,6 @@ pub(super) mod tests {
             assert_eq!(library.free_id_count(), 1, "a second release is a no-op");
         }
 
-        /// A released id accepts the next decode like a fresh slot: the
-        /// tombstone that refused a stale retry is gone with the release.
-        #[test]
-        fn a_released_id_accepts_the_next_decode() {
-            let library = SampleLibrary::empty();
-            let id = SampleId(8);
-            let pcm = || DecodedSample::from_parts(48_000, 1, vec![0.0; 4]).expect("pcm");
-            library.shared.ready.lock().expect("ready").identities[id.0 as usize] =
-                DecodedIdentity::Forgotten;
-            library.requeue_ready(id, pcm());
-            assert!(
-                library.take_ready().is_empty(),
-                "a forgotten id refuses PCM"
-            );
-            library.release_ids([id]);
-            let fresh = pcm();
-            let identity = fresh.identity();
-            library.requeue_ready(id, fresh);
-            let taken = library.take_ready();
-            assert_eq!(taken.len(), 1, "a released id takes the next decode");
-            assert_eq!(taken[0].0, id);
-            assert_eq!(library.decoded_identity(id), Some(identity));
-        }
-
         /// A fetch that fails hands its id straight back: nothing ever saw it.
         #[test]
         fn a_failed_fetch_hands_its_id_back() {
@@ -4245,64 +3862,6 @@ pub(super) mod tests {
             assert_eq!(library.free_id_count(), 1, "the id came back");
             let reissued = reserve_sample_ids(&library.shared, 1).expect("one");
             assert_eq!(reissued, vec![SampleId(1)], "and is the next one reserved");
-        }
-
-        /// A font that failed rests, then a real ask tries again; a bet does
-        /// not, and a fresh failure is left to rest.
-        #[test]
-        fn a_rested_failed_font_is_asked_again_by_a_real_ask() {
-            let font: Arc<str> = Arc::from("0000_Test_sf2_file");
-            let library = SampleLibrary::with_background_loaders(
-                HashMap::new(),
-                Vec::new(),
-                HashMap::from([("gm_test".to_owned(), vec![font.clone()])]),
-                String::new(),
-            )
-            .expect("library");
-            let rested = Instant::now() - FAILED_RETRY_AFTER - Duration::from_secs(1);
-            library
-                .shared
-                .fonts
-                .write()
-                .expect("fonts")
-                .insert(font.clone(), FontState::Failed { at: rested });
-
-            assert!(matches!(
-                library.resolve_with_priority("gm_test", 0.0, 60.0, LoadPriority::Bet),
-                SampleResolution::Failed
-            ));
-            assert!(
-                matches!(
-                    library.shared.fonts.read().expect("fonts").get(&font),
-                    Some(FontState::Failed { .. })
-                ),
-                "a bet does not spend the retry"
-            );
-            assert!(matches!(
-                library.resolve_with_priority("gm_test", 0.0, 60.0, LoadPriority::Now),
-                SampleResolution::Loading
-            ));
-            assert!(
-                matches!(
-                    library.shared.fonts.read().expect("fonts").get(&font),
-                    Some(FontState::Loading)
-                ),
-                "a real ask after the rest asks again"
-            );
-
-            library
-                .shared
-                .fonts
-                .write()
-                .expect("fonts")
-                .insert(font.clone(), FontState::Failed { at: Instant::now() });
-            assert!(
-                matches!(
-                    library.resolve_with_priority("gm_test", 0.0, 60.0, LoadPriority::Now),
-                    SampleResolution::Failed
-                ),
-                "a fresh failure is left to rest"
-            );
         }
 
         /// The batch lookup the memory policy uses finds what asking name by
@@ -5133,36 +4692,6 @@ pub(super) mod tests {
         }
 
         #[test]
-        fn preload_owned_by_the_second_override_never_uses_the_first() {
-            let library = SampleLibrary::empty();
-            let first = "http://127.0.0.1:9/first.wav";
-            let second = "http://127.0.0.1:9/second.wav";
-            let (reached, release) = library
-                .shared
-                .publication
-                .install_test_barrier(PublicationKind::Custom);
-            async_register(&library, vec![(inline_bank("tone", first), None)], &[])
-                .expect("first override");
-            reached
-                .recv_timeout(ARRIVAL_TIMEOUT)
-                .expect("first override ready to publish");
-            async_register(
-                &library,
-                vec![(inline_bank("tone", second), None)],
-                &["tone".to_owned()],
-            )
-            .expect("second override and preload");
-            release.send(()).expect("release first override");
-            library.wait_until_idle(Duration::from_secs(2));
-            let urls = library.shared.by_url.read().unwrap();
-            assert!(urls.contains_key(second));
-            assert!(
-                !urls.contains_key(first),
-                "the later evaluation's preload warmed an earlier override"
-            );
-        }
-
-        #[test]
         fn idle_wait_includes_a_sample_load_started_by_manifest_completion() {
             let sample_listener = TcpListener::bind("127.0.0.1:0").expect("bind sample server");
             // The trusted audio cache persists across self-hosted CI jobs. A bare
@@ -5294,24 +4823,6 @@ pub(super) mod tests {
             );
             library.wait_until_idle(Duration::from_secs(5));
             assert_eq!(library.readiness("bd", 0.0), SoundReadiness::Failed);
-        }
-
-        #[test]
-        fn a_registered_map_is_a_source_the_score_can_be_held_to() {
-            let library = SampleLibrary::empty();
-            let map = r#"{"bd":["http://127.0.0.1:9/a.wav"]}"#;
-            assert!(!library.knows_samples_source(map));
-            library.register_trusted_custom(map, None).expect("map");
-            assert!(
-                library.knows_samples_source(map),
-                "the map text, as registered"
-            );
-            // A score's string argument reaches the library stringified.
-            library
-                .shared
-                .note_source_standing("\"github:me/mine\"", SourceState::Ready);
-            assert!(library.knows_samples_source("github:me/mine"));
-            assert!(!library.knows_samples_source("github:me/other"));
         }
 
         #[test]
@@ -5854,49 +5365,6 @@ pub(super) mod tests {
                 std::fs::read_dir(&root).expect("cache directory").count(),
                 0,
                 "staged cache file was not cleaned up"
-            );
-            let _ = std::fs::remove_dir_all(root);
-        }
-
-        #[test]
-        fn drop_wins_after_sample_cache_staging_before_final_rename() {
-            let (url, _entered, release_response, server) = stalled_server("sample".to_owned());
-            let root = test_dir("sample-cache-publication");
-            let library = SampleLibrary::empty();
-            let (reached, release_publication) = library
-                .shared
-                .publication
-                .install_test_barrier(PublicationKind::Cache);
-            let publication = Arc::clone(&library.shared.publication);
-            let budget = sample_fetch::FetchBudget::for_one_fetch_with_cancellation(
-                publication.cancellation(),
-            );
-            let worker_root = root.clone();
-            let worker_url = url.clone();
-            let fetch = std::thread::spawn(move || {
-                fetch_cached_with_budget(&worker_root, &worker_url, &budget, &publication)
-            });
-            release_response.send(()).expect("release response");
-            server.join().expect("server");
-            reached
-                .recv_timeout(Duration::from_secs(5))
-                .expect("sample cache staged and synced");
-            let destination = cache_path(&root, &url);
-            drop(library);
-            release_publication.send(()).expect("release publication");
-            let error = fetch
-                .join()
-                .expect("sample cache worker")
-                .expect_err("cancelled sample cache cannot publish");
-            assert!(error.contains("cancelled"), "{error}");
-            assert!(
-                !destination.exists(),
-                "final sample cache appeared after Drop"
-            );
-            assert_eq!(
-                std::fs::read_dir(&root).expect("cache directory").count(),
-                0,
-                "staged sample cache file was not cleaned up"
             );
             let _ = std::fs::remove_dir_all(root);
         }

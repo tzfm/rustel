@@ -54,6 +54,7 @@ pub(super) enum RotationStop {
     Memory,
     Reference,
     Knobs,
+    Outline,
 }
 
 impl App {
@@ -72,6 +73,7 @@ impl App {
             PanelKind::Mixer => self.mixer_panel.is_some(),
             PanelKind::Memory => self.memory_dock.is_some(),
             PanelKind::Knobs => self.knobs_panel.is_some(),
+            PanelKind::Outline => self.outline_panel.is_some(),
         }
     }
 
@@ -191,6 +193,9 @@ impl App {
         if self.knobs_panel.is_some() && !self.regions.knobs.is_empty() {
             stops.push(RotationStop::Knobs);
         }
+        if self.outline_panel.is_some() && !self.regions.outline.is_empty() {
+            stops.push(RotationStop::Outline);
+        }
         if stops.len() == 1 {
             self.status = "nothing open to walk the keyboard round - just the score".into();
             self.dirty_frame = true;
@@ -206,6 +211,7 @@ impl App {
             Focus::Panel(PanelKind::Memory) => Some(RotationStop::Memory),
             Focus::Panel(PanelKind::Reference) => Some(RotationStop::Reference),
             Focus::Panel(PanelKind::Knobs) => Some(RotationStop::Knobs),
+            Focus::Panel(PanelKind::Outline) => Some(RotationStop::Outline),
             // A panel outside the rotation - a sheet - has
             // no place in this order; walking from it starts the rotation
             // over at its first stop rather than guessing where it fits.
@@ -278,6 +284,12 @@ impl App {
                 self.status = "keyboard on the knobs".into();
                 self.arm_focus_rotation_flash(RotationStop::Knobs);
             }
+            RotationStop::Outline => {
+                self.focus = Focus::Editor;
+                self.focus_panel(PanelKind::Outline);
+                self.status = "keyboard on the outline".into();
+                self.arm_focus_rotation_flash(RotationStop::Outline);
+            }
         }
     }
 
@@ -316,6 +328,7 @@ impl App {
             RotationStop::Memory => self.regions.memory,
             RotationStop::Reference => self.regions.reference,
             RotationStop::Knobs => self.regions.knobs,
+            RotationStop::Outline => self.regions.outline,
         };
         (!room.is_empty()).then_some(room)
     }
@@ -497,6 +510,12 @@ impl App {
                 if self.knobs_panel.is_some() {
                     self.close_knobs_panel();
                     self.status = "knobs hidden".into();
+                }
+            }
+            PanelKind::Outline => {
+                if self.outline_panel.take().is_some() {
+                    self.invalidate_maps();
+                    self.status = "outline hidden".into();
                 }
             }
         }

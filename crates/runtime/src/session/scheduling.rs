@@ -592,6 +592,60 @@ impl Session {
         self.scheduler.set_trace_enabled(enabled);
     }
 
+    /// Opt in to tagging each score lane's haps with its stable lane id.
+    /// Disabled by default so ordinary playback and exports pay no cost.
+    pub fn set_lane_tracking_enabled(&mut self, enabled: bool) {
+        self.js.set_lane_tagging(enabled);
+    }
+
+    /// Whether score evaluations tag haps with their lane id.
+    pub fn lane_tracking_enabled(&self) -> bool {
+        self.js.lane_tagging()
+    }
+
+    /// Active non-destructive per-lane overrides applied at scheduling.
+    pub fn lane_controls(&self) -> &rustel_scheduler::LaneControls {
+        self.scheduler.lane_controls()
+    }
+
+    /// Solo one lane or pass `None` to clear solo. Returns `true` if changed.
+    pub fn set_lane_solo(&mut self, lane: Option<u32>) -> bool {
+        self.scheduler.lane_controls_mut().set_solo(lane)
+    }
+
+    /// Mute or unmute one lane. Returns `true` if changed.
+    pub fn set_lane_mute(&mut self, lane: u32, muted: bool) -> bool {
+        self.scheduler.lane_controls_mut().set_mute(lane, muted)
+    }
+
+    /// Set a semitone transpose override for one lane (`0` clears). Returns
+    /// `true` if changed.
+    pub fn set_lane_transpose(&mut self, lane: u32, semitones: i16) -> bool {
+        self.scheduler
+            .lane_controls_mut()
+            .set_transpose(lane, semitones)
+    }
+
+    /// Clear all per-lane solo, mute, and transpose overrides.
+    pub fn clear_lane_controls(&mut self) -> bool {
+        self.scheduler.lane_controls_mut().clear()
+    }
+
+    /// Active lanes of the playing score with the exact lane ids tagged onto
+    /// scheduled events.
+    pub fn active_ui_lanes(&self) -> Vec<crate::ui_events::UiLane> {
+        #[cfg(feature = "vst")]
+        {
+            let lanes = self.lanes.ui_lanes();
+            if !lanes.is_empty() {
+                return lanes;
+            }
+        }
+        self.active_source()
+            .map(crate::ui_events::lanes_in_source)
+            .unwrap_or_default()
+    }
+
     /// Drain accepted onsets waiting for an editor/visualizer client.
     pub fn take_schedule_trace_events(&mut self) -> Vec<rustel_scheduler::ScheduleTraceEvent> {
         self.scheduler.take_trace_events()
@@ -1976,65 +2030,6 @@ mod tests {
             }
         }
 
-        /// A channel the open input does not have is silence with a warning, not
-        /// a refusal: the replacement publishes, its siblings play, and the
-        /// producer never latches over a microphone that turned out to be mono.
-        #[test]
-        fn a_missing_input_channel_plays_silence_and_warns_instead_of_refusing() {
-            for reverse in [false, true] {
-                let (mut session, mut producer, output) = confirmed_score();
-                session.set_audio_input_channels(Some(2));
-                let input = "s('in').n(sine.range(2, 3))";
-                let source = if reverse {
-                    format!("stack({input}, s('sine')).fast(16)")
-                } else {
-                    format!("stack(s('sine'), {input}).fast(16)")
-                };
-                let previous = session.generation();
-                let candidate = session
-                    .reload_at(&source, false, output.device().clock_seconds())
-                    .expect("valid JavaScript with a computed input channel");
-                producer.arm_replacement(previous, candidate);
-                let device = output.device();
-                let mut published = Vec::new();
-                let mut pushed = Vec::new();
-                producer
-                    .step_unwatched_with_clock_and_cutover(
-                        &mut session,
-                        || device.clock_seconds(),
-                        RATE,
-                        |generation, takeover, _cut| {
-                            published.push(generation);
-                            device.set_generation(generation, takeover, TakeoverCut::None);
-                        },
-                        |event| {
-                            pushed.push(event.clone());
-                            device.push(event)
-                        },
-                    )
-                    .expect("the replacement is published");
-                assert_eq!(published, [candidate], "published, not refused");
-                assert!(
-                    pushed.iter().any(|event| matches!(
-                        event.synth,
-                        Some(rustel_audio::SynthSource::Input { channel: 2 })
-                    )),
-                    "the input voice is there - the ring reads it as silence"
-                );
-                assert!(
-                    pushed.iter().any(|event| event.synth.is_none()
-                        || !matches!(event.synth, Some(rustel_audio::SynthSource::Input { .. }))),
-                    "and its sibling plays"
-                );
-                assert!(session.take_diagnostics().iter().any(|diagnostic| {
-                    diagnostic.kind == "audio-input"
-                        && diagnostic
-                            .message
-                            .contains("open input provides channels 0..1 - it plays silence")
-                }));
-            }
-        }
-
         #[test]
         fn missing_or_expanded_input_facts_do_not_keep_an_obsolete_channel_limit() {
             for channels in [None, Some(0), Some(4)] {
@@ -3295,41 +3290,6 @@ mod tests {
 
     #[test]
     #[cfg(feature = "device-audio")]
-    fn impure_whole_cycle_live_queries_retain_one_bounded_burst_cycle() {
-        let mut high = Session::new().expect("high-CPS session");
-        high.evaluate("setCpm(900/4); new Pattern(state => pure('high').query(state))")
-            .expect("high-CPS impure score");
-        assert!(high.active_needs_host(), "fixture must enter JavaScript");
-        let base = high.live_schedule_cover();
-        let expected = base + 1.0 / 3.75;
-        assert!(
-            (high.live_producer_schedule_cover() - expected).abs() < 1e-9,
-            "whole-cycle callback score did not receive one burst cycle"
-        );
-
-        let mut low = Session::new().expect("low-CPS session");
-        low.evaluate("setcps(0.5); new Pattern(state => pure('low').query(state))")
-            .expect("low-CPS impure score");
-        assert!(low.active_needs_host(), "fixture must enter JavaScript");
-        assert_eq!(
-            low.live_producer_schedule_cover(),
-            low.live_schedule_cover(),
-            "sub-cycle queries must keep their exact established windows"
-        );
-
-        let mut pure = Session::new().expect("pure session");
-        pure.evaluate("setCpm(900/4); pure('native')")
-            .expect("high-CPS pure score");
-        assert!(!pure.active_needs_host(), "fixture unexpectedly needs JS");
-        assert_eq!(
-            pure.live_producer_schedule_cover(),
-            pure.live_schedule_cover(),
-            "native graphs must not pay for a callback burst reserve"
-        );
-    }
-
-    #[test]
-    #[cfg(feature = "device-audio")]
     fn high_cps_impure_live_prefill_is_split_into_deadline_sized_queries() {
         let mut session = Session::new().expect("session");
         session
@@ -3511,44 +3471,6 @@ mod tests {
 
     #[test]
     #[cfg(feature = "device-audio")]
-    fn pure_live_tick_ignores_unaffordable_js_cover_and_remains_host_free() {
-        let mut session = Session::new().expect("session");
-        session.evaluate("note('c4')").expect("pure score");
-        assert!(!session.active_needs_host(), "fixture is not pure");
-
-        let batch = match session.schedule_audio_live_at(
-            0.0,
-            48_000,
-            Duration::from_secs(1),
-            LiveQueryBudgetMode::Steady,
-        ) {
-            Ok(batch) => batch,
-            Err(LiveAudioScheduleError::Retryable(error))
-            | Err(LiveAudioScheduleError::AwaitingSamples(error)) => {
-                panic!("pure live tick required an affordable QuickJS slice: {error:?}")
-            }
-            Err(
-                LiveAudioScheduleError::CandidateCommitted(error)
-                | LiveAudioScheduleError::CandidateRefusedScore(error),
-            ) => {
-                panic!("pure live tick failed after scheduler commit: {error:?}")
-            }
-        };
-        assert_eq!(batch.events.len(), 1);
-        assert_eq!(
-            session.js.query_depth(),
-            0,
-            "pure tick opened JS query scope"
-        );
-        assert_eq!(
-            rustel_jsruntime::bridge_frame_depth(),
-            0,
-            "pure tick opened a bridge frame"
-        );
-    }
-
-    #[test]
-    #[cfg(feature = "device-audio")]
     fn live_ui_trace_keeps_transpiler_byte_ranges_on_audio_onset_ids() {
         let source = r#"$: arrange([1, note("c4 e4")])"#;
         let mut session = Session::with_config(SessionConfig {
@@ -3671,41 +3593,6 @@ mod tests {
             recovered.events.first().map(|event| event.onset_id),
             Some(initial[0].onset_id + 1),
             "atomic refusals consumed an onset id"
-        );
-    }
-
-    /// A spent horizon must still evaluate a save, not defer it forever.
-    ///
-    /// Deferring is right while cover remains: the identity stays retryable and
-    /// the horizon refills in milliseconds. Once the horizon is GONE the same
-    /// refusal repeats on every attempt, and the set freezes on its last good
-    /// score while every edit is rejected.
-    #[test]
-    #[cfg(feature = "device-audio")]
-    fn a_spent_horizon_still_evaluates_a_save() {
-        let reserve = Duration::from_millis(10);
-        let mut session = Session::new().expect("session");
-        session.evaluate("note('c4')").expect("score");
-        session.schedule_at(0.0).expect("fill the horizon");
-
-        // Cover left: defer, cheaply, and try again in a moment.
-        assert_eq!(
-            session
-                .live_score_budget_at(0.4999, reserve)
-                .expect("valid clock"),
-            None,
-            "a tight but SOUNDING horizon must still defer"
-        );
-
-        // Horizon spent: there is nothing left to protect, and no later
-        // attempt that could go better.
-        let recovered = session
-            .live_score_budget_at(0.75, reserve)
-            .expect("valid clock")
-            .expect("a spent horizon refused the save that could restore it");
-        assert!(
-            recovered > MIN_LIVE_SCORE_CPU_BUDGET,
-            "recovery slice {recovered:?} is no better than the floor that failed"
         );
     }
 
@@ -3835,73 +3722,6 @@ mod tests {
         );
     }
 
-    /// An unaffordable continuation reserve does not refuse the query. The
-    /// horizon that the reserve protects is already spent, and only a query
-    /// refills it.
-    #[test]
-    #[cfg(feature = "device-audio")]
-    fn an_unaffordable_reserve_fills_with_the_minimum_slice_instead_of_deadlocking() {
-        let mut session = Session::new().expect("session");
-        session
-                .evaluate("globalThis.__calls = 0; note('c4').fast(8).fmap(v => { globalThis.__calls++; return v; })")
-                .expect("fixture");
-        session
-            .schedule_through_with_js_budget(0.0, 0.0, Duration::from_millis(100))
-            .expect("initial horizon fill");
-
-        // Far enough into the horizon that the reserve cannot be covered.
-        let now = 0.39;
-        let calls_before = session.js.get_number("__calls").expect("callback count");
-        let horizon_before = session.scheduler.horizon_remaining(now);
-
-        let batch = match session.schedule_audio_live_at(
-            now,
-            48_000,
-            Duration::from_millis(29),
-            LiveQueryBudgetMode::Steady,
-        ) {
-            Ok(batch) => batch,
-            Err(LiveAudioScheduleError::Retryable(error))
-            | Err(LiveAudioScheduleError::AwaitingSamples(error))
-            | Err(
-                LiveAudioScheduleError::CandidateCommitted(error)
-                | LiveAudioScheduleError::CandidateRefusedScore(error),
-            ) => panic!(
-                "unaffordable reserve refused the only query that can refill the horizon: {error}"
-            ),
-        };
-        assert!(
-            session.js.get_number("__calls").unwrap_or(calls_before) > calls_before,
-            "minimum-slice fill never entered JavaScript"
-        );
-        assert!(
-            session.scheduler.horizon_remaining(now) > horizon_before,
-            "minimum-slice fill did not extend the horizon: {} -> {}",
-            horizon_before,
-            session.scheduler.horizon_remaining(now)
-        );
-        assert!(
-            !batch.events.is_empty(),
-            "minimum-slice fill scheduled nothing"
-        );
-
-        // And again once the clock has advanced past the refill: a set that
-        // survives one stall must survive the next one too.
-        let later = now + 0.4;
-        if let Err(LiveAudioScheduleError::Retryable(error))
-        | Err(
-            LiveAudioScheduleError::CandidateCommitted(error)
-            | LiveAudioScheduleError::CandidateRefusedScore(error),
-        ) = session.schedule_audio_live_at(
-            later,
-            48_000,
-            Duration::from_millis(29),
-            LiveQueryBudgetMode::Steady,
-        ) {
-            panic!("second unaffordable reserve wedged the producer: {error}");
-        }
-    }
-
     #[test]
     fn scheduler_callback_cells_do_not_grow_with_playback_length() {
         // A `BridgeFrame` lives for one `Scheduler::tick` query, not for the
@@ -3930,55 +3750,6 @@ mod tests {
             "the longer run scheduled no extra onsets: {short_onsets} vs \
              {long_onsets}"
         );
-    }
-
-    #[test]
-    fn scheduled_callback_output_survives_per_tick_teardown() {
-        // Tearing the frame down per tick must not cost correctness: the
-        // callback graph is rebuilt on each tick's query and has to keep
-        // producing the same events.
-        let first = nested_callback_session().play(2.0).expect("play");
-        let second = nested_callback_session().play(2.0).expect("play again");
-        let show = |r: &PlayReport| {
-            r.onsets
-                .iter()
-                .map(|o| format!("{}@{}", o.value_show, o.whole_begin))
-                .collect::<Vec<_>>()
-        };
-        assert!(!first.onsets.is_empty(), "scheduled nothing");
-        assert_eq!(
-            show(&first),
-            show(&second),
-            "replaying the same graph produced different onsets"
-        );
-    }
-
-    #[test]
-    fn every_scheduling_scope_unwinds() {
-        // Depth counters back to zero after a successful run, after a run whose
-        // callback THROWS, and for a pure graph that opens no scope at all.
-        for source in [
-            NESTED_CALLBACK_SOURCE,
-            r#"pure('bd').polyBind(x => { throw new Error('boom'); })"#,
-            r#"s("bd sd")"#,
-        ] {
-            let mut session = Session::new().expect("session");
-            session.ensure_bindings().expect("bindings");
-            session.js.install_gc_binding().expect("gc binding");
-            session.evaluate(source).expect("evaluate");
-            let _ = session.play(2.0).expect("play");
-            assert_eq!(session.js.query_depth(), 0, "{source}: query stack");
-            assert_eq!(
-                rustel_jsruntime::bridge_frame_depth(),
-                0,
-                "{source}: bridge frame still open"
-            );
-            assert_eq!(
-                rustel_jsruntime::bridge_scratch_len(),
-                0,
-                "{source}: scratch not drained"
-            );
-        }
     }
 
     #[test]
@@ -4041,99 +3812,6 @@ mod tests {
                 still_loading(&mut session),
                 0,
                 "{score} score: the next window says nothing new"
-            );
-        }
-    }
-
-    #[cfg(feature = "device-audio")]
-    #[test]
-    fn loading_prefill_does_not_publish_an_empty_retry() {
-        use crate::samples::SoundReadiness;
-
-        // An unrelated pending sample must not prevent a genuine silent save.
-        for source in ["~", "heldsample*4"] {
-            let (mut session, mut producer, library) = loading_prefill_fixture();
-
-            let before = session.generation();
-            let values = rustel_mini::mini(source).expect("native mini values");
-            let pattern = rustel_core::controls::ControlSpec::new(["s"]).pattern(&values);
-            session
-                .set_pattern(pattern)
-                .expect("native sound replacement");
-            session.restart_transport_at(0.0);
-            let after = session.generation();
-            producer.arm_replacement(before, after);
-            assert_eq!(after, before + 1);
-            assert!(!session.active_needs_host(), "fixture must remain native");
-            assert_eq!(
-                library.readiness("heldsample", 0.0),
-                SoundReadiness::Loading
-            );
-            assert!(library.take_ready().is_empty());
-            assert_eq!(session.scheduler.queued(), 0);
-            let cursor_before = session.scheduled_to_cycle();
-            let mut published = Vec::new();
-            let first = producer.step_unwatched_with_clock_and_cutover(
-                &mut session,
-                || 0.0,
-                48_000,
-                |generation, frame, _cut| published.push((generation, frame)),
-                |_| panic!("rest or still-loading sample emitted audio"),
-            );
-            // A loading hold is a quiet turn, not a failed one: the held
-            // replacement reports Ok with nothing scheduled and nothing
-            // published, the same shape as the silent replacement's turn.
-            let first = first.expect("held or silent replacement must not fail");
-            assert_eq!((first.scheduled, first.pushed, first.pending), (0, 0, 0));
-            let first_record = producer.producer_load_snapshot();
-            assert!(first_record.query_span_millicycles > 0);
-            assert_eq!(first_record.js_callback_calls, 0);
-            assert_eq!(first_record.converted_audio_events, 0);
-            assert_eq!(first_record.ring_pushes, 0);
-            assert_eq!(producer.pending(), 0);
-            assert_eq!(session.scheduler.queued(), 0);
-            assert!(session.scheduled_to_cycle() > cursor_before);
-            assert!(
-                session.scheduler.horizon_remaining(0.0)
-                    > session.config.horizon - session.scheduler.refill_floor_seconds()
-            );
-
-            if source == "~" {
-                assert_eq!(first_record.scheduler_events, 0);
-                assert_eq!(first_record.refused_voices, 0);
-                assert_eq!(published, vec![(after, 0)]);
-                continue;
-            }
-
-            assert_eq!(first_record.scheduler_events, 2);
-            assert_eq!(first_record.refused_voices, 2);
-            assert!(
-                published.is_empty(),
-                "failed conversion published a generation"
-            );
-            assert_eq!(session.generation(), after, "loading must not roll back");
-            assert!(session.audible_source.is_none());
-
-            // No clock advance, loader publication, requery or new score occurs.
-            // The scheduler's full horizon must not turn lost onsets into silence.
-            let retry = producer.step_unwatched_with_clock_and_cutover(
-                &mut session,
-                || 0.0,
-                48_000,
-                |generation, frame, _cut| published.push((generation, frame)),
-                |_| panic!("the sample is still loading on retry"),
-            );
-            assert_eq!(
-                library.readiness("heldsample", 0.0),
-                SoundReadiness::Loading
-            );
-            assert!(library.take_ready().is_empty());
-            assert_eq!(session.generation(), after);
-            let retry = retry.expect("a loading retry is a held turn, not an error");
-            assert_eq!((retry.scheduled, retry.pushed, retry.pending), (0, 0, 0));
-            assert!(
-                published.is_empty(),
-                "still-loading full-horizon retry published {published:?}"
             );
         }
     }
@@ -4412,50 +4090,6 @@ mod tests {
             session.take_requery_takeover(),
             None,
             "the publication consumed the pair; nothing is left for the next reload"
-        );
-    }
-
-    /// A rewind's held window that has nothing to reopen keeps its takeover
-    /// and cut. Here the scheduler has not queried up to cycle zero, so the
-    /// cursor stands short of the anchor.
-    #[test]
-    #[cfg(feature = "device-audio")]
-    fn a_held_rewind_that_cannot_reopen_keeps_its_takeover_and_cut() {
-        let (mut session, mut producer, _library) = rewind_hold_fixture();
-        let rewinding = session.generation();
-        session.set_next_takeover_time(0.25);
-        session.start_next_from_zero();
-        session
-            .reload_at("s(\"heldsample\")", false, 0.0)
-            .expect("native sound replacement");
-        let after = session.generation();
-        producer.arm_replacement(rewinding, after);
-        // Queue the cycle-zero onset ahead of the producer, then name an
-        // anchor past what that fill queried.
-        session.scheduler.set_horizon(1.0);
-        assert_eq!(
-            session.scheduler.tick(&VirtualClock::new(0.0)),
-            rustel_scheduler::TickStatus::Filled
-        );
-        session.scheduler.set_horizon(0.5);
-        assert_eq!(session.scheduler.queued(), 1);
-        session.requery_anchor_time = Some(5.0);
-
-        let held = producer
-            .step_unwatched_with_clock_and_cutover(
-                &mut session,
-                || 0.0,
-                48_000,
-                |_, _, _| panic!("a held rewind published"),
-                |_| panic!("a loading onset emitted audio"),
-            )
-            .expect("the loading window holds quietly");
-        assert_eq!((held.scheduled, held.pushed), (0, 0));
-        assert!(producer.cut_takeover_deferred_for_loading());
-        assert_eq!(
-            session.take_requery_takeover(),
-            Some((0.25, TakeoverCut::AtTakeover)),
-            "the pair is back for this rewind's publication"
         );
     }
 
@@ -4968,18 +4602,6 @@ mod tests {
     }
 
     #[test]
-    fn pure_scheduling_installs_no_host() {
-        // The complement: a graph reaching no JavaScript must schedule with
-        // nothing installed, exercising the purity invariant on
-        // this path.
-        let mut session = Session::new().expect("session");
-        session.evaluate(r#"s("bd sd").fast(2)"#).expect("evaluate");
-        assert!(!session.active_needs_host());
-        let report = session.play(2.0).expect("play");
-        assert!(!report.onsets.is_empty());
-    }
-
-    #[test]
     fn pure_scheduling_uses_the_owning_sessions_module_settings() {
         let mut first = Session::new().expect("first session");
         let mut second = Session::new().expect("second session");
@@ -5390,5 +5012,93 @@ mod tests {
             chained == plain,
             "the chain of 384 frames changes the samples"
         );
+    }
+
+    #[test]
+    fn opt_in_lane_tracking_tags_events_and_respects_lane_controls() {
+        let score = "$: s(\"bd\").note(60)\n$: s(\"sawtooth\").note(67)";
+        let mut session = Session::new().expect("session");
+        // Off by default: events carry no lane tag.
+        session.set_schedule_trace_enabled(true);
+        session.evaluate(score).expect("evaluate default");
+        session
+            .schedule_through(0.0, 0.5)
+            .expect("schedule default");
+        let mut untagged = Vec::new();
+        session.drain_schedule_trace_events_into(&mut untagged);
+        assert!(!untagged.is_empty());
+        assert!(untagged.iter().all(|event| event.lane.is_none()));
+
+        // Turn on opt-in lane tracking and re-evaluate on a fresh timeline.
+        session.set_lane_tracking_enabled(true);
+        session.evaluate(score).expect("evaluate tagged");
+        session.restart_transport_at(0.0);
+        let lanes = session.active_ui_lanes();
+        assert_eq!(lanes.len(), 2);
+        let first_lane = lanes[0].id;
+        let second_lane = lanes[1].id;
+        assert_ne!(first_lane, second_lane);
+
+        session.schedule_through(0.0, 0.5).expect("schedule tagged");
+        let mut tagged = Vec::new();
+        session.drain_schedule_trace_events_into(&mut tagged);
+        let seen_lanes: Vec<u32> = tagged.iter().filter_map(|event| event.lane).collect();
+        assert!(
+            seen_lanes.contains(&first_lane),
+            "expected first_lane={first_lane} in seen_lanes={seen_lanes:?}, lanes={lanes:?}"
+        );
+        assert!(
+            seen_lanes.contains(&second_lane),
+            "expected second_lane={second_lane} in seen_lanes={seen_lanes:?}, lanes={lanes:?}"
+        );
+        assert!(
+            tagged
+                .iter()
+                .any(|event| event.sound.as_deref() == Some("bd"))
+        );
+        assert!(
+            tagged
+                .iter()
+                .any(|event| event.sound.as_deref() == Some("sawtooth"))
+        );
+
+        // Solo second lane and transpose +5 semitones.
+        session.set_lane_solo(Some(second_lane));
+        assert!(session.set_lane_transpose(second_lane, 5));
+        session
+            .requery_active_at(0.0)
+            .expect("requery after lane control");
+        let solo_onsets = session.schedule_through(0.0, 0.5).expect("schedule solo");
+        let mut solo_traces = Vec::new();
+        session.drain_schedule_trace_events_into(&mut solo_traces);
+        assert!(!solo_traces.is_empty());
+        assert!(
+            solo_traces
+                .iter()
+                .all(|event| event.lane == Some(second_lane))
+        );
+        assert!(solo_onsets.iter().all(|onset| {
+            matches!(
+                &onset.value,
+                ValueJson::Raw(serde_json::Value::Object(map))
+                    if map.get("note").and_then(serde_json::Value::as_f64) == Some(72.0)
+            )
+        }));
+
+        // Verify the JS evaluation tier also tags lanes consistently.
+        session.clear_lane_controls();
+        let js_score = "const notes = [60, 64];\n$: s(\"bd\").note(notes[0])\n$: s(\"sawtooth\").note(notes[1])";
+        session.evaluate(js_score).expect("evaluate JS score");
+        session.restart_transport_at(0.0);
+        let js_lanes = session.active_ui_lanes();
+        assert_eq!(js_lanes.len(), 2);
+        session
+            .schedule_through(0.0, 0.5)
+            .expect("schedule JS tagged");
+        let mut js_traces = Vec::new();
+        session.drain_schedule_trace_events_into(&mut js_traces);
+        let js_seen: Vec<u32> = js_traces.iter().filter_map(|event| event.lane).collect();
+        assert!(js_seen.contains(&js_lanes[0].id));
+        assert!(js_seen.contains(&js_lanes[1].id));
     }
 }

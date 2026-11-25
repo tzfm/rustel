@@ -3571,6 +3571,8 @@ mod tests {
                 frequency_hz: None,
                 gain: Some(1.0),
                 sample: None,
+                lane: None,
+                sound: None,
                 ui_visuals: 0,
                 context: vec![(first.offset + 3, first.offset + 5)],
             };

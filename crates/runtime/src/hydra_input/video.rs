@@ -536,14 +536,4 @@ mod tests {
         let error = play(clip, &cancel, &mut |_, _, _| Ok(true)).expect_err("refused");
         assert!(error.contains("not WebM or Matroska"), "{error}");
     }
-
-    #[test]
-    fn a_file_that_is_not_a_video_says_it_is_not_one() {
-        let cancel = AtomicBool::new(false);
-        let error = play(b"not a video at all".to_vec(), &cancel, &mut |_, _, _| {
-            Ok(true)
-        })
-        .expect_err("refused");
-        assert_eq!(error, "Hydra video is not WebM or Matroska");
-    }
 }

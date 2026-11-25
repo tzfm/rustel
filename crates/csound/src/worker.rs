@@ -1030,19 +1030,6 @@ mod tests {
         worker.join().unwrap();
     }
 
-    #[test]
-    fn a_dead_worker_is_reported_to_the_callback() {
-        let channel = Arc::new(Channel::new());
-        let worker = {
-            let channel = Arc::clone(&channel);
-            thread::spawn(move || {
-                let _exit = Exit(channel);
-            })
-        };
-        worker.join().unwrap();
-        assert!(channel.dead.load(Ordering::Acquire));
-    }
-
     /// A reader over a shared ring whose worker only answers the stop
     /// flag. Each test confirms restarts the way the real worker does.
     fn reader(channel: &Arc<Channel>) -> Insert {

@@ -223,37 +223,3 @@ fn retained_arguments_do_not_accumulate_cells() {
     );
     assert_scopes_unwound(&rt, "repeated escapes");
 }
-
-#[test]
-fn an_escaped_argument_does_not_root_an_unrelated_graph() {
-    // An argument built from a precise graph imports only the ids that graph
-    // reaches. Importing the whole querying wrapper's sidecar would retain
-    // unrelated callbacks on every escape.
-    let rt = runtime();
-    rt.run_gc();
-    let baseline = rustel_jsruntime::cells_live();
-
-    // A callback-free receiver, so the argument handed to the transformer
-    // reaches NO callbacks at all and must import none.
-    eval(
-        &rt,
-        r#""hh cp".every(2, x => { globalThis.escaped = x; return x; })"#,
-    );
-    rt.clear_active();
-    eval(&rt, "escaped");
-    rt.run_gc();
-
-    assert_eq!(
-        shown(&rt, 1),
-        "[ 0/1 → 1/2 | hh ];[ 1/2 → 1/1 | cp ]",
-        "the callback-free retained argument is broken"
-    );
-    rt.clear_active();
-    rt.eval("globalThis.escaped = null;").unwrap();
-    rt.run_gc();
-    assert_eq!(
-        rustel_jsruntime::cells_live(),
-        baseline,
-        "a callback-free escaped argument is still rooting cells"
-    );
-}

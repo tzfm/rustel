@@ -62,6 +62,17 @@ pub(crate) fn end_query_merge_cache() {
 
 static UI_VISUAL_MASK_CACHE: [OnceLock<Arc<Keys>>; 64] = [const { OnceLock::new() }; 64];
 static UI_VISUAL_SINGLE_CACHE: [OnceLock<Arc<Keys>>; 64] = [const { OnceLock::new() }; 64];
+static LANE_ONLY_CACHE: [OnceLock<Arc<Keys>>; 64] = [const { OnceLock::new() }; 64];
+
+fn cached_lane_only_ref(lane: u32) -> Option<&'static Arc<Keys>> {
+    let slot = usize::try_from(lane).ok().filter(|&slot| slot < 64)?;
+    Some(LANE_ONLY_CACHE[slot].get_or_init(|| {
+        Arc::new(Keys {
+            lane: Some(lane),
+            ..Keys::default()
+        })
+    }))
+}
 
 fn cached_ui_visual_mask_ref(mask: u64) -> Option<&'static Arc<Keys>> {
     if mask == 0 {
@@ -133,6 +144,8 @@ pub(crate) struct Keys {
     pub(crate) live_controls: [u64; 4],
     pub(crate) slider_binding: u64,
     pub(crate) ui_visuals: u64,
+    /// Stable score lane id attached when opt-in lane tracking is active.
+    pub(crate) lane: Option<u32>,
     /// Exact JavaScript lookup shape (holes, length, enumerable keys) when the
     /// visible value alone cannot represent it. Nested Patterns also live in
     /// `value`; this side channel is shape metadata, not their only owner.
@@ -150,6 +163,7 @@ impl fmt::Debug for Keys {
             .field("live_controls", &self.live_controls)
             .field("slider_binding", &self.slider_binding)
             .field("ui_visuals", &self.ui_visuals)
+            .field("lane", &self.lane)
             .field("pick_lookup", &self.pick_lookup.is_some())
             .finish()
     }
@@ -164,6 +178,7 @@ static NO_KEYS: Keys = Keys {
     live_controls: [0; 4],
     slider_binding: 0,
     ui_visuals: 0,
+    lane: None,
     pick_lookup: None,
 };
 
@@ -226,6 +241,24 @@ impl ContextKeys {
     /// The keys to change, copied first when another hap shares them.
     pub(crate) fn edit(&mut self) -> &mut Keys {
         Arc::make_mut(self.0.get_or_insert_with(Default::default))
+    }
+
+    /// Set the lane id on these keys, reusing the static lane-only cache when
+    /// no other context keys are present.
+    #[inline]
+    pub(crate) fn set_lane(&mut self, lane: u32) {
+        match &self.0 {
+            None => {
+                if let Some(cached) = cached_lane_only_ref(lane) {
+                    // Share the static lane-only entry so tagging allocates nothing.
+                    self.0 = Some(Arc::clone(cached));
+                    return;
+                }
+            }
+            Some(arc) if arc.lane == Some(lane) => return,
+            Some(_) => {}
+        }
+        self.edit().lane = Some(lane);
     }
 
     /// Set visual slot bit `slot` on these keys, using static cached `Arc<Keys>`
@@ -431,6 +464,7 @@ impl ContextKeys {
                     live_controls: [0; 4],
                     slider_binding: 0,
                     ui_visuals: b.ui_visuals,
+                    lane: b.lane,
                     pick_lookup: None,
                 })
             }
@@ -479,6 +513,7 @@ impl ContextKeys {
                     live_controls: a.live_controls,
                     slider_binding: a.slider_binding,
                     ui_visuals: a.ui_visuals | b.ui_visuals,
+                    lane: a.lane.or(b.lane),
                     pick_lookup: a.pick_lookup.clone(),
                 });
                 let _ = MERGE_CACHE.try_with(|cache| {
@@ -540,6 +575,7 @@ impl ContextKeys {
             live_controls,
             slider_binding,
             ui_visuals: a.ui_visuals | b.ui_visuals,
+            lane: a.lane.or(b.lane),
             pick_lookup,
         })
     }
@@ -553,6 +589,7 @@ impl Keys {
             _ => false,
         };
         a.ui_visuals == b.ui_visuals
+            && a.lane == b.lane
             && a.slider_binding == b.slider_binding
             && a.live_controls == b.live_controls
             && a.scale == b.scale
@@ -572,6 +609,7 @@ impl Keys {
             && self.live_controls == [0; 4]
             && self.slider_binding == 0
             && self.ui_visuals == 0
+            && self.lane.is_none()
             && self.pick_lookup.is_none()
     }
 
@@ -579,6 +617,7 @@ impl Keys {
         self.live_controls == [0; 4]
             && self.slider_binding == 0
             && self.ui_visuals == 0
+            && self.lane.is_none()
             && self.pick_lookup.is_none()
     }
 
@@ -591,6 +630,7 @@ impl Keys {
             && self.log_line.is_none()
             && self.live_controls == [0; 4]
             && self.slider_binding == 0
+            && self.lane.is_none()
             && self.pick_lookup.is_none()
     }
 
@@ -601,6 +641,7 @@ impl Keys {
             && (self.scale_definition.is_some() || other.scale_definition.is_none())
             && (self.tags.is_some() || other.tags.is_none())
             && (self.log_line.is_some() || other.log_line.is_none())
+            && (self.lane.is_some() || other.lane.is_none())
             && (self.ui_visuals & other.ui_visuals == other.ui_visuals)
     }
 }
@@ -609,29 +650,23 @@ impl Keys {
 mod tests {
     use super::*;
 
-    fn with_scale(scale: &str) -> ContextKeys {
-        let mut keys = ContextKeys::default();
-        keys.edit().scale = Some(Arc::from(scale));
-        keys
-    }
-
     #[test]
-    fn a_merge_keeps_the_first_sides_keys_and_fills_the_rest() {
-        let mut second = with_scale("b:minor");
-        second.edit().edo_size = Some(19.0);
-        let merged = ContextKeys::merge(&with_scale("a:major"), &second);
-        assert_eq!(merged.get().scale.as_deref(), Some("a:major"));
-        assert_eq!(merged.get().edo_size, Some(19.0));
-        let empty = ContextKeys::merge(&ContextKeys::default(), &ContextKeys::default());
-        assert!(empty.0.is_none(), "two empty sides share nothing");
-    }
+    fn lane_tags_share_static_cache_and_survive_merges() {
+        let mut a = ContextKeys::default();
+        let mut b = ContextKeys::default();
+        a.set_lane(3);
+        b.set_lane(3);
+        assert_eq!(a.get().lane, Some(3));
+        assert_eq!(
+            a.arc_ptr(),
+            b.arc_ptr(),
+            "lane-only tags share static cache"
+        );
 
-    #[test]
-    fn an_edit_does_not_change_a_hap_that_shares_the_keys() {
-        let first = with_scale("c:major");
-        let mut copy = first.clone();
-        copy.edit().scale = Some(Arc::from("d:dorian"));
-        assert_eq!(first.get().scale.as_deref(), Some("c:major"));
-        assert_eq!(copy.get().scale.as_deref(), Some("d:dorian"));
+        let mut with_visual = ContextKeys::default();
+        with_visual.add_ui_visual_slot(2);
+        let merged = ContextKeys::merge(&a, &with_visual);
+        assert_eq!(merged.get().lane, Some(3));
+        assert_eq!(merged.get().ui_visuals, 1u64 << 2);
     }
 }

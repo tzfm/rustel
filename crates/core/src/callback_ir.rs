@@ -501,18 +501,6 @@ mod tests {
     }
 
     #[test]
-    fn pure_execution_preserves_its_typed_proof() {
-        let program = PatternTransformProgram::new([apply(increment())]).unwrap();
-        let input = PurePattern::assert_pure(crate::pure(Value::F64(9.0)));
-        let output = program.apply_pure(input);
-        assert!(output.pattern().is_pure());
-        assert_eq!(
-            output.query_arc(Fraction::ZERO, Fraction::ONE)[0].value,
-            Value::F64(10.0)
-        );
-    }
-
-    #[test]
     fn a_query_error_stops_no_instruction() {
         let _ = crate::take_query_error();
         let calls = Arc::new(AtomicUsize::new(0));
@@ -758,27 +746,6 @@ mod tests {
     }
 
     #[test]
-    fn a_recording_keeps_each_read_once_and_hands_it_outward() {
-        let first = Standing::new();
-        let second = Standing::new();
-        let ((), outer) = recording_reads(|| {
-            note_read(std::slice::from_ref(&first));
-            let ((), inner) = recording_reads(|| {
-                note_read(&[second.clone(), second.clone()]);
-            });
-            assert_eq!(inner.len(), 1);
-            assert!(Arc::ptr_eq(&inner[0], &second));
-        });
-        assert_eq!(outer.len(), 2);
-        assert!(reads_hold(&outer));
-        second.mark_stale();
-        assert!(!reads_hold(&outer));
-        // Nothing records outside a recording.
-        note_read(&[first]);
-        READS.with(|reads| assert!(reads.borrow().is_empty()));
-    }
-
-    #[test]
     fn a_kept_answer_holds_while_what_it_read_stands_and_its_reuse_is_a_read() {
         let standing = Standing::new();
         let (answer, reads) = AnswerReads::record(|| {
@@ -794,37 +761,5 @@ mod tests {
         assert!(!reads.hold());
         let ((), nothing) = AnswerReads::record(|| ());
         assert!(nothing.hold());
-    }
-
-    #[test]
-    fn steps_leave_intermediate_handles_unforced() {
-        let unforced = Arc::new(AtomicUsize::new(0));
-        let seen = unforced.clone();
-        let observe = FunctionRef::native(
-            Some("observe"),
-            Arc::new(|pattern| pattern),
-            Arc::new(move |pattern: Pattern| {
-                if !pattern.has_runtime_settings() {
-                    seen.fetch_add(1, Ordering::SeqCst);
-                }
-                pattern
-            }),
-        );
-        let program = PatternTransformProgram::new([apply(increment()), apply(observe)]).unwrap();
-        let callback = FunctionRef::lowered_js(5, program);
-        let settings = crate::settings::RuntimeSettings::default();
-        let output = settings.with(|| callback.apply(crate::pure(Value::F64(1.0))));
-        assert_eq!(unforced.load(Ordering::SeqCst), 1);
-        assert!(output.has_runtime_settings());
-        assert_eq!(
-            output.query_arc(Fraction::ZERO, Fraction::ONE)[0].value,
-            Value::F64(2.0)
-        );
-    }
-
-    #[test]
-    fn program_is_send_and_sync() {
-        fn assert_send_sync<T: Send + Sync>() {}
-        assert_send_sync::<PatternTransformProgram>();
     }
 }

@@ -532,6 +532,7 @@ impl App {
                 .and_then(|panel| view::log_dock(panel, terminal_area)),
             self.memory_dock.map(|dock| dock.dock(terminal_area)),
             self.knobs_panel.is_some(),
+            self.outline_panel.is_some(),
             self.footer_notice_rows(),
             self.has_piano_notes(),
         );
@@ -545,6 +546,7 @@ impl App {
             // the keyboard goes back to the score rather than to rails that
             // are not on screen.
             Focus::Panel(PanelKind::Knobs) => regions.knobs.is_empty(),
+            Focus::Panel(PanelKind::Outline) => regions.outline.is_empty(),
             _ => false,
         };
         if hidden_focus {
@@ -554,6 +556,7 @@ impl App {
                 Focus::Panel(PanelKind::Viz) => format!("visuals {}", self.viz_focus + 1),
                 Focus::Panel(PanelKind::Set) => "the set panel".to_owned(),
                 Focus::Panel(PanelKind::Log) => "the log".to_owned(),
+                Focus::Panel(PanelKind::Outline) => "the outline".to_owned(),
                 _ => "the knobs".to_owned(),
             };
             self.status = format!("{panel} has no room on screen - the keys go to the score");
@@ -580,6 +583,7 @@ impl App {
         // body left the column.
         self.knobs_unlaid = false;
         self.refresh_knobs(regions.knobs);
+        self.refresh_outline();
         if let Some(panel) = self.set_panel.as_mut() {
             panel.sync_marks(&self.scenes);
             if !regions.sidebar_hidden
@@ -1320,6 +1324,12 @@ impl App {
                     panel,
                     fine_lock: self.fine_drag.lock,
                 }),
+            outline: self.outline_panel.as_ref(),
+            outline_native: self
+                .snapshot
+                .as_ref()
+                .and_then(|snapshot| snapshot.score_engine)
+                .map(|engine| engine == rustel_runtime::ScoreEngine::Native),
             mixer_selection: self.mixer_selection.as_ref(),
             reference_on_top: self.reference_on_top(),
             #[cfg(feature = "hydra")]

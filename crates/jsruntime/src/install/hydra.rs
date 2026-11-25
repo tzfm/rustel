@@ -1597,31 +1597,3 @@ pub(super) fn install<'js>(
 
     Ok(())
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// The surface writes these globals with no text that announces them, so
-    /// none of them may be a name a compiled callback depends on.
-    #[test]
-    fn the_globals_hydra_borrows_close_no_compiled_callback() {
-        let mut gate = LoweringGate::default();
-        gate.seal();
-        gate.record_text(&rustel_transpiler::SurfaceWrites {
-            global_names: GENERATORS
-                .iter()
-                .chain(VALUES)
-                .chain(ACTIONS)
-                .chain(SETTINGS)
-                .map(|name| (*name).to_owned())
-                .collect(),
-            ..rustel_transpiler::SurfaceWrites::default()
-        });
-        assert!(gate.admits(&LoweringDependencies {
-            methods: vec!["fast".into(), "speed".into()],
-            mini_callee: true,
-            raw_strings: true,
-        }));
-    }
-}

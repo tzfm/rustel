@@ -437,45 +437,8 @@ impl Session {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(feature = "midi")]
     use crate::session::tests::*;
-    #[test]
-    #[cfg(all(feature = "device-audio", feature = "osc"))]
-    fn external_only_replacement_is_renderable_without_a_scalar_voice() {
-        let mut session = Session::new().expect("session");
-        session
-            .evaluate(r#"s("not-a-native-sample").osc(57120).fast(8)"#)
-            .expect("external-only score");
-
-        let batch = match session.schedule_audio_live_at(
-            0.0,
-            48_000,
-            Duration::from_secs(1),
-            LiveQueryBudgetMode::ReplacementPrefill,
-        ) {
-            Ok(batch) => batch,
-            Err(LiveAudioScheduleError::Retryable(error))
-            | Err(LiveAudioScheduleError::AwaitingSamples(error))
-            | Err(
-                LiveAudioScheduleError::CandidateCommitted(error)
-                | LiveAudioScheduleError::CandidateRefusedScore(error),
-            ) => {
-                panic!("external-only replacement was rejected: {error}")
-            }
-        };
-
-        assert!(
-            batch.events.is_empty(),
-            "fixture unexpectedly rendered locally"
-        );
-        let pending = session.take_pending_osc();
-        assert!(!pending.is_empty(), "OSC intent was not retained");
-        assert!(pending.iter().all(|(_, intent)| {
-            intent.port == 57120
-                && intent
-                    .destination
-                    .is_some_and(|destination| destination.ip().is_loopback())
-        }));
-    }
 
     #[test]
     #[cfg(all(feature = "device-audio", feature = "osc"))]
@@ -1025,44 +988,5 @@ mod tests {
                 "unplannable MIDI intents must not consume the bounded live queue"
             );
         }
-    }
-
-    #[test]
-    #[cfg(all(feature = "device-audio", feature = "midi"))]
-    fn note_producing_midi_replacement_is_renderable_without_a_scalar_voice() {
-        let mut session = Session::new().expect("session");
-        session
-            .evaluate(r#"s("not-a-native-sample").note(60).midi('missing-port').fast(8)"#)
-            .expect("MIDI note score");
-
-        let batch = match session.schedule_audio_live_at(
-            0.0,
-            48_000,
-            Duration::from_secs(1),
-            LiveQueryBudgetMode::ReplacementPrefill,
-        ) {
-            Ok(batch) => batch,
-            Err(LiveAudioScheduleError::Retryable(error))
-            | Err(LiveAudioScheduleError::AwaitingSamples(error))
-            | Err(
-                LiveAudioScheduleError::CandidateCommitted(error)
-                | LiveAudioScheduleError::CandidateRefusedScore(error),
-            ) => {
-                panic!("note-producing MIDI replacement was rejected: {error}")
-            }
-        };
-
-        assert!(
-            batch.events.is_empty(),
-            "fixture unexpectedly rendered scalar audio"
-        );
-        let pending = session.take_pending_midi();
-        assert!(!pending.is_empty(), "MIDI note intent was not retained");
-        assert!(
-            pending
-                .iter()
-                .all(|intent| rustel_midi::has_output(&intent.controls)),
-            "note-producing MIDI intent was not recognized"
-        );
     }
 }

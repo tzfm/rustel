@@ -554,6 +554,12 @@ impl BindAction {
                 control: true,
                 shift: false,
             },
+            // iTerm2 keeps ⇧F9. ^F9 stays beside the log's own F9.
+            Self::LogSticky => KeyCombo {
+                code: KeyCode::F(9),
+                control: true,
+                shift: false,
+            },
             // Some terminal context menus keep ⇧F10 for themselves.
             Self::FocusPanels => shift_key(4),
             // Legacy CSI 1;2R is mistaken for a cursor-position reply.
@@ -3028,6 +3034,38 @@ mod tests {
             assert_eq!(binds.binding(action), Some(chord));
             assert_eq!(binds.adapted_action_for(&combo_event(chord)), Some(action));
             assert!(binds.overrules(&combo_event(action.default_binding())));
+        }
+    }
+
+    /// iTerm2 keeps ⇧F9, so the log docks on ^F9 there. Other terminals
+    /// keep ⇧F9.
+    #[test]
+    fn iterm2_docks_the_log_on_ctrl_f9() {
+        let _platform = super::super::terminal::profiles::ForcePlatformForTest::set("macos");
+        for (terminal, spelling) in [
+            ("iTerm2 3.6.11", "ctrl+f9"),
+            ("tmux via iTerm2 3.6.11", "ctrl+f9"),
+            ("Ghostty", "shift+f9"),
+        ] {
+            let mut binds = Keybinds::default();
+            binds.set_reach(Reach {
+                terminal: terminal.into(),
+                enhanced: false,
+            });
+            let chord = KeyCombo::parse(spelling).unwrap();
+            assert_eq!(
+                binds.binding(BindAction::LogSticky),
+                Some(chord),
+                "{terminal}"
+            );
+            // A moved default dispatches ahead of the built-in ⇧F9.
+            let moved =
+                (chord != BindAction::LogSticky.default_binding()).then_some(BindAction::LogSticky);
+            assert_eq!(
+                binds.adapted_action_for(&combo_event(chord)),
+                moved,
+                "{terminal}"
+            );
         }
     }
 

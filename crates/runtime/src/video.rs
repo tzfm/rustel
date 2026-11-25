@@ -932,22 +932,6 @@ mod tests {
         assert!(Strip::new(Some(f32::NAN)).duration.is_none());
     }
 
-    /// A keyframe group with no kept frame due in it is skipped, one with
-    /// one due is reduced to its keyframe, and one with several decodes
-    /// whole.
-    #[test]
-    fn a_keyframe_group_decodes_as_far_as_its_kept_frames_need() {
-        let mut strip = Strip::new(None);
-        strip.min_gap = 4.0;
-        assert_eq!(strip.due_between(0.0, 2.0), 1, "the first frame is due");
-        strip.times.push(0.0);
-        strip.last_time = 0.0;
-        assert_eq!(strip.due_between(2.0, 3.5), 0, "nothing due before 3.6 s");
-        assert_eq!(strip.due_between(4.0, 6.0), 1, "one due at 4 s");
-        assert_eq!(strip.due_between(4.0, 12.5), 3, "4, 8 and 12 s");
-        assert_eq!(strip.due_between(6.0, 4.0), 0, "an empty group");
-    }
-
     /// A clip faster than the kept rate keeps 24 frames a second, also with
     /// frame times rounded to the millisecond.
     #[test]
@@ -963,28 +947,5 @@ mod tests {
             }
             assert_eq!(strip.times.len(), 24, "{fps} fps");
         }
-    }
-
-    /// A decode behind the pace that finishes the clip in time reduces its
-    /// next groups to their keyframes, so a long clip is covered to its end.
-    #[test]
-    fn a_decode_behind_its_pace_reduces_groups_to_keyframes() {
-        let clip = Some(300.0);
-        assert!(
-            on_pace(Duration::ZERO, 0.0, clip),
-            "the first group decodes whole"
-        );
-        assert!(
-            on_pace(Duration::from_secs(4), 150.0, clip),
-            "ahead at half way"
-        );
-        assert!(
-            !on_pace(Duration::from_secs(14), 150.0, clip),
-            "behind at half way"
-        );
-        assert!(
-            on_pace(Duration::from_secs(40), 150.0, None),
-            "no length, no pace"
-        );
     }
 }

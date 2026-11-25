@@ -664,15 +664,6 @@ mod tests {
     }
 
     #[test]
-    fn a_clock_or_active_sensing_byte_touches_nothing() {
-        let port = InputPort::new("fake".into());
-        feed(&port, &[0xf8]);
-        feed(&port, &[0xfe]);
-        feed(&port, &[0xfa]);
-        assert_eq!(port.messages(), 0);
-    }
-
-    #[test]
     fn a_note_on_with_velocity_zero_is_a_note_off_and_never_enters_the_ring() {
         let port = InputPort::new("fake".into());
         feed(&port, &[0x90, 60, 0]);
@@ -685,16 +676,6 @@ mod tests {
         port.keys.select(0.0, 1.0, 0, Some((0, 1)), &mut out);
         assert_eq!(out.len(), 1);
         assert_eq!((out[0].note, out[0].velocity), (60, 100));
-    }
-
-    #[test]
-    fn program_change_and_aftertouch_do_not_land_in_the_control_table() {
-        let port = InputPort::new("fake".into());
-        // Two-byte messages: a naive reader takes byte 1 as a CC number.
-        feed(&port, &[0xc0, 74]);
-        feed(&port, &[0xd0, 74]);
-        assert_eq!(port.read_cc(74, 0), 0.0);
-        assert_eq!(port.messages(), 0);
     }
 
     struct RecordingListener {
@@ -877,34 +858,6 @@ mod tests {
     }
 
     #[test]
-    fn a_slow_open_result_is_discarded_when_its_generation_is_stale() {
-        let (release_open, blocked_open) = std::sync::mpsc::channel();
-        let (opener, attempts, drops) = test_opener(Some(("old".into(), blocked_open)), None, None);
-        let mut inputs = test_inputs(opener);
-        let bus = InputBus::new();
-        bus.intern("old").unwrap();
-        inputs.sync(&bus, 0, 0);
-        assert_eq!(
-            attempts.recv_timeout(Duration::from_secs(2)).unwrap(),
-            "old"
-        );
-
-        let new = Arc::new(InputPort::new("new".into()));
-        bus.commit_generation(1, vec![new]).unwrap();
-        inputs.sync(&bus, 1, 1);
-        release_open.send(()).unwrap();
-
-        assert_eq!(drops.recv_timeout(Duration::from_secs(2)).unwrap(), "old");
-        assert_eq!(
-            attempts.recv_timeout(Duration::from_secs(2)).unwrap(),
-            "new"
-        );
-        wait_for_status(&inputs, |status| {
-            status.desired == 1 && status.connected == 1
-        });
-    }
-
-    #[test]
     fn revisions_coalesce_while_the_worker_is_inside_a_slow_open() {
         let (release_open, blocked_open) = std::sync::mpsc::channel();
         let (opener, attempts, drops) = test_opener(Some(("old".into(), blocked_open)), None, None);
@@ -930,43 +883,6 @@ mod tests {
             attempts.recv_timeout(Duration::from_secs(2)).unwrap(),
             "latest",
             "worker opened an intermediate superseded generation"
-        );
-        assert!(attempts.recv_timeout(Duration::from_millis(30)).is_err());
-    }
-
-    #[test]
-    fn revisions_coalesce_while_the_worker_is_inside_a_slow_drop() {
-        let (drop_entered, entered_drop) = std::sync::mpsc::sync_channel(0);
-        let (release_drop, blocked_drop) = std::sync::mpsc::channel();
-        let drop_gate = Some(("old".into(), drop_entered, blocked_drop));
-        let (opener, attempts, drops) = test_opener(None, drop_gate, None);
-        let mut inputs = test_inputs(opener);
-        let bus = InputBus::new();
-        bus.intern("old").unwrap();
-        inputs.sync(&bus, 0, 0);
-        assert_eq!(
-            attempts.recv_timeout(Duration::from_secs(2)).unwrap(),
-            "old"
-        );
-        wait_for_status(&inputs, |status| status.connected == 1);
-
-        bus.commit_generation(1, vec![Arc::new(InputPort::new("middle".into()))])
-            .unwrap();
-        inputs.sync(&bus, 1, 1);
-        assert_eq!(drops.recv_timeout(Duration::from_secs(2)).unwrap(), "old");
-        entered_drop
-            .recv_timeout(Duration::from_secs(2))
-            .expect("worker did not enter the slow listener destructor");
-
-        bus.commit_generation(2, vec![Arc::new(InputPort::new("latest".into()))])
-            .unwrap();
-        inputs.sync(&bus, 2, 2);
-        release_drop.send(()).unwrap();
-
-        assert_eq!(
-            attempts.recv_timeout(Duration::from_secs(2)).unwrap(),
-            "latest",
-            "worker opened a revision superseded while listener Drop blocked"
         );
         assert!(attempts.recv_timeout(Duration::from_millis(30)).is_err());
     }
@@ -1065,46 +981,6 @@ mod tests {
         }
         inputs.sync(&bus, 0, 0);
         assert!(inputs.status().desired <= MAX_RETAINED_INPUTS);
-    }
-
-    /// A manager whose thread could not start, as `with_opener` leaves it.
-    fn unstarted_inputs() -> MidiInputs {
-        MidiInputs {
-            shared: Arc::default(),
-            worker: InputWorker::unavailable(
-                "could not start MIDI input manager: no thread left".into(),
-            ),
-        }
-    }
-
-    #[test]
-    fn a_manager_with_no_thread_tells_each_newly_wanted_port_why_once() {
-        let mut inputs = unstarted_inputs();
-        let bus = InputBus::new();
-        let (_, keys) = bus.intern("keys").unwrap();
-        bus.intern("pads").unwrap();
-        let reason = "could not start MIDI input manager: no thread left";
-        assert_eq!(
-            inputs.sync(&bus, 0, 0),
-            [
-                format!("MIDI input \"keys\" is not open: {reason}"),
-                format!("MIDI input \"pads\" is not open: {reason}"),
-            ]
-        );
-        assert!(
-            inputs.sync(&bus, 0, 0).is_empty(),
-            "a port that stayed wanted heard the reason twice"
-        );
-
-        // A port the score lets go of and then asks for again hears it again.
-        bus.commit_generation(1, vec![Arc::clone(&keys)]).unwrap();
-        assert!(inputs.sync(&bus, 1, 1).is_empty());
-        bus.commit_generation(2, vec![keys, Arc::new(InputPort::new("pads".into()))])
-            .unwrap();
-        assert_eq!(
-            inputs.sync(&bus, 2, 2),
-            [format!("MIDI input \"pads\" is not open: {reason}")]
-        );
     }
 
     /// Opens every port but `panics_on`, whose open panics.

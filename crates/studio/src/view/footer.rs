@@ -962,6 +962,7 @@ mod tests {
                     None,
                     None,
                     false,
+                    false,
                     u16::from(error.is_some()),
                     true,
                 );
@@ -1044,6 +1045,7 @@ mod tests {
                 None,
                 None,
                 None,
+                false,
                 false,
                 2,
                 false,
@@ -1274,6 +1276,7 @@ mod tests {
             None,
             None,
             None,
+            false,
             false,
             1,
             false,

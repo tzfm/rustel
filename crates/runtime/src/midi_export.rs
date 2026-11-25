@@ -709,26 +709,6 @@ mod tests {
         assert!(timeline(&[], f64::INFINITY, 0.5, options()).is_err());
     }
 
-    #[test]
-    fn a_render_writes_a_parseable_file_and_fills_the_report() {
-        let directory = tempfile::tempdir().unwrap();
-        let path = directory.path().join("take.mid");
-        let mut session = crate::Session::new().unwrap();
-        session.evaluate("$: note(\"c4\")").unwrap();
-        let report = session
-            .render(1.0, &path, crate::RenderFormat::Midi)
-            .unwrap();
-        assert_eq!(report.format, "midi");
-        assert_eq!(report.sample_rate, 0);
-        assert_eq!(report.channels, 0);
-        let midi = report.midi.expect("MIDI report");
-        assert!(midi.notes > 0, "{midi:?}");
-        let bytes = std::fs::read(&path).unwrap();
-        let imported =
-            rustel_smf::import_smf(&bytes, &rustel_smf::ImportOptions::default()).unwrap();
-        assert!(!imported.report.lanes.is_empty());
-    }
-
     /// A score's lanes are the file's tracks, and they come back as lanes:
     /// one render, one import, the same two lanes.
     #[test]

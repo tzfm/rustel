@@ -56,6 +56,8 @@ fn a_complete_frame_draws_every_surface_in_solid_blocks() {
             },
             gain: Some(1.0),
             sample: None,
+            lane: None,
+            sound: None,
             // The inline roll is the layout's first widget, slot 0; the
             // engine tags every event of its pattern with that bit.
             ui_visuals: 1,
@@ -206,6 +208,8 @@ fn a_complete_frame_draws_every_surface_in_solid_blocks() {
                     mixer: None,
                     mixer_panel: None,
                     knobs: None,
+                    outline: None,
+                    outline_native: None,
                     mixer_selection: None,
                     reference_on_top: false,
                     theme_camera: None,
@@ -563,6 +567,8 @@ fn a_sheet_paints_over_a_visuals_dock() {
                     mixer: None,
                     mixer_panel: None,
                     knobs: None,
+                    outline: None,
+                    outline_native: None,
                     mixer_selection: None,
                     reference_on_top: false,
                     theme_camera: None,

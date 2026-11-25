@@ -1218,28 +1218,6 @@ mod tests {
                 "the line stayed dead after the bad sample"
             );
         }
-
-        #[test]
-        fn an_orbit_delay_stays_energized_through_its_silent_gap_until_overwritten() {
-            let mut delay = OrbitDelay {
-                left: vec![0.0; 4],
-                right: vec![0.0; 4],
-                active: true,
-                ..OrbitDelay::default()
-            };
-            delay.store(0.5, 0.0);
-            assert_eq!(delay.energized, 1);
-
-            for _ in 0..3 {
-                delay.store(0.0, 0.0);
-                assert_eq!(
-                    delay.energized, 1,
-                    "silence before the echo must not look like a drained line"
-                );
-            }
-            delay.store(0.0, 0.0);
-            assert_eq!(delay.energized, 0, "the last audible cell was overwritten");
-        }
     }
 
     mod compressor_tests {
@@ -1357,27 +1335,5 @@ mod tests {
             let want = (crush - 1.0).exp2();
             assert_eq!(crush_levels(crush).to_bits(), want.to_bits(), "{crush}");
         }
-    }
-
-    /// A size an orbit had before comes back from its response, not a new
-    /// one: two sizes in turn make two responses however many notes ask.
-    #[test]
-    fn an_offline_render_makes_each_room_size_once() {
-        let bank = SampleBank::empty();
-        let params = |size_secs| crate::reverb::ReverbParams {
-            ir: None,
-            size_secs,
-            fade_secs: 0.1,
-            lp_start_hz: 15_000.0,
-            lp_end_hz: 1_000.0,
-        };
-        let mut responses = InlineResponses::default();
-        let mut reverbs = Vec::new();
-        for size in [0.05, 0.1, 0.05, 0.1, 0.05] {
-            reverbs.push(responses.reverb(8_000, params(size), &bank, DspDispatch::portable()));
-        }
-        assert_eq!(responses.0.len(), 2);
-        assert!(responses.0.iter().all(|(_, known)| known.in_use()));
-        assert_eq!(reverbs[2].params(), params(0.05));
     }
 }

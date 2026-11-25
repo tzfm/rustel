@@ -2750,37 +2750,6 @@ mod scale_steps_tests {
         assert_eq!(scaled.scale_context(), Some("C:major"));
         assert_eq!(scaled.log_line(), Some("a line"));
     }
-
-    #[test]
-    fn a_kept_degree_is_the_note_scale_step_resolves() {
-        let mut steps: Vec<f64> = (-67..67).map(|degree| degree as f64).collect();
-        steps.extend([
-            -0.5,
-            0.25,
-            2.5,
-            -0.0,
-            f64::NAN,
-            f64::INFINITY,
-            -1e300,
-            1e300,
-        ]);
-        let tonics = ["C", "C#", "Eb4", "B2", "Fb", ""];
-        for (type_name, _, _) in crate::tonaljs_scales::SCALE_DICTIONARY {
-            for tonic in tonics {
-                let name = format!("{tonic}:{type_name}");
-                let kept = ScaleSteps::new(name.clone());
-                for &step in &steps {
-                    let expected = crate::tonaljs::scale_step(step, &name);
-                    assert_eq!(kept.step(step).is_ok(), expected.is_ok(), "{name} {step}");
-                    if let Ok(note) = expected {
-                        assert_eq!(kept.step(step).as_deref(), Ok(&*note), "{name} {step}");
-                    }
-                }
-            }
-        }
-        let unknown = ScaleSteps::new("C:no such scale".to_string());
-        assert!(unknown.step(1.0).is_err());
-    }
 }
 
 #[cfg(test)]

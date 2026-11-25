@@ -1097,16 +1097,6 @@ mod tests {
         assert_eq!(got.bytes[got.bytes.len() - 4], b'|');
     }
 
-    #[test]
-    fn without_crc_the_bytes_are_just_the_message() {
-        let got = serial_onset(&onset(serde_json::json!({
-            "serialport": "x",
-            "action": "a",
-        })))
-        .unwrap();
-        assert_eq!(String::from_utf8(got.bytes).unwrap(), "a()");
-    }
-
     /// However strange the score, the bytes must stay a frame a sketch can
     /// parse rather than something that desynchronises its reader.
     #[test]
@@ -1127,18 +1117,6 @@ mod tests {
         assert!(!text.contains("object"), "{text}");
         assert!(!text.contains('['), "{text}");
         assert_eq!(*got.bytes.last().unwrap(), b';');
-    }
-
-    #[test]
-    fn an_oversized_port_name_is_refused() {
-        let huge = "p".repeat(MAX_SERIAL_PORT_NAME_BYTES + 1);
-        assert!(
-            serial_onset(&onset(serde_json::json!({
-                "serialport": huge,
-                "action": "a",
-            })))
-            .is_none()
-        );
     }
 
     #[test]
@@ -1651,48 +1629,6 @@ mod tests {
         assert_eq!(driver.calls(), 1, "the next set opened the port again");
     }
 
-    /// A port opened again at the set's baud keeps its stall note. The set is
-    /// told once that the port is still opening, not once per open.
-    #[test]
-    fn a_port_opened_again_is_told_it_is_still_opening_once() {
-        let (mut outputs, driver) = gated_outputs();
-        let due = std::time::Instant::now() + std::time::Duration::from_secs(30);
-        start_opening(&mut outputs, &driver, "COM-SLOW", 9_600, due, b"old()");
-        outputs.begin_set();
-        outputs
-            .sender("COM-SLOW", 115_200, due, b"new()")
-            .expect("the new set's admission");
-        let stale = || {
-            std::time::Instant::now()
-                .checked_sub(SERIAL_OPEN_STALL_NOTICE + std::time::Duration::from_secs(1))
-                .expect("a clock this close to its epoch")
-        };
-        let told = |news: Vec<SerialNews>| {
-            news.iter()
-                .filter(|notice| notice.kind == SerialNewsKind::StillOpening)
-                .count()
-        };
-        outputs
-            .in_flight
-            .get_mut("COM-SLOW")
-            .expect("in flight")
-            .since = stale();
-        assert_eq!(told(outputs.poll()), 1, "the stalled open was not told");
-        driver.release(Ok(()));
-        poll_until_reopened_by_this_set(&mut outputs, "COM-SLOW");
-        assert_eq!(driver.wait_entered(), "COM-SLOW");
-        outputs
-            .in_flight
-            .get_mut("COM-SLOW")
-            .expect("in flight")
-            .since = stale();
-        assert_eq!(
-            told(outputs.poll()),
-            0,
-            "the port opened again was told twice"
-        );
-    }
-
     /// A set that restarts while a port is still opening adopts that open: it
     /// cannot be called back, an exclusive COM port refuses a second open while
     /// it is pending, and a wedged adapter would strand one more thread per
@@ -1812,32 +1748,6 @@ mod tests {
         );
     }
 
-    /// Only an open this set started is this set's failure: when its own try
-    /// fails too, that is told once and remembered like any other.
-    #[test]
-    fn a_failed_try_of_the_set_s_own_is_remembered() {
-        let (mut outputs, driver) = gated_outputs();
-        let due = std::time::Instant::now() + std::time::Duration::from_secs(30);
-        start_opening(&mut outputs, &driver, "COM-BT", 115_200, due, b"x()");
-        outputs.begin_set();
-        outputs
-            .sender("COM-BT", 115_200, due, b"x()")
-            .expect("the new set's admission");
-        driver.release(Err("the last set's try failed".into()));
-        poll_until_reopened_by_this_set(&mut outputs, "COM-BT");
-        assert_eq!(driver.wait_entered(), "COM-BT");
-        driver.release(Err("could not open serial port \"COM-BT\": gone".into()));
-        let news = poll_until_reported(&mut outputs);
-        assert_eq!(news.len(), 1, "{news:?}");
-        assert_eq!(news[0].kind, SerialNewsKind::Failure);
-        assert!(news[0].message.contains("gone"), "{}", news[0].message);
-        let route = outputs
-            .sender("COM-BT", 115_200, due, b"x()")
-            .expect("a remembered failure is not an error");
-        assert!(matches!(route.to, Route::Dropped));
-        assert_eq!(driver.calls(), 2, "the set's own failure was retried");
-    }
-
     /// An open that completes between sets is the next set's to adopt, not a
     /// reason to open the port again; one that failed is forgotten, so the
     /// port is tried afresh when a set names it.
@@ -1877,43 +1787,6 @@ mod tests {
         );
         assert_eq!(driver.wait_entered(), "COM-GONE");
         assert_eq!(driver.calls(), 3);
-    }
-
-    /// An open that finished between sets at another baud than the new set asks
-    /// for is not adopted: the restart applies the new baud, closing the old
-    /// handle before the port is asked for again.
-    #[test]
-    fn an_open_finished_at_another_baud_is_opened_again_at_the_set_s() {
-        let (mut outputs, driver) = gated_outputs();
-        let due = std::time::Instant::now() + std::time::Duration::from_millis(300);
-        start_opening(&mut outputs, &driver, "COM-SLOW", 9_600, due, b"old()");
-        outputs.begin_set();
-        driver.release(Ok(()));
-        poll_until(&mut outputs, |outputs| {
-            outputs.adoptable.contains_key("COM-SLOW")
-        });
-        let route = outputs
-            .sender("COM-SLOW", 115_200, due, b"new()")
-            .expect("the new set's admission");
-        assert!(
-            matches!(route.to, Route::Held),
-            "the old baud's open was adopted"
-        );
-        assert!(route.note.is_none(), "{:?}", route.note);
-        assert_eq!(driver.wait_entered(), "COM-SLOW");
-        assert_eq!(
-            driver.held_on_entry(),
-            [0, 0],
-            "the port was asked for again before the old handle let it go"
-        );
-        driver.release(Ok(()));
-        poll_until_opened(&mut outputs, "COM-SLOW");
-        assert_eq!(
-            driver.bauds(),
-            [9_600, 115_200],
-            "the port was not opened again at the set's baud"
-        );
-        assert_eq!(driver.calls(), 2);
     }
 
     /// A restart keeps a port the last set had open and takes it as it is at

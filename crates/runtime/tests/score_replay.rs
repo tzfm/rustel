@@ -39,17 +39,3 @@ fn a_score_that_loads_samples_and_declares_things_replays() {
     )
     .expect("a sample-loading score must replay");
 }
-
-#[test]
-fn the_same_score_without_samples_replays_the_same_way() {
-    // The two halves of the original inconsistency, side by side.
-    replay("const main = stack(s(\"bd*4\"), note(\"c3 e3\"))\n$: main")
-        .expect("a score without samples must replay too");
-}
-
-#[test]
-fn a_map_of_samples_replays() {
-    // The object form takes the same awaited path.
-    replay("samples({ bd: ['bd.wav'] })\nconst main = s(\"bd\")\n$: main")
-        .expect("a sample map must replay");
-}

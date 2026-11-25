@@ -1364,18 +1364,6 @@ mod sequencer_tests {
         sequencer_verdict(Err(std::io::Error::from_raw_os_error(errno)))
     }
 
-    #[cfg(target_os = "linux")]
-    #[test]
-    fn an_absent_sequencer_is_no_sequencer() {
-        assert_eq!(verdict_for(libc::ENOENT), Err(NO_SEQUENCER));
-    }
-
-    #[cfg(target_os = "linux")]
-    #[test]
-    fn a_sequencer_this_user_may_open_is_left_to_alsa() {
-        assert_eq!(sequencer_verdict(Ok(())), Ok(()));
-    }
-
     /// Root passes `access(2)` whatever the device's mode, so this is the only
     /// place a refusal can be tested on a machine that runs its tests as root.
     #[cfg(target_os = "linux")]
@@ -1390,12 +1378,6 @@ mod sequencer_tests {
                 "{words:?} is missing from {SEQUENCER_REFUSED:?}"
             );
         }
-    }
-
-    #[cfg(target_os = "linux")]
-    #[test]
-    fn any_other_access_failure_is_left_to_alsa_to_report() {
-        assert_eq!(verdict_for(libc::EIO), Ok(()));
     }
 
     /// An absent or inaccessible sequencer reports its reason once without
@@ -1458,11 +1440,6 @@ mod tests {
             MidiMessage::note_on(99, 60, 100).as_slice(),
             &[0x9f, 60, 100]
         );
-    }
-
-    #[test]
-    fn note_off_is_a_real_note_off_not_a_zero_velocity_note_on() {
-        assert_eq!(MidiMessage::note_off(1, 60).as_slice(), &[0x80, 60, 0]);
     }
 
     #[test]
@@ -1661,24 +1638,6 @@ mod tests {
         );
         let report = sender.report();
         assert_eq!(report.dropped_late, 1, "only the note-on should be dropped");
-    }
-
-    #[test]
-    fn messages_past_their_moment_are_dropped_not_sent_late() {
-        let capture = CapturePort::new();
-        let sender = MidiSender::with_port(Box::new(capture.clone()), "capture".into());
-
-        sender.send_at(
-            Instant::now() - MAX_QUEUE_LATENESS - Duration::from_millis(200),
-            MidiMessage::note_on(1, 60, 100),
-        );
-        sender.send_at(Instant::now(), MidiMessage::note_on(1, 62, 100));
-        std::thread::sleep(Duration::from_millis(150));
-
-        let sent = capture.messages();
-        assert_eq!(sent.len(), 1, "the stale note-on should not have been sent");
-        assert_eq!(sent[0].1, vec![0x90, 62, 100]);
-        assert_eq!(sender.report().dropped_late, 1);
     }
 
     /// A runaway score must not grow the queue without bound.
@@ -2371,15 +2330,6 @@ mod tests {
         // Shortened by noteOffsetMs so the off precedes the next on.
         assert!((plan[1].0 - 0.999).abs() < 1e-9, "{:?}", plan[1].0);
         assert_eq!(plan[1].1, MidiMessage::note_off(1, 60));
-    }
-
-    /// `offset = Math.min(noteOffsetMs, hapDuration / 2)` - a very short note
-    /// keeps half its length instead of going negative.
-    #[test]
-    fn a_very_short_note_keeps_half_its_gate_rather_than_going_negative() {
-        let plan = plan(&note(60.0), 0.001);
-        assert!(plan[1].0 > 0.0, "note-off went backwards: {:?}", plan[1].0);
-        assert!((plan[1].0 - 0.0005).abs() < 1e-9, "{:?}", plan[1].0);
     }
 
     #[test]

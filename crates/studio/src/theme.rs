@@ -893,6 +893,16 @@ impl ThemeOpacity {
 }
 
 impl Theme {
+    /// The colour that says what evaluates a score or a part of one:
+    /// native Rust, or the script engine.
+    pub fn engine(&self, native: bool) -> Color {
+        if native {
+            self.error
+        } else {
+            self.syntax.keyword.unwrap_or(self.syntax.punctuation)
+        }
+    }
+
     /// The terminal cursor colour, always resolved even for an older theme.
     pub fn caret(&self) -> Color {
         self.caret.unwrap_or(self.foreground)

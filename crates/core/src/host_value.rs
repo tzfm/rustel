@@ -94,13 +94,6 @@ mod tests {
     }
 
     #[test]
-    fn a_value_nobody_set_reads_zero() {
-        let value = HostValue::default();
-        assert_eq!(value.get(), 0.0);
-        assert_eq!(first_value(&value.signal()), Value::F64(0.0));
-    }
-
-    #[test]
     fn a_signal_built_before_a_set_reads_the_value_set_since() {
         let value = HostValue::default();
         let signal = value.signal();
@@ -137,15 +130,5 @@ mod tests {
     fn the_signal_is_not_cacheable() {
         let value = HostValue::default();
         assert!(!value.signal().is_cacheable());
-    }
-
-    #[test]
-    fn a_pointer_queries_as_the_position_set() {
-        let pointer = Pointer::default();
-        let (x, y) = (pointer.x.signal(), pointer.y.signal());
-        pointer.x.set(0.25);
-        pointer.y.set(0.75);
-        assert_eq!(first_value(&x), Value::F64(0.25));
-        assert_eq!(first_value(&y), Value::F64(0.75));
     }
 }

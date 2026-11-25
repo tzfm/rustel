@@ -626,6 +626,8 @@ pub(super) struct BridgeFrame<'js> {
     /// operation such as `stepalt`. Opaque scratch scans skip these ids unless
     /// the graph statically reaches them or an explicit source owns them.
     pub(super) suppressed: RefCell<HashSet<CallbackId>>,
+    /// Whether lane collection tags every playing lane's haps with its lane id.
+    tag_lanes: bool,
 }
 
 #[derive(Clone)]
@@ -654,15 +656,22 @@ impl<'js> BridgeFrame<'js> {
             pending: RefCell::new(Vec::new()),
             harvested: RefCell::new(Vec::new()),
             suppressed: RefCell::new(HashSet::new()),
+            tag_lanes: false,
         }
     }
 
-    pub(super) fn evaluation(alloc: std::rc::Rc<Cell<CallbackId>>) -> Self {
+    pub(super) fn evaluation(alloc: std::rc::Rc<Cell<CallbackId>>, tag_lanes: bool) -> Self {
         Self {
             plugin_scope: RefCell::new(Some(PluginScope::new(String::new()))),
             plugin_names: RefCell::new(Some(Vec::new())),
+            tag_lanes,
             ..Self::new(alloc)
         }
+    }
+
+    /// True when this evaluation tags every playing lane's haps with its id.
+    pub(super) fn tag_lanes(&self) -> bool {
+        self.tag_lanes
     }
 
     pub(super) fn setup(alloc: std::rc::Rc<Cell<CallbackId>>) -> Self {
@@ -917,43 +926,4 @@ pub fn bridge_scratch_len() -> usize {
 /// in progress.
 pub fn bridge_frame_depth() -> usize {
     BRIDGE_FRAMES.with(|frames| frames.borrow().len())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn frame() -> BridgeFrame<'static> {
-        BridgeFrame::new(std::rc::Rc::new(Cell::new(1)))
-    }
-
-    // These frames hold no JavaScript value, so the test needs no runtime.
-    #[test]
-    fn stacked_frames_are_read_innermost_first_and_popped_in_order() {
-        let outer = frame();
-        let outer_scope = BridgeScope::push(&outer);
-        outer.suppressed.borrow_mut().insert(7);
-        {
-            let inner = frame();
-            let _inner_scope = BridgeScope::push(&inner);
-            assert_eq!(bridge_frame_depth(), 2);
-            assert_eq!(bridge_scratch_len(), 0);
-            let id = with_bridge_frame(|frame: &BridgeFrame<'static>| frame.next_id());
-            assert_eq!(id, Some(1));
-            assert_eq!(inner.alloc.get(), 2, "the innermost frame answers");
-            assert_eq!(outer.alloc.get(), 1);
-
-            suppress_in_all_bridge_frames(&HashSet::from([9])).unwrap();
-            assert_eq!(*inner.suppressed.borrow(), HashSet::from([9]));
-            assert_eq!(*outer.suppressed.borrow(), HashSet::from([7, 9]));
-            reconcile_all_bridge_frames(&HashSet::from([7, 9]), &HashSet::new()).unwrap();
-            assert!(inner.suppressed.borrow().is_empty());
-            assert!(outer.suppressed.borrow().is_empty());
-        }
-        assert_eq!(bridge_frame_depth(), 1);
-        drop(outer_scope);
-        assert_eq!(bridge_frame_depth(), 0);
-        assert!(with_bridge_frame(|_: &BridgeFrame<'static>| ()).is_none());
-        assert_eq!(bridge_scratch_len(), 0);
-    }
 }

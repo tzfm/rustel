@@ -184,6 +184,7 @@ mod menu_bar;
 mod midi_import;
 mod mixer;
 mod mouse;
+mod outline;
 mod panes;
 mod permissions;
 mod persistence;
@@ -1058,6 +1059,8 @@ struct App {
     /// at the caret - while it is open. Sticky like the mixer: Esc leaves
     /// it standing.
     knobs_panel: Option<super::knobs_panel::KnobsPanel>,
+    /// The score outline column, while it is open.
+    outline_panel: Option<super::outline_panel::OutlinePanel>,
     /// Opened since the last draw, like `mixer_unlaid`: until a draw lays
     /// the column, its keys must not fall through to the score.
     knobs_unlaid: bool,
@@ -1827,6 +1830,7 @@ impl App {
             mixer_unlaid: false,
             mixer_panel: None,
             knobs_panel: None,
+            outline_panel: None,
             knobs_unlaid: false,
             knobs_parse: None,
             knobs_rows: None,
@@ -2330,6 +2334,7 @@ impl App {
             log,
             memory,
             self.knobs_panel.is_some(),
+            self.outline_panel.is_some(),
             self.footer_notice_rows(),
             self.has_piano_notes(),
         )

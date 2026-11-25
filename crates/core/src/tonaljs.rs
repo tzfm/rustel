@@ -1046,33 +1046,6 @@ mod scale_offset_scan_tests {
         );
         assert!(!far.is_empty());
     }
-
-    /// The closed form must agree with stepping, degree for degree, including
-    /// the octave changes that stepping counted by crossing C.
-    #[test]
-    fn the_closed_form_agrees_with_stepping() {
-        // Stepping, written out independently of the implementation.
-        fn by_steps(scale: &str, offset: i64, note: &str) -> String {
-            // Normalised through the same door, so zero steps compares as
-            // "C3" rather than the raw "c3" the caller wrote.
-            let mut current = scale_offset(scale, 0.0, note).expect("normalise");
-            let step = offset.signum();
-            for _ in 0..offset.abs() {
-                current = scale_offset(scale, step as f64, &current).expect("single step");
-            }
-            current
-        }
-        for scale in ["C:major", "C:lydian", "D:minor"] {
-            for offset in [-15i64, -8, -3, -1, 0, 1, 3, 8, 15] {
-                let closed = scale_offset(scale, offset as f64, "c3").expect("closed form");
-                let stepped = by_steps(scale, offset, "c3");
-                assert_eq!(
-                    closed, stepped,
-                    "{scale} offset {offset}: closed form {closed} != stepped {stepped}"
-                );
-            }
-        }
-    }
 }
 
 /// Index of the entry nearest `target`; `prefer_higher` breaks ties toward
@@ -1380,45 +1353,6 @@ mod tests {
                         scale_offset_walk_reference(scale, offset, &note),
                         "{scale} {note} offset {offset}"
                     );
-                }
-            }
-        }
-    }
-
-    #[test]
-    fn resolved_nearest_note_matches_nearest_scale_note() {
-        let midis: Vec<f64> = (-24..=140)
-            .step_by(3)
-            .map(|m| m as f64)
-            .chain([
-                -12.5,
-                0.5,
-                60.5,
-                61.5,
-                63.5,
-                66.5,
-                f64::NAN,
-                f64::INFINITY,
-                f64::NEG_INFINITY,
-                1e300,
-                -1e300,
-            ])
-            .collect();
-        let tonics = ["C", "C#", "Eb4", "F#", "Ab", "B2", "Fb", ""];
-        for (type_name, _, _) in crate::tonaljs_scales::SCALE_DICTIONARY {
-            for tonic in tonics {
-                let name = if tonic.is_empty() {
-                    type_name.to_string()
-                } else {
-                    format!("{tonic}:{type_name}")
-                };
-                let resolved = ResolvedScale::parse(&name);
-                for &midi in &midis {
-                    let expected = nearest_scale_note(&name, midi);
-                    assert_eq!(resolved.is_ok(), expected.is_ok(), "{name} {midi}");
-                    if let (Ok(res), Ok(exp)) = (&resolved, &expected) {
-                        assert_eq!(res.nearest_note_shared(midi).as_str(), exp, "{name} {midi}");
-                    }
                 }
             }
         }

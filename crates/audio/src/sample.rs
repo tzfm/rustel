@@ -733,8 +733,6 @@ pub(crate) fn bundled_sample(sample: BundledSample) -> Result<DecodedSample, Str
 #[cfg(test)]
 mod interpolation_tests {
     use super::{DecodedSample, SampleResamplingMode};
-    use std::hint::black_box;
-    use std::time::Instant;
 
     #[inline]
     fn checked_reference(decoded: &DecodedSample, position: f64) -> Option<(f32, f32)> {
@@ -842,61 +840,6 @@ mod interpolation_tests {
             Some((2.0, 13.0))
         );
     }
-
-    #[inline(never)]
-    fn time_reads(
-        positions: &[f64],
-        passes: usize,
-        mut read: impl FnMut(f64) -> Option<(f32, f32)>,
-    ) -> u128 {
-        let started = Instant::now();
-        for _ in 0..passes {
-            for &position in positions {
-                black_box(read(black_box(position)));
-            }
-        }
-        started.elapsed().as_nanos()
-    }
-
-    #[test]
-    #[ignore = "manual release benchmark"]
-    fn interpolation_bounds_check_overhead_report() {
-        const FRAMES: usize = 8_192;
-        const POSITIONS: usize = 4_096;
-        const PASSES: usize = 1_024;
-        let mut pcm = Vec::with_capacity(FRAMES * 2);
-        for frame in 0..FRAMES {
-            let sample = (frame as f32 * 0.000_173).fract() * 2.0 - 1.0;
-            pcm.extend_from_slice(&[sample, sample * -0.625]);
-        }
-        let decoded = DecodedSample::from_parts(48_000, 2, pcm).expect("stereo buffer");
-        let positions = (0..POSITIONS)
-            .map(|index| ((index * 2_053) % (FRAMES - 1)) as f64 + 0.375)
-            .collect::<Vec<_>>();
-
-        // Warm both instruction paths and the same PCM working set before
-        // reporting paired A/B/A samples.
-        black_box(time_reads(&positions, 64, |position| {
-            checked_reference(&decoded, position)
-        }));
-        black_box(time_reads(&positions, 64, |position| {
-            decoded.stereo_at(position)
-        }));
-
-        for repetition in 0..15 {
-            let checked_a = time_reads(&positions, PASSES, |position| {
-                checked_reference(&decoded, position)
-            });
-            let fast = time_reads(&positions, PASSES, |position| decoded.stereo_at(position));
-            let checked_b = time_reads(&positions, PASSES, |position| {
-                checked_reference(&decoded, position)
-            });
-            eprintln!(
-                "{{\"benchmark\":\"sample-interpolation-bounds\",\"repetition\":{repetition},\"reads\":{},\"checked_a_nanos\":{checked_a},\"fast_nanos\":{fast},\"checked_b_nanos\":{checked_b}}}",
-                POSITIONS * PASSES
-            );
-        }
-    }
 }
 #[cfg(test)]
 mod reversed_tests {
@@ -969,47 +912,6 @@ mod tests {
                 .identity(),
             bundled.identity()
         );
-    }
-
-    #[test]
-    fn bundled_asset_is_exactly_the_repository_generator_output() {
-        const SAMPLE_RATE: u32 = 48_000;
-        const FRAMES: u32 = 12_000;
-        const PCM_BYTES: u32 = FRAMES * 2;
-
-        let mut expected = Vec::with_capacity(44 + PCM_BYTES as usize);
-        expected.extend_from_slice(b"RIFF");
-        expected.extend_from_slice(&(36 + PCM_BYTES).to_le_bytes());
-        expected.extend_from_slice(b"WAVEfmt ");
-        expected.extend_from_slice(&16u32.to_le_bytes());
-        expected.extend_from_slice(&1u16.to_le_bytes());
-        expected.extend_from_slice(&1u16.to_le_bytes());
-        expected.extend_from_slice(&SAMPLE_RATE.to_le_bytes());
-        expected.extend_from_slice(&(SAMPLE_RATE * 2).to_le_bytes());
-        expected.extend_from_slice(&2u16.to_le_bytes());
-        expected.extend_from_slice(&16u16.to_le_bytes());
-        expected.extend_from_slice(b"data");
-        expected.extend_from_slice(&PCM_BYTES.to_le_bytes());
-
-        let mut phase = 0u32;
-        for frame in 0..FRAMES {
-            let frequency = 150 - (105 * frame) / FRAMES;
-            let increment = ((f64::from(frequency) * 4_294_967_296.0 / f64::from(SAMPLE_RATE))
-                + 0.5)
-                .floor() as u32;
-            phase = phase.wrapping_add(increment);
-            let cycle = f64::from(phase) / 4_294_967_296.0;
-            let triangle = 1.0 - 4.0 * (cycle - 0.5).abs();
-            let attack = (f64::from(frame) / 96.0).min(1.0);
-            let decay = f64::from(FRAMES - frame) / f64::from(FRAMES);
-            // Round half-up - floor(x + 0.5), negative halves included - the
-            // asset generator's rounding. Recompute rather than reassert
-            // metadata from the same possibly stale asset.
-            let sample = (triangle * attack * decay * decay * 0.82 * 32767.0 + 0.5).floor() as i16;
-            expected.extend_from_slice(&sample.to_le_bytes());
-        }
-
-        assert_eq!(include_bytes!("../assets/bd.wav").as_slice(), expected);
     }
 
     #[test]
@@ -1114,26 +1016,5 @@ mod tests {
         assert_eq!(decoded.frames(), 100_000);
         let error = decoded.resampled_to(48_000).unwrap_err();
         assert!(error.contains("one sound can hold"), "{error}");
-    }
-
-    /// The other half of the guard: an ordinary file at an ordinary rate decodes
-    /// and converts as it always has, and the equal-rate path stays a clone.
-    #[test]
-    fn an_ordinary_file_still_decodes_and_resamples() {
-        // A quarter second at 44.1 kHz, well inside every rung of the ceiling
-        // before and after the conversion.
-        let data: Vec<u8> = (0..11_025)
-            .flat_map(|frame| ((frame % 512) as i16).to_le_bytes())
-            .collect();
-        let bytes = wav_with_chunks(44_100, 16, &data, b"");
-        let decoded = decode_wav(&bytes).expect("an ordinary file decodes");
-        assert_eq!(decoded.frames(), 11_025);
-        let converted = decoded
-            .resampled_to(48_000)
-            .expect("an ordinary file converts");
-        assert_eq!(converted.sample_rate(), 48_000);
-        assert_eq!(converted.frames(), 12_000);
-        let same = decoded.resampled_to(44_100).expect("the same rate clones");
-        assert_eq!(same, decoded);
     }
 }

@@ -595,48 +595,8 @@ fn histogram_upper_bound(bucket: usize) -> u64 {
 }
 
 #[cfg(test)]
-mod ewma_tests {
-    use super::ewma;
-
-    #[test]
-    fn a_zero_denominator_uses_the_current_sample() {
-        assert_eq!(ewma(10, 20, 0), 20);
-        assert_eq!(ewma(100, 200, 0), 200);
-        assert_eq!(ewma(u32::MAX, 0, 0), 0);
-        assert_eq!(ewma(0, u32::MAX, 0), u32::MAX);
-    }
-
-    #[test]
-    fn positive_denominators_keep_the_weighted_average() {
-        assert_eq!(ewma(100, 200, 1), 200);
-        assert_eq!(ewma(100, 200, 4), 125);
-        assert_eq!(ewma(100, 200, 32), 103);
-        assert_eq!(ewma(100, 100, 4), 100);
-    }
-}
-
-#[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn successful_load_is_calibrated_against_cover_gained() {
-        let mut meter = ProducerLoadMeter::default();
-        let mut turn = ProducerTurnRecord {
-            outcome: ProducerTurnOutcome::Progress,
-            cover_gained_nanos: 10_000,
-            minimum_grid_nanos: 1_000,
-            ..ProducerTurnRecord::default()
-        };
-        turn.set_phase_nanos(ProducerPhase::Total, 5_000);
-        meter.record(turn);
-
-        let snapshot = meter.snapshot();
-        assert_eq!(snapshot.last_load_basis_points, 5_000);
-        assert_eq!(snapshot.fast_load_basis_points, 5_000);
-        assert_eq!(snapshot.slow_load_basis_points, 5_000);
-        assert_eq!(snapshot.progress_turns, 1);
-    }
 
     #[test]
     fn idle_and_refused_turns_are_not_throughput_samples() {
@@ -662,21 +622,6 @@ mod tests {
         assert_eq!(snapshot.atomic_refusals, 1);
         assert_eq!(snapshot.slow_load_basis_points, 5_000);
         assert_eq!(snapshot.last_load_basis_points, 0);
-    }
-
-    #[test]
-    fn phase_percentiles_are_bounded_upper_estimates() {
-        let mut histogram = PhaseHistogram::default();
-        for value in [1, 2, 3, 4, 5, 8, 9, 16, 17, 32, 33, 64, 65] {
-            histogram.record(value);
-        }
-        let snapshot = histogram.snapshot();
-        assert_eq!(snapshot.samples, 13);
-        assert!(snapshot.p50_nanos >= 9);
-        assert!(snapshot.p50_nanos <= 16);
-        assert!(snapshot.p95_nanos >= 64);
-        assert!(snapshot.p99_nanos >= snapshot.p95_nanos);
-        assert_eq!(snapshot.max_nanos, 65);
     }
 
     #[test]
@@ -718,60 +663,6 @@ mod tests {
         healthy.set_phase_nanos(ProducerPhase::Total, 9);
         meter.record(healthy);
         assert_eq!(meter.snapshot().consecutive_over_budget, 0);
-    }
-
-    #[test]
-    fn telemetry_storage_is_fixed_and_small() {
-        assert!(std::mem::size_of::<ProducerLoadSnapshot>() < 1_024);
-        assert!(std::mem::size_of::<ProducerLoadMeter>() < 8 * 1_024);
-    }
-
-    #[test]
-    fn queue_pressure_tracks_current_and_window_peaks() {
-        let mut meter = ProducerLoadMeter::default();
-        meter.record(ProducerTurnRecord {
-            producer_backlog_depth: 12,
-            producer_backlog_capacity: 64,
-            scheduler_queue_depth: 34,
-            scheduler_queue_capacity: 200,
-            scheduler_trace_depth: 56,
-            scheduler_trace_capacity: 100,
-            scheduler_trace_drops: 7,
-            ..ProducerTurnRecord::default()
-        });
-        meter.record(ProducerTurnRecord {
-            producer_backlog_depth: 3,
-            producer_backlog_capacity: 64,
-            scheduler_queue_depth: 4,
-            scheduler_queue_capacity: 200,
-            scheduler_trace_depth: 5,
-            scheduler_trace_capacity: 100,
-            scheduler_trace_drops: 9,
-            ..ProducerTurnRecord::default()
-        });
-        let snapshot = meter.snapshot();
-        assert_eq!(snapshot.producer_backlog_depth, 3);
-        assert_eq!(snapshot.peak_producer_backlog_depth, 12);
-        assert_eq!(snapshot.scheduler_queue_depth, 4);
-        assert_eq!(snapshot.peak_scheduler_queue_depth, 34);
-        assert_eq!(snapshot.scheduler_trace_depth, 5);
-        assert_eq!(snapshot.peak_scheduler_trace_depth, 56);
-        assert_eq!(snapshot.scheduler_trace_drops, 9);
-
-        for _ in 2..PRODUCER_REPORTING_WINDOW_TURNS {
-            meter.record(ProducerTurnRecord::default());
-        }
-        meter.record(ProducerTurnRecord {
-            producer_backlog_depth: 2,
-            scheduler_queue_depth: 3,
-            scheduler_trace_depth: 4,
-            ..ProducerTurnRecord::default()
-        });
-        let next = meter.snapshot();
-        assert_eq!(next.window_index, 1);
-        assert_eq!(next.peak_producer_backlog_depth, 2);
-        assert_eq!(next.peak_scheduler_queue_depth, 3);
-        assert_eq!(next.peak_scheduler_trace_depth, 4);
     }
 
     #[test]

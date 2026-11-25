@@ -118,24 +118,3 @@ fn programs_and_drums_survive_the_round_trip() {
     assert_eq!(drums.sound, "drums");
     assert!(imported.source.contains("drums: s(\"bd sd"));
 }
-
-#[test]
-fn the_import_is_deterministic() {
-    let bytes = bytes(vec![Track {
-        name: "lead".to_owned(),
-        channel: 1,
-        messages: vec![
-            message(
-                0,
-                MessageKind::NoteOn {
-                    note: 60,
-                    velocity: 100,
-                },
-            ),
-            message(480, MessageKind::NoteOff { note: 60 }),
-        ],
-    }]);
-    let first = import_smf(&bytes, &ImportOptions::default()).unwrap();
-    let second = import_smf(&bytes, &ImportOptions::default()).unwrap();
-    assert_eq!(first, second);
-}

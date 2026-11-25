@@ -383,6 +383,7 @@ impl App {
             || self.click_mixer_panel(x, y)
             || self.click_memory_dock(x, y)
             || self.press_knobs(self.regions.knobs, x, y)
+            || self.press_outline(x, y)
             || self.click_viz_panel(x, y)
         {
             return Ok(true);
@@ -720,6 +721,7 @@ impl App {
             || self.memory_dock_at(x, y)
             || self.scroll_viz_panel(x, y, direction)
             || self.wheel_knobs_over(x, y, direction)
+            || self.wheel_outline_over(x, y, direction)
         {
             return true;
         }

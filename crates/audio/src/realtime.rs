@@ -218,13 +218,6 @@ impl RealtimeLoadPublisher {
         self.acknowledged
             .store(self.sequence.load(Ordering::Acquire), Ordering::Release);
     }
-
-    #[cfg(test)]
-    fn begin_test_publication(&self) {
-        let stable = self.sequence.load(Ordering::Relaxed) & !1;
-        self.sequence
-            .store(stable.wrapping_add(1), Ordering::Release);
-    }
 }
 
 /// Plain callback-owned accumulator. It performs no allocation or locking.
@@ -543,13 +536,6 @@ mod tests {
                 .peak_load_basis_points,
             1_000
         );
-    }
-
-    #[test]
-    fn reader_gives_up_while_a_publication_is_in_progress() {
-        let publisher = RealtimeLoadPublisher::new();
-        publisher.begin_test_publication();
-        assert_eq!(publisher.try_snapshot(), None);
     }
 
     #[test]

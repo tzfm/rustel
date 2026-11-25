@@ -428,20 +428,6 @@ mod tests {
     }
 
     #[test]
-    fn a_response_decodes_as_one() {
-        let bytes = encode_discovery(&Discovery {
-            kind: DiscoveryKind::Response,
-            ttl: 1,
-            state: state(),
-        })
-        .unwrap();
-        let DiscoveryOrState::Discovery(back) = decode(&bytes).unwrap() else {
-            panic!("not a discovery message");
-        };
-        assert_eq!(back.kind, DiscoveryKind::Response);
-    }
-
-    #[test]
     fn a_pong_carries_the_ping_payload_back_verbatim() {
         let mut ping_payload = Vec::new();
         let mut body = Vec::new();

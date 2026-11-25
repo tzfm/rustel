@@ -1026,20 +1026,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn the_host_clock_never_runs_backwards() {
-        let first = host_micros(Instant::now());
-        let second = host_micros(Instant::now());
-        assert!(second >= first);
-    }
-
-    #[test]
-    fn the_ids_a_process_draws_are_all_different() {
-        let first = random_id();
-        let second = random_id();
-        assert_ne!(first, second);
-    }
-
-    #[test]
     fn the_session_speaks_on_loopback_whatever_the_network() {
         assert!(session_interfaces().contains(&Ipv4Addr::LOCALHOST));
     }

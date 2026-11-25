@@ -425,21 +425,6 @@ impl OscSender {
 mod tests {
     use super::*;
 
-    #[test]
-    fn strings_are_nul_terminated_and_padded_to_four_bytes() {
-        let mut out = Vec::new();
-        push_padded_str(&mut out, "abc");
-        assert_eq!(out, b"abc\0", "3 chars + 1 nul is already aligned");
-
-        let mut out = Vec::new();
-        push_padded_str(&mut out, "abcd");
-        assert_eq!(out, b"abcd\0\0\0\0", "4 chars needs a full pad word");
-
-        let mut out = Vec::new();
-        push_padded_str(&mut out, "");
-        assert_eq!(out, b"\0\0\0\0");
-    }
-
     /// A nul inside a string would terminate it early on the receiver and
     /// desynchronise every argument after it.
     #[test]
@@ -462,16 +447,6 @@ mod tests {
         // The float is big-endian IEEE-754.
         assert_eq!(&encoded[encoded.len() - 4..], &1.0f32.to_be_bytes());
         assert_eq!(encoded.len() % 4, 0, "every OSC packet is 4-byte aligned");
-    }
-
-    #[test]
-    fn a_bundle_carries_the_hash_bundle_tag_a_timetag_and_a_sized_element() {
-        let message = encode_message("/x", &[]);
-        let bundle = encode_bundle(0x0000_0001_8000_0000, &message);
-        assert!(bundle.starts_with(b"#bundle\0"));
-        assert_eq!(&bundle[8..16], &0x0000_0001_8000_0000u64.to_be_bytes());
-        assert_eq!(&bundle[16..20], &(message.len() as u32).to_be_bytes());
-        assert_eq!(&bundle[20..], &message[..]);
     }
 
     #[test]

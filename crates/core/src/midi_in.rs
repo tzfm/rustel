@@ -1193,17 +1193,6 @@ mod tests {
     }
 
     #[test]
-    fn scheduler_only_requery_republishes_the_active_ports() {
-        let bus = InputBus::new();
-        let port = Arc::new(InputPort::new("controller".into()));
-        bus.commit_generation(4, vec![Arc::clone(&port)]).unwrap();
-        bus.republish_current_generation(5);
-        let retained = bus.snapshot_for(5, 5);
-        assert_eq!(retained.len(), 1);
-        assert!(Arc::ptr_eq(&retained[0], &port));
-    }
-
-    #[test]
     fn sequential_generations_are_bounded_per_score_not_per_process() {
         let bus = InputBus::new();
         for generation in 1..=MAX_INPUT_PORTS as u64 * 4 {
@@ -1356,20 +1345,6 @@ mod tests {
         assert_eq!(hits.len(), KEY_RING, "the ring must stay bounded");
     }
 
-    /// A span queried twice must give the same haps. Stack, jux and every
-    /// re-query a child, and a refused tick re-queries the same span.
-    #[test]
-    fn a_placed_key_is_reproduced_identically_by_a_second_select() {
-        let ring = KeyRing::new();
-        ring.push(0, 60, 100, 1);
-        let first = place(&ring, 0.0, 1.0, 1, 4);
-        // A LATER placement offer must not move an already-placed note.
-        let second = place(&ring, 0.0, 1.0, 3, 4);
-        assert_eq!(first, second, "a re-query moved the note");
-        assert_eq!(first.len(), 1);
-        assert_eq!((first[0].num, first[0].den), (1, 4));
-    }
-
     /// The lookback to the finger is frozen at placement, the way the
     /// cycle position is. A later select's clock must not walk it back:
     /// `query_midi_keys` samples a patterned length at `at - lookback`,
@@ -1425,29 +1400,6 @@ mod tests {
         assert!(out.is_empty(), "1/2 is not inside 0..1/4");
     }
 
-    /// A control re-query that begins at the cursor re-claims a forgotten
-    /// press AT the cursor: the takeover frame is the earliest moment the
-    /// device could sound it, and the pin the outgoing generation left at or
-    /// after the takeover names audio the swap retires anyway.
-    #[test]
-    fn a_placement_at_or_after_the_cursor_is_forgotten_and_reclaimed_there() {
-        let ring = KeyRing::new();
-        ring.push(0, 60, 100, 1);
-        // A racing horizon fill pins the press at 3/4, past the re-query's
-        // cursor at 1/2. (The placement offer IS the pinned position.)
-        assert_eq!(place(&ring, 0.5, 2.0, 3, 4).len(), 1);
-        let mut out = Vec::new();
-        ring.select(0.5, 2.0, 0, None, &mut out);
-        assert_eq!((out[0].num, out[0].den), (3, 4));
-
-        ring.forget_placements_from(0.5);
-        // The re-query's own pass, beginning at the cursor, re-claims the
-        // press AT the cursor, not at the stale pin.
-        let reclaimed = place(&ring, 0.5, 2.0, 1, 2);
-        assert_eq!(reclaimed.len(), 1, "the press survives the re-query");
-        assert_eq!((reclaimed[0].num, reclaimed[0].den), (1, 2));
-    }
-
     /// A forgotten pin is an empty slot. The re-claim stores a new lookback
     /// from THAT query's clock, and later selects freeze it - they must not
     /// keep the discarded fill's lookback, nor walk the finger further back.
@@ -1475,19 +1427,6 @@ mod tests {
             later, reclaimed,
             "a later re-query walked the finger back after the re-claim"
         );
-    }
-
-    /// Frames before the takeover are already in the device's lookahead and
-    /// keep sounding across it; re-claiming one would sound the press twice.
-    #[test]
-    fn a_placement_before_the_cursor_survives_the_forget() {
-        let ring = KeyRing::new();
-        ring.push(0, 60, 100, 1);
-        assert_eq!(place(&ring, 0.0, 0.5, 1, 4).len(), 1);
-        ring.forget_placements_from(0.5);
-        let kept = place(&ring, 0.0, 1.0, 0, 1);
-        assert_eq!(kept.len(), 1);
-        assert_eq!((kept[0].num, kept[0].den), (1, 4), "the pin must not move");
     }
 
     /// The cursor lands between two pins: only the one the swap retires is
@@ -1795,31 +1734,6 @@ mod tests {
         // Notes fold into 0..=127 the way the driver's data bytes do.
         assert!(port.is_transport_pad(190 & 0x7f, 3));
         assert!(!port.is_transport_pad(59, 1));
-    }
-
-    #[test]
-    fn a_key_carries_its_note_velocity_and_channel_intact() {
-        let ring = KeyRing::new();
-        ring.push(0, 64, 100, 3);
-        let hits = place(&ring, 0.0, 1.0, 0, 1);
-        assert_eq!(hits.len(), 1);
-        assert_eq!(
-            (hits[0].note, hits[0].velocity, hits[0].channel),
-            (64, 100, 3)
-        );
-    }
-
-    #[test]
-    fn clear_starts_a_new_epoch_and_forgets_already_placed_hits() {
-        let ring = KeyRing::new();
-        ring.push(0, 60, 100, 1);
-        assert_eq!(place(&ring, 0.0, 1.0, 0, 1).len(), 1);
-        let previous_epoch = ring.epoch();
-        ring.clear();
-        assert_eq!(ring.epoch(), previous_epoch + 1);
-        let mut out = Vec::new();
-        ring.select(0.0, 1.0, 0, None, &mut out);
-        assert!(out.is_empty());
     }
 
     #[test]

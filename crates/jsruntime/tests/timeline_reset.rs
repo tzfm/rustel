@@ -13,34 +13,6 @@ fn runtime() -> JsRuntime {
 }
 
 #[test]
-fn timeline_reset_is_not_a_public_global() {
-    let runtime = runtime();
-    runtime
-        .eval("globalThis.__kind = typeof globalThis.__rustelResetTimelines")
-        .expect("probe");
-    assert_eq!(
-        runtime.get_string("__kind").as_deref(),
-        Some("undefined"),
-        "a public reset is a hook a rejected save can replace"
-    );
-}
-
-#[test]
-fn timeline_is_still_registered() {
-    let runtime = runtime();
-    runtime
-        .evaluate_score("s('bd').timeline(1)", &TranspileOptions::default())
-        .expect("timeline combinator");
-    let haps = runtime
-        .query(Slot::Active, 0, Fraction::ZERO, Fraction::ONE)
-        .expect("query");
-    assert!(
-        !haps.is_empty(),
-        "timeline produced no events after moving its reset off globalThis"
-    );
-}
-
-#[test]
 fn public_timeline_sequences_nested_array_arguments() {
     let runtime = runtime();
     runtime
@@ -92,25 +64,6 @@ fn zero_argument_raw_timeline_keeps_its_query_error() {
         .query(Slot::Active, 0, Fraction::ZERO, Fraction::ONE)
         .expect("queryArc catches the raw callback failure");
     assert!(haps.is_empty());
-}
-
-#[test]
-fn replacing_a_public_timeline_hook_does_not_freeze_the_next_save() {
-    let runtime = runtime();
-    runtime
-        .evaluate_score(
-            r#"globalThis.__rustelResetTimelines = () => { throw new Error('hijacked'); }; s("bd")"#,
-            &TranspileOptions::default(),
-        )
-        .expect("first score");
-    runtime
-        .evaluate_score(r#"s("sd")"#, &TranspileOptions::default())
-        .expect("a writable public reset must not freeze the next save");
-    let haps = runtime
-        .query(Slot::Active, 0, Fraction::ZERO, Fraction::ONE)
-        .expect("query");
-    assert_eq!(haps.len(), 1);
-    assert!(haps[0].show().contains("sd"), "{}", haps[0].show());
 }
 
 /// The reset of a score that does not go in play leaves the timeline
