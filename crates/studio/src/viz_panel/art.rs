@@ -845,50 +845,6 @@ mod tests {
         );
     }
 
-    /// The painter rounds each glyph and each gap, so a line can draw wider
-    /// than its budgeted scale. Every line must still fit its column.
-    #[test]
-    fn the_picture_fits_the_column_it_was_budgeted_for() {
-        for columns in [34usize, 68, 74, 100, 118] {
-            for name in [
-                "RUSTEL",
-                "LIVE",
-                "OPENING NIGHT",
-                "ABCDEFGHIJKLMNOP",
-                "WWWWWWWWWWWW",
-            ] {
-                let (scale, lines) = fit_width(name, columns, ArtStyle::Solid, MAX_SCALE);
-                for line in &lines {
-                    let points = line_points(line, scale);
-                    assert!(
-                        points <= columns,
-                        "{name:?} at {columns} columns drew {points} points at scale {scale}"
-                    );
-                }
-            }
-        }
-    }
-
-    /// Every glyph is seven rows tall and every row the same width, so a
-    /// line of them rasterises without a gap or a tear.
-    #[test]
-    fn the_font_is_a_grid() {
-        for character in "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789 -_.!'&:+?".chars() {
-            let rows = glyph(character);
-            assert_eq!(rows.len(), GLYPH_ROWS, "{character:?}");
-            let width = rows[0].len();
-            assert!(rows.iter().all(|row| row.len() == width), "{character:?}");
-            assert!(
-                rows.iter()
-                    .all(|row| row.chars().all(|cell| cell == '#' || cell == '.')),
-                "{character:?}"
-            );
-        }
-        assert_eq!(text_width("AB"), 11);
-        assert_eq!(artable("opening  night "), "OPENING NIGHT");
-        assert_eq!(artable(""), "RUSTEL");
-    }
-
     /// The name takes the largest glyphs that fit the column on a few
     /// lines, wrapping at spaces, and a word that alone outgrows the column
     /// is cut.

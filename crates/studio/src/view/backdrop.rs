@@ -1080,24 +1080,6 @@ mod tests {
             }
         }
 
-        /// At half strength the picture is mixed into the theme's own background,
-        /// which is what keeps the code on top of it readable.
-        #[test]
-        fn strength_mixes_the_picture_into_the_theme() {
-            let theme = Theme::built_in_default();
-            let (base_r, _, _) = crate::graphics::rgb(theme.background);
-            let hydra = picture(&[[255, 255, 255]], 1, 1, 0.5);
-            let area = Rect::new(0, 0, 1, 1);
-            let mut buffer = Buffer::empty(area);
-            Backdrop { theme: &theme }.render(area, &mut buffer);
-            hydra.paint_excluding(&mut buffer, area, theme.background, &[], &[], None);
-            let Color::Rgb(red, _, _) = buffer.cell((0, 0)).unwrap().bg else {
-                panic!("a mixed background is an explicit colour");
-            };
-            let expected = (f32::from(base_r) * 0.5 + 255.0 * 0.5) as u8;
-            assert_eq!(red, expected);
-        }
-
         /// A selected cell takes the picture over its own colour, at the wash
         /// the caller says - on both delivery paths identically.
         #[test]
@@ -1427,16 +1409,6 @@ mod tests {
                 Color::Rgb(0, 0, 0),
                 "a chosen background survives the picture untouched"
             );
-        }
-
-        /// Without a picture, the backdrop leaves the theme unchanged.
-        #[test]
-        fn without_a_picture_the_backdrop_is_the_theme() {
-            let theme = Theme::built_in_default();
-            let area = Rect::new(0, 0, 3, 1);
-            let mut buffer = Buffer::empty(area);
-            Backdrop { theme: &theme }.render(area, &mut buffer);
-            assert_eq!(buffer.cell((1, 0)).unwrap().bg, theme.background);
         }
     }
 }

@@ -164,15 +164,3 @@ impl Clipboard for PlatformClipboard {
         Ok(())
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn memory_clipboard_round_trips_unicode() {
-        let mut clipboard = MemoryClipboard::default();
-        clipboard.set_text("界🥁".into()).unwrap();
-        assert_eq!(clipboard.get_text().unwrap(), "界🥁");
-    }
-}

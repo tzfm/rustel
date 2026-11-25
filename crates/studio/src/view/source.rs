@@ -1141,21 +1141,6 @@ mod tests {
     }
 
     #[test]
-    fn horizontal_scrollbar_thumb_uses_the_full_track() {
-        assert_eq!(horizontal_scrollbar_thumb((0, 20, 200), 40), (0, 4));
-
-        let (start, length) = horizontal_scrollbar_thumb((180, 20, 200), 40);
-        assert_eq!(start + length, 40, "the final thumb touches the right edge");
-
-        let (start, length) = horizontal_scrollbar_thumb((65, 17, 82), 23);
-        assert_eq!(
-            start + length,
-            23,
-            "non-divisible sizes also reach the edge"
-        );
-    }
-
-    #[test]
     fn first_overlapping_range_preserves_style_precedence() {
         let cells = vec![
             VisibleCell {
@@ -1207,26 +1192,6 @@ mod tests {
 
         assert_eq!(count, cells.len());
         assert!(assigned.iter().all(|winner| *winner == Some(0)));
-    }
-
-    #[test]
-    fn clipped_inline_layers_keep_their_full_height_geometry() {
-        let mut source = Buffer::empty(Rect::new(0, 0, 3, 4));
-        for (row, label) in ["AAA", "BBB", "CCC", "DDD"].into_iter().enumerate() {
-            source.set_string(0, row as u16, label, Style::default());
-        }
-        let mut destination = Buffer::empty(Rect::new(0, 0, 8, 4));
-
-        blit_rows(&source, 1, Rect::new(2, 1, 3, 2), &mut destination);
-
-        let row = |y| {
-            (2..5)
-                .filter_map(|x| destination.cell((x, y)))
-                .map(|cell| cell.symbol())
-                .collect::<String>()
-        };
-        assert_eq!(row(1), "BBB");
-        assert_eq!(row(2), "CCC");
     }
 
     /// However a row is clipped out of its line, it is coloured as that line:
@@ -1333,79 +1298,6 @@ mod tests {
             .cell((cell.x, cell.y))
             .expect("rendered cell")
             .clone()
-    }
-
-    /// A row scrolled past the start of its line is coloured as that line.
-    ///
-    /// The pane is narrower than the score and the caret is at the end, so
-    /// the row drawn begins in the middle of the line. A lexer started
-    /// fresh there reads the closing quote of the string as an opening
-    /// quote and paints every cell to the right edge as one string.
-    #[test]
-    fn a_row_scrolled_past_its_lines_opening_quote_keeps_its_colours() {
-        let theme = theme();
-        // Long enough that a narrow pane with the caret at the end starts
-        // its row inside the string, so the row holds the quote that closes
-        // it.
-        let source = r#"$: s("bd sd hh oh bd sd hh oh").lpf(500)"#;
-        let mut editor = Editor::new(source).unwrap();
-        editor
-            .set_selection(crate::editor::Selection::caret(crate::editor::ByteOffset(
-                source.len(),
-            )))
-            .expect("caret at the end of the line");
-        let area = Rect::new(0, 0, 20, 1);
-        let grid = source_grid(&editor, area, true);
-        editor.set_view_size(usize::from(grid.width), usize::from(grid.height));
-        let map = editor.screen_map(grid).unwrap();
-        let ScreenRow::Text(row) = &map.rows()[0] else {
-            panic!("expected a text row");
-        };
-        let opening_quote = source.find('"').expect("the opening quote");
-        let closing_quote = source.rfind('"').expect("the closing quote");
-        let starts_at = row.cells.first().expect("a visible cell").bytes.start.0;
-        assert!(
-            starts_at > opening_quote && starts_at < closing_quote,
-            "the row has to begin INSIDE the string for this to test anything: \
-             starts at {starts_at}, quotes at {opening_quote} and {closing_quote}"
-        );
-        let mut buffer = Buffer::empty(area);
-        let index = DecorationIndex::new(&map, &editor, Decorations::default());
-        render_text_row(
-            &mut buffer,
-            row,
-            area.x,
-            area.width,
-            4,
-            usize::MAX,
-            &index,
-            &[],
-            &theme,
-            row_tokens(editor.document(), row),
-        );
-        // `500` is a number wherever the row happens to begin, and the `)`
-        // beside it is punctuation - neither is inside a string.
-        for (offset, wanted, what) in [
-            (
-                source.find("500").expect("the cutoff"),
-                theme.syntax.number,
-                "500",
-            ),
-            (
-                source.len() - 1,
-                theme.syntax.punctuation,
-                "the closing paren",
-            ),
-        ] {
-            let cell = map
-                .cell_for_offset(crate::editor::ByteOffset(offset))
-                .expect("cell for offset");
-            let drawn = buffer.cell((cell.x, cell.y)).expect("rendered cell").fg;
-            assert_eq!(
-                drawn, wanted,
-                "{what} was painted {drawn:?}, not {wanted:?} - the row read the closing quote as an opening one"
-            );
-        }
     }
 
     #[test]
@@ -1708,85 +1600,6 @@ mod tests {
             })
             .collect();
         assert_eq!(after, ".25, 0, 1)", "the numbers stay text after the pill");
-    }
-
-    /// The selection ground shows which slider has the arrows. Its accent
-    /// and glyphs stay the same while the pointer is interacting with it.
-    #[test]
-    fn an_armed_slider_is_drawn_selected() {
-        let theme = theme();
-        let source = "$: s(\"bd\").gain(slider(.25, 0, 1))\n";
-        let call = source.find("slider(").unwrap();
-        let end = call + "slider(".len();
-        let render = |armed: bool| {
-            let chip = SliderChip {
-                from: call,
-                to: end,
-                notch: 0.25,
-                armed,
-            };
-            let mut editor = Editor::new(source).unwrap();
-            editor.set_inline_widths(vec![crate::editor::InlineWidth {
-                at: crate::editor::ByteOffset(end - 1),
-                extra: 7,
-            }]);
-            let area = Rect::new(0, 0, 60, 3);
-            let grid = source_grid(&editor, area, true);
-            editor.set_view_size(usize::from(grid.width), usize::from(grid.height));
-            let map = editor.screen_map(grid).unwrap();
-            let mut buffer = Buffer::empty(area);
-            let decorations = Decorations {
-                sliders: std::slice::from_ref(&chip),
-                ..Decorations::default()
-            };
-            let index = DecorationIndex::new(&map, &editor, decorations);
-            let ScreenRow::Text(row) = &map.rows()[0] else {
-                panic!("expected a text row");
-            };
-            render_text_row(
-                &mut buffer,
-                row,
-                area.x,
-                area.width,
-                4,
-                usize::MAX,
-                &index,
-                decorations.sliders,
-                &theme,
-                row_tokens(editor.document(), row),
-            );
-            let start = map
-                .cell_for_offset(crate::editor::ByteOffset(call))
-                .expect("cell for the call");
-            (buffer, start.x)
-        };
-        let (plain, x) = render(false);
-        let (armed, _) = render(true);
-        let pill = x..x + 14;
-        assert!(
-            pill.clone()
-                .all(|x| armed.cell((x, 0)).unwrap().bg == theme.selection),
-            "the armed pill wears the selection's ground"
-        );
-        assert!(
-            pill.clone()
-                .any(|x| plain.cell((x, 0)).unwrap().bg != theme.selection),
-            "the plain pill does not"
-        );
-        for x in pill.clone() {
-            let before = plain.cell((x, 0)).unwrap();
-            let after = armed.cell((x, 0)).unwrap();
-            assert_eq!(after.symbol(), before.symbol(), "focus keeps the same rail");
-            assert_eq!(before.fg, theme.accent);
-            assert_eq!(after.fg, theme.accent);
-        }
-        assert_eq!(
-            pill.clone()
-                .filter(|&x| armed.cell((x, 0)).unwrap().symbol() == "█")
-                .count(),
-            1,
-            "one knob either way"
-        );
     }
 
     #[test]

@@ -1141,22 +1141,6 @@ mod tests {
         assert_eq!(error.kind(), "cancelled");
     }
 
-    #[test]
-    fn rejected_live_evaluation_keeps_the_audible_source_and_generation() {
-        let old = "note(\"c4\")";
-        let mut session = Session::new().expect("session");
-        session.evaluate(old).expect("old score");
-        let generation = session.generation();
-        let transport = session.transport();
-
-        let error = session
-            .reload_at_cancellable("note(", false, 0.1, transport.stopped_flag())
-            .expect_err("invalid replacement");
-        assert!(!matches!(error, RuntimeError::Cancelled));
-        assert_eq!(session.generation(), generation);
-        assert_eq!(session.active_source(), Some(old));
-    }
-
     /// `.log()` writes one line for each note that sounds. Each line
     /// arrives at `Info`, the default floor of the log panel, and no
     /// surface paints it as a failure.

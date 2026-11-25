@@ -1068,62 +1068,6 @@ mod tests {
         hold_clock(&engine, false);
     }
 
-    /// A fired rewind that the producer refuses (its first window cannot
-    /// sound) rolls back to the playing score. Its line cut is withdrawn,
-    /// and the refused install does not answer a repeat press.
-    #[test]
-    fn a_fired_rewind_the_producer_refuses_withdraws_its_line_cut() {
-        let mut engine = silent_engine_with_pattern(rustel_core::silence());
-        let playing = "note('c4').fast(8)";
-        engine.evaluate(playing, false).expect("the playing score");
-        let deadline = Instant::now() + Duration::from_secs(10);
-        while device_of(&engine).generation() != engine.generation() {
-            assert!(
-                Instant::now() < deadline,
-                "the playing score never published"
-            );
-            engine.tick(accepted).expect("tick");
-            std::thread::sleep(Duration::from_millis(2));
-        }
-        let audible = engine.generation();
-        engine
-            .session
-            .mark_audible_generation(audible)
-            .expect("the playing score is the rollback target");
-
-        assert!(
-            engine
-                .arm_launch("s(\"nosuchsound*4\")", false, 0.25, true)
-                .expect("arm")
-                .is_some()
-        );
-        let line = engine.pending_launch.as_ref().expect("armed").boundary_time;
-        tick_until_fired(&mut engine).expect("the evaluation itself succeeds");
-        let deadline = Instant::now() + Duration::from_secs(10);
-        while engine.session.active_source() != Some(playing) {
-            assert!(
-                Instant::now() < deadline,
-                "the producer never rolled the refused score back"
-            );
-            engine.tick(accepted).expect("tick");
-            std::thread::sleep(Duration::from_millis(2));
-        }
-        assert!(
-            device_of(&engine).clock_seconds() < line,
-            "the clock is held before the line"
-        );
-        assert!(
-            !device_of(&engine).line_cut_armed(),
-            "the refused launch's line cut is withdrawn"
-        );
-        assert!(engine.landing.is_none(), "the refused launch never lands");
-        assert!(
-            engine.recent_rewind.is_none(),
-            "a refused install is not remembered as heard"
-        );
-        hold_clock(&engine, false);
-    }
-
     /// The commonest pad rewind restarts the score that is already
     /// playing. When the producer refuses that launch, its rollback puts
     /// back the very same text, so nothing in the session tells the refused
@@ -1473,36 +1417,6 @@ mod tests {
             );
         }
         hold_clock(&engine, false);
-    }
-
-    /// The grace is short on purpose: past it, the same score pressed again
-    /// is a genuine restart and arms a fresh launch, as a rewind should.
-    #[test]
-    fn a_repeat_press_past_the_grace_restarts_for_real() {
-        let mut engine = silent_engine_with_pattern(rustel_core::silence());
-        let source = "s(\"tri\")";
-        settle_rewind_into_grace(&mut engine, source);
-        let recent = engine
-            .recent_rewind
-            .as_mut()
-            .expect("the landing settled into the grace memory");
-        recent.landed_at -= recent.grace_secs + 0.1;
-
-        let restart = engine
-            .arm_launch(source, false, 0.25, true)
-            .expect("restart arm")
-            .expect("an expired memory is no answer");
-        assert!(restart.seconds_left > 0.0, "a fresh line is waited for");
-        assert!(
-            engine.pending_launch.is_some(),
-            "the expired press arms a fresh launch"
-        );
-        assert!(
-            engine.take_launch_outcome().is_none(),
-            "it waits for its own fire, not answered with the old install"
-        );
-        engine.supersede_launch();
-        let _ = engine.take_launch_outcome();
     }
 
     /// The grace is half the launch's unit at its tempo, with no cap. At

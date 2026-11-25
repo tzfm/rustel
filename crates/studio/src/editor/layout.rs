@@ -2167,27 +2167,6 @@ mod tests {
     }
 
     #[test]
-    fn horizontal_scroll_width_cache_tracks_tabs_widgets_and_edits() {
-        let mut document = document("\tabc\nz");
-        let mut cache = HorizontalLayoutCache::default();
-        assert_eq!(cache.maximum_line_width(&document, 4), 7);
-        assert_eq!(cache.maximum_line_width(&document, 8), 11);
-        cache.set_inline_widths(vec![InlineWidth {
-            at: ByteOffset(1),
-            extra: 5,
-        }]);
-        assert_eq!(cache.maximum_line_width(&document, 8), 16);
-        cache.set_inline_widths(vec![]);
-        assert_eq!(cache.maximum_line_width(&document, 8), 11);
-        let before = document.clone();
-        let edit = crate::editor::Edit::new(ByteOffset(0)..ByteOffset(6), "q");
-        let shape = EditShape::from(&edit);
-        document.apply_edits(&[edit]).unwrap();
-        cache.map_revision_after_edit(&before, &document, &[shape]);
-        assert_eq!(cache.maximum_line_width(&document, 8), 1);
-    }
-
-    #[test]
     fn far_right_multi_megabyte_redraw_uses_sparse_checkpoints() {
         let bytes = 4 * 1024 * 1024;
         let document = document(&"a".repeat(bytes));

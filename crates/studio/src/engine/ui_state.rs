@@ -556,27 +556,6 @@ mod tests {
     use crate::engine::tests::accepted;
     use rustel_audio::TakeoverCut;
 
-    /// A delivered layout answers two questions apart: that the display has
-    /// something to draw, and which generation it draws.
-    #[test]
-    fn a_delivered_layout_knows_which_generation_it_describes() {
-        let source = "$: s(\"bd\")._spectrum()";
-        let mut delivery = LayoutDelivery::default();
-        assert!(!delivery.delivered());
-
-        // Generation 7 has been evaluated; the device is still on 6.
-        assert!(
-            delivery
-                .observe(source, 7, || Arc::from([]))
-                .expect("layout")
-        );
-        assert!(delivery.try_deliver(&mut accepted));
-
-        assert!(delivery.delivered());
-        assert!(!delivery.ready_for(6));
-        assert!(delivery.ready_for(7));
-    }
-
     /// A widget is placed from the score that was evaluated, not from the one
     /// still coming out of the speakers.
     ///

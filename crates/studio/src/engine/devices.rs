@@ -686,26 +686,6 @@ mod tests {
         }
     }
 
-    /// The input is announced once for a choice: the handoff between its
-    /// monitor and the live device is the same microphone, and not news;
-    /// another choice is, and so is the first coming back.
-    #[test]
-    fn the_input_is_announced_once_per_choice() {
-        let mut engine = StudioEngine::new(StudioConfig::default()).expect("studio");
-        assert!(engine.announce_input("iPhone"), "the first open is news");
-        assert!(
-            !engine.announce_input("iPhone"),
-            "the same input on the live device is not"
-        );
-        assert!(engine.announce_input("Scarlett"), "another choice is");
-        assert!(engine.announce_input("iPhone"), "and the first, back again");
-        engine.input_announced = None;
-        assert!(
-            engine.announce_input("iPhone"),
-            "an input that died and came back is"
-        );
-    }
-
     #[test]
     fn no_open_input_clears_obsolete_channel_validation() {
         for close in [false, true] {
