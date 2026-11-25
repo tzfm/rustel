@@ -2428,7 +2428,18 @@ pub(super) mod tests {
                 .find(|source| source.name == "Dirt-Samples")
                 .cloned()
                 .expect("Dirt-Samples is a shipped pack");
-            let library = SampleLibrary::empty_without_loading();
+            // A cache of its own: the refresh deletes the cached pinned
+            // manifests, and the shared cache feeds later studio tests.
+            let cache = tempfile::tempdir().expect("cache");
+            let library = SampleLibrary::with_background_loaders_at(
+                HashMap::new(),
+                Vec::new(),
+                HashMap::new(),
+                String::new(),
+                cache.path().to_path_buf(),
+                crate::samples::Loading::NotStarted,
+            )
+            .expect("empty library");
             let (sounds, files) = library.default_source_holds(&dirt);
             assert!(sounds > 0, "the pin file lists inline banks");
             assert!(files > 0, "each bank names wav files");

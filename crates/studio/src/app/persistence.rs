@@ -224,8 +224,11 @@ impl App {
     /// switch.
     pub(super) fn wait_for_saves(&mut self) {
         for _ in 0..2_000 {
+            // Idle is read before the drain: a write that ends in between
+            // has already left its completion, and this drain takes it.
+            let idle = self.save_worker.idle();
             self.drain_save();
-            if self.save_worker.idle() {
+            if idle {
                 return;
             }
             std::thread::sleep(Duration::from_millis(5));
