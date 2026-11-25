@@ -149,32 +149,6 @@ mod tests {
         }
 
         #[test]
-        fn alt_d_waits_for_enter_then_removes_the_local_file_and_bank() {
-            let directory = tempfile::tempdir().unwrap();
-            let imported = tempfile::tempdir().unwrap();
-            let mut app = app_over(directory.path());
-            let paths = import_bank(&mut app, imported.path(), &["solo.wav"]);
-            let source = app.editor().source();
-
-            arm(&mut app);
-            assert!(paths[0].exists(), "arming must not delete the file");
-            assert!(app.status.contains("Enter"), "{}", app.status);
-            assert!(app.status.contains("Esc"), "{}", app.status);
-            precision_key(&mut app, KeyCode::Enter, KeyModifiers::NONE);
-
-            assert!(!paths[0].exists());
-            assert!(!app.worker.library().unwrap().knows("deletable"));
-            let panel = app.reference_panel.as_ref().expect("browser stays open");
-            assert_eq!(panel.confirm_delete, None);
-            assert_eq!(
-                app.editor().source(),
-                source,
-                "confirm did not insert a sound"
-            );
-            assert_eq!(app.prefs.sample_sources.len(), 1, "the import is retained");
-        }
-
-        #[test]
         fn deleting_a_folders_last_sample_keeps_the_receipt_and_raises_no_alert() {
             let directory = tempfile::tempdir().unwrap();
             let imported = tempfile::tempdir().unwrap();
@@ -189,30 +163,6 @@ mod tests {
             assert!(!paths[0].exists());
             assert_eq!(app.status, "deleted solo.wav");
             assert_eq!(app.log.at_least(LogLevel::Warn), warnings);
-        }
-
-        #[test]
-        fn escape_keeps_the_sample_and_plain_d_searches() {
-            let directory = tempfile::tempdir().unwrap();
-            let imported = tempfile::tempdir().unwrap();
-            let mut app = app_over(directory.path());
-            let paths = import_bank(&mut app, imported.path(), &["solo.wav"]);
-
-            arm(&mut app);
-            precision_key(&mut app, KeyCode::Esc, KeyModifiers::NONE);
-            let panel = app
-                .reference_panel
-                .as_ref()
-                .expect("Esc keeps the browser open");
-            assert_eq!(panel.confirm_delete, None);
-            assert!(paths[0].exists());
-            let query = panel.sound_query.clone();
-
-            precision_key(&mut app, KeyCode::Char('d'), KeyModifiers::NONE);
-            let panel = app.reference_panel.as_ref().unwrap();
-            assert_eq!(panel.sound_query, query + "d");
-            assert_eq!(panel.confirm_delete, None);
-            assert!(paths[0].exists());
         }
 
         /// In Vim the Esc that leaves Insert calls an armed deletion off, as

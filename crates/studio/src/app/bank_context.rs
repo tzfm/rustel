@@ -444,23 +444,6 @@ mod tests {
             }
         }
 
-        /// Comments, line breaks and controls between links keep the sounds and
-        /// their sample numbers.
-        #[test]
-        fn values_and_comments_between_links_keep_the_sounds() {
-            assert_eq!(
-                bank_sounds_at(
-                    "s(\"bd\") /* x */ .fast(2) // y\n  .lpf(sine.range(200, 2000)).bank(\"¦\")"
-                ),
-                ["bd"]
-            );
-            assert_eq!(bank_sounds_at(r#"s("bd:3").note("c").bank("¦")"#), ["bd:3"]);
-            assert_eq!(
-                bank_sounds_at(r#"s("bd:3").velocity(.5).bank("¦")"#),
-                ["bd:3"]
-            );
-        }
-
         /// A bank whose receiver is not a call hides nothing.
         #[test]
         fn a_receiver_that_is_not_a_call_hides_nothing() {

@@ -54,6 +54,8 @@ pub enum HelpContext {
     Memory,
     /// The knobs column beside the score.
     Knobs,
+    /// The score outline beside the score.
+    Outline,
 }
 
 impl HelpContext {
@@ -86,6 +88,7 @@ impl HelpContext {
             Self::Mixer => "mixer",
             Self::Memory => "memory breakdown",
             Self::Knobs => "knobs",
+            Self::Outline => "score outline",
         }
     }
 
@@ -159,6 +162,11 @@ impl HelpContext {
                  the score as they move, and the far left takes an optional entry out. \
                  Press Enter to type an exact value. A plugin keeps the knobs you add to \
                  it, and its presets sit under the rails: → opens them, Enter takes one."
+            }
+            Self::Outline => {
+                "The score as a tree of its statements and calls. Red parts run native, \
+                 purple parts need the script engine, in the theme's colours. It reads \
+                 the score again when the text changes, and only while it is open."
             }
         }
     }
@@ -241,6 +249,11 @@ impl HelpContext {
                     "Home · End · f · Esc",
                     "bottom or off / top / fine drag lock / back to the score",
                 ),
+            ],
+            Self::Outline => [
+                ("↑/↓ · PgUp/PgDn", "choose a node"),
+                ("Enter · click", "put the caret on the node"),
+                ("Esc", "back to the score"),
             ],
             Self::Set => [
                 (

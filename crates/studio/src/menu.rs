@@ -39,6 +39,8 @@ pub enum MenuAction {
     Mixer,
     /// The knobs column beside the score.
     Knobs,
+    /// The score outline beside the score.
+    Outline,
     // File - the set is the file: a folder of scores.
     NewSet,
     NewSession,
@@ -1341,6 +1343,8 @@ pub struct MenuContext<'a> {
     /// The knobs column is open, whether or not the terminal has room to
     /// draw it just now.
     pub knobs: bool,
+    /// The score outline column is open.
+    pub outline: bool,
     /// The numbers down the left edge of the score.
     pub line_numbers: bool,
     /// Long lines continue on the next row.
@@ -1861,6 +1865,15 @@ pub fn menus(cx: &MenuContext) -> Vec<Menu> {
             ),
             MenuItem::new(
                 MenuItemKind::Toggle {
+                    id: MenuAction::Outline,
+                    on: cx.outline,
+                },
+                "Score outline",
+                'o',
+                "",
+            ),
+            MenuItem::new(
+                MenuItemKind::Toggle {
                     id: MenuAction::Zen,
                     on: cx.zen,
                 },
@@ -2005,6 +2018,7 @@ mod tests {
             jobs: false,
             memory: false,
             knobs: false,
+            outline: false,
             line_numbers: true,
             wrap: false,
             show_menu: true,

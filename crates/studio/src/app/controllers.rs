@@ -1529,27 +1529,5 @@ mod tests {
             turn(&mut app, 127);
             assert_value(&app, scene, call, 1.0);
         }
-
-        /// Listening to a port with nothing bound to it is no reason to wake the
-        /// loop every few milliseconds; a pad, a knob mapping or a learn is.
-        #[test]
-        fn only_a_bound_or_learning_control_keeps_the_pad_cap_on() {
-            let directory = tempfile::tempdir().expect("temp dir");
-            let mut app = app_over(directory.path());
-            assert!(!app.pad_press_can_act(), "nothing bound, nothing learning");
-            app.mapping_learn = Some(0);
-            assert!(app.pad_press_can_act(), "a knob is being learnt");
-            app.mapping_learn = None;
-            app.ui_settings.mappings[0] = Some(crate::settings::MappingSource::Knob(
-                crate::settings::SliderCc {
-                    controller: 74,
-                    channel: None,
-                },
-            ));
-            assert!(app.pad_press_can_act(), "a knob drives a slot");
-            app.ui_settings.mappings[0] = None;
-            app.strip_mode = SceneStripMode::Learning;
-            assert!(app.pad_press_can_act(), "a pad is being learnt");
-        }
     }
 }

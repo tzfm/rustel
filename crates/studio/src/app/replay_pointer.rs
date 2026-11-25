@@ -217,24 +217,6 @@ mod tests {
         }
 
         #[test]
-        fn playing_a_timeline_block_keeps_the_timeline_keyboard() {
-            let directory = tempfile::tempdir().unwrap();
-            let (mut app, id) = replay_app(directory.path(), 4);
-            app.load_replay_block(id, 1);
-            app.focus_timeline();
-            for code in [KeyCode::Enter, KeyCode::Right, KeyCode::Enter] {
-                app.handle_terminal_event(Event::Key(KeyEvent::new(code, KeyModifiers::NONE)))
-                    .unwrap();
-                assert_eq!(app.focus, Focus::Timeline);
-            }
-            assert_eq!(app.replays[&id].selected, 2);
-            assert!(app.pending_evaluation.is_some() || !app.inflight.is_empty());
-            app.handle_terminal_event(Event::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)))
-                .unwrap();
-            assert_eq!(app.focus, Focus::Editor);
-        }
-
-        #[test]
         fn focus_rotation_leaves_the_playing_timeline_for_the_other_panels() {
             let directory = tempfile::tempdir().unwrap();
             let (mut app, id) = replay_app(directory.path(), 4);

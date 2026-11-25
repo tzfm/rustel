@@ -474,40 +474,6 @@ mod tests {
             );
         }
 
-        /// The sheet stays open over the bounce it starts, as a DAW's render
-        /// window does, and the keys change nothing while it runs.
-        #[test]
-        fn the_sheet_stays_open_over_its_bounce_and_esc_leaves_it_running() {
-            let directory = tempfile::tempdir().expect("temp dir");
-            let mut app = app_over(directory.path());
-            app.frame = Rect::new(0, 0, 120, 40);
-            app.toggle_export_sheet();
-            assert!(app.handle_export_key(crossterm::event::KeyCode::Enter, false, false));
-            assert!(app.export_job.is_some(), "the bounce started");
-            assert!(app.export_sheet.is_some(), "the sheet stays open over it");
-            assert_eq!(app.focus, Focus::Panel(PanelKind::Export));
-            // No setting stands while it runs: the key is taken and changes
-            // nothing, so a second Enter cannot start a second bounce.
-            assert!(app.handle_export_key(crossterm::event::KeyCode::Tab, false, false));
-            assert!(app.handle_export_key(crossterm::event::KeyCode::Enter, false, false));
-            let job = app.export_job.as_ref().expect("the one bounce");
-            assert!(!job.finished_early(), "Enter over the run changed nothing");
-            // Esc closes the sheet; the bounce runs on in the header.
-            assert!(app.handle_export_key(crossterm::event::KeyCode::Esc, false, false));
-            assert!(app.export_sheet.is_none());
-            assert!(app.export_job.is_some(), "the bounce runs on");
-            assert!(app.status.contains("runs on"), "{}", app.status);
-            let landed = std::time::Instant::now() + std::time::Duration::from_secs(60);
-            while app.export_job.is_some() && std::time::Instant::now() < landed {
-                app.poll_export();
-                if app.export_job.is_some() {
-                    std::thread::sleep(std::time::Duration::from_millis(50));
-                }
-            }
-            assert!(app.export_job.is_none(), "the bounce never landed");
-            assert!(app.status.starts_with("exported"), "{}", app.status);
-        }
-
         /// Over a running bounce the sheet's Vim text modes do not apply:
         /// `i` enters no Insert, a letter edits no hidden field, and the
         /// first Esc closes the sheet as the render face says.

@@ -5,7 +5,7 @@
 
 use ratatui::layout::Rect;
 
-use super::super::{knobs_panel, set_panel, viz_panel};
+use super::super::{knobs_panel, outline_panel, set_panel, viz_panel};
 
 /// Narrowest source pane that still gets a minimap.
 const MINIMAP_MIN_EDITOR_WIDTH: u16 = 64;
@@ -113,6 +113,9 @@ pub struct StudioRegions {
     /// the caret, when it is open and the panes keep their least. Empty in
     /// zen, where the column refuses to open.
     pub knobs: Rect,
+    /// The score outline column, when it is open and the panes keep their
+    /// least. Empty in zen.
+    pub outline: Rect,
     /// The notice rows, the status line and, while the footer setting is
     /// on, the meter, orbits and device chips. Empty in zen.
     pub footer: Rect,
@@ -320,6 +323,7 @@ pub fn regions_with(
         log,
         None,
         false,
+        false,
         0,
         false,
     )
@@ -348,6 +352,7 @@ pub fn regions_with_footer(
     log: Option<viz_panel::Dock>,
     memory: Option<viz_panel::Dock>,
     knobs: bool,
+    outline: bool,
     notice_rows: u16,
     has_piano_notes: bool,
 ) -> StudioRegions {
@@ -366,6 +371,7 @@ pub fn regions_with_footer(
             log,
             memory,
             knobs,
+            outline,
             notice_rows,
             has_piano_notes,
         )
@@ -407,6 +413,7 @@ fn layout_regions(
     log: Option<viz_panel::Dock>,
     memory: Option<viz_panel::Dock>,
     knobs: bool,
+    outline: bool,
     notice_rows: u16,
     has_piano_notes: bool,
 ) -> StudioRegions {
@@ -702,6 +709,24 @@ fn layout_regions(
         }
     }
 
+    // The score outline stands outside the knobs: it reads the whole
+    // score, not the call at the caret. It waits for room the same way.
+    let mut outline_area = Rect::default();
+    if outline
+        && !reference_overlays
+        && body.width >= outline_panel::OUTLINE_WIDTH + least
+        && body.height >= outline_panel::OUTLINE_HEIGHT
+    {
+        let width = outline_panel::OUTLINE_WIDTH;
+        outline_area = Rect::new(
+            body.right().saturating_sub(width),
+            body.y,
+            width,
+            body.height,
+        );
+        body.width = body.width.saturating_sub(width);
+    }
+
     // The knobs column hugs the score, inside every other column: the
     // rails are for the call under the caret, and everything between
     // them and the score is one more thing the eye crosses. It is the
@@ -789,6 +814,7 @@ fn layout_regions(
         reference,
         reference_overlays,
         knobs: knobs_area,
+        outline: outline_area,
         footer,
     }
 }

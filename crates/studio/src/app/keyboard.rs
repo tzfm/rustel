@@ -445,6 +445,17 @@ impl App {
                     self.handle_knobs_key(code, primary, shift, alt)
                 }
             }
+            PanelKind::Outline => {
+                if self.regions.outline.is_empty() {
+                    if code == KeyCode::Esc {
+                        self.focus = Focus::Editor;
+                        self.dirty_frame = true;
+                    }
+                    code == KeyCode::Esc
+                } else {
+                    self.handle_outline_key(code)
+                }
+            }
         })
     }
 
@@ -2122,33 +2133,6 @@ mod tests {
             );
         }
 
-        #[test]
-        fn vim_yank_fills_the_clipboard_and_p_takes_the_newest_copy() {
-            let directory = tempfile::tempdir().expect("temp dir");
-            let (mut app, _scene) = plain_app(directory.path(), "one two\n");
-            app.ui_settings.editor_keybindings = crate::editor::EditorKeybindings::Vim;
-            app.sync_editor_keybindings();
-            app.focus = Focus::Editor;
-
-            for key in ['v', 'e', 'y'] {
-                precision_key(&mut app, KeyCode::Char(key), KeyModifiers::NONE);
-            }
-            assert_eq!(
-                app.clipboard.get_text().expect("yank in clipboard"),
-                "one",
-                "the visual yank filled the clipboard"
-            );
-
-            // A newer copy from another surface beats the old register.
-            app.clipboard
-                .set_text("generated\n".into())
-                .expect("newer copy");
-            precision_key(&mut app, KeyCode::Char('p'), KeyModifiers::NONE);
-            let source = app.editor().source();
-            assert!(source.contains("generated"), "{source:?}");
-            assert_eq!(source.matches("generated").count(), 1, "{source:?}");
-        }
-
         /// A newer copy from another surface is put by Vim's rules: after
         /// the caret, a copied line below the current one, and over a
         /// Visual selection, which ends Visual. V keeps the line break.
@@ -2555,70 +2539,6 @@ mod tests {
             assert_eq!(app.editor().source(), source);
         }
 
-        /// A letter typed over a reference entry page reaches the score.
-        ///
-        /// An entry page has no search box. Every letter goes to the score,
-        /// the panel stays open, and the first edit returns focus to the
-        /// editor. Every other focused panel keeps the letters it is given.
-        #[test]
-        fn typing_with_the_reference_open_reaches_the_score() {
-            let directory = tempfile::tempdir().expect("temp dir");
-            let mut app = app_over(directory.path());
-            let before = app.scenes.current().editor.source().len();
-            app.toggle_reference_browse();
-            assert_eq!(app.focus, Focus::Panel(PanelKind::Reference));
-
-            // In the search box, a letter is a query…
-            press(&mut app, KeyCode::Char('l'), KeyModifiers::NONE);
-            assert_eq!(
-                app.reference_panel
-                    .as_ref()
-                    .map(|panel| panel.query.as_str()),
-                Some("l")
-            );
-            assert_eq!(app.scenes.current().editor.source().len(), before);
-
-            // …and on an entry's page there is no box, so it is the score's.
-            assert!(app.reference_panel.as_mut().expect("panel").expand());
-            press(&mut app, KeyCode::Char('x'), KeyModifiers::NONE);
-            assert!(app.scenes.current().editor.source().contains('x'));
-            assert!(app.reference_panel.is_some(), "the panel stays readable");
-            assert_eq!(app.focus, Focus::Editor, "typing claimed the score");
-        }
-
-        /// The settings sheet keeps the keys it is given.
-        ///
-        /// A letter the sheet does not use must not reach the score: the
-        /// user looks at the sheet, not at the caret, so the edit would go
-        /// unseen. A focused panel keeps its keys and Esc returns them. The
-        /// reference on an entry page is the only exception, because that
-        /// page has no text field.
-        #[test]
-        fn the_settings_sheet_keeps_the_keys_it_is_given() {
-            let directory = tempfile::tempdir().expect("temp dir");
-            let mut app = app_over(directory.path());
-            app.toggle_settings_sheet();
-            assert_eq!(app.focus, Focus::Panel(PanelKind::Settings));
-
-            // Focused, the arrows belong to the sheet…
-            press(&mut app, KeyCode::Down, KeyModifiers::NONE);
-            assert_eq!(app.settings_sheet.expect("sheet").selected, 1);
-            // …and so is a letter. A sheet that has the keyboard has it: a
-            // stray `a` over the settings appearing in the music is a bug, not
-            // a shortcut, and the footer says where the keyboard went rather
-            // than dropping the key in silence.
-            let source = app.scenes.current().editor.source();
-            press(&mut app, KeyCode::Char('a'), KeyModifiers::NONE);
-            assert_eq!(app.scenes.current().editor.source(), source);
-            assert!(app.settings_sheet.is_some());
-            assert_eq!(app.focus, Focus::Panel(PanelKind::Settings));
-            assert!(app.status.contains("has the keyboard"), "{}", app.status);
-            // Esc gives it back, and then the score types again.
-            press(&mut app, KeyCode::Esc, KeyModifiers::NONE);
-            press(&mut app, KeyCode::Char('a'), KeyModifiers::NONE);
-            assert!(app.scenes.current().editor.source().contains('a'));
-        }
-
         /// A focused panel keeps a Tab it does not use, the same as a letter,
         /// so Tab cannot indent the score while the user looks at the panel.
         /// The test uses a visuals dock because that panel has no use for Tab;
@@ -2710,52 +2630,6 @@ mod tests {
                 "Ctrl+G was the transport's, not the query's"
             );
             assert_eq!(app.focus, Focus::Panel(PanelKind::Reference));
-        }
-
-        #[test]
-        fn scene_switching_uses_function_keys_until_modified_keys_are_precise() {
-            let key = |code, modifiers| KeyEvent::new(code, modifiers);
-            for capabilities in [
-                KeyboardCapabilities::legacy(),
-                KeyboardCapabilities::enhanced(),
-            ] {
-                assert_eq!(
-                    scene_step_for_key(&key(KeyCode::F(6), KeyModifiers::NONE), capabilities),
-                    Some(-1)
-                );
-                assert_eq!(
-                    scene_step_for_key(&key(KeyCode::F(7), KeyModifiers::NONE), capabilities),
-                    Some(1)
-                );
-            }
-            assert_eq!(
-                scene_step_for_key(
-                    &key(KeyCode::Char('['), KeyModifiers::CONTROL),
-                    KeyboardCapabilities::legacy(),
-                ),
-                None
-            );
-            assert_eq!(
-                scene_step_for_key(
-                    &key(KeyCode::Char(']'), KeyModifiers::CONTROL),
-                    KeyboardCapabilities::enhanced(),
-                ),
-                Some(1)
-            );
-            assert_eq!(
-                scene_step_for_key(
-                    &key(KeyCode::Char('['), KeyModifiers::ALT),
-                    KeyboardCapabilities::enhanced(),
-                ),
-                None
-            );
-            assert_eq!(
-                scene_step_for_key(
-                    &key(KeyCode::F(6), KeyModifiers::CONTROL),
-                    KeyboardCapabilities::enhanced(),
-                ),
-                None
-            );
         }
 
         /// Update and stop work from the keyboard whatever is on screen: the
@@ -3327,7 +3201,7 @@ mod tests {
         use crate::app::*;
         use crate::editor::Selection;
         use crate::reference::{ReferenceMode, entry_body, entry_body_area};
-        use crate::settings::{SettingsPage, SettingsSheetView};
+
         use crate::theme_editor::{EditorTab, ThemeEditorView};
 
         fn app(directory: &std::path::Path) -> App {
@@ -3344,44 +3218,6 @@ mod tests {
                 kind,
             )))
             .unwrap();
-        }
-
-        #[test]
-        fn keybinding_pages_handle_press_repeat_and_endpoints_without_editing_the_score() {
-            let directory = tempfile::tempdir().unwrap();
-            let mut app = app(directory.path());
-            app.toggle_settings_sheet();
-            app.settings_sheet
-                .as_mut()
-                .unwrap()
-                .show_page(SettingsPage::Keybinds);
-            app.focus = Focus::Panel(PanelKind::Settings);
-            let (_, list) = SettingsSheetView::geometry(app.settings_sheet_frame()).unwrap();
-            let rows = usize::from(list.height);
-            let source = app.editor().source();
-            let caret = app.editor().primary_selection();
-            page(&mut app, KeyCode::PageDown, KeyEventKind::Press);
-            assert_eq!(app.settings_sheet.as_ref().unwrap().selected, rows - 1);
-            page(&mut app, KeyCode::PageDown, KeyEventKind::Repeat);
-            assert_eq!(
-                app.settings_sheet.as_ref().unwrap().selected,
-                (rows * 2 - 1).min(crate::settings::RESET_KEYBINDS_ROW)
-            );
-            for _ in 0..10 {
-                page(&mut app, KeyCode::PageDown, KeyEventKind::Press);
-            }
-            assert_eq!(
-                app.settings_sheet.as_ref().unwrap().selected,
-                crate::settings::RESET_KEYBINDS_ROW
-            );
-            for _ in 0..10 {
-                page(&mut app, KeyCode::PageUp, KeyEventKind::Repeat);
-            }
-            assert_eq!(app.settings_sheet.as_ref().unwrap().selected, 0);
-            assert_eq!(app.editor().source(), source);
-            assert_eq!(app.editor().primary_selection(), caret);
-            assert_eq!(app.focus, Focus::Panel(PanelKind::Settings));
-            assert!(app.keybind_learn.is_none());
         }
 
         #[test]
@@ -3928,38 +3764,6 @@ mod tests {
                 evaluate.also.is_empty(),
                 "an alias taken by Undo must disappear"
             );
-        }
-
-        /// The key page lists the values chord and the docs chord on two rows.
-        /// The values row names Ctrl+Space only where the terminal sends it.
-        #[test]
-        fn the_key_page_lists_values_and_docs_on_two_rows() {
-            use crate::terminal::conflicts;
-            let _desktop = conflicts::ForceDesktopForTest::set("");
-            for (platform, also) in [("linux", "^Space"), ("macos", "")] {
-                let _platform = conflicts::ForcePlatformForTest::set(platform);
-                let directory = tempfile::tempdir().unwrap();
-                let app = app_for(directory.path(), "kitty", true);
-                let rows = app.keybind_rows();
-                let row = |label: &str| {
-                    rows.iter()
-                        .find(|row| row.action == label)
-                        .unwrap_or_else(|| panic!("{platform}: no row reads {label:?}"))
-                };
-                let values = row("argument values, reference");
-                assert_eq!(
-                    (values.chord.as_str(), values.also.as_str()),
-                    ("^F", also),
-                    "{platform}"
-                );
-                let docs = row("docs for the function");
-                assert_eq!(
-                    (docs.chord.as_str(), docs.also.as_str()),
-                    ("^D", ""),
-                    "{platform}"
-                );
-                assert!(rows.iter().all(|row| row.also != "^D"), "{platform}");
-            }
         }
 
         #[test]

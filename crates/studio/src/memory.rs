@@ -58,8 +58,7 @@ pub struct MemoryFigures {
     /// The script engine's heap; `None` until the engine's first snapshot.
     pub script_heap: Option<usize>,
     /// What evaluated the score, when the engine says: a native score
-    /// needs no script engine, and the breakdown says which line of a
-    /// score needs it.
+    /// needs no script engine. The breakdown says one word for it.
     pub score_engine: Option<rustel_runtime::ScoreEngine>,
     /// What the audio side holds, only while an output or input is open.
     pub audio: Option<AudioMemory>,
@@ -264,6 +263,20 @@ impl Row {
     }
 }
 
+/// The one word the breakdown says for what evaluated the score.
+fn engine_word(engine: rustel_runtime::ScoreEngine) -> &'static str {
+    match engine {
+        rustel_runtime::ScoreEngine::Native => "native",
+        rustel_runtime::ScoreEngine::Script { .. } => "script",
+    }
+}
+
+/// The score row's word, in the colour of what evaluated the score.
+fn engine_style(figures: &MemoryFigures, theme: &Theme) -> Style {
+    let native = figures.score_engine == Some(rustel_runtime::ScoreEngine::Native);
+    Style::default().fg(theme.engine(native))
+}
+
 /// A pause as the settings sheet spells one: `30 s`, `5 min`.
 fn pause(duration: Duration) -> String {
     let seconds = duration.as_secs();
@@ -331,19 +344,9 @@ pub fn rows(figures: &MemoryFigures) -> Vec<Row> {
         None => rows.push(Row::unknown(Part, "script engine")),
     }
     if let Some(engine) = figures.score_engine {
-        use rustel_runtime::ScoreEngine;
-        let label = match engine {
-            // The engine starts at the first score that needs it.
-            ScoreEngine::Native if figures.script_heap.unwrap_or(0) == 0 => {
-                "off · the score is native".to_owned()
-            }
-            ScoreEngine::Native => "idle · the score is native".to_owned(),
-            ScoreEngine::Script { line: Some(line) } => {
-                format!("runs the score · line {line} needs it")
-            }
-            ScoreEngine::Script { line: None } => "runs the score".to_owned(),
-        };
-        rows.push(Row::text(Of(Detail::Script), label));
+        let mut row = Row::text(Of(Detail::Script), "score");
+        row.value = engine_word(engine).to_owned();
+        rows.push(row);
     }
     // Only while something is open: the audio side is nothing otherwise.
     // Its parts are what has been written, not what was set aside, so the
@@ -577,6 +580,10 @@ impl Widget for MemorySidecarView<'_> {
                 RowKind::Part => (
                     Style::default().fg(self.theme.foreground),
                     Style::default().fg(self.theme.foreground),
+                ),
+                RowKind::Detail(Detail::Script) => (
+                    Style::default().fg(self.theme.muted),
+                    engine_style(self.figures, self.theme),
                 ),
                 _ => (
                     Style::default().fg(self.theme.muted),
@@ -885,6 +892,9 @@ impl Widget for MemoryView<'_> {
                         plain.add_modifier(Modifier::BOLD),
                     ),
                     RowKind::Part => (0, plain, plain),
+                    RowKind::Detail(Detail::Script) => {
+                        (2, muted, engine_style(self.figures, theme))
+                    }
                     RowKind::Detail(_) => (2, muted, muted),
                     RowKind::Excess | RowKind::Outside => (0, muted, muted),
                     RowKind::Hint => (2, muted, muted),
@@ -1235,8 +1245,8 @@ mod tests {
     /// discrete card's and, on Linux and Windows, an integrated one's: they
     /// are said beside the visuals and never added to the figure, which
     /// only the readback buffers count toward.
-    /// The breakdown says what the script engine does for the score, under
-    /// the engine's part, and keeps that line on a short terminal.
+    /// The breakdown says in one word what evaluated the score, under the
+    /// engine's part, and keeps that line on a short terminal.
     #[test]
     fn the_script_engine_part_says_what_evaluated_the_score() {
         use rustel_runtime::ScoreEngine;
@@ -1253,24 +1263,24 @@ mod tests {
             let detail = rows.get(part + 1);
             detail
                 .filter(|row| row.kind == RowKind::Detail(Detail::Script))
-                .map(|row| row.label.clone())
+                .map(|row| row.value.clone())
         };
         assert_eq!(said(None, 0), None);
         assert_eq!(
             said(Some(ScoreEngine::Native), 0).as_deref(),
-            Some("off · the score is native")
+            Some("native")
         );
         assert_eq!(
             said(Some(ScoreEngine::Native), MIB).as_deref(),
-            Some("idle · the score is native")
+            Some("native")
         );
         assert_eq!(
             said(Some(ScoreEngine::Script { line: Some(12) }), MIB).as_deref(),
-            Some("runs the score · line 12 needs it")
+            Some("script")
         );
         assert_eq!(
             said(Some(ScoreEngine::Script { line: None }), MIB).as_deref(),
-            Some("runs the score")
+            Some("script")
         );
         // The line stays where every other detail goes.
         let rows = rows(&MemoryFigures {

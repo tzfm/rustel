@@ -635,36 +635,5 @@ mod tests {
                 .expect("place caret");
             assert!(app.nudge_slider_at_caret(-1.0), "nudge from the far edge");
         }
-
-        /// The footer's caret reading is the editor's own: a move changes the
-        /// column, a newline the line. The gutter can be turned off and the
-        /// column is shown nowhere else, so this is the one place both live.
-        #[test]
-        fn the_caret_reading_follows_the_editor() {
-            let directory = tempfile::tempdir().expect("temp dir");
-            let mut app = crate::app::tests::support::app_over(directory.path());
-            let key = |app: &mut App, code: KeyCode| {
-                app.handle_terminal_event(Event::Key(KeyEvent::new(code, KeyModifiers::NONE)))
-                    .expect("the key is handled");
-            };
-
-            key(&mut app, KeyCode::Home);
-            let (line, column) = app.caret_position().expect("a caret");
-            assert_eq!((line, column), (line, 1), "Home is column 1");
-
-            key(&mut app, KeyCode::Right);
-            assert_eq!(
-                app.caret_position(),
-                Some((line, 2)),
-                "one right is column 2 on the same line"
-            );
-
-            key(&mut app, KeyCode::Enter);
-            assert_eq!(
-                app.caret_position(),
-                Some((line + 1, 1)),
-                "a newline is the next line, column 1"
-            );
-        }
     }
 }

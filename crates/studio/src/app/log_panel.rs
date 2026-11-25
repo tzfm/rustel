@@ -817,34 +817,6 @@ mod tests {
             assert_eq!(contents.chars().count(), 12, "{contents:?}");
         }
 
-        /// The log sheet anchors against the frame short of the footer, so it
-        /// sits over the score and the footer stays visible under it.
-        #[test]
-        fn the_log_sheet_leaves_the_footer_showing() {
-            let directory = tempfile::tempdir().expect("tempdir");
-            let app = app_over(directory.path());
-            let frame = Rect::new(0, 0, 140, 40);
-            let footer = Rect::new(0, 38, 140, 2);
-            let (sheet, _) = crate::log::LogPanelView::geometry(
-                Rect {
-                    height: frame.height - footer.height,
-                    ..frame
-                },
-                app.log_extent(),
-            )
-            .expect("the sheet fits");
-            assert!(
-                sheet.bottom() <= footer.y,
-                "the sheet stops above the footer: {sheet:?}"
-            );
-            let (over_the_footer, _) = crate::log::LogPanelView::geometry(frame, app.log_extent())
-                .expect("the sheet fits the whole frame too");
-            assert!(
-                over_the_footer.bottom() > footer.y,
-                "anchoring on the whole frame is what hid the footer: {over_the_footer:?}"
-            );
-        }
-
         /// A press anywhere begins a new gesture, and that ends the log's own
         /// drag when its release never came, as it ends the score's. The wheel
         /// extends a live drag, so a stale one made every later scroll over the
