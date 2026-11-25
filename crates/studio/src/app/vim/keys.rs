@@ -449,6 +449,7 @@ pub(crate) fn panel_takes_list_navigation(app: &App, kind: PanelKind) -> bool {
         | PanelKind::Jobs
         | PanelKind::Reference
         | PanelKind::Knobs
+        | PanelKind::Outline
         | PanelKind::Theme
         | PanelKind::Export
         | PanelKind::Memory => true,

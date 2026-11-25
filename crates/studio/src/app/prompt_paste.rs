@@ -198,7 +198,8 @@ impl App {
             | PanelKind::Jobs
             | PanelKind::Settings
             | PanelKind::Mixer
-            | PanelKind::Memory => false,
+            | PanelKind::Memory
+            | PanelKind::Outline => false,
         };
         if kept {
             self.dirty_frame = true;

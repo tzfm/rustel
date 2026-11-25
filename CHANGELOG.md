@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- Studio: View ▸ Score outline shows the score as a tree, with native parts and script parts in two colours. The memory breakdown says native or script in one word.
 - Fixed: in iTerm2, Ctrl+F9 docks the log, because iTerm2 keeps Shift+F9.
 - External editor and bridge integrations: added `rustel lsp --stdio` (completion, hover, and lint diagnostics), `rustel doc --all [--json]` for full reference catalogue export, opt-in lane ids and sound names on `--ui-events` telemetry (`ui_layout.lanes` and `ui_events`), and inbound `ui_control` commands (`lane_solo`, `lane_mute`, `lane_transpose`, `tempo`, `transport`) with `ui_control_ack` replies.
 - Studio deletes the last open score of a set: the next score in the set panel opens in its place, or a new empty score when it was the only one.
