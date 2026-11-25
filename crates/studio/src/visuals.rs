@@ -553,7 +553,6 @@ impl VisualState {
         }
     }
 
-
     pub fn layout(&self) -> Option<&UiLayout> {
         self.layout.as_ref()
     }
@@ -1280,7 +1279,6 @@ pub(super) const BRAILLE_DITHER: [[u8; 2]; 4] = [[0, 4], [6, 2], [1, 5], [7, 3]]
 pub(super) fn braille_dot(level: f32, dx: usize, dy: usize) -> bool {
     level * 8.0 > f32::from(BRAILLE_DITHER[dy][dx]) + 0.5
 }
-
 
 impl Canvas {
     /// A canvas for filled shapes - bars, discs - at the current tier.
@@ -5993,7 +5991,6 @@ mod tests {
             "the spectrogram ignored its decibel window"
         );
     }
-
 
     #[test]
     fn an_unsupported_kind_explains_itself() {

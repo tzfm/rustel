@@ -886,7 +886,6 @@ pub fn edit_caret(panel: &KnobsPanel, area: Rect) -> Option<(u16, u16)> {
 mod tests {
     use super::*;
 
-
     /// A rail's handle cell and a click on that cell have to agree, or a
     /// drag jumps the value on its first move.
     #[test]

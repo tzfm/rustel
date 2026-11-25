@@ -7807,7 +7807,6 @@ mod tests {
         );
     }
 
-
     /// Walking a page taller than the sheet keeps rows in sight past the
     /// selection, so the next setting is on screen before it is chosen; a
     /// click selects without moving the page.
