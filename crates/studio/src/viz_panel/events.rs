@@ -222,6 +222,8 @@ mod tests {
             frequency_hz: None,
             gain: None,
             sample: None,
+            lane: None,
+            sound: None,
             ui_visuals: 0,
             context: Vec::new(),
         }

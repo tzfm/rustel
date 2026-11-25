@@ -255,21 +255,35 @@ fn finish<'js>(
     }
     let ran_plugins =
         with_bridge_frame(|frame: &BridgeFrame<'js>| frame.ran_plugin_calls()).unwrap_or(false);
+    let tag_lanes =
+        with_bridge_frame(|frame: &BridgeFrame<'js>| frame.tag_lanes()).unwrap_or(false);
     let mut lane_patterns = Vec::new();
     let mut lane_sidecars = Vec::new();
     // The lanes that do not play, with their tags: the lanes a solo drops
     // and the muted lanes.
     let mut shadow = Vec::new();
+    let mut ordinal: u32 = 0;
     for entry in patterns.props::<String, rquickjs::Value>() {
         let (name, pattern) = entry?;
         let plays = !solo_active || solo(&name);
         // A lane with no number has its name as tag.
         let tag: Option<String> = tags.get(name.as_str())?;
+        let lane_number = tag
+            .as_deref()
+            .and_then(|value| value.strip_prefix('#'))
+            .and_then(|digits| digits.parse::<u32>().ok())
+            .unwrap_or(ordinal);
+        ordinal = ordinal.saturating_add(1);
         let tag = tag.unwrap_or(name);
         if plays {
             let (pat, sidecar) = reify_bridged(&ctx, &pattern)?;
             let pat = if ran_plugins || pat.may_have_plugin_notes() {
                 lane_tagged(&pat, tag)
+            } else {
+                pat
+            };
+            let pat = if tag_lanes {
+                pat.with_lane(lane_number)
             } else {
                 pat
             };
@@ -285,7 +299,11 @@ fn finish<'js>(
     }
 
     let mut result = if lane_patterns.is_empty() {
-        returned
+        if tag_lanes && let Ok((pat, sidecar)) = reify_bridged(&ctx, &returned) {
+            derive_wrapper(ctx.clone(), pat.with_lane(0), &[sidecar])?.into_value()
+        } else {
+            returned
+        }
     } else {
         derive_wrapper(
             ctx.clone(),

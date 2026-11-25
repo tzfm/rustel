@@ -626,6 +626,8 @@ pub(super) struct BridgeFrame<'js> {
     /// operation such as `stepalt`. Opaque scratch scans skip these ids unless
     /// the graph statically reaches them or an explicit source owns them.
     pub(super) suppressed: RefCell<HashSet<CallbackId>>,
+    /// Whether lane collection tags every playing lane's haps with its lane id.
+    tag_lanes: bool,
 }
 
 #[derive(Clone)]
@@ -654,15 +656,22 @@ impl<'js> BridgeFrame<'js> {
             pending: RefCell::new(Vec::new()),
             harvested: RefCell::new(Vec::new()),
             suppressed: RefCell::new(HashSet::new()),
+            tag_lanes: false,
         }
     }
 
-    pub(super) fn evaluation(alloc: std::rc::Rc<Cell<CallbackId>>) -> Self {
+    pub(super) fn evaluation(alloc: std::rc::Rc<Cell<CallbackId>>, tag_lanes: bool) -> Self {
         Self {
             plugin_scope: RefCell::new(Some(PluginScope::new(String::new()))),
             plugin_names: RefCell::new(Some(Vec::new())),
+            tag_lanes,
             ..Self::new(alloc)
         }
+    }
+
+    /// True when this evaluation tags every playing lane's haps with its id.
+    pub(super) fn tag_lanes(&self) -> bool {
+        self.tag_lanes
     }
 
     pub(super) fn setup(alloc: std::rc::Rc<Cell<CallbackId>>) -> Self {

@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- External editor and bridge integrations: added `rustel lsp --stdio` (completion, hover, and lint diagnostics), `rustel doc --all [--json]` for full reference catalogue export, opt-in lane ids and sound names on `--ui-events` telemetry (`ui_layout.lanes` and `ui_events`), and inbound `ui_control` commands (`lane_solo`, `lane_mute`, `lane_transpose`, `tempo`, `transport`) with `ui_control_ack` replies.
 - Studio deletes the last open score of a set: the next score in the set panel opens in its place, or a new empty score when it was the only one.
 - The set panel marks empty scores with `○`.
 - Fixed: when the set open last time is gone from the disk, `rustel studio` opens the newest recent set that is still there, instead of a new empty set.

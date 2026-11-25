@@ -133,6 +133,8 @@ calls `setMaxPolyphony`. Score-level `.limit()` still applies.
 rustel check song.strudel
 rustel query -e 'note("c e g").s("piano")' --begin 0 --end 2 --json
 rustel doc inspire
+rustel doc --all --json
+rustel lsp --stdio
 rustel validate song.strudel
 rustel bench song.strudel
 ```
@@ -143,6 +145,12 @@ refused sample imports return a failure status. A score must end on a pattern
 or collect patterns with `$:`. A definition-only `register(...)` is valid setup.
 `--prebake setup.js` runs a setup before the score in both, as for `play`, so
 a helper it defines is not reported as an unknown function.
+
+`doc --all` lists every reference entry and `doc --all --json` exports the full
+catalogue for editor tooling. `lsp --stdio` runs the built-in language server
+for completion, hover, and live diagnostics without starting audio. See
+[Integrations](integrations.md) for LSP setup and live `--ui-events` telemetry
+and control commands.
 
 `validate`, `bench`, and `trace` provide validation, timing, and scheduling
 reports. Use their `--help` for options. `trace` gives no sound without

@@ -2025,9 +2025,9 @@ fn route_update(
         },
         StudioUpdate::Layout(layout) => send_structural(
             controls,
-            StudioControlEvent::Layout(layout),
+            StudioControlEvent::Layout(*layout),
             |event| match event {
-                StudioControlEvent::Layout(layout) => StudioUpdate::Layout(layout),
+                StudioControlEvent::Layout(layout) => StudioUpdate::Layout(Box::new(layout)),
                 _ => unreachable!(),
             },
         ),
