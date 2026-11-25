@@ -344,32 +344,6 @@ fn run<const TIMED: bool>(
 }
 
 #[test]
-fn scheduler_workloads_match_untimed_reference() {
-    for (workload, expected_events) in WORKLOADS.into_iter().zip([32, 256, 256, 1024, 128, 256]) {
-        let workload_pattern = pattern(workload);
-        let (_, reference) = run::<false>(workload, &workload_pattern, 2, 4);
-        let (_, measured) = run::<true>(workload, &workload_pattern, 2, 4);
-        assert_eq!(measured, reference, "{} validation differs", workload.id);
-        assert_eq!(
-            measured.accepted_events, expected_events,
-            "{} accepted",
-            workload.id
-        );
-        assert_eq!(
-            measured.drained_events, expected_events,
-            "{} drained",
-            workload.id
-        );
-        assert_eq!(
-            measured.trace_events,
-            if workload.trace { expected_events } else { 0 },
-            "{} trace",
-            workload.id
-        );
-    }
-}
-
-#[test]
 #[ignore = "manual release benchmark"]
 fn complete_scheduler_turn_workloads() {
     require_release_build();

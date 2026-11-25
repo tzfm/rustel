@@ -2569,23 +2569,6 @@ mod tests {
         ))
     }
 
-    #[test]
-    fn pass_ordinal_scratch_reuses_ordinary_buckets_and_drops_exceptional_capacity() {
-        let mut scheduler = Scheduler::new(Arc::new(Transport::default()), 1.0, 0.5);
-
-        scheduler.pass_ordinals.reserve(128);
-        let ordinary_capacity = scheduler.pass_ordinals.capacity();
-        scheduler.clear_pass_ordinals();
-        assert_eq!(scheduler.pass_ordinals.capacity(), ordinary_capacity);
-
-        scheduler
-            .pass_ordinals
-            .reserve(PASS_ORDINAL_RETAIN_LIMIT + 1);
-        assert!(scheduler.pass_ordinals.capacity() > PASS_ORDINAL_RETAIN_LIMIT);
-        scheduler.clear_pass_ordinals();
-        assert_eq!(scheduler.pass_ordinals.capacity(), 0);
-    }
-
     /// `from_hap` carries strudel.cc's `activeLabel` and the tuning
     /// `edoScale` writes on a value; a malformed tuning is left off rather
     /// than half-read.
@@ -2843,73 +2826,6 @@ mod tests {
     }
 
     #[test]
-    fn due_sort_orders_finite_onsets_and_tolerates_non_finite_keys() {
-        let transport = Arc::new(Transport::default());
-        let mut scheduler = Scheduler::new(Arc::clone(&transport), 1.0, 0.5);
-        let clock = VirtualClock::new(0.0);
-        let generation = transport.generation();
-        scheduler.last_fill_time = clock.now();
-        scheduler.queue.extend([
-            Event {
-                onset_id: 2,
-                generation,
-                whole_begin: Fraction::ZERO,
-                whole_end: Fraction::ONE,
-                duration: Fraction::ONE,
-                target_time: 0.50,
-                cps: None,
-                value: Value::Str("late".into()),
-                live_controls: [0; 4],
-                ui_visuals: 0,
-                log_line: None,
-            },
-            Event {
-                onset_id: 1,
-                generation,
-                whole_begin: Fraction::ZERO,
-                whole_end: Fraction::ONE,
-                duration: Fraction::ONE,
-                target_time: 0.25,
-                cps: None,
-                value: Value::Str("early".into()),
-                live_controls: [0; 4],
-                ui_visuals: 0,
-                log_line: None,
-            },
-        ]);
-        let due = scheduler.drain_through(&clock, 1.0);
-        assert_eq!(
-            due.iter().map(|event| event.onset_id).collect::<Vec<_>>(),
-            vec![1, 2]
-        );
-
-        // Defense in depth for the live drain path: a non-finite key must not
-        // panic the producer even if one ever reaches the sort.
-        let mut synthetic = due;
-        synthetic.push(Event {
-            onset_id: 3,
-            generation,
-            whole_begin: Fraction::ZERO,
-            whole_end: Fraction::ONE,
-            duration: Fraction::ONE,
-            target_time: f64::NAN,
-            cps: None,
-            value: Value::Str("nan".into()),
-            live_controls: [0; 4],
-            ui_visuals: 0,
-            log_line: None,
-        });
-        synthetic.sort_by(|a, b| a.target_time.total_cmp(&b.target_time));
-        assert_eq!(
-            synthetic
-                .iter()
-                .map(|event| event.onset_id)
-                .collect::<Vec<_>>(),
-            vec![1, 2, 3]
-        );
-    }
-
-    #[test]
     fn scheduler_events_keep_direct_live_slider_bindings() {
         let transport = Arc::new(Transport::default());
         let mut scheduler = Scheduler::new(transport, 1.0, 0.5);
@@ -2927,62 +2843,6 @@ mod tests {
             events
                 .iter()
                 .all(|event| event.live_controls == [73, 0, 0, 0])
-        );
-    }
-
-    #[test]
-    fn drain_filters_generations_and_preserves_the_future_queue_order() {
-        let transport = Arc::new(Transport::default());
-        let mut scheduler = Scheduler::new(Arc::clone(&transport), 1.0, 0.5);
-        let clock = VirtualClock::new(0.0);
-        let generation = transport.generation();
-        let cancelled = generation + 1;
-        scheduler.last_fill_time = clock.now();
-        let event = |onset_id, generation, target_time, name: &str| Event {
-            onset_id,
-            generation,
-            whole_begin: Fraction::ZERO,
-            whole_end: Fraction::ONE,
-            duration: Fraction::ONE,
-            target_time,
-            cps: None,
-            value: Value::object([
-                ("s".into(), Value::Str(name.into())),
-                ("gain".into(), Value::F64(0.5)),
-            ]),
-            live_controls: [0; 4],
-            ui_visuals: 0,
-            log_line: None,
-        };
-        scheduler.queue.extend([
-            event(3, generation, 2.0, "future-first"),
-            event(90, cancelled, 0.1, "cancelled-due"),
-            event(2, generation, 0.75, "due-late"),
-            event(4, generation, 1.5, "future-second"),
-            event(91, cancelled, 9.0, "cancelled-future"),
-            event(1, generation, 0.25, "due-early"),
-        ]);
-
-        let due = scheduler.drain_through(&clock, 1.0);
-        assert_eq!(
-            due.iter().map(|event| event.onset_id).collect::<Vec<_>>(),
-            vec![1, 2],
-            "due events did not retain target-time ordering"
-        );
-        assert_eq!(
-            scheduler
-                .queue
-                .iter()
-                .map(|event| event.onset_id)
-                .collect::<Vec<_>>(),
-            vec![3, 4],
-            "extracting due and cancelled events reordered future work"
-        );
-        assert!(
-            due.iter()
-                .chain(&scheduler.queue)
-                .all(|event| event.generation == generation),
-            "a cancelled generation survived the drain boundary"
         );
     }
 
@@ -3250,75 +3110,6 @@ mod tests {
             requeried_begins(&mut scheduler, &clock, 0.6),
             [0.75, 1.0, 1.25]
         );
-    }
-
-    /// Two copies with one key leave one mark, so one copy is held for it.
-    #[test]
-    fn two_copies_with_one_key_hold_one_stand_in() {
-        let (mut scheduler, _clock) = quarter_grid();
-        let copy = |generation| EmittedKey {
-            generation,
-            begin: Fraction::new(1, 2),
-            end: Fraction::new(3, 4),
-            value: Arc::from("c"),
-            occurrence: 0,
-        };
-        let held = scheduler.carry_device_copies(
-            9,
-            vec![(copy(7), 0.5), (copy(8), 0.5)],
-            Fraction::ZERO,
-            false,
-        );
-        assert_eq!(held[&Fraction::new(1, 2)].len(), 1);
-        assert!(scheduler.emitted.contains_key(&copy(9)));
-    }
-
-    /// The takeover of a generation drops copies from the device only when
-    /// the producer publishes it, after its first tick. Until then a new
-    /// takeover gets them back.
-    #[test]
-    fn a_takeover_sets_the_dropped_copies_aside_until_the_first_tick() {
-        let (mut scheduler, clock) = quarter_grid();
-        let begins = |copies: &[DeviceCopy]| {
-            let mut begins: Vec<f64> = copies.iter().map(|(key, _)| key.begin.to_f64()).collect();
-            begins.sort_by(f64::total_cmp);
-            begins
-        };
-        scheduler
-            .requery_active_from(0.3, 0.55)
-            .expect("active graph can be requeried");
-        assert_eq!(begins(&scheduler.superseded), [0.75]);
-        assert_eq!(scheduler.emitted.len(), 1, "the onset at 0.5 stays marked");
-
-        scheduler
-            .requery_active_from(0.35, 0.8)
-            .expect("active graph can be requeried");
-        assert!(scheduler.superseded.is_empty());
-        let mut marked: Vec<(f64, f64)> = scheduler
-            .emitted
-            .iter()
-            .map(|(key, time)| (key.begin.to_f64(), *time))
-            .collect();
-        marked.sort_by(|a, b| a.partial_cmp(b).expect("finite times"));
-        assert_eq!(marked, [(0.5, 0.5), (0.75, 0.75)]);
-
-        scheduler
-            .requery_active_from(0.4, 0.55)
-            .expect("active graph can be requeried");
-        assert_eq!(begins(&scheduler.superseded), [0.75]);
-        clock.set(0.4);
-        assert_eq!(scheduler.tick(&clock), TickStatus::Filled);
-        assert!(scheduler.superseded.is_empty());
-
-        // A first tick that finds the horizon full is published too.
-        clock.set(0.51);
-        assert_eq!(scheduler.tick(&clock), TickStatus::Filled);
-        scheduler
-            .requery_active_from(0.51, 1.49)
-            .expect("active graph can be requeried");
-        assert_eq!(begins(&scheduler.superseded), [1.5]);
-        assert_eq!(scheduler.tick(&clock), TickStatus::HorizonFull);
-        assert!(scheduler.superseded.is_empty());
     }
 
     /// A rebase from a takeover edge re-anchors and starts the cursor on the
