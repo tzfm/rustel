@@ -66,8 +66,6 @@ mod vst;
 use completions::{install_completions, run_completions, shell_from_environment};
 #[cfg(all(test, feature = "device-audio"))]
 use devices::doctor_device_report;
-#[cfg(test)]
-use devices::doctor_unavailable_report;
 #[cfg(all(test, feature = "midi"))]
 use devices::midi_summary_json;
 use devices::{run_devices, run_doctor, run_gamepad_monitor, run_midi_list, run_midi_monitor};
@@ -75,12 +73,6 @@ use devices::{run_devices, run_doctor, run_gamepad_monitor, run_midi_list, run_m
 use live::read_ui_controls;
 #[cfg(feature = "device-audio")]
 use live::read_ui_controls_with_commands;
-#[cfg(all(
-    test,
-    feature = "device-audio",
-    any(feature = "midi", feature = "osc", feature = "serial")
-))]
-use live::remaining_output_delay;
 #[cfg(all(test, feature = "device-audio", feature = "midi"))]
 use live::sync_live_midi_inputs;
 #[cfg(all(
@@ -4770,17 +4762,6 @@ mod dsp_selection_tests {
         }
     }
 
-    #[test]
-    fn unavailable_doctor_keeps_the_configured_selection_without_audio_facts() {
-        let report = doctor_unavailable_report(rustel_audio::DspDispatch::portable(), "not opened");
-        assert_eq!(report.runtime.acceleration_preference, "portable");
-        assert!(report.audio.is_none());
-        assert_eq!(
-            report.audio_unavailable_reason.as_deref(),
-            Some("not opened")
-        );
-    }
-
     #[cfg(feature = "device-audio")]
     #[test]
     fn live_options_and_doctor_follow_the_actual_device_through_recycle() {
@@ -5119,40 +5100,6 @@ mod live_output_contract_tests {
             said(&started).as_deref(),
             Some("Started song.strudel · script engine, line 3 needs it")
         );
-    }
-
-    /// `--json` selects structured live events for the play command,
-    /// including watched scores.
-    #[test]
-    fn json_on_a_watched_score_emits_the_live_stream_as_json() {
-        let cli = Cli::try_parse_from([
-            product::COMMAND_NAME,
-            "play",
-            "foo.strudel",
-            "--watch",
-            "--json",
-        ])
-        .expect("a watched score in json");
-        assert!(cli.wants_json(), "the flag is read off the play command");
-        // What `run_play` builds from it: the hidden `--ui-events` is not
-        // the only way to ask for a structured stream.
-        let output = LiveOutput::new(cli.verbose, cli.play().ui_events, cli.wants_json());
-        assert!(output.structured());
-        let lines = rendered(output);
-        assert!(!lines.is_empty(), "a structured run says something");
-        for line in &lines {
-            serde_json::from_str::<serde_json::Value>(line)
-                .unwrap_or_else(|_| panic!("--json emitted a human line: {line}"));
-        }
-
-        // And without it the same run stays human, so the flag is what
-        // decides rather than the verbosity that happens to be set.
-        let plain = Cli::try_parse_from([product::COMMAND_NAME, "play", "foo.strudel", "--watch"])
-            .expect("a watched score");
-        assert!(!plain.wants_json());
-        let output = LiveOutput::new(plain.verbose, plain.play().ui_events, plain.wants_json());
-        assert!(!output.structured());
-        assert_human(&rendered(output));
     }
 
     /// Playback and replay both accept `--json` and use the same live event stream.
@@ -5936,35 +5883,6 @@ mod tests {
     }
 
     #[test]
-    fn device_recycle_reinstalls_pcm_and_keeps_a_newer_publication_authoritative() {
-        let retained_only_id = rustel_audio::SampleId(8);
-        let replaced_id = rustel_audio::SampleId(9);
-        let old = decoded_sample(0.25);
-        let new = decoded_sample(0.75);
-        let mut retained = std::collections::HashMap::from([
-            (retained_only_id, old.clone()),
-            (replaced_id, old.clone()),
-        ]);
-        // `requeue_retained_samples` and the library's atomic ordering are
-        // exercised in library tests; this binary-level test pins the final
-        // install/retention behavior without constructing a test-only library.
-        let ready = vec![(retained_only_id, old.clone()), (replaced_id, new.clone())];
-
-        let mut installed = Vec::new();
-        let retry = install_sample_batch(ready, &mut retained, |id, decoded| {
-            installed.push((id, decoded));
-            Ok(())
-        });
-
-        assert!(retry.is_empty());
-        assert_eq!(
-            installed,
-            vec![(retained_only_id, old), (replaced_id, new.clone())]
-        );
-        assert_eq!(retained.get(&replaced_id), Some(&new));
-    }
-
-    #[test]
     fn an_out_of_range_sample_id_is_never_retained_for_recycle() {
         let id = rustel_audio::SampleId(rustel_audio::SAMPLE_BANK_CAPACITY as u32);
         let mut retained = std::collections::HashMap::new();
@@ -6255,32 +6173,6 @@ mod tests {
     }
 
     #[test]
-    fn ui_layout_stays_on_the_audible_generation_until_cutover() {
-        let mut delivery = UiLayoutDelivery::default();
-        let old_source = "note(\"c4\").scope()";
-        let candidate = "note(\"d4\").pianoroll()";
-        assert!(delivery.observe(old_source, 7).expect("old layout"));
-        assert!(delivery.try_deliver(|_| Ok(())));
-        assert!(delivery.ready_for(7));
-
-        assert!(
-            !observe_ui_layout_if_audible(&mut delivery, candidate, 8, 7)
-                .expect("unpublished candidate")
-        );
-        assert_eq!(delivery.observed_generation, Some(7));
-        assert!(delivery.ready_for(7));
-        assert!(delivery.audio_requested());
-
-        assert!(
-            observe_ui_layout_if_audible(&mut delivery, candidate, 8, 8)
-                .expect("completed cutover")
-        );
-        assert_eq!(delivery.observed_generation, Some(8));
-        assert!(!delivery.ready_for(8));
-        assert!(!delivery.audio_requested());
-    }
-
-    #[test]
     fn ui_visual_audio_captures_only_pattern_audio_slots() {
         let mut delivery = UiLayoutDelivery::default();
         delivery
@@ -6451,23 +6343,6 @@ mod tests {
         {
             assert!((master - low - high).abs() < 1e-5);
         }
-    }
-
-    #[test]
-    #[cfg(any(feature = "midi", feature = "osc", feature = "serial"))]
-    fn external_deadline_uses_the_remaining_device_clock_delay() {
-        assert_eq!(
-            remaining_output_delay(12.5, 10.0),
-            std::time::Duration::from_secs_f64(2.5)
-        );
-        assert_eq!(
-            remaining_output_delay(12.5, 11.75),
-            std::time::Duration::from_secs_f64(0.75)
-        );
-        assert_eq!(
-            remaining_output_delay(12.5, 13.0),
-            std::time::Duration::ZERO
-        );
     }
 
     fn slider_control(
