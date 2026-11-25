@@ -219,6 +219,27 @@ pub struct OutlineView<'a> {
     pub native: Option<bool>,
 }
 
+/// `text` in `width` cells. A string that ends the text is shortened
+/// inside its quotes, `"bd sd[...]"`, so the line still reads as one.
+fn fit(text: &str, width: u16) -> String {
+    let width = usize::from(width);
+    if text.chars().count() <= width {
+        return text.to_owned();
+    }
+    match text.chars().last() {
+        Some(quote @ ('"' | '\'' | '`')) if width > 8 => {
+            let head = text.strip_suffix(quote).unwrap_or(text);
+            let head = head.strip_suffix("[...]").unwrap_or(head);
+            let line: String = head.chars().take(width - 6).collect();
+            let mut line = line.trim_end().to_owned();
+            line.push_str("[...]");
+            line.push(quote);
+            line
+        }
+        _ => super::view::ellipsize(text, width as u16),
+    }
+}
+
 /// The rows of the top-level statement that holds `caret`: the statement's
 /// row and the rows under it.
 pub fn statement_rows(nodes: &[OutlineNode], caret: usize) -> std::ops::Range<usize> {
@@ -324,7 +345,7 @@ impl Widget for OutlineView<'_> {
                     let indent = (usize::from(node.depth) * 2).min(usize::from(body.width) / 2);
                     let branch = if node.depth == 0 { "" } else { "· " };
                     let text = format!("{}{branch}{}", " ".repeat(indent), node.label);
-                    let text = super::view::ellipsize(&text, body.width);
+                    let text = fit(&text, body.width);
                     let mut style = Style::default().fg(theme.engine(native(node)));
                     // A bar at the left of the caret's statement, between the
                     // rule and the text.
@@ -437,6 +458,13 @@ mod tests {
         assert!(panel.run);
         panel.check_run(SceneId(1), Revision(2), 7, || false);
         assert!(!panel.run);
+    }
+
+    #[test]
+    fn a_long_string_is_shortened_inside_its_quotes() {
+        assert_eq!(fit("note \"c e g a b\"", 14), "note \"c[...]\"");
+        assert_eq!(fit("note \"c[...]\"", 14), "note \"c[...]\"");
+        assert_eq!(fit("short", 14), "short");
     }
 
     #[test]

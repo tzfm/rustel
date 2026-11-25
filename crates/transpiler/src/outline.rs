@@ -476,7 +476,14 @@ fn short(text: &str) -> String {
     }
     if line.chars().count() > LABEL_CHARS {
         line = line.chars().take(LABEL_CHARS).collect();
-        line.push('…');
+        // A string cut short keeps its closing quote.
+        match text.trim_end().chars().last() {
+            Some(quote @ ('"' | '\'' | '`')) => {
+                line.push_str("[...]");
+                line.push(quote);
+            }
+            _ => line.push('…'),
+        }
     }
     line
 }
@@ -570,6 +577,13 @@ mod tests {
                 ".gain 1 + 0.2 * -2 @1 (method gain)",
             ]
         );
+    }
+
+    #[test]
+    fn a_long_string_keeps_its_closing_quote() {
+        let long = format!("note(\"{}\")", "c ".repeat(60));
+        let label = &outline(&long).expect("an outline")[0].label;
+        assert!(label.ends_with("[...]\""), "{label}");
     }
 
     #[test]
