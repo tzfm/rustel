@@ -35,6 +35,17 @@ impl App {
         let editor = &scene.editor;
         panel.refresh(scene.id, editor.revision(), || editor.source());
         panel.light(editor.primary_selection().head.0);
+        // The engine's word in the title is about this score only while
+        // the engine runs this text of it.
+        let engine = self
+            .evaluated_source
+            .as_ref()
+            .map_or(0, |source| source.as_ptr() as usize);
+        let audible = self.audible_scene == Some(scene.id);
+        let evaluated = self.evaluated_source.as_deref();
+        panel.check_run(scene.id, editor.revision(), engine, || {
+            audible && evaluated.is_some_and(|source| source == editor.source())
+        });
     }
 
     /// The rows of nodes the column shows at once.

@@ -38,6 +38,11 @@ pub struct OutlinePanel {
     /// The rows of the statement that holds the caret. While the tree is
     /// stale, those of the last text that parsed.
     pub lit: std::ops::Range<usize>,
+    /// The engine runs this text of this score, so what it says ran the
+    /// score is about this one.
+    pub run: bool,
+    /// The score, its text and the engine's text `run` was worked out for.
+    run_of: Option<(SceneId, Revision, usize)>,
 }
 
 impl Default for OutlinePanel {
@@ -49,6 +54,8 @@ impl Default for OutlinePanel {
             nodes: Ok(Vec::new()),
             stale: false,
             lit: 0..0,
+            run: false,
+            run_of: None,
         }
     }
 }
@@ -78,6 +85,23 @@ impl OutlinePanel {
             }
         }
         self.clamp();
+    }
+
+    /// Work out again whether the engine runs this text, when the score,
+    /// its text or the engine's text changed. `engine` names the engine's
+    /// text, and `runs` compares the two.
+    pub fn check_run(
+        &mut self,
+        scene: SceneId,
+        revision: Revision,
+        engine: usize,
+        runs: impl FnOnce() -> bool,
+    ) {
+        let key = (scene, revision, engine);
+        if self.run_of != Some(key) {
+            self.run_of = Some(key);
+            self.run = runs();
+        }
     }
 
     /// Light the statement that holds the caret's byte. A stale tree keeps
@@ -191,6 +215,7 @@ pub struct OutlineView<'a> {
     pub focused: bool,
     pub area: Rect,
     /// What ran the score last, when the engine has said: native or not.
+    /// Not said for a text the engine does not run.
     pub native: Option<bool>,
 }
 
@@ -253,19 +278,18 @@ impl Widget for OutlineView<'_> {
                 Style::default().fg(theme.muted),
             );
         }
-        // What ran the score, at the title's end, in its colour.
-        if let Some(native) = self.native {
-            let word = if native { "native" } else { "script" };
-            let x = parts.title.right().saturating_sub(word.len() as u16);
-            if x > parts.title.x + 10 {
-                buffer.set_stringn(
-                    x,
-                    parts.title.y,
-                    word,
-                    word.len(),
-                    Style::default().fg(theme.engine(native)),
-                );
-            }
+        // What ran the score, at the title's end, in its colour. A text
+        // the engine does not run has no answer until an update.
+        let (word, style) = match self.native.filter(|_| self.panel.run) {
+            Some(native) => (
+                if native { "native" } else { "script" },
+                Style::default().fg(theme.engine(native)),
+            ),
+            None => ("not run", Style::default().fg(theme.muted)),
+        };
+        let x = parts.title.right().saturating_sub(word.len() as u16);
+        if x > parts.title.x + 10 {
+            buffer.set_stringn(x, parts.title.y, word, word.len(), style);
         }
         let body = parts.body;
         let muted = Style::default().fg(theme.muted);
@@ -405,6 +429,16 @@ mod tests {
         });
         panel.light(20);
         assert_eq!(panel.lit, 0..2);
+    }
+
+    #[test]
+    fn the_run_is_worked_out_again_only_when_a_text_changes() {
+        let mut panel = panel("s(\"bd\")");
+        panel.check_run(SceneId(1), Revision(1), 7, || true);
+        panel.check_run(SceneId(1), Revision(1), 7, || unreachable!("same texts"));
+        assert!(panel.run);
+        panel.check_run(SceneId(1), Revision(2), 7, || false);
+        assert!(!panel.run);
     }
 
     #[test]
