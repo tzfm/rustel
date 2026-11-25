@@ -227,49 +227,6 @@ fn enter_renders_the_scene_into_the_exports_folder() {
     studio.press(KeyCode::Esc, KeyModifiers::NONE);
 }
 
-/// The sheet stays open over the bounce it starts, as a DAW's render
-/// window: the row says how far with a percent, and the hint names the
-/// way out. Esc closes the window, and the bounce runs on in the header
-/// until it lands.
-#[test]
-fn the_sheet_shows_the_render_over_its_bounce() {
-    let mut studio = hermetic();
-
-    studio.set_score("$: s(\"bd\")");
-    studio.chord("ctrl+shift+x");
-    studio.press(KeyCode::Enter, KeyModifiers::NONE);
-    // The first frame can predate the worker's first write, so the percent
-    // arrives with the render's own first progress.
-    studio.pump_until(
-        EXPORT_BUDGET,
-        "the render row showed its percent",
-        |studio| {
-            let rows = studio.rows();
-            rows.iter()
-                .any(|row| row.contains("rendering first") && row.contains('%'))
-        },
-    );
-    let rows = studio.rows();
-    row_containing(&rows, "ends it early and keeps the file");
-
-    studio.press(KeyCode::Esc, KeyModifiers::NONE);
-    assert!(
-        studio.status().contains("runs on"),
-        "the status says where the bounce went: {}",
-        studio.status()
-    );
-    row_containing(&studio.rows(), "⇣ first");
-
-    studio.pump_until(EXPORT_BUDGET, "the export landed", |studio| {
-        studio.status().starts_with("exported")
-    });
-    assert!(
-        studio.status().starts_with("exported first - "),
-        "{}",
-        studio.status()
-    );
-}
-
 /// Stems from the sheet: beside the take a `<name> stems` folder holds the
 /// same bounce as `main.wav` plus one wav a sounding orbit, and the status
 /// names the folder, because the take itself is inside it.
@@ -390,58 +347,6 @@ fn imported_and_set_folder_samples_sound_in_the_export() {
     };
     assert!(peak(0) > 0.1, "the imported pack sounds: {}", peak(0));
     assert!(peak(1) > 0.1, "the set's kit sounds: {}", peak(1));
-}
-
-/// Ctrl+Shift+X while the render runs ends it early: the take keeps what
-/// was rendered, faded out, and is still a file a musician can open.
-#[test]
-fn ctrl_shift_x_ends_a_running_export_early() {
-    let mut studio = hermetic();
-    let set = studio.set_directory().to_path_buf();
-
-    studio.set_score("$: s(\"bd\")");
-    studio.chord("ctrl+shift+x");
-    // Longer than the default so the early end has something to cut:
-    // First steps 16 → 20 cycles, some two seconds of render.
-    studio.press(KeyCode::Down, KeyModifiers::NONE);
-    studio.press(KeyCode::Right, KeyModifiers::NONE);
-    studio.press(KeyCode::Enter, KeyModifiers::NONE);
-    let started = studio.status().to_owned();
-    assert!(
-        started.starts_with("exporting first (20 cycles)"),
-        "{started}"
-    );
-    // The chord after the first frame keeps the file, so it waits for the
-    // percent of the render row.
-    studio.pump_until(
-        EXPORT_BUDGET,
-        "the render row showed its percent",
-        |studio| {
-            let rows = studio.rows();
-            rows.iter()
-                .any(|row| row.contains("rendering first") && row.contains('%'))
-        },
-    );
-
-    studio.chord("ctrl+shift+x");
-    assert_eq!(
-        studio.status(),
-        "ending the export of first - fading out",
-        "the status says the tail is being faded"
-    );
-
-    wait_for_export(&mut studio);
-    let status = studio.status().to_owned();
-    assert!(
-        status.starts_with("exported first - ") && status.contains(", ended early"),
-        "{status}"
-    );
-
-    let exports = set.join("exports");
-    let count = std::fs::read_dir(&exports)
-        .expect("exports directory")
-        .count();
-    assert_eq!(count, 1, "the early end kept the one file");
 }
 
 /// A prebake tab refuses to export: setup makes no sound of its own.

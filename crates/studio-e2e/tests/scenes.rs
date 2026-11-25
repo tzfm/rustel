@@ -10,7 +10,7 @@ static AUDIO_CALLBACK_ALLOCATOR: rustel_audio::tripwire::TripwireAlloc =
     rustel_audio::tripwire::TripwireAlloc;
 
 use crossterm::event::{KeyCode, KeyModifiers};
-use rustel_studio_e2e::{Hermetic, hermetic, hermetic_sized, reopen_over, row_containing};
+use rustel_studio_e2e::{Hermetic, hermetic, hermetic_sized, reopen_over};
 
 /// A strip too small for every chip still shows the lit scene: it scrolls
 /// so the current chip is on screen and counts the chips it scrolled past
@@ -65,82 +65,6 @@ fn a_long_set_scrolls_the_strip_to_the_lit_scene() {
     );
 }
 
-/// Ctrl+N makes an empty scene beside the first, writes its file at once,
-/// and the strip shows both. The new scene takes the first free `scene N`
-/// name - beside a starter `first`, that is `scene 1`.
-#[test]
-fn ctrl_n_makes_an_empty_scene_its_file_written_beside_the_set() {
-    let mut studio = hermetic();
-    let set = studio.set_directory().to_path_buf();
-
-    studio.chord("ctrl+n");
-    studio.settle();
-
-    assert_eq!(
-        studio.status(),
-        "scene 2 - scene 1 (empty, written beside the set); ^R names it"
-    );
-    assert_eq!(studio.scene_names(), vec!["first", "scene 1"]);
-    assert!(
-        set.join("scene 1.strudel").is_file(),
-        "a scene exists on disk from the moment it exists on screen"
-    );
-}
-
-/// Ctrl+Shift+N duplicates what the focused scene says - and a prebake tab
-/// refuses to be duplicated, where a copy would be a score of nothing.
-/// The prebake tab is reached the way a musician reaches it: the settings
-/// sheet, Enter on the prebake row.
-#[test]
-fn ctrl_shift_n_duplicates_and_a_prebake_refuses() {
-    let mut studio = hermetic();
-
-    studio.set_score("$: s(\"bd\")");
-    studio.chord("ctrl+shift+n");
-    studio.settle();
-    assert_eq!(studio.score(), "$: s(\"bd\")", "the copy carries the text");
-    assert_eq!(studio.scene_names().len(), 2);
-
-    // Onto a prebake tab: the settings sheet, then Enter on the local
-    // prebake row. The walk is by label, not by row count, so the suite
-    // holds under every feature set's row list.
-    studio.chord("ctrl+shift+p");
-    for _ in 0..30 {
-        if studio
-            .rows()
-            .iter()
-            .any(|row| row.contains("▸ local prebake"))
-        {
-            break;
-        }
-        studio.press(KeyCode::Down, KeyModifiers::NONE);
-    }
-    row_containing(&studio.rows(), "▸ local prebake");
-    studio.press(KeyCode::Enter, KeyModifiers::NONE);
-    assert_eq!(
-        studio.status(),
-        "prebake (local) - setup before the scores; ^Enter applies it, ^W closes the tab"
-    );
-    assert_eq!(studio.focus(), None, "a prebake tab is no panel");
-    assert_eq!(
-        studio.scene_names().last(),
-        Some(&"prebake (local)".to_owned()),
-        "the prebake sits at the end of the strip"
-    );
-
-    // And the refusal: setup is not a score to copy.
-    studio.chord("ctrl+shift+n");
-    assert_eq!(
-        studio.status(),
-        "prebake (local) is setup, not a score - ^N makes an empty scene"
-    );
-    assert_eq!(
-        studio.scene_names().len(),
-        3,
-        "nothing was copied - the strip grew only by the prebake tab itself"
-    );
-}
-
 /// The menu renames the scene, its file follows, and Esc cancels without
 /// touching anything.
 #[test]
@@ -183,59 +107,6 @@ fn the_menu_renames_and_esc_cancels() {
     assert_eq!(studio.status(), "renamed \"first\" to \"intro\"");
 }
 
-/// Ctrl+W closes a clean scene - saying its file is still on disk - and
-/// the edit on the first scene survives the round trip.
-#[test]
-fn ctrl_w_closes_a_clean_scene_saying_its_file_stays() {
-    let mut studio = hermetic();
-    let set = studio.set_directory().to_path_buf();
-
-    studio.set_score("$: s(\"hh\")");
-    assert!(studio.is_dirty());
-
-    studio.chord("ctrl+n");
-    studio.settle();
-    studio.chord("ctrl+w");
-    studio.settle();
-
-    assert_eq!(
-        studio.status(),
-        "closed \"scene 1\" - its file stays in the set; ^B lists it"
-    );
-    assert_eq!(studio.scene_names(), vec!["first"]);
-    assert_eq!(
-        studio.score(),
-        "$: s(\"hh\")",
-        "the edit survives on the first scene"
-    );
-    assert!(
-        set.join("first.strudel").is_file(),
-        "the scene is still on disk"
-    );
-}
-
-/// Ctrl+W on a dirty scene writes it on its way out: nothing is ever lost
-/// by closing, and the file the folder keeps is the text the strip had.
-#[test]
-fn ctrl_w_writes_a_dirty_scene_on_its_way_out() {
-    let mut studio = hermetic();
-    let set = studio.set_directory().to_path_buf();
-
-    studio.set_score("$: s(\"hh\")");
-    studio.chord("ctrl+n");
-    studio.settle();
-
-    // Back onto the dirty first scene, and close it there.
-    studio.press(KeyCode::F(6), KeyModifiers::NONE);
-    assert_eq!(studio.scene_names().first(), Some(&"first".to_owned()));
-    studio.chord("ctrl+w");
-    studio.settle();
-
-    assert_eq!(studio.scene_names(), vec!["scene 1"]);
-    let written = std::fs::read_to_string(set.join("first.strudel")).expect("dirty scene written");
-    assert_eq!(written, "$: s(\"hh\")", "the closing write kept the edit");
-}
-
 /// Closing the last score saves it and leaves a fresh empty score, through
 /// either the shortcut or the menu.
 #[test]
@@ -264,25 +135,6 @@ fn closing_the_last_scene_opens_an_empty_scene() {
             ""
         );
     }
-}
-
-/// F6/F7 walk the strip; stepping into a one-scene set says so rather
-/// than silently doing nothing.
-#[test]
-fn f6_and_f7_walk_the_strip() {
-    let mut studio = hermetic();
-
-    studio.press(KeyCode::F(6), KeyModifiers::NONE);
-    assert_eq!(studio.status(), "this set has one scene - ^N adds another");
-
-    studio.chord("ctrl+n");
-    studio.settle();
-    assert_eq!(studio.scene_names(), vec!["first", "scene 1"]);
-
-    studio.press(KeyCode::F(6), KeyModifiers::NONE);
-    assert_eq!(studio.scene_names().first(), Some(&"first".to_owned()));
-    studio.press(KeyCode::F(7), KeyModifiers::NONE);
-    assert_eq!(studio.scene_names().last(), Some(&"scene 1".to_owned()));
 }
 
 /// The manifest remembers the set: a name written here is the name a

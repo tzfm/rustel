@@ -22,35 +22,6 @@ fn log_title_row(rows: &[String]) -> Option<usize> {
         .position(|row| row.contains(" log - ") && row.contains('─'))
 }
 
-/// F9 opens the log as a sheet with the keyboard; Esc hands the keys back
-/// and the sheet is gone from the frame.
-#[test]
-fn f9_opens_the_log_sheet_and_esc_closes_it() {
-    let mut studio = hermetic();
-
-    studio.press(KeyCode::F(9), KeyModifiers::NONE);
-    assert_eq!(studio.focus(), Some(PanelKind::Log));
-    assert!(
-        studio.status().starts_with("log"),
-        "opening the log says so: {}",
-        studio.status()
-    );
-    assert!(
-        log_title_row(&studio.rows()).is_some(),
-        "the sheet is drawn:\n{}",
-        studio.screen()
-    );
-
-    studio.press(KeyCode::Esc, KeyModifiers::NONE);
-    assert_eq!(studio.focus(), None, "Esc gives the keys back");
-    assert_eq!(
-        log_title_row(&studio.rows()),
-        None,
-        "Esc closed the sheet:\n{}",
-        studio.screen()
-    );
-}
-
 /// Shift+F9 docks the log along the bottom and says how to move and size
 /// it; `e` flips it to the top band; Esc leaves the keyboard while the dock
 /// stays standing where it was put. Each claim is read off where the

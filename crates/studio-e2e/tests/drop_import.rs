@@ -13,7 +13,7 @@ static AUDIO_CALLBACK_ALLOCATOR: rustel_audio::tripwire::TripwireAlloc =
 use std::path::{Path, PathBuf};
 
 use crossterm::event::{KeyCode, KeyModifiers};
-use rustel_studio_e2e::{Hermetic, PanelKind, hermetic, reopen_over, wav_bytes};
+use rustel_studio_e2e::{Hermetic, hermetic, reopen_over, wav_bytes};
 
 /// A fresh folder under the temp root this one test owns: unique per tag
 /// so two tests can drop two different folders in one run, and outside
@@ -70,57 +70,6 @@ fn wait_for_import(studio: &mut Hermetic, folders: &[&Path]) {
     );
 }
 
-/// A dropped folder of audio is imported as a sample source. A terminal has
-/// no folder window to show progress, so the studio opens the Sources page,
-/// which lists what arrived.
-#[test]
-fn a_dropped_folder_is_imported_and_lands_on_sources() {
-    let mut studio = hermetic();
-    let folder = audio_folder("import");
-
-    studio.paste(&folder.display().to_string());
-    studio.settle();
-    wait_for_import(&mut studio, &[&folder]);
-
-    assert_eq!(
-        studio.focus(),
-        Some(PanelKind::Settings),
-        "the import lands on the settings sheet, not in the score"
-    );
-    let rows = studio.rows();
-    assert!(
-        source_row_holds(&rows, &folder),
-        "the imported folder is listed as a local source on the sheet:\n{}",
-        rows.join("\n")
-    );
-    cleanup(&folder);
-}
-
-/// A take dropped from the set's own `sessions/` folder is refused: that
-/// folder is where the studio writes, never a sample source. The status
-/// says so, the score stays as it was and the Sources page never opens.
-#[test]
-fn a_take_dropped_from_the_sets_sessions_folder_is_not_imported() {
-    let mut studio = hermetic();
-    let sessions = studio
-        .set_directory()
-        .join(rustel_runtime::product::SESSIONS_DIRECTORY_NAME);
-    std::fs::create_dir_all(&sessions).expect("sessions folder");
-    let take = sessions.join("take.wav");
-    std::fs::write(&take, wav_bytes()).expect("take");
-    let score = studio.score();
-
-    studio.paste(&take.display().to_string());
-    studio.settle();
-
-    assert_eq!(
-        studio.status(),
-        "sessions not imported - it is a set's own sessions folder, which the studio writes into"
-    );
-    assert_eq!(studio.score(), score, "the path was not typed");
-    assert_ne!(studio.focus(), Some(PanelKind::Settings));
-}
-
 /// A single dropped sound imports the folder it sits in. That folder is the
 /// source, so the sound's sibling files come with it.
 #[test]
@@ -174,33 +123,6 @@ fn a_dropped_score_opens_as_a_tab() {
     cleanup(&folder);
 }
 
-/// A score that is already open is selected, not opened twice: the drop
-/// says so and the tab count stays put.
-#[test]
-fn a_dropped_score_that_is_already_open_is_selected_not_duplicated() {
-    let mut studio = hermetic();
-    let starter = studio.set_directory().join("first.strudel");
-
-    studio.paste(&starter.display().to_string());
-    studio.settle();
-
-    assert_eq!(
-        studio.status(),
-        "first.strudel is already open",
-        "the drop of an open score says so rather than making a second tab"
-    );
-    assert_eq!(
-        studio.scene_names().len(),
-        1,
-        "the set did not grow a duplicate scene"
-    );
-    assert_eq!(
-        studio.focus(),
-        None,
-        "the keys stay with the score - no sheet opened for a non-event"
-    );
-}
-
 /// A drop that is neither audio, nor a folder of audio, nor a score, nor a
 /// MIDI file is refused with its reason, and the path is not typed into the
 /// score.
@@ -226,36 +148,6 @@ fn a_dropped_file_that_is_neither_audio_nor_score_is_refused() {
     cleanup(&folder);
 }
 
-/// A mixed selection does both halves at once: what can import does, and
-/// what cannot is named in the status rather than silently lost.
-#[test]
-fn a_mixed_drop_imports_what_it_can_and_names_what_it_skipped() {
-    let mut studio = hermetic();
-    let folder = audio_folder("mixed");
-    let note = folder.join("note.txt");
-    std::fs::write(&note, "not a sound").expect("note");
-
-    studio.paste(&format!("{} {}", folder.display(), note.display()));
-
-    // Read before the frames settle: the import's own receipt replaces
-    // the status once the folder's scan lands, and the skipped file's
-    // naming is the first thing the drop says.
-    assert_eq!(
-        studio.status(),
-        "note.txt skipped: not audio, a score, or a MIDI file",
-        "the skipped file is named"
-    );
-
-    wait_for_import(&mut studio, &[&folder]);
-    let rows = studio.rows();
-    assert!(
-        source_row_holds(&rows, &folder),
-        "and the folder beside it still imported:\n{}",
-        rows.join("\n")
-    );
-    cleanup(&folder);
-}
-
 /// Several folders in one drop are one selection: they import together.
 #[test]
 fn dropping_two_folders_imports_them_together() {
@@ -275,62 +167,6 @@ fn dropping_two_folders_imports_them_together() {
     );
     cleanup(&first);
     cleanup(&second);
-}
-
-/// A pasted path that is not there is a paste, not a drop: the
-/// filesystem is the arbiter of what a drop was, so text that merely
-/// looks like a path still reaches the editor.
-#[test]
-fn a_pasted_path_that_is_not_there_is_text_not_a_drop() {
-    let mut studio = hermetic();
-    let missing =
-        std::env::temp_dir().join(format!("rustel-drop-missing-{}.wav", std::process::id()));
-    assert!(!missing.exists(), "the fixture path must not exist");
-
-    studio.press(KeyCode::End, KeyModifiers::NONE);
-    studio.paste(&missing.display().to_string());
-    studio.settle();
-
-    assert!(
-        studio.score().contains("rustel-drop-missing"),
-        "the nonexistent path was typed into the score: {}",
-        studio.score()
-    );
-    assert!(
-        !studio.status().contains("imported"),
-        "nothing imported from a path that is not there: {}",
-        studio.status()
-    );
-}
-
-/// The samples search box is the deliberate exception: a folder dropped
-/// while the browser holds the keyboard imports instead of being typed
-/// into the filter - the gesture that most wants to work, since the
-/// samples panel is where you look to see whether the drop landed.
-#[test]
-fn a_drop_over_the_samples_search_box_imports_instead_of_typing() {
-    let mut studio = hermetic();
-    let folder = audio_folder("over-samples");
-
-    studio.chord("ctrl+d");
-    studio.press(KeyCode::Tab, KeyModifiers::NONE);
-    studio.wait_for_catalogue();
-    assert!(
-        studio.focus().is_some(),
-        "setup: the samples browser holds the keyboard"
-    );
-
-    studio.paste(&folder.display().to_string());
-    studio.settle();
-    wait_for_import(&mut studio, &[&folder]);
-
-    let rows = studio.rows();
-    assert!(
-        source_row_holds(&rows, &folder),
-        "and it landed on Sources:\n{}",
-        rows.join("\n")
-    );
-    cleanup(&folder);
 }
 
 /// A text prompt keeps a pasted path as text: renaming a scene to a

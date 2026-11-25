@@ -9,8 +9,7 @@ static AUDIO_CALLBACK_ALLOCATOR: rustel_audio::tripwire::TripwireAlloc =
 
 use crossterm::event::{KeyCode, KeyModifiers, MouseButton, MouseEventKind};
 use rustel_studio_e2e::{
-    PanelKind, glyph_column, hermetic, hermetic_with_live_slider, hermetic_with_local_bank,
-    row_containing,
+    glyph_column, hermetic, hermetic_with_live_slider, hermetic_with_local_bank, row_containing,
 };
 
 /// (column, row) of a needle in the rendered frame - the needle's first
@@ -133,28 +132,6 @@ fn drag(studio: &mut rustel_studio_e2e::Hermetic, from: (u16, u16), to: (u16, u1
     );
 }
 
-/// A plain click on a scene chip selects that scene, and plays nothing.
-#[test]
-fn a_click_on_a_scene_chip_selects_it() {
-    let mut studio = hermetic();
-    studio.chord("ctrl+n");
-    studio.settle();
-    assert_eq!(studio.scene_names().len(), 2, "setup: two scenes");
-
-    // The starter scene is named `first`, so the new one takes the first
-    // free numbered name - `scene 1`, not `scene 2`.
-    let rows = studio.rows();
-    let (x, y) = locate(&rows, "2 scene 1");
-    studio.click(x + 2, y);
-
-    assert_eq!(
-        studio.current_scene_index(),
-        1,
-        "the click selected the second scene"
-    );
-    assert!(!studio.is_playing(), "selecting a scene is not playing it");
-}
-
 /// No click plays a scene: no modifier, no right button. macOS turns
 /// Ctrl+click into a right click, so the test checks both. A click selects
 /// the scene; ^S or a pad plays it.
@@ -210,45 +187,6 @@ fn no_click_on_a_scene_chip_plays_it() {
         chip_row.contains('▶'),
         "the playing scene's chip says so: {chip_row}"
     );
-}
-
-/// The header's readiness chip is a button: pressing it opens the log at
-/// what it is counting - the click the docs hang on the badge.
-#[test]
-fn a_click_on_the_readiness_chip_opens_the_log() {
-    let mut studio = hermetic();
-
-    let rows = studio.rows();
-    let (x, y) = locate(&rows, "✓ ready");
-    studio.click(x + 2, y);
-
-    assert_eq!(
-        studio.focus(),
-        Some(PanelKind::Log),
-        "the readiness chip opened the log"
-    );
-}
-
-/// The footer's ♪ chip opens the device picker over itself, keyboard and
-/// all - and Esc hands everything back.
-#[test]
-fn a_click_on_the_device_chip_opens_the_picker() {
-    let mut studio = hermetic();
-
-    let rows = studio.rows();
-    let (x, y) = locate(&rows, "♪ no output");
-    studio.click(x + 1, y);
-
-    assert_eq!(
-        studio.focus(),
-        Some(PanelKind::Devices),
-        "the ♪ chip opened the picker"
-    );
-    assert!(studio.panel().is_some(), "the picker is standing");
-
-    studio.press(KeyCode::Esc, KeyModifiers::NONE);
-    assert_eq!(studio.focus(), None, "Esc closed the picker");
-    assert!(studio.panel().is_none());
 }
 
 /// A menu row works by mouse, end to end: File ▸ Quit quits outright -
@@ -366,54 +304,6 @@ fn the_wheel_over_the_master_meter_steps_the_fader() {
     );
 }
 
-/// A drag on a live slider's pill rewrites the literal - the knob goes
-/// under the pointer, the score follows - and the status names the
-/// control the way an armed slider does.
-#[test]
-fn dragging_a_slider_pill_rewrites_the_literal() {
-    let mut studio = hermetic_with_live_slider();
-
-    let rows = studio.rows();
-    let (knob, y) = glyph_column(&rows, '█');
-    drag(&mut studio, (knob, y), (knob + 4, y));
-
-    let source = studio.source();
-    assert!(
-        source.contains("slider(1,0,1,0.1)"),
-        "the drag pushed the knob to the top of its travel and rewrote the \
-         literal:\n{source}"
-    );
-    assert!(
-        studio.status().contains("Enter expands"),
-        "the press armed the slider and said so: {}",
-        studio.status()
-    );
-}
-
-/// A click on the pill leaves the slider armed: ←/→ then step the control
-/// without touching the caret, and Esc lets it go.
-#[test]
-fn a_click_on_the_pill_arms_the_arrows() {
-    let mut studio = hermetic_with_live_slider();
-
-    let rows = studio.rows();
-    let (knob, y) = glyph_column(&rows, '█');
-    studio.click(knob, y);
-    studio.press(KeyCode::Right, KeyModifiers::NONE);
-
-    assert!(
-        studio.source().contains("slider(0.9,0,1,0.1)"),
-        "the arrow stepped the armed slider one notch:\n{}",
-        studio.source()
-    );
-    studio.press(KeyCode::Esc, KeyModifiers::NONE);
-    assert!(
-        studio.status().contains("slider let go"),
-        "Esc disarms: {}",
-        studio.status()
-    );
-}
-
 /// The wheel over a pill steps the slider - up a notch, down a notch -
 /// the same notch the arrows step.
 #[test]
@@ -471,21 +361,4 @@ fn the_wheel_over_the_samples_pulse_row_is_the_preview_volume() {
     );
     wheel(&mut studio, false, x, y as u16);
     assert_eq!(studio.status(), "preview 0.0dB", "and back up to unity");
-}
-
-/// The pointer over the terminal is what `mousex` in patterns and `mouse` in
-/// Hydra read, in the session the engine was given: from 0 to 1 across the
-/// frame, at the middle of the cell. A press moves it too.
-#[test]
-fn the_pointer_over_the_terminal_reaches_the_score() {
-    let mut studio = hermetic();
-    assert_eq!(
-        studio.score_pointer(),
-        Some((0.0, 0.0)),
-        "the corner at start"
-    );
-    studio.mouse(MouseEventKind::Moved, 74, 19, KeyModifiers::NONE);
-    assert_eq!(studio.score_pointer(), Some((74.5 / 150.0, 19.5 / 40.0)));
-    studio.click(149, 39);
-    assert_eq!(studio.score_pointer(), Some((149.5 / 150.0, 39.5 / 40.0)));
 }

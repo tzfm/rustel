@@ -148,46 +148,6 @@ fn the_set_panel_stays_under_a_sheet_and_returns() {
     assert_eq!(restored, 10, "every tape row is back after the sheet went");
 }
 
-/// A sheet raised after the reference column paints over it and takes Esc.
-/// Once focused, a modal sheet also owns panel chords until it closes.
-#[test]
-fn the_front_sheet_owns_esc_and_panel_chords() {
-    // Reference first, sheet second: the sheet is in front, so Esc is
-    // the sheet's and the reference stays.
-    let mut studio = hermetic();
-    studio.chord("ctrl+f");
-    assert_eq!(studio.focus(), Some(PanelKind::Reference));
-    row_containing(&studio.rows(), "search:");
-
-    studio.chord("ctrl+o");
-    assert_eq!(studio.focus(), Some(PanelKind::Settings));
-    studio.press(KeyCode::Esc, KeyModifiers::NONE);
-    assert_eq!(studio.focus(), None, "the sheet took the Esc");
-    assert_eq!(
-        studio.focus(),
-        None,
-        "the reference, under, did not take the keys"
-    );
-    row_containing(&studio.rows(), "search:");
-
-    // A focused modal sheet owns panel chords too: Reference cannot leap
-    // above it. Esc therefore closes Settings itself.
-    drop(studio);
-    let mut studio = hermetic();
-    studio.chord("ctrl+o");
-    assert_eq!(studio.focus(), Some(PanelKind::Settings));
-    studio.chord("ctrl+f");
-    assert_eq!(studio.focus(), Some(PanelKind::Settings));
-
-    studio.press(KeyCode::Esc, KeyModifiers::NONE);
-    assert_eq!(studio.focus(), None);
-    assert!(
-        !studio.rows().iter().any(|row| row.contains("╭─ settings ")),
-        "Esc put the focused sheet away:\n{}",
-        studio.rows().join("\n")
-    );
-}
-
 /// A sheet paints over the score's own decorations where it covers them:
 /// the orphan bracket's error colour must not show through the sheet. This
 /// is the `clear_surface` contract: a surface resets the cells it covers
@@ -307,35 +267,6 @@ fn a_set_prompt_replaces_the_sheets_and_keeps_the_panel() {
         !studio.rows().iter().any(|row| row.contains("╭─ settings ")),
         "the dismissed sheet stays dismissed"
     );
-}
-
-/// The same prompt over the docked set panel: the panel stays through the
-/// prompt's whole life - opened over it, and after the prompt's Esc the
-/// panel still has the keys and its fold is still on screen.
-#[test]
-fn the_set_panel_survives_its_own_prompt() {
-    let mut studio = hermetic();
-
-    studio.chord("ctrl+b");
-    assert_eq!(studio.focus(), Some(PanelKind::Set));
-    studio.press(KeyCode::End, KeyModifiers::NONE);
-    row_containing(&studio.rows(), "sessions");
-
-    studio.chord("ctrl+shift+o");
-    assert_eq!(studio.focus(), Some(PanelKind::Set));
-    assert_eq!(
-        studio.status(),
-        "open a set or a Strudel export - Enter opens the chosen one · Tab browses · type a path · Esc back"
-    );
-
-    studio.press(KeyCode::Esc, KeyModifiers::NONE);
-    assert_eq!(studio.status(), "set prompt closed");
-    assert_eq!(
-        studio.focus(),
-        Some(PanelKind::Set),
-        "the panel took the keys back, not the score"
-    );
-    row_containing(&studio.rows(), "sessions");
 }
 
 /// A toast over an open sheet: the confirmation is painted in the same

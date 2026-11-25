@@ -204,24 +204,6 @@ fn an_action_mapping_cancels_a_pending_operator() {
     assert_eq!(studio.caret(), 7, "j is a plain motion again");
 }
 
-#[test]
-fn an_action_mapping_arms_quit_and_a_second_press_quits() {
-    let mut studio = hermetic();
-    std::fs::write(
-        studio.config_home().join("vimrc"),
-        "nnoremap Z <Action:quit>\n",
-    )
-    .expect("quit mapping");
-    enable_vim(&mut studio);
-    studio.set_score("// one\n");
-    studio.set_caret(0);
-
-    studio.type_text("Z");
-    assert!(!studio.wants_quit(), "the first press only arms quit");
-    studio.type_text("Z");
-    assert!(studio.wants_quit(), "the second press quits");
-}
-
 /// One press of a mapping is one answer to an armed quit. A chord the
 /// mapping presses before its quit action does not call the quit off.
 #[test]

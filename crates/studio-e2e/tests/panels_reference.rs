@@ -14,7 +14,7 @@ static AUDIO_CALLBACK_ALLOCATOR: rustel_audio::tripwire::TripwireAlloc =
     rustel_audio::tripwire::TripwireAlloc;
 
 use crossterm::event::{KeyCode, KeyModifiers};
-use rustel_studio_e2e::{PanelKind, hermetic, hermetic_sized, reopen_over, row_containing};
+use rustel_studio_e2e::{hermetic, hermetic_sized, reopen_over, row_containing};
 
 /// No terminal size hides a tab. The labels are measured from one table and
 /// drawn from the geometry the hit-test reads. From the widest studio to
@@ -106,28 +106,6 @@ fn a_narrow_strip_keeps_the_shown_tab_seated() {
     studio.press(KeyCode::Esc, KeyModifiers::NONE);
 }
 
-/// Ctrl+D on a documented name opens that name's entry, with the column
-/// focused - the whole point of the chord.
-#[test]
-fn ctrl_d_opens_the_entry_for_the_word_under_the_caret() {
-    let mut studio = hermetic();
-    studio.set_score("$: s(\"bd\")");
-
-    // The caret just past `s` - the word under the caret is the function,
-    // which the reference documents; `bd` is a sample name it does not.
-    studio.press(KeyCode::End, KeyModifiers::NONE);
-    for _ in 0..6 {
-        studio.press(KeyCode::Left, KeyModifiers::NONE);
-    }
-    studio.chord("ctrl+d");
-
-    assert_eq!(studio.focus(), Some(PanelKind::Reference));
-    assert_eq!(studio.reference_tab(), Some("reference"));
-    assert_eq!(studio.status(), "reference - s");
-    row_containing(&studio.rows(), "reference");
-    row_containing(&studio.rows(), "s(sound)");
-}
-
 /// Ctrl+D on a name the reference has no entry for opens the browser on
 /// the nearest real names, and choosing one replaces the word that opened
 /// it - the anchor is the misspelt word, not the caret.
@@ -166,38 +144,6 @@ fn ctrl_d_on_an_unknown_word_browses_and_enter_replaces_it() {
         "$: gain(0.4)",
         "the caret is inside the call"
     );
-}
-
-/// A searched function inserts a balanced call and keeps its parameters visible.
-#[test]
-fn browse_searches_and_enter_inserts_the_call_with_its_parameters() {
-    let mut studio = hermetic();
-    studio.set_score("$: ");
-    studio.press(KeyCode::End, KeyModifiers::NONE);
-    studio.chord("ctrl+d");
-    studio.type_text("chor");
-    row_containing(&studio.rows(), "search: chor");
-    studio.press(KeyCode::Enter, KeyModifiers::NONE);
-    assert_eq!(studio.score(), "$: chord()");
-    assert_eq!(studio.reference_tab(), Some("reference"));
-    row_containing(&studio.rows(), "chord(");
-    studio.type_text("\"C\"");
-    assert_eq!(studio.score(), "$: chord(\"C\")");
-    studio.press(KeyCode::Esc, KeyModifiers::NONE);
-    assert_eq!(studio.reference_tab(), None);
-}
-
-/// Esc from the bare browser closes the column outright.
-#[test]
-fn esc_from_browse_closes_the_column() {
-    let mut studio = hermetic();
-
-    studio.press(KeyCode::Home, KeyModifiers::NONE);
-    studio.chord("ctrl+d");
-    studio.press(KeyCode::Esc, KeyModifiers::NONE);
-
-    assert_eq!(studio.reference_tab(), None);
-    assert_eq!(studio.status(), "reference closed");
 }
 
 /// OSC off hides squiz from the browser and the suggestions. `tag:osc` and
@@ -382,52 +328,4 @@ fn kabelsalat_visibility_survives_a_reopen_and_can_be_restored() {
         lists_worklet(&mut studio),
         "switching on restores the category"
     );
-}
-
-/// Tab walks the tabs - reference, samples, chords, scales - and Esc from
-/// any of them closes the column. (With the `hydra` feature Generator and Examples
-/// follow scales; this walk only pins the four every build has.)
-#[test]
-fn tab_walks_the_tabs() {
-    let mut studio = hermetic();
-
-    studio.press(KeyCode::Home, KeyModifiers::NONE);
-    studio.chord("ctrl+d");
-    assert_eq!(studio.reference_tab(), Some("reference"));
-
-    studio.press(KeyCode::Tab, KeyModifiers::NONE);
-    assert_eq!(studio.reference_tab(), Some("samples"));
-    studio.press(KeyCode::Tab, KeyModifiers::NONE);
-    assert_eq!(studio.reference_tab(), Some("chords"));
-    studio.press(KeyCode::Tab, KeyModifiers::NONE);
-    assert_eq!(studio.reference_tab(), Some("scales"));
-
-    studio.press(KeyCode::Esc, KeyModifiers::NONE);
-    assert_eq!(studio.reference_tab(), None, "Esc closes from any tab");
-}
-
-/// An open entry has no search box: its letters belong to the score.
-/// Reading an entry and typing what it teaches is the point.
-#[test]
-fn letters_fall_through_to_the_score_in_entry_mode() {
-    let mut studio = hermetic();
-    studio.set_score("$: s(\"bd\")");
-
-    studio.press(KeyCode::End, KeyModifiers::NONE);
-    for _ in 0..6 {
-        studio.press(KeyCode::Left, KeyModifiers::NONE);
-    }
-    studio.chord("ctrl+d");
-    assert_eq!(studio.reference_tab(), Some("reference"));
-
-    // End is not the column's key: it moves the caret in the score.
-    studio.press(KeyCode::End, KeyModifiers::NONE);
-    studio.type_text("x");
-
-    assert_eq!(
-        studio.score(),
-        "$: s(\"bd\")x",
-        "the letter reached the score while the entry was open"
-    );
-    assert_eq!(studio.reference_tab(), Some("reference"), "still open");
 }

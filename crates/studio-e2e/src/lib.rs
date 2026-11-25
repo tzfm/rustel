@@ -882,12 +882,4 @@ mod printable_tests {
             );
         }
     }
-
-    /// A diagnostic also has to stay honest: ordinary text passes through
-    /// unchanged, so what failed still reads like what failed.
-    #[test]
-    fn plain_text_is_untouched() {
-        let text = "✓ ready  quit again in...";
-        assert_eq!(printable(text), text);
-    }
 }

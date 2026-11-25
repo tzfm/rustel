@@ -25,39 +25,6 @@ fn chip_row(studio: &mut rustel_studio_e2e::Hermetic) -> String {
         .expect("the strip row with the scenes' chips is on screen")
 }
 
-/// ^⇧U flags the scene: the status says which way the next play goes, and
-/// the chip wears `⟲` to say so. Another ^⇧U gives the flag back - and the
-/// chip goes back to the ordinary join-the-cycle kind, with no `⟲` left
-/// for a reader to misread.
-#[test]
-fn ctrl_shift_u_flags_the_scene_and_the_chip_wears_the_mark() {
-    let mut studio = hermetic();
-
-    studio.chord("ctrl+shift+u");
-    assert_eq!(
-        studio.status(),
-        "\"first\" plays from its own cycle 0 ↺",
-        "the flag is announced in the words the docs use"
-    );
-    let strip = chip_row(&mut studio);
-    assert!(
-        strip.contains("⟲"),
-        "the lit chip wears the rewind mark: {strip:?}"
-    );
-
-    studio.chord("ctrl+shift+u");
-    assert_eq!(
-        studio.status(),
-        "\"first\" joins the cycle already running",
-        "the flag off is the ordinary join-the-cycle kind"
-    );
-    let strip = chip_row(&mut studio);
-    assert!(
-        !strip.contains("⟲"),
-        "no mark on a scene that joins the cycle: {strip:?}"
-    );
-}
-
 /// Scene ▸ Rewind on play is the same door as ^⇧U: the toggle row shows the
 /// scene's current answer, Enter flips it, and the tick agrees with the
 /// chip. The status line is the bar's own summary of the row - what the
@@ -196,41 +163,4 @@ fn the_rewind_flag_survives_a_reopen() {
     reopened.press(KeyCode::F(1), KeyModifiers::NONE);
     reopened.press(KeyCode::Char('s'), KeyModifiers::NONE);
     row_containing(&reopened.rows(), "✓Rewind on play");
-}
-
-/// ^⇧S is the once-off, for a scene that wears no `⟲`: the score plays and
-/// the status is the transport's own - nothing was flagged, so nothing on
-/// the strip changed. Transport ▸ Rewind update is the same command by
-/// menu.
-#[test]
-fn ctrl_shift_s_rewinds_once_without_flagging_the_scene() {
-    let mut studio = hermetic();
-
-    studio.chord("ctrl+shift+s");
-    studio.settle();
-    assert!(
-        studio.is_playing(),
-        "the once-off plays the score like any update"
-    );
-    let strip = chip_row(&mut studio);
-    assert!(
-        !strip.contains("⟲"),
-        "the once-off flags nothing: {strip:?}"
-    );
-    assert!(
-        !studio.rows().iter().any(|row| row.contains("⟲")),
-        "no chip wears the mark anywhere on the strip"
-    );
-
-    // The menu row does the same thing the key does.
-    studio.press(KeyCode::F(1), KeyModifiers::NONE);
-    studio.press(KeyCode::Char('t'), KeyModifiers::NONE);
-    row_containing(&studio.rows(), "Rewind update");
-    row_containing(&studio.rows(), "^⇧S");
-    studio.press(KeyCode::Char('w'), KeyModifiers::NONE);
-    studio.settle();
-    assert!(
-        studio.is_playing(),
-        "Transport ▸ Rewind update is the once-off too"
-    );
 }

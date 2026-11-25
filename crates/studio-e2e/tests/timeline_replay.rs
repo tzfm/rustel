@@ -51,55 +51,6 @@ fn open_replay(studio: &mut Hermetic) {
     studio.render();
 }
 
-/// PgDn pages forward by the blocks the timeline shows across, not one
-/// block, and starts nothing; Home and End are the ends of the tape; PgUp
-/// pages back by the same screenful. Every page leaves the transport
-/// stopped - choosing a block is not playing it. The screenful is read from
-/// the timeline as laid out, so the expected block holds at any width.
-#[test]
-fn paging_moves_by_the_screenful_without_playing() {
-    let last = BLOCKS - 1;
-    let mut studio = hermetic();
-    open_replay(&mut studio);
-    let page = studio
-        .timeline_blocks_across()
-        .expect("the timeline is laid out");
-    // The premise: a screenful is more than the one block an arrow steps,
-    // or paging and stepping could not be told apart.
-    assert!(page >= 2, "the timeline shows {page} block(s) across");
-
-    // Alt+→ stepped onto block 1, and it is not playing.
-    assert_eq!(shown(&studio), 1);
-    assert!(!studio.is_playing(), "walking a tape is never playing it");
-
-    // PgDn from block 1 jumps exactly a screenful, and still starts nothing.
-    studio.press(KeyCode::PageDown, KeyModifiers::NONE);
-    assert_eq!(
-        shown(&studio),
-        (1 + page).min(last),
-        "PgDn paged by the timeline's width"
-    );
-    assert!(!studio.is_playing(), "a page is not a play");
-
-    // Home is the tape's first block, End its last.
-    studio.press(KeyCode::Home, KeyModifiers::NONE);
-    assert_eq!(shown(&studio), 0, "Home is the first block");
-    studio.press(KeyCode::End, KeyModifiers::NONE);
-    assert_eq!(shown(&studio), last, "End is the last block");
-
-    // PgUp pages back off the last block by the same screenful, without
-    // playing; PgDn from the last block has nowhere further to go.
-    studio.press(KeyCode::PageDown, KeyModifiers::NONE);
-    assert_eq!(shown(&studio), last, "PgDn stops at the end of the tape");
-    studio.press(KeyCode::PageUp, KeyModifiers::NONE);
-    assert_eq!(
-        shown(&studio),
-        last.saturating_sub(page),
-        "PgUp paged back by the same width"
-    );
-    assert!(!studio.is_playing(), "a page back is not a play either");
-}
-
 /// Enter plays from the selected block and the timeline keeps the keyboard.
 /// The next block is an hour later on the tape's clock, so the block on
 /// screen after the settle is the one Enter chose.

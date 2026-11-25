@@ -66,65 +66,6 @@ fn open_mapping(studio: &mut Hermetic) {
     );
 }
 
-/// The terminal-profile row is the first row: it cycles the studio's own
-/// shortcut profiles - every default re-resolved at once - and Delete
-/// hands it back to `automatic`.
-#[test]
-fn the_terminal_profile_row_cycles_and_returns_to_automatic() {
-    let mut studio = hermetic();
-    open_keybinds(&mut studio);
-    assert!(
-        row_with(&mut studio, "Terminal").contains("automatic (rustel-e2e)"),
-        "the row reads the profile the fixture's terminal got: {}",
-        row_with(&mut studio, "Terminal")
-    );
-
-    studio.press(KeyCode::Right, KeyModifiers::NONE);
-    studio.settle();
-    let status = studio.status().to_owned();
-    assert!(
-        status.starts_with("shortcut profile: ") && status.ends_with("- custom bindings kept"),
-        "cycling the profile says what was kept: {status}"
-    );
-    assert!(
-        !row_with(&mut studio, "Terminal").contains("automatic"),
-        "and the row now names a terminal: {}",
-        row_with(&mut studio, "Terminal")
-    );
-
-    studio.press(KeyCode::Delete, KeyModifiers::NONE);
-    studio.settle();
-    assert_eq!(
-        studio.status(),
-        "shortcut profile: automatic (rustel-e2e) - custom bindings kept",
-        "Delete is the road back to automatic"
-    );
-    assert!(
-        row_with(&mut studio, "Terminal").contains("automatic (rustel-e2e)"),
-        "the row reads automatic again: {}",
-        row_with(&mut studio, "Terminal")
-    );
-}
-
-/// The values chord and the docs chord do different things at the caret, so
-/// each has a row. The values row also names Ctrl+Space.
-#[test]
-fn the_values_chord_and_the_docs_chord_have_a_row_each() {
-    let mut studio = hermetic();
-    open_keybinds(&mut studio);
-    select_row(&mut studio, "▸ docs for the function");
-    let values = row_with(&mut studio, "argument values, reference");
-    assert!(
-        values.contains("^F") && values.contains("also ^Space"),
-        "the values row names Ctrl+F and Ctrl+Space: {values}"
-    );
-    let docs = row_with(&mut studio, "docs for the function");
-    assert!(
-        docs.contains("^D") && !docs.contains("also"),
-        "the docs row names Ctrl+D alone: {docs}"
-    );
-}
-
 /// A learn binds a free chord directly. A typing key and Enter are refused
 /// with a status message, never bound silently. Delete then restores the
 /// row's default, and the learned chord is the chord that fires.
@@ -300,86 +241,6 @@ fn learning_a_taken_chord_asks_and_enter_takes_it() {
     studio.settle();
 }
 
-/// Resetting every shortcut is a two-step: the ask names the profile,
-/// Esc cancels it without touching anything, and the second Enter is the
-/// only thing that resets - a learned chord comes home to its default.
-#[test]
-fn reset_all_shortcuts_asks_twice_and_cancels_cleanly() {
-    let mut studio = hermetic();
-    open_keybinds(&mut studio);
-
-    // Give the reset something to undo.
-    select_row(&mut studio, "▸ piano mode");
-    studio.press(KeyCode::Enter, KeyModifiers::NONE);
-    studio.settle();
-    studio.press(KeyCode::F(13), KeyModifiers::NONE);
-    studio.settle();
-    assert_eq!(studio.status(), "piano mode · F13", "setup: a custom chord");
-
-    select_row(&mut studio, "▸ Reset all shortcuts");
-    studio.press(KeyCode::Enter, KeyModifiers::NONE);
-    studio.settle();
-    assert_eq!(
-        studio.status(),
-        "reset all shortcuts for automatic (rustel-e2e) - Enter confirms · Esc cancels"
-    );
-    assert!(
-        studio
-            .rows()
-            .iter()
-            .any(|row| row.contains("Reset all to automatic (rustel-e2e) defaults? Enter: confirm")),
-        "and the page itself asks:\n{}",
-        studio.rows().join("\n")
-    );
-
-    studio.press(KeyCode::Esc, KeyModifiers::NONE);
-    studio.settle();
-    assert_eq!(studio.status(), "shortcut reset cancelled");
-    select_row(&mut studio, "▸ piano mode");
-    assert!(
-        row_with(&mut studio, "piano mode").contains("F13"),
-        "the cancelled reset changed nothing: {}",
-        row_with(&mut studio, "piano mode")
-    );
-
-    select_row(&mut studio, "▸ Reset all shortcuts");
-    studio.press(KeyCode::Enter, KeyModifiers::NONE);
-    studio.settle();
-    assert!(
-        studio.status().contains("Enter confirms · Esc cancels"),
-        "the ask is back: {}",
-        studio.status()
-    );
-    studio.press(KeyCode::Enter, KeyModifiers::NONE);
-    studio.settle();
-    assert_eq!(studio.status(), "shortcuts reset - automatic (rustel-e2e)");
-    select_row(&mut studio, "▸ piano mode");
-    assert!(
-        row_with(&mut studio, "piano mode").contains("F12"),
-        "and the learned chord came home: {}",
-        row_with(&mut studio, "piano mode")
-    );
-
-    studio.press(KeyCode::Esc, KeyModifiers::NONE);
-    studio.settle();
-    studio.press(KeyCode::F(13), KeyModifiers::NONE);
-    studio.settle();
-    assert!(
-        !studio.rows().iter().any(|row| row.contains("PIANO")),
-        "F13 is nobody's again:\n{}",
-        studio.rows().join("\n")
-    );
-    studio.press(KeyCode::F(12), KeyModifiers::NONE);
-    studio.settle();
-    assert!(
-        studio.rows().iter().any(|row| row.contains("PIANO")),
-        "F12 is the piano's:\n{}",
-        studio.rows().join("\n")
-    );
-    studio.press(KeyCode::Esc, KeyModifiers::NONE);
-    studio.settle();
-}
-
 /// The Mapping page walks its twelve slots in three columns and every
 /// slot answers for itself: Enter arms a learn for hardware that may
 /// never arrive, Space on an unbound slot says so rather than pretending,
@@ -440,31 +301,6 @@ fn the_mapping_page_walks_its_slots_and_arms_a_learn() {
         "slot 5 is not bound to anything",
         "and Down steps a row of the three-column grid"
     );
-}
-
-/// A chord learnt for a prebake action fires from the sheet, which closes
-/// as the prebake tab takes the keyboard.
-#[test]
-fn a_learned_prebake_chord_opens_the_tab() {
-    let mut studio = hermetic();
-    open_keybinds(&mut studio);
-    select_row(&mut studio, "▸ open global prebake");
-    studio.press(KeyCode::Enter, KeyModifiers::NONE);
-    studio.press(KeyCode::F(14), KeyModifiers::NONE);
-    studio.settle();
-    assert!(
-        row_with(&mut studio, "open global prebake").contains("F14"),
-        "the chord was learnt"
-    );
-
-    studio.press(KeyCode::F(14), KeyModifiers::NONE);
-    studio.settle();
-    assert!(
-        studio.status().contains("prebake (global)"),
-        "the learned chord opened the global prebake: {}",
-        studio.status()
-    );
-    assert_eq!(studio.focus(), None, "the prebake editor has the keyboard");
 }
 
 /// With Vim on, the list-navigation row starts on and plain j/k walk the

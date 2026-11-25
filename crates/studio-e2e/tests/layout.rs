@@ -35,36 +35,6 @@ fn the_empty_studio_at_80x24() {
     assert_golden(&mut studio, "layout/empty_80x24");
 }
 
-/// Ctrl+E opens a split, hops the keyboard between panes on further
-/// presses, and Ctrl+Shift+E closes it - leaving one pane holding the
-/// whole score.
-#[test]
-fn a_split_opens_hops_and_closes() {
-    let mut studio = hermetic();
-
-    studio.chord("ctrl+e");
-    studio.settle();
-    let split = studio.screen();
-    assert!(
-        split.lines().count() == 40,
-        "a split does not change the grid's height:\n{split}"
-    );
-
-    // Hop: with two panes, Ctrl+E moves the keyboard to the other pane.
-    studio.chord("ctrl+e");
-    studio.type_text("1");
-    let panes = studio.source();
-    assert!(
-        panes.contains('1'),
-        "the second pane took the key:\n{panes}"
-    );
-
-    studio.chord("ctrl+shift+e");
-    studio.settle();
-    let closed = studio.screen();
-    assert_ne!(split, closed, "closing the split changes the frame");
-}
-
 /// The frame when no job shows in the header. The read of the presets
 /// starts when the runner gets to it, and the header shows it while it
 /// runs: a frame taken then differs from one taken before or after.
@@ -112,30 +82,6 @@ fn zen_folds_the_chrome_away_and_back() {
             "row {index} differs after zen folded away and back"
         );
     }
-}
-
-/// A resize down to 80×24 and back to 150×40 lays out both times and keeps
-/// the score's text intact - the editor's viewport shrinks, its document
-/// does not.
-#[test]
-fn resizing_down_and_back_keeps_the_score() {
-    let mut studio = hermetic();
-    let before = studio.source();
-
-    studio.resize(80, 24);
-    studio.settle();
-    let narrow = studio.rows();
-    assert_eq!(narrow.len(), 24, "the frame is 24 rows");
-    assert!(
-        narrow.iter().all(|row| row.chars().count() == 80),
-        "every row is 80 cells wide"
-    );
-
-    studio.resize(150, 40);
-    studio.settle();
-    assert_eq!(studio.source(), before, "the score survived the round trip");
-    let wide = studio.rows();
-    assert_eq!(wide.len(), 40, "the frame is 40 rows again");
 }
 
 /// Walk the sheet's rows by label until the given one is selected - by

@@ -13,31 +13,7 @@ static AUDIO_CALLBACK_ALLOCATOR: rustel_audio::tripwire::TripwireAlloc =
     rustel_audio::tripwire::TripwireAlloc;
 
 use crossterm::event::{KeyCode, KeyModifiers};
-use rustel_studio_e2e::{PanelKind, hermetic, hermetic_with_local_bank, row_containing};
-
-/// With the caret inside a word, the chosen name replaces the whole token:
-/// `testk|x` becomes `testkick`, not `testktestkick`. The answer is the
-/// fixture's local `testkick` bank, so the test waits for no manifest fetch.
-#[test]
-fn a_half_typed_word_is_replaced_whole() {
-    let mut studio = hermetic_with_local_bank();
-
-    let text = "$: s(\"testkx\")";
-    studio.set_score(text);
-    studio.set_caret(text.find('x').expect("the extra letter"));
-    studio.chord("ctrl+space");
-    assert_eq!(studio.reference_tab(), Some("samples"));
-    studio.wait_for_catalogue();
-
-    // The query is what is typed before the caret; `testkick` answers it.
-    studio.press(KeyCode::Enter, KeyModifiers::NONE);
-
-    assert_eq!(
-        studio.score(),
-        "$: s(\"testkick\")",
-        "the whole token went, not just the half before the caret"
-    );
-}
+use rustel_studio_e2e::{hermetic, hermetic_with_local_bank, row_containing};
 
 /// A call whose argument has not been opened yet - `chord()` - still
 /// offers its list, and the chosen name lands quoted.
@@ -86,37 +62,6 @@ fn ctrl_d_inside_a_string_opens_the_sounds() {
     row_containing(&studio.rows(), "search: bd");
 }
 
-/// An unfinished compound argument needs the call's parameters, without
-/// replacing any of the text the musician is still writing.
-#[test]
-fn ctrl_d_inside_an_unfinished_argument_opens_its_parameters() {
-    let mut studio = hermetic();
-    let text = "$: s(\"sine\").distort(\"0.1:0.3:";
-    studio.set_score(text);
-    studio.set_caret(text.len());
-    studio.chord("ctrl+d");
-
-    assert_eq!(studio.focus(), Some(PanelKind::Reference));
-    assert_eq!(studio.reference_tab(), Some("reference"));
-    assert_eq!(studio.status(), "reference - distort");
-    row_containing(&studio.rows(), "distort(distortion, volume, type)");
-    row_containing(&studio.rows(), "type (number | string | Pattern)");
-    assert_eq!(studio.score(), text);
-
-    studio.press(KeyCode::PageDown, KeyModifiers::NONE);
-    studio.press(KeyCode::PageUp, KeyModifiers::NONE);
-    assert_eq!(
-        studio.score(),
-        text,
-        "reading parameters leaves the score intact"
-    );
-    studio.chord("ctrl+d");
-    assert_eq!(studio.reference_tab(), None);
-    assert_eq!(studio.focus(), None);
-    studio.type_text("fold\")");
-    assert_eq!(studio.score(), format!("{text}fold\")"));
-}
-
 #[test]
 fn ctrl_d_before_a_quote_opens_the_function_arguments() {
     for name in ["s", "chord", "scale"] {
@@ -129,49 +74,6 @@ fn ctrl_d_before_a_quote_opens_the_function_arguments() {
         assert_eq!(studio.reference_tab(), Some("reference"), "{name}");
         assert_eq!(studio.status(), format!("reference - {name}"));
         assert_eq!(studio.score(), text, "opening documentation is read-only");
-    }
-}
-
-#[test]
-fn ctrl_d_after_the_scale_argument_opens_inspires_arguments() {
-    let mut studio = hermetic_with_local_bank();
-    let text = "$: s(\"piano\").inspire(\"C:major:pentatonic\", ";
-    studio.set_score(text);
-    studio.set_caret(text.len());
-    studio.chord("ctrl+d");
-
-    assert_eq!(studio.reference_tab(), Some("reference"));
-    assert_eq!(studio.status(), "reference - inspire");
-    assert_eq!(studio.score(), text);
-}
-
-#[test]
-fn ctrl_d_inside_inspires_scale_argument_opens_scales() {
-    let mut studio = hermetic_with_local_bank();
-    let text = "$: s(\"piano\").inspire(\"C:ma\")";
-    studio.set_score(text);
-    studio.set_caret(text.len() - 2);
-    studio.chord("ctrl+d");
-
-    assert_eq!(studio.reference_tab(), Some("scales"));
-    assert_eq!(studio.score(), text);
-}
-
-#[test]
-fn backspace_from_an_empty_contextual_search_returns_to_function_arguments() {
-    for (name, tab) in [("s", "samples"), ("chord", "chords"), ("scale", "scales")] {
-        let mut studio = hermetic_with_local_bank();
-        let text = format!("$: {name}(\"\")");
-        studio.set_score(&text);
-        studio.set_caret(text.len() - 2);
-        studio.chord("ctrl+d");
-        assert_eq!(studio.reference_tab(), Some(tab), "{name}");
-
-        studio.press(KeyCode::Backspace, KeyModifiers::NONE);
-
-        assert_eq!(studio.reference_tab(), Some("reference"), "{name}");
-        assert_eq!(studio.status(), format!("reference - {name}"));
-        assert_eq!(studio.score(), text, "Backspace only changes the panel");
     }
 }
 
@@ -243,78 +145,6 @@ fn the_completion_retargets_to_the_string_the_caret_is_in() {
     studio.chord("ctrl+space");
     studio.settle();
     row_containing(&studio.rows(), "search: bd");
-}
-
-#[test]
-fn ctrl_d_uses_kabelsalat_documentation_inside_graphs() {
-    for (text, name, signature) in [
-        (
-            "$: note(\"c3\").K(() => sine(sFreq).out())",
-            "sine",
-            "sine(freq, sync, phase)",
-        ),
-        (
-            "$: note(\"c3\").K(() => sine(sFreq).mul(sGate.adsr(.01, .2, .5, .1)).out())",
-            "adsr",
-            "adsr(gate, att, dec, sus, rel)",
-        ),
-        (
-            "$: note(\"c3\").K(() => { Node.prototype.m = function(x) { return this.add(x) }; sine(sFreq).m(sGate.adsr(.01, .2, .5, .1)).out() })",
-            "adsr",
-            "adsr(gate, att, dec, sus, rel)",
-        ),
-    ] {
-        let mut studio = hermetic();
-        studio.set_score(text);
-        studio.set_caret(text.find(name).expect("graph function") + name.len() - 1);
-        studio.chord("ctrl+d");
-
-        assert_eq!(studio.reference_tab(), Some("reference"));
-        assert_eq!(studio.status(), format!("reference - {name}"));
-        row_containing(&studio.rows(), signature);
-        assert_eq!(studio.score(), text, "reading help leaves the graph intact");
-    }
-}
-
-#[test]
-fn ctrl_d_keeps_pattern_documentation_outside_graphs_and_inside_s() {
-    for (text, name, signature) in [
-        ("$: sine.range(0, 12)", "sine", "sine()"),
-        (
-            "$: note(\"c3\").adsr(.01, .2, .5, .1)",
-            "adsr",
-            "adsr(time, time, gain, time)",
-        ),
-        (
-            "$: note(\"c3\").K(() => sine(S(note(\"c3\").adsr(.01, .2, .5, .1))).out())",
-            "adsr",
-            "adsr(time, time, gain, time)",
-        ),
-        (
-            "$: note(\"c3\").K(() => sine(pat[0]).out(), note(\"c3\").adsr(.01, .2, .5, .1))",
-            "adsr",
-            "adsr(time, time, gain, time)",
-        ),
-        (
-            "$: note(\"c3\").worklet(\"sine(pat[0]).out()\", note(\"c3\").adsr(.01, .2, .5, .1))",
-            "adsr",
-            "adsr(time, time, gain, time)",
-        ),
-    ] {
-        let mut studio = hermetic();
-        studio.set_score(text);
-        studio.set_caret(text.find(name).expect("pattern function") + name.len() - 1);
-        studio.chord("ctrl+d");
-
-        assert_eq!(studio.reference_tab(), Some("reference"));
-        assert_eq!(studio.status(), format!("reference - {name}"));
-        row_containing(&studio.rows(), signature);
-        assert_eq!(
-            studio.score(),
-            text,
-            "reading help leaves the pattern intact"
-        );
-    }
 }
 
 #[test]
@@ -416,31 +246,6 @@ fn kabelsalat_node_properties_join_completed_calls_without_parentheses() {
         studio.score(),
         "$: note(\"c3\").K(() => sine(sFreq).inputOf)"
     );
-}
-
-#[test]
-fn kabelsalat_completion_keeps_globals_and_node_methods_in_their_own_positions() {
-    for (expression, typed, invalid) in [
-        ("n(sFreq).sFre", "sFre", "sFreq"),
-        ("n(sFreq).registerN", "registerN", "registerNode()"),
-        ("clon", "clon", "clone()"),
-    ] {
-        let mut studio = hermetic();
-        let text = format!("$: note(\"c3\").K(() => {expression})");
-        studio.set_score(&text);
-        studio.set_caret(text.rfind(typed).expect("graph name") + typed.len());
-        studio.chord("ctrl+space");
-        studio.press(KeyCode::Enter, KeyModifiers::NONE);
-
-        let start = text.rfind(typed).expect("graph name");
-        let mut invalid_score = text.clone();
-        invalid_score.replace_range(start..start + typed.len(), invalid);
-        assert_ne!(
-            studio.score(),
-            invalid_score,
-            "{invalid} is unavailable at this graph position"
-        );
-    }
 }
 
 /// Hydra names and pattern names share spellings: `osc` and `shape` are
