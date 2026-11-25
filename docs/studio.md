@@ -72,7 +72,7 @@ Use these alternatives if the terminal or operating system takes a shortcut.
 | Close scene | ^W |
 | Record a take | ^⇧R or Shift+F11 |
 | Record an input sample | ^H |
-| Log | F9; Shift+F9 docks it |
+| Log | F9; Shift+F9 docks it, Ctrl+F9 where the terminal keeps it |
 | Mixer | F4 |
 | Export | ^⇧X |
 | Set panel | ^B |
@@ -1309,7 +1309,8 @@ See [CLI export](cli.md#export) for command-line options.
 
 ## Log
 
-Press F9 to open the Log, or Shift+F9 to dock it. Esc returns to the editor.
+Press F9 to open the Log, or Shift+F9 to dock it. iTerm2 keeps Shift+F9, so
+there Ctrl+F9 docks it. Esc returns to the editor.
 End follows the newest entry. Press `v` to show verbose entries. The file
 always includes them.
 
