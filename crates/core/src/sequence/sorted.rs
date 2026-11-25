@@ -1125,6 +1125,10 @@ pub(crate) fn query_sequence_sorted_onto(
     state: &State,
     out: &mut Vec<Hap>,
 ) -> bool {
+    // A reversed span, which a negative speed asks, meets no step.
+    if state.span.begin > state.span.end {
+        return true;
+    }
     let k = layers.len();
     if k == 1 {
         return query_single_layer_sorted_onto(thread, layers, state, out);

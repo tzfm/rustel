@@ -3569,7 +3569,7 @@ fn banked_source_name(object: &serde_json::Map<String, serde_json::Value>) -> Op
 
 /// A number as JavaScript prints it, the way it names an object key: a
 /// whole number has no fraction, `808` not `808.0`.
-fn js_number_spelling(number: &serde_json::Number) -> String {
+pub fn js_number_spelling(number: &serde_json::Number) -> String {
     match number.as_f64() {
         // The shortest spelling that reads back, without a `.0` and with
         // -0 as 0, as JavaScript prints a number in its usual range.

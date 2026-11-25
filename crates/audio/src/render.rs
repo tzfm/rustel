@@ -618,7 +618,8 @@ fn write_render_wav_events(
         pcm[render_count * CHANNELS as usize..input_count * CHANNELS as usize].fill(0.0);
         input_offset += input_count;
         if let Some(steps) = fader {
-            let first = input_offset - input_count;
+            // Steps count file frames, which start after the pre-roll.
+            let first = input_offset - input_count - preroll;
             for (index, frame) in pcm[..input_count * CHANNELS as usize]
                 .as_chunks_mut::<2>()
                 .0
@@ -1309,6 +1310,41 @@ mod export_limiter_tests {
                 assert_eq!(observed, actual, "the scope sees what is written");
             }
         }
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// A fader move lands on its file frame, after a pre-roll too.
+    #[test]
+    fn a_fader_step_lands_on_its_file_frame_after_a_preroll() {
+        let dir = std::env::temp_dir().join(format!("rustel-export-fader-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("bounce.wav");
+        let (preroll, frames) = (256, 1_000);
+        let mut backend = Signal {
+            pcm: vec![0.5; (preroll + frames) * 2],
+            frames: 0,
+            preroll,
+        };
+        write_wav_controlled(
+            &path,
+            &mut backend,
+            48_000,
+            frames,
+            &[],
+            RenderControl {
+                fader: Some(&[(500, 0.0)]),
+                ..RenderControl::default()
+            },
+            WavSampleFormat::Float32,
+        )
+        .unwrap();
+        let wav = std::fs::read(&path).unwrap();
+        let left = |frame: usize| {
+            let at = 44 + frame * 8;
+            f32::from_le_bytes(wav[at..at + 4].try_into().unwrap())
+        };
+        assert_eq!(left(499), 0.5, "before the step");
+        assert_eq!(left(500), 0.0, "from the step on");
         std::fs::remove_dir_all(dir).unwrap();
     }
 }

@@ -311,7 +311,11 @@ pub(crate) fn scalar_events(
     cps: f64,
     samples: &dyn rustel_voice::SampleLookup,
 ) -> Result<Vec<rustel_audio::OnsetEvent>, String> {
-    let local: Vec<_> = onsets.iter().filter(|onset| plays_locally(onset)).collect();
+    // A voice before the start, as a strum at cycle 0, does not sound.
+    let local: Vec<_> = onsets
+        .iter()
+        .filter(|onset| plays_locally(onset) && !before_the_render(onset, sample_rate))
+        .collect();
     #[cfg(feature = "vst")]
     let mut chains = crate::vst::render_chains(&local).into_iter();
     local
@@ -2430,6 +2434,20 @@ mod tests {
             non_finite_pitch: None,
             log_line: None,
         }
+    }
+
+    /// A play skips a voice before its start, as an export does, and
+    /// plays the rest.
+    #[test]
+    fn a_play_skips_a_voice_before_its_start() {
+        let early = OnsetEventJson {
+            target_time: -0.01,
+            ..onset(serde_json::json!({"s": "sine", "note": 60}))
+        };
+        let on_time = onset(serde_json::json!({"s": "sine", "note": 64}));
+        let events =
+            scalar_events(&[early, on_time], 48_000, 0.5, &rustel_voice::BundledOnly).unwrap();
+        assert_eq!(events.len(), 1);
     }
 
     #[test]

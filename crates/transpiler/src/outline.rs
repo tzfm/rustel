@@ -308,8 +308,10 @@ impl<'s> Outline<'s> {
                         });
                         break;
                     }
+                    // `f()(1)` or `a[0](1)`: shown as script. Handing the
+                    // call back to `expression` would loop forever.
                     _ => {
-                        links.push(Link::Other(at));
+                        links.push(Link::Script(call.span));
                         break;
                     }
                 },
@@ -358,6 +360,9 @@ impl<'s> Outline<'s> {
                     self.push(depth, span, format!(".{name}"), OutlineForm::Read);
                 }
                 Link::Other(expression) => self.expression(expression, depth),
+                Link::Script(span) => {
+                    self.push(depth, span, self.text(span), OutlineForm::Script);
+                }
             }
         }
     }
@@ -419,6 +424,8 @@ enum Link<'a, 's> {
     },
     /// The first link when it is not a call of a name.
     Other(&'a Expression<'s>),
+    /// A first call whose callee is no name or member, as text.
+    Script(Span),
 }
 
 /// A literal or a name: shown on its call's line, with no node of its own.
@@ -577,6 +584,18 @@ mod tests {
         let long = format!("note(\"{}\")", "c ".repeat(60));
         let label = &outline(&long).expect("an outline")[0].label;
         assert!(label.ends_with('…'), "{label}");
+    }
+
+    #[test]
+    fn a_call_of_a_call_is_script() {
+        assert_eq!(
+            lines("foo()(1).fast(2)\na[0](1)"),
+            [
+                "foo()(1) @1 (script)",
+                ".fast 2 @1 (method fast)",
+                "a[0](1) @2 (script)",
+            ]
+        );
     }
 
     #[test]
