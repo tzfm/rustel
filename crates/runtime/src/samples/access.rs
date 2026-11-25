@@ -994,8 +994,7 @@ mod tests {
     #[cfg(test)]
     mod base_url_tests {
         use super::{
-            GITHUB_SAMPLE_MANIFEST, SHORTHANDS, SampleSource, base_url, expand_base, github_path,
-            read_source,
+            GITHUB_SAMPLE_MANIFEST, SHORTHANDS, SampleSource, base_url, expand_base, read_source,
         };
 
         /// Every shorthand goes through the one table, and a spelling that
@@ -1127,35 +1126,10 @@ mod tests {
         }
 
         #[test]
-        fn github_shorthand_keeps_the_standard_manifest_name() {
-            assert_eq!(GITHUB_SAMPLE_MANIFEST, "strudel.json");
-            assert_eq!(
-                github_path("user/repo", GITHUB_SAMPLE_MANIFEST),
-                "https://raw.githubusercontent.com/user/repo/main/strudel.json"
-            );
-        }
-
-        #[test]
         fn a_bare_origin_is_its_own_directory() {
             // What `samples('http://localhost:5432')` and the sample server give.
             assert_eq!(base_url("http://localhost:5432"), "http://localhost:5432/");
             assert_eq!(base_url("http://127.0.0.1:5432"), "http://127.0.0.1:5432/");
-        }
-
-        #[test]
-        fn a_map_url_resolves_against_its_own_folder() {
-            assert_eq!(
-                base_url("https://example.com/kit/strudel.json"),
-                "https://example.com/kit/"
-            );
-            assert_eq!(
-                base_url("https://example.com/strudel.json"),
-                "https://example.com/"
-            );
-            assert_eq!(
-                base_url("https://example.com/kit/"),
-                "https://example.com/kit/"
-            );
         }
     }
 

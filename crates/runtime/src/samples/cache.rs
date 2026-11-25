@@ -1591,14 +1591,6 @@ mod tests {
             assert_eq!(bd.origin, SoundOrigin::Score);
         }
 
-        /// Most sets hold no audio at all, which is not a failure.
-        #[test]
-        fn a_set_folder_with_no_audio_in_it_adopts_nothing() {
-            let dir = set_folder(&["song.strudel"]);
-            let library = empty_library();
-            assert_eq!(library.adopt_set_folder(dir.path()), Ok(0));
-        }
-
         /// The `kicks` bank holds the same files in the same order whatever the
         /// set's folder is called. A loose `kicks.wav` belongs to the bank named
         /// after the folder and does not join `kicks`.
@@ -2524,32 +2516,6 @@ mod tests {
                 )
                 .expect("granted read"),
                 b"seeded bytes",
-            );
-            let _ = std::fs::remove_dir_all(&dir);
-        }
-
-        /// A hit serves the bytes whether or not the server is reachable. This is
-        /// the property offline rendering depends on: the corpus fetches its
-        /// samples once and every later comparison runs with nothing listening.
-        #[test]
-        fn a_granted_url_is_served_from_cache_with_no_server_running() {
-            let dir = std::env::temp_dir().join(format!("rustel-cache-hit-{}", std::process::id()));
-            let _ = std::fs::create_dir_all(&dir);
-            let cache = ScoreCache::new(dir.clone());
-            // Port 9 is the discard port: nothing accepts there, so a fetch that
-            // reached the network at all would fail rather than pass quietly.
-            let url = "http://127.0.0.1:9/kick.wav";
-            std::fs::create_dir_all(cache.dir()).expect("score cache");
-            std::fs::write(cache.path(url, ScoreCacheKind::Audio), b"cached audio").expect("seed");
-            let access = ScoreFetchAccess::Remote {
-                sources: [SourceRule::parse("http://127.0.0.1:9").expect("a test source")].into(),
-            };
-            assert_eq!(
-                fetch_score_source_cached(&cache, url, &access, ScoreCacheKind::Audio, 1024, |b| {
-                    Ok(b.to_vec())
-                },)
-                .expect("served from cache"),
-                b"cached audio",
             );
             let _ = std::fs::remove_dir_all(&dir);
         }

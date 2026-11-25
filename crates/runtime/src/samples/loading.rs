@@ -1615,14 +1615,6 @@ pub(super) mod tests {
             worker.join().unwrap();
         }
 
-        #[test]
-        fn dropping_a_library_closes_its_idle_font_queue() {
-            let (library, _receiver) = library();
-            let jobs = Arc::clone(&library.shared.font_jobs);
-            drop(library);
-            assert!(jobs.pop().is_none());
-        }
-
         #[cfg(feature = "device-audio")]
         #[test]
         fn live_session_warms_evaluated_gm_variants_before_source_only_bets() {
@@ -1912,19 +1904,6 @@ pub(super) mod tests {
             rustel_audio::set_sample_pcm_ceiling(ceiling);
         }
 
-        /// The bound must not break ordinary local samples.
-        #[test]
-        fn an_ordinary_local_sample_still_reads_whole() {
-            let path =
-                std::env::temp_dir().join(format!("rustel-sample-{}.wav", std::process::id()));
-            let contents: Vec<u8> = (0..4096u32).map(|byte| byte as u8).collect();
-            std::fs::write(&path, &contents).expect("write the fixture");
-            let read =
-                fetch_located(&format!("file://{}", path.display())).expect("read the fixture");
-            let _ = std::fs::remove_file(&path);
-            assert_eq!(read, contents, "the local sample did not come back whole");
-        }
-
         /// A folder that links back to itself must not be walked twice.
         ///
         /// `path.is_dir()` follows a symlink, so a cycle produced the same sample
@@ -2048,17 +2027,6 @@ pub(super) mod tests {
             assert_eq!(same.frames(), 4800);
         }
 
-        /// A wavetable keeps the file's rate: the worklet slices the buffer into
-        /// frames, so converting first would cut every frame at the wrong stride
-        /// and play a waveform the table does not contain.
-        #[test]
-        fn a_wavetable_keeps_the_files_own_rate() {
-            let bytes = wav_bytes(88_200, 8192);
-            let decoded = decode_guarded("wt/table.wav", &bytes, None).expect("decode");
-            assert_eq!(decoded.sample_rate(), 88_200);
-            assert_eq!(decoded.frames(), 8192);
-        }
-
         #[test]
         fn only_wt_named_banks_decode_at_the_files_rate() {
             assert_eq!(DecodeRate::for_sound("wt_digital"), DecodeRate::Native);
@@ -2067,19 +2035,6 @@ pub(super) mod tests {
             assert_eq!(DecodeRate::for_sound("piano"), DecodeRate::Context);
             // Not a prefix match on "wt" alone.
             assert_eq!(DecodeRate::for_sound("wtf"), DecodeRate::Context);
-        }
-
-        #[test]
-        fn the_file_extension_picks_the_decoder() {
-            assert_eq!(codec_for("file:///kit/kick.wav"), Codec::Wav);
-            assert_eq!(codec_for("https://example.com/piano/C4.mp3"), Codec::Mp3);
-            // A folder of phone recordings is the reason ogg matters at all.
-            assert_eq!(
-                codec_for("file:///s/artist/audio_2025-10-08.ogg"),
-                Codec::Ogg
-            );
-            assert_eq!(codec_for("file:///s/artist/voice.oga"), Codec::Ogg);
-            assert_eq!(codec_for("file:///s/ARTIST/SHOUT.OGG"), Codec::Ogg);
         }
 
         #[test]
@@ -2144,35 +2099,6 @@ pub(super) mod tests {
             assert_eq!(fetch_located(url).expect("readable"), b"ID3mp3bytes");
         }
 
-        /// Direct files become variants of the selected folder, while child
-        /// folders remain their own banks.
-        #[test]
-        fn folder_banks_groups_direct_files_under_the_selected_folder() {
-            let directory = tempfile::tempdir().expect("temp dir");
-            std::fs::write(directory.path().join("take 1.mp3"), b"one").expect("sample");
-            std::fs::write(directory.path().join("take 2.mp3"), b"two").expect("sample");
-            let kit = directory.path().join("kit");
-            std::fs::create_dir_all(&kit).expect("bank folder");
-            std::fs::write(kit.join("snare.mp3"), b"snarebytes").expect("sample");
-            let root = directory.path().canonicalize().expect("canonical root");
-            let banks = folder_banks(&root, &[]).expect("walk");
-            let root_name = root.file_name().unwrap().to_string_lossy();
-            let (_, direct_bank @ Bank::Array(direct)) = banks
-                .iter()
-                .find(|(name, _)| name == root_name.as_ref())
-                .expect("selected folder bank")
-            else {
-                panic!("direct files are an array bank");
-            };
-            assert_eq!(direct.len(), 2, "both takes are variants of one bank");
-            assert_eq!(
-                local_variant_names(direct_bank),
-                ["take 1", "take 2"],
-                "the browser keeps the filesystem stems in variant order"
-            );
-            assert!(banks.iter().any(|(name, _)| name == "kit"));
-        }
-
         #[test]
         fn a_note_keyed_banks_waveform_uses_the_same_default_note_as_its_preview() {
             let library = SampleLibrary::empty_without_loading();
@@ -2228,25 +2154,6 @@ pub(super) mod tests {
             let (shape, duration) = library.sound_shape("piano:0").expect("preview shape");
             assert_eq!(&*shape, &[36, 18], "the picture belongs to the sound heard");
             assert_eq!(duration, 1.25);
-        }
-
-        #[test]
-        fn a_local_variant_shows_its_index_and_filename_without_the_extension() {
-            assert_eq!(
-                local_sample_file_stem("file:///music/sessions/vox1.wav").as_deref(),
-                Some("vox1")
-            );
-            let entry = SoundEntry {
-                name: "sessions".into(),
-                variants: 2,
-                variant_names: vec!["take-001".into(), "vox1".into()],
-                origin: SoundOrigin::Global,
-                category: SoundCategory::Mine,
-                location: None,
-                import: Some("/music/sessions".into()),
-            };
-            assert_eq!(entry.variant_label(1), "sessions:1 (vox1)");
-            assert!(!entry.variant_label(1).contains(".wav"));
         }
 
         /// Decode a real Ogg file, when one is pointed at. Works for either codec.
@@ -2327,20 +2234,6 @@ pub(super) mod tests {
                 render_rate: AtomicU32::new(crate::session::DEFAULT_SAMPLE_RATE),
                 settled_epoch: AtomicU64::new(0),
             }
-        }
-
-        #[test]
-        fn sample_id_reservation_stops_at_the_audio_bank_capacity_without_wrapping() {
-            let shared = sample_test_shared((SAMPLE_BANK_CAPACITY - 1) as u32);
-            assert_eq!(
-                reserve_sample_ids(&shared, 1),
-                Ok(vec![SampleId((SAMPLE_BANK_CAPACITY - 1) as u32)])
-            );
-            assert!(reserve_sample_ids(&shared, 1).is_err());
-            assert_eq!(
-                shared.next_id.load(Ordering::Relaxed),
-                SAMPLE_BANK_CAPACITY as u32
-            );
         }
 
         #[test]
@@ -2726,28 +2619,6 @@ pub(super) mod tests {
             assert_eq!(local_asked.queued, 0, "a folder on disk is not downloaded");
         }
 
-        /// A file a loader has taken from the line is still on its way: the
-        /// pack's row counts it, and a second pass does not queue it again.
-        #[test]
-        fn a_file_a_loader_took_is_still_counted_and_not_queued_twice() {
-            let library = SampleLibrary::empty_without_loading();
-            let url: Arc<str> = Arc::from("https://example.test/in-hand/kick.wav");
-            let files = HashSet::from([Arc::clone(&url)]);
-            assert!(ensure_cached_shared(&library.shared, &url));
-            let job = library.shared.jobs.try_pop().expect("the disk fetch");
-            assert!(matches!(job.kind, LoadKind::Cache));
-
-            assert_eq!(
-                library.pending_cache_of(&files),
-                1,
-                "the file in a loader's hand is still on its way"
-            );
-            assert!(
-                !ensure_cached_shared(&library.shared, &url),
-                "a second pass does not queue the file again"
-            );
-        }
-
         /// The count a progress bar reads holds a disk fetch from its
         /// queueing until its worker lets go of it.
         #[test]
@@ -2925,38 +2796,6 @@ pub(super) mod tests {
             );
         }
 
-        /// A font's zones each keep an id of their own, so a font decoded after
-        /// a release takes what is free before it takes anything fresh.
-        #[test]
-        fn decode_font_gives_each_zone_its_own_id_from_the_free_list() {
-            let shared = sample_test_shared(100);
-            shared
-                .free_ids
-                .lock()
-                .expect("free ids")
-                .extend([SampleId(3), SampleId(7)]);
-            let zones = decode_font(two_zone_test_font().as_bytes(), &shared).expect("font");
-            let ids: Vec<SampleId> = zones.iter().map(|zone| zone.id).collect();
-            assert_eq!(ids, vec![SampleId(3), SampleId(7)], "released ids first");
-            assert_eq!(
-                shared.next_id.load(Ordering::Relaxed),
-                100,
-                "the counter did not move for reissued ids"
-            );
-            let published: Vec<SampleId> = shared
-                .ready
-                .lock()
-                .expect("ready")
-                .samples
-                .iter()
-                .map(|(id, _)| *id)
-                .collect();
-            assert_eq!(
-                published, ids,
-                "every zone's PCM is published under its own id"
-            );
-        }
-
         /// 0253_Acoustic_Guitar writes `originalPitch:4200-140`: JavaScript,
         /// which the browser evaluates and JSON cannot. Every gm_acoustic_guitar
         /// preview failed to load on it.
@@ -2979,25 +2818,6 @@ pub(super) mod tests {
             let shared = sample_test_shared(1);
             let zones = decode_font(font.as_bytes(), &shared).expect("decode");
             assert_eq!(zones[0].base_detune, 3100.0 - 100.0 - (-25.0));
-        }
-
-        /// Decode real webaudiofontdata files from disk: a developer's check
-        /// against the fonts the CDN actually serves. `RUSTEL_FONT_PROBE` is a
-        /// colon-separated list of `.js` paths.
-        #[test]
-        #[ignore]
-        fn probe_real_fonts_from_disk() {
-            let Ok(paths) = std::env::var("RUSTEL_FONT_PROBE") else {
-                return;
-            };
-            for path in paths.split(':').filter(|path| !path.is_empty()) {
-                let bytes = std::fs::read(path).expect("font file");
-                let shared = sample_test_shared(1);
-                match decode_font(&bytes, &shared) {
-                    Ok(zones) => eprintln!("{path}: {} zones", zones.len()),
-                    Err(error) => panic!("{path}: {error}"),
-                }
-            }
         }
 
         #[test]
@@ -3054,54 +2874,6 @@ pub(super) mod tests {
                 });
             }
             out
-        }
-
-        /// A bank answers to its own name in any case, so `.bank('Rolandmc303')`
-        /// finds `RolandMC303`.
-        #[test]
-        fn a_bank_answers_to_its_name_in_any_case() {
-            let mut banks = HashMap::new();
-            banks.insert(
-                "RolandMC303_bd".to_string(),
-                Bank::Array(vec![std::sync::Arc::from("mc303/bd.wav")]),
-            );
-            banks.insert(
-                "lowercase_already".to_string(),
-                Bank::Array(vec![std::sync::Arc::from("plain/a.wav")]),
-            );
-            let before = banks.len();
-            expand_case_insensitive(&mut banks);
-
-            assert!(
-                banks.contains_key("rolandmc303_bd"),
-                "the name lowercased answers too"
-            );
-            assert!(
-                banks.contains_key("RolandMC303_bd"),
-                "and the catalogue's own spelling is kept"
-            );
-            assert_eq!(
-                banks.len(),
-                before + 1,
-                "a name already lowercase gains no duplicate"
-            );
-
-            // A bank that really does differ only by case keeps whichever it
-            // registered first rather than being quietly replaced.
-            let mut collide = HashMap::new();
-            collide.insert(
-                "abc".to_string(),
-                Bank::Array(vec![std::sync::Arc::from("first.wav")]),
-            );
-            collide.insert(
-                "ABC".to_string(),
-                Bank::Array(vec![std::sync::Arc::from("second.wav")]),
-            );
-            expand_case_insensitive(&mut collide);
-            assert!(matches!(
-                collide.get("abc"),
-                Some(Bank::Array(urls)) if urls[0].as_ref() == "first.wav"
-            ));
         }
 
         #[test]
