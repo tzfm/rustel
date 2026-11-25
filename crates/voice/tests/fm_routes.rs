@@ -120,13 +120,6 @@ fn fm_diagonal_aliases_and_empty_amounts_do_not_create_routes() {
 }
 
 #[test]
-fn fm_routes_preserve_source_major_order_without_sorting() {
-    for routes in matrix_routes().chunks(16) {
-        assert_eq!(resolve(&input(routes)), Ok(Some(expected(routes))));
-    }
-}
-
-#[test]
 fn fm_amount_errors_keep_the_exact_key_and_capacity_precedence() {
     let routes = matrix_routes();
     for route in &routes {

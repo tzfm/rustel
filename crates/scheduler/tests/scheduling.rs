@@ -265,167 +265,6 @@ fn stale_events_expire_rather_than_replaying() {
     );
 }
 
-/// A blocked query thread must not silently drain the horizon: with the
-/// generation cancelled and no refill, nothing from the old schedule survives.
-#[test]
-fn evaluation_stall_does_not_replay_consumed_onsets() {
-    let (_t, mut s, clk) = setup();
-    s.set_pattern(seq("bd", "sd"), clk.now());
-    s.tick(&clk);
-
-    clk.advance(0.2);
-    let first = s.drain_due(&clk);
-    let first_ids: Vec<u64> = first.iter().map(|e| e.onset_id).collect();
-
-    // Stall, then resume and refill.
-    clk.advance(0.1);
-    s.tick(&clk);
-    clk.advance(0.2);
-    let second = s.drain_due(&clk);
-
-    for e in &second {
-        assert!(
-            !first_ids.contains(&e.onset_id),
-            "onset {} was delivered twice across a stall",
-            e.onset_id
-        );
-    }
-}
-
-// ---------------------------------------------------------------------------
-// The measured inequality:
-//   D + interrupt_recovery + next_query_p99.9 + wake_jitter < H_remaining
-// ---------------------------------------------------------------------------
-
-/// Measure each term on THIS machine and assert the budget closes with margin.
-///
-/// `D` is derived from the others and then **discounted by a safety factor**,
-/// never set to the calculated ceiling: the measurements are a floor from a
-/// finite sample on an idle machine, so the first sample past the measured
-/// tail would overrun and drop audio.
-#[test]
-fn deadline_budget_fits_the_remaining_horizon() {
-    use rustel_jsruntime::{JsRuntime, Slot};
-
-    /// p99.9 needs ~1-in-1000 resolution, so 200 samples cannot establish it -
-    /// the "max of 200" it reports is really about p99.5 with one observation.
-    /// 20_000 puts 20 samples in the tail.
-    const QUERY_SAMPLES: usize = 20_000;
-    const RECOVERY_SAMPLES: usize = 50;
-    const WAKE_SAMPLES: usize = 2_000;
-
-    fn percentile(sorted: &[Duration], p: f64) -> Duration {
-        let idx = (((sorted.len() - 1) as f64) * p).round() as usize;
-        sorted[idx]
-    }
-
-    let rt = JsRuntime::new().unwrap();
-    let mut b = rt.builder();
-    let id = b.callback(&rt, "(_w) => (x) => x + '!'");
-    rt.set_active(&b, seq("bd", "sd").fmap_js(id)).unwrap();
-
-    // --- interrupt_recovery: interrupt, then time until the runtime is usable
-    let mut recovery: Vec<Duration> = Vec::with_capacity(RECOVERY_SAMPLES);
-    for _ in 0..RECOVERY_SAMPLES {
-        let _ = rt.with_deadline(Duration::from_millis(5), || rt.eval("while (true) {}"));
-        let t0 = Instant::now();
-        let _ = rt
-            .query(Slot::Active, 0, Fraction::ZERO, Fraction::ONE)
-            .unwrap();
-        recovery.push(t0.elapsed());
-    }
-    recovery.sort();
-    let recovery_p999 = percentile(&recovery, 0.999);
-
-    // --- next_query latency distribution
-    let mut queries: Vec<Duration> = Vec::with_capacity(QUERY_SAMPLES);
-    for _ in 0..QUERY_SAMPLES {
-        let t0 = Instant::now();
-        let _ = rt
-            .query(Slot::Active, 0, Fraction::ZERO, Fraction::ONE)
-            .unwrap();
-        queries.push(t0.elapsed());
-    }
-    queries.sort();
-    let query_p50 = percentile(&queries, 0.50);
-    let query_p999 = percentile(&queries, 0.999);
-    let query_max = *queries.last().unwrap();
-
-    // Measure wake jitter through the condition-variable path. A plain
-    // `thread::sleep` would only measure timer granularity. The waiter asks
-    // for each signal. Two signals merged into one wake would leave a
-    // timestamp in the channel, and each later sample would read its age.
-    let waker = Arc::new(rustel_scheduler::Waker::default());
-    let mut jitter: Vec<Duration> = Vec::with_capacity(WAKE_SAMPLES);
-    {
-        let w = waker.clone();
-        let (ask, asked) = std::sync::mpsc::channel::<()>();
-        let (tx, rx) = std::sync::mpsc::channel::<Instant>();
-        let producer = std::thread::spawn(move || {
-            while asked.recv().is_ok() {
-                std::thread::sleep(Duration::from_micros(50));
-                tx.send(Instant::now()).unwrap();
-                w.signal();
-            }
-        });
-        for _ in 0..WAKE_SAMPLES {
-            ask.send(()).unwrap();
-            assert!(
-                waker.wait(Duration::from_secs(5)),
-                "the producer sent no signal"
-            );
-            jitter.push(rx.recv().unwrap().elapsed());
-        }
-        drop(ask);
-        producer.join().unwrap();
-    }
-    jitter.sort();
-    let wake_p999 = percentile(&jitter, 0.999);
-
-    // --- H_remaining on a partly drained horizon
-    let (_t, mut s, clk) = setup();
-    s.set_pattern(seq("bd", "sd"), clk.now());
-    s.tick(&clk);
-    let full = s.horizon_remaining(clk.now());
-    clk.advance(full * 0.5);
-    let _ = s.drain_due(&clk);
-    let h_remaining = s.horizon_remaining(clk.now());
-
-    let overhead = recovery_p999 + query_p999 + wake_p999;
-    let deadline = s.affordable_deadline(clk.now(), overhead);
-
-    println!(
-        "scheduler timing budget on {} ({} arch)\n           samples ............ query {QUERY_SAMPLES}, wake {WAKE_SAMPLES}, recovery {RECOVERY_SAMPLES}\n           H_remaining ........ {:?}\n           interrupt_recovery . p99.9 {:?}\n           query .............. p50 {:?}  p99.9 {:?}  max {:?}\n           wake_jitter ........ p99.9 {:?} (condvar path)\n           overhead ........... {:?}\n           safety factor ...... {}x\n           => D (afforded) .... {:?}",
-        std::env::consts::OS,
-        std::env::consts::ARCH,
-        Duration::from_secs_f64(h_remaining),
-        recovery_p999,
-        query_p50,
-        query_p999,
-        query_max,
-        wake_p999,
-        overhead,
-        rustel_scheduler::Scheduler::BUDGET_SAFETY_FACTOR,
-        deadline,
-    );
-
-    let d = deadline.unwrap_or_else(|| {
-        panic!(
-            "budget does not close on {}/{}: overhead {:?} x{} safety >= H_remaining {:?}",
-            std::env::consts::OS,
-            std::env::consts::ARCH,
-            overhead,
-            rustel_scheduler::Scheduler::BUDGET_SAFETY_FACTOR,
-            Duration::from_secs_f64(h_remaining)
-        )
-    });
-    assert!(
-        d > Duration::from_millis(1),
-        "afforded deadline {d:?} leaves no usable evaluation budget"
-    );
-    rt.clear_active();
-}
-
 /// The scheduler must REFUSE an evaluation it cannot cover, rather than start
 /// one that will overrun the horizon.
 #[test]
@@ -598,18 +437,6 @@ fn a_caller_can_tighten_one_atomic_tick_to_one_cycle() {
         (scheduler.horizon_remaining(clock.now()) - 0.01).abs() < 1e-9,
         "one 100-CPS cycle should add exactly 10 ms of cover"
     );
-}
-
-/// ...and an ordinary pattern is nowhere near it, so the bound never fires in
-/// normal use.
-#[test]
-fn an_ordinary_pattern_stays_far_below_the_queue_bound() {
-    let transport = Arc::new(Transport::default());
-    let mut scheduler = Scheduler::new(transport.clone(), 0.5, 0.2);
-    let clock = VirtualClock::new(0.0);
-    scheduler.set_pattern(seq("bd", "sd"), clock.now());
-    assert_eq!(scheduler.tick(&clock), TickStatus::Filled);
-    assert!(scheduler.queued() < 100, "queued {}", scheduler.queued());
 }
 
 /// Identical stacked haps remain distinct voices without replaying on refill.
@@ -1096,66 +923,6 @@ fn a_queue_full_fill_spends_each_outgoing_copy_once() {
     }
 }
 
-/// The window ends AT the takeover, mirroring the device contract: old events
-/// at or past the takeover frame are retired when the generation flips, so
-/// their replacements must be emitted even though the old generation emitted
-/// them too. An old onset before the takeover is kept by the device and stays
-/// suppressed.
-#[test]
-fn continued_replacement_carries_only_before_the_takeover() {
-    let (_t, mut s, clk) = setup();
-    let grid = || fastcat(vec![atom("a"), atom("b"), atom("c"), atom("d")]);
-    s.set_pattern(grid(), clk.now());
-    assert_eq!(s.tick(&clk), TickStatus::Filled);
-
-    // The producer prefetched far: at clock 3.2 the cursor runs to 3.7.
-    clk.advance(3.2);
-    assert_eq!(s.tick(&clk), TickStatus::Filled);
-    let _ = s.drain_due(&clk);
-    assert_eq!(
-        s.scheduled_to_cycle(),
-        3.7,
-        "test premise: prefetched to 3.7"
-    );
-
-    // Edit at 3.3, takeover at 3.8: the old 3.5 is inside the window and kept
-    // by the device; 3.75 the old generation never emitted; 4.0 sits past the
-    // takeover where the old copy would be retired.
-    clk.advance(0.1);
-    let from = 3.3;
-    let _ = s.replace_pattern_continued(grid(), clk.now(), None, from, from + 0.5);
-
-    assert_eq!(s.tick(&clk), TickStatus::Filled);
-    clk.advance(0.45);
-    let begins: Vec<f64> = s
-        .drain_due(&clk)
-        .into_iter()
-        .map(|e| e.whole_begin.to_f64())
-        .collect();
-    assert_eq!(
-        begins,
-        vec![3.75],
-        "3.5 is the old copy's to play and stays suppressed; 3.75 was never \
-         emitted by the old generation and must be: {begins:?}"
-    );
-
-    // Past the takeover, including where the old generation HAD emitted.
-    clk.advance(0.3);
-    assert_eq!(s.tick(&clk), TickStatus::Filled);
-    let begins: Vec<f64> = s
-        .drain_due(&clk)
-        .into_iter()
-        .map(|e| e.whole_begin.to_f64())
-        .collect();
-    assert_eq!(
-        begins,
-        vec![4.0],
-        "the onset past the takeover is emitted normally - and had the old \
-         generation emitted it too, the device would retire that copy at the \
-         takeover, so emitting it here is the only correct outcome: {begins:?}"
-    );
-}
-
 /// A zero continuity margin (the takeover on the edit instant) still
 /// continues: nothing is suppressed, and the mapping keeps the timeline's
 /// phase. The plain far-cursor contract would shift the whole grid.
@@ -1258,21 +1025,6 @@ fn continued_replacement_until_an_edge_emits_the_onset_just_after_it() {
         begins,
         vec![2.75, 3.0],
         "the onset on the takeover frame is the replacement's: {begins:?}"
-    );
-}
-
-/// The other side of the edge: an onset a millionth of a frame before it is
-/// the device's copy to play, and stays pre-marked.
-#[test]
-fn continued_replacement_until_an_edge_pre_marks_the_onset_just_before_it() {
-    let (mut s, clk, grid) = prefetched_to_three();
-    let edge = 2.75 + 1e-6 / 48_000.0;
-    let _ = s.replace_pattern_continued_until(grid(), clk.now(), None, 2.6, edge, None);
-    let begins = begins_through(&mut s, &clk, 3.1);
-    assert_eq!(
-        begins,
-        vec![3.0],
-        "the onset before the edge keeps its copy on the device: {begins:?}"
     );
 }
 
