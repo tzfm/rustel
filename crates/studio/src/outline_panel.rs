@@ -311,7 +311,7 @@ impl Widget for OutlineView<'_> {
             Ok(nodes) => {
                 let rows = usize::from(body.height);
                 let lit = &self.panel.lit;
-                let lane = theme.current_line.unwrap_or(theme.surface);
+                let bar = Style::default().fg(theme.accent);
                 for (row, (index, node)) in nodes
                     .iter()
                     .enumerate()
@@ -326,12 +326,10 @@ impl Widget for OutlineView<'_> {
                     let text = format!("{}{branch}{}", " ".repeat(indent), node.label);
                     let text = super::view::ellipsize(&text, body.width);
                     let mut style = Style::default().fg(theme.engine(native(node)));
+                    // A bar at the left of the caret's statement, between the
+                    // rule and the text.
                     if lit.contains(&index) {
-                        style = style.bg(lane);
-                        // From the rule to the edge.
-                        let x = parts.rule.x + 1;
-                        let blank = " ".repeat(usize::from(self.area.right() - x));
-                        buffer.set_stringn(x, y, &blank, blank.len(), style);
+                        buffer.set_stringn(parts.rule.x + 1, y, "│", 1, bar);
                     }
                     if chosen {
                         style = style.bg(theme.selection).add_modifier(Modifier::BOLD);

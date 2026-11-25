@@ -819,7 +819,7 @@ that only JavaScript has. The column reads the score again when the text
 changes, and only while it is open. While the text does not parse, it keeps
 the last tree. Its title says what ran the score, native or script, once the
 score plays as written, and "not run" before an update. The colours of the
-tree read the text alone. The statement that holds the caret is lit. ↑ and ↓ choose a node, Enter or a
+tree read the text alone. A bar in the accent colour marks the statement that holds the caret. ↑ and ↓ choose a node, Enter or a
 click puts the caret on it, and Esc returns the keyboard to the score.
 
 The memory breakdown says the same for the whole score in one word: native
