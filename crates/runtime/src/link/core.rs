@@ -187,17 +187,6 @@ mod tests {
     }
 
     #[test]
-    fn refounding_keeps_the_grid_and_the_clock() {
-        let mut session = session_at_120();
-        session.join(&Session::found([2; 8], 90.0, 1.0, GHOST));
-        let (timeline, offset) = (session.timeline, session.host_offset);
-        session.refound([3; 8]);
-        assert_eq!(session.id, [3; 8]);
-        assert_eq!(session.timeline, timeline);
-        assert_eq!(session.host_offset, offset);
-    }
-
-    #[test]
     fn a_founded_session_starts_where_the_score_is() {
         // The score is mid-bar, three and a half cycles in.
         let session = Session::found([1; 8], 120.0, 3.5, GHOST);

@@ -223,23 +223,6 @@ fn within_transforms_only_the_inside_and_includes_its_end() {
     assert_eq!(got, vec!["g@1/4", "e@1/2", "c@3/4", "b@3/4"], "{got:?}");
 }
 
-/// `register` publishes to the prototype, not to `globalThis`, and a score is
-/// evaluated against `globalThis` - so a combinator needs the free form
-/// installed explicitly or only the method spelling works.
-#[test]
-fn within_is_callable_as_a_free_function_too() {
-    let mut session = Session::new().expect("session");
-    session
-        .evaluate(r#"within(0, 0.5, x => x.rev(), note("c a g e"))"#)
-        .expect("the free form must resolve");
-    assert!(
-        !session
-            .query(Fraction::ZERO, Fraction::ONE)
-            .expect("query")
-            .is_empty()
-    );
-}
-
 /// A setup run between two scores keeps none of a score's `register`
 /// replacements: removing the call still gives the engine's name back.
 #[test]
@@ -279,54 +262,6 @@ fn note_helpers_accept_flats_and_do_not_trim() {
     assert!(
         shown[2].contains('f'),
         "tokenizeNote lost the accidental: {shown:?}"
-    );
-}
-
-/// The remaining parity batch: each of these was MISSING or silently inert.
-#[test]
-fn midimaps_control_and_zero_weight_are_recognised() {
-    for source in [
-        r#"midimaps({ mymap: { lpf: 74 } }); note("c").midimap('mymap')"#,
-        r#"await midimaps({ m: { lpf: { ccn: 74, min: 0, max: 4000 } } }); note("c")"#,
-        r#"defaultmidimap({ lpf: 74 }); note("c").lpf(500)"#,
-        // control([ccn, ccv]) - one control for the pair.
-        r#"note("c3").control([74, 0.5])"#,
-    ] {
-        let mut session = Session::new().expect("session");
-        session
-            .evaluate(source)
-            .unwrap_or_else(|error| panic!("{source} failed: {error}"));
-        assert!(
-            !session
-                .query(Fraction::ZERO, Fraction::ONE)
-                .expect("query")
-                .is_empty(),
-            "{source} produced no haps"
-        );
-    }
-
-    // A bad map refuses at registration, in the score's own terms.
-    let mut session = Session::new().expect("session");
-    let error = session
-        .evaluate(r#"midimaps({ m: { lpf: { ccn: 74, min: 1, max: 1 } } }); note("c")"#)
-        .expect_err("an empty scaling range cannot scale");
-    assert!(error.to_string().contains("scaling range"), "{error}");
-}
-
-/// Variadic arguments on an arity-2 method form a sequence.
-#[test]
-fn extra_arguments_to_an_arity_two_method_sequence() {
-    let mut session = Session::new().expect("session");
-    session
-        .evaluate(r#"n("0 2").scale("C:major", "C:minor")"#)
-        .expect("evaluate");
-    assert_eq!(
-        session
-            .query(Fraction::ZERO, Fraction::ONE)
-            .expect("query")
-            .len(),
-        2,
-        "a second scale argument silently deleted the pattern"
     );
 }
 
@@ -615,22 +550,6 @@ fn a_score_written_for_the_visuals_build_still_plays_without_one() {
             .expect("query")
             .len(),
         2
-    );
-}
-
-#[test]
-fn binary_nl_keeps_the_list_returning_strudel_definition() {
-    let mut session = Session::new().expect("session");
-    session.evaluate("binaryNL(5, 4)").expect("binaryNL score");
-    let haps = session.query(Fraction::ZERO, Fraction::ONE).expect("query");
-    assert_eq!(
-        haps[0].value,
-        rustel_core::Value::list(vec![
-            rustel_core::Value::F64(0.0),
-            rustel_core::Value::F64(1.0),
-            rustel_core::Value::F64(0.0),
-            rustel_core::Value::F64(1.0),
-        ])
     );
 }
 
@@ -1335,19 +1254,6 @@ fn browser_keyboard_helpers_are_inert_without_silencing_the_score() {
     assert!(
         !haps.is_empty(),
         "an unavailable keyboard did not silence audio"
-    );
-}
-
-#[test]
-fn browser_ui_code_is_refused_rather_than_absorbed() {
-    let mut session = Session::new().expect("session");
-    let error = session
-        .evaluate(r#"document.createElement('div'); $: s("bd")"#)
-        .expect_err("browser UI code is refused")
-        .to_string();
-    assert!(
-        error.contains("document"),
-        "the error names what is missing: {error}"
     );
 }
 

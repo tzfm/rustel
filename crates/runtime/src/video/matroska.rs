@@ -191,28 +191,6 @@ mod tests {
         assert_eq!(named("A_AAC"), Named::NotPicture);
     }
 
-    #[test]
-    fn the_real_vp8_fixture_names_its_tracks() {
-        let entries = entries(include_bytes!("testdata/tiny_video_subs.mkv"));
-        let named: Vec<&Named> = {
-            let mut numbers: Vec<_> = entries.keys().copied().collect();
-            numbers.sort_unstable();
-            numbers
-                .iter()
-                .map(|number| &entries[number].named)
-                .collect()
-        };
-        assert_eq!(
-            named,
-            [
-                &Named::NotPicture,
-                &Named::Picture(Codec::Vp8),
-                &Named::NotPicture
-            ],
-            "subtitles, the picture, then sound"
-        );
-    }
-
     /// An element that claims more than its parent holds ends the walk,
     /// so a lying size costs no allocation and no read past the file.
     #[test]

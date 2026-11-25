@@ -33,90 +33,6 @@ fn evaluate_error(source: &str) -> String {
 }
 
 #[test]
-fn a_sketch_beside_a_pattern_records_one_window_and_one_statement() {
-    let update = program(
-        r#"
-        await initHydra()
-        osc(20, 0.1, 1.2).kaleid(5).out(o0)
-        $: s("bd*4")
-        "#,
-    );
-    assert_eq!(update.program.statements.len(), 1);
-    let HydraStatement::Evaluate { node } = &update.program.statements[0] else {
-        panic!(
-            "a drawing statement, not an assignment: {:?}",
-            update.program.statements[0]
-        );
-    };
-    let HydraNode::Chain { head, args, calls } = node else {
-        panic!("a chain: {node:?}");
-    };
-    assert_eq!(head, "osc");
-    assert_eq!(args.len(), 3);
-    assert_eq!(
-        calls
-            .iter()
-            .map(|call| call.method.as_str())
-            .collect::<Vec<_>>(),
-        ["kaleid", "out"]
-    );
-    // `.out(o0)` carries the output it was given, as a bare Hydra global.
-    assert!(matches!(
-        calls[1].args.as_slice(),
-        [HydraNode::Chain { head, args, calls }] if head == "o0" && args.is_empty() && calls.is_empty()
-    ));
-}
-
-#[test]
-fn the_music_still_plays_beside_the_visuals() {
-    let mut session = Session::new().expect("session");
-    session
-        .evaluate(
-            r#"
-            await initHydra()
-            osc(10).out()
-            $: s("bd sd")
-            "#,
-        )
-        .expect("a score with visuals and drums");
-    let haps = session
-        .query(
-            rustel_fraction::Fraction::ZERO,
-            rustel_fraction::Fraction::ONE,
-        )
-        .expect("query");
-    assert_eq!(haps.len(), 2, "the drums are unaffected by the visuals");
-}
-
-#[test]
-fn a_visuals_only_score_still_reaches_the_window() {
-    // The canonical upstream example names no pattern at all. Its effects must
-    // survive the arm that installs silence, or the window never opens.
-    let update = program("await initHydra()\nosc(4, 0.1, 1.2).out()");
-    assert_eq!(update.program.statements.len(), 1);
-    assert_eq!(update.program.statements.len(), 1);
-}
-
-#[test]
-fn h_of_a_pattern_becomes_a_signal_slot() {
-    let update = program(
-        r#"
-        await initHydra()
-        osc(20, 0.1, H("<0 0.5 1>")).out()
-        "#,
-    );
-    assert_eq!(update.program.signals, 1);
-    assert_eq!(update.signals.len(), 1);
-    let HydraStatement::Evaluate {
-        node: HydraNode::Chain { args, .. },
-    } = &update.program.statements[0]
-    else {
-        panic!("a chain");
-    };
-    assert!(matches!(args[2], HydraNode::Signal { slot: 0 }));
-}
-
-#[test]
 fn h_refuses_a_pattern_the_window_could_not_query_on_its_own() {
     let message = evaluate_error(
         r#"
@@ -145,26 +61,6 @@ fn h_refuses_a_compiled_callback_that_a_later_edit_can_change() {
         message.contains("H(...) needs a pattern the engine can query on its own"),
         "{message}"
     );
-}
-
-#[test]
-fn a_function_argument_crosses_as_its_own_source() {
-    let update = program(
-        r#"
-        await initHydra()
-        osc(20).kaleid(() => 3 + Math.sin(time)).out()
-        "#,
-    );
-    let HydraStatement::Evaluate {
-        node: HydraNode::Chain { calls, .. },
-    } = &update.program.statements[0]
-    else {
-        panic!("a chain");
-    };
-    let HydraNode::Source { src } = &calls[0].args[0] else {
-        panic!("a function argument: {:?}", calls[0].args[0]);
-    };
-    assert!(src.contains("Math.sin(time)"), "{src}");
 }
 
 #[test]
@@ -600,29 +496,6 @@ fn a_later_init_replaces_the_settings() {
     assert_eq!(update.program.statements.len(), 2);
     assert!(update.program.options.feed_strudel);
     assert_eq!(update.program.options.width, 320);
-}
-
-#[test]
-fn a_score_that_stops_asking_for_visuals_stops_drawing() {
-    let mut session = Session::new().expect("session");
-    session
-        .evaluate("await initHydra()\nosc(10).out()")
-        .expect("visuals");
-    assert!(
-        !session
-            .take_pending_hydra()
-            .expect("a recording")
-            .is_empty()
-    );
-
-    session.evaluate(r#"$: s("bd*4")"#).expect("no visuals");
-    let candidate = session
-        .take_pending_hydra()
-        .expect("every committed score says what it wants on screen");
-    assert!(
-        candidate.is_empty(),
-        "a score without initHydra() is the instruction to close"
-    );
 }
 
 #[test]

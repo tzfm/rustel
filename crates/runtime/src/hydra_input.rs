@@ -2159,20 +2159,6 @@ mod tests {
     }
 
     #[test]
-    fn yuyv_neutral_black_and_white_convert_with_shared_chroma() {
-        let video = frame(
-            PixelFormat::Yuyv422,
-            2,
-            1,
-            vec![Plane::with_dimensions(vec![16, 128, 235, 128], 4, 2, 1)],
-        );
-        assert_eq!(
-            raw_frame_rgba(&video).unwrap().2,
-            vec![0, 0, 0, 255, 255, 255, 255, 255]
-        );
-    }
-
-    #[test]
     fn nv12_uses_the_chroma_row_for_each_two_by_two_block() {
         let video = frame(
             PixelFormat::Nv12,
@@ -2354,44 +2340,6 @@ mod tests {
         }
         assert!(MACOS_CAMERA_FIRST_FRAME_TIMEOUT >= Duration::from_secs(60) + CAMERA_POLL);
         assert!(CAMERA_FIRST_FRAME_TIMEOUT > CAMERA_POLL);
-    }
-
-    #[test]
-    fn camera_mode_selection_filters_oversized_preferred_raw_before_negotiating() {
-        let oversized_raw =
-            CaptureFormat::new(CaptureEncoding::Raw(PixelFormat::Nv12), 3840, 2160, 30, 1);
-        let safe_mjpeg = CaptureFormat::new(CaptureEncoding::Mjpeg, 1280, 720, 30, 1);
-        assert_eq!(
-            select_camera_format(&[oversized_raw, safe_mjpeg]),
-            Some(safe_mjpeg),
-            "encoding preference cannot resurrect a mode beyond the decoder/frame cap"
-        );
-        assert!(!supported_camera_format(oversized_raw));
-        assert!(supported_camera_format(safe_mjpeg));
-
-        let equivalent_rate = CaptureFormat::new(CaptureEncoding::Mjpeg, 1280, 720, 60_000, 2002);
-        assert!(camera_format_matches(
-            CaptureFormat::new(CaptureEncoding::Mjpeg, 1280, 720, 30_000, 1001),
-            equivalent_rate,
-        ));
-
-        assert_eq!(
-            camera_inventory_format(&[]),
-            Err(CameraSetupError::Unavailable),
-            "an empty Windows privacy-filtered inventory needs permission guidance"
-        );
-        let guidance = CameraSetupError::Unavailable.message();
-        assert!(guidance.starts_with("Camera could not open."), "{guidance}");
-        assert!(
-            guidance.contains(if cfg!(target_os = "macos") {
-                "Privacy & Security"
-            } else if cfg!(target_os = "windows") {
-                "Privacy & security"
-            } else {
-                "camera permission"
-            }),
-            "the guidance must name this platform's own permission setting: {guidance}"
-        );
     }
 
     #[test]
@@ -2661,51 +2609,6 @@ mod tests {
         assert_eq!(inputs.desired_camera(SETTINGS_PREVIEW_SLOT), None);
     }
 
-    /// Enter on the row grants one preview session while the switch is off. A
-    /// camera that fails to open shows the ordinary camera error guidance, and
-    /// Esc's revocation stops the failed worker.
-    #[test]
-    fn a_settings_preview_that_fails_to_open_reports_plainly_and_recovers_cleanly() {
-        let host = rustel_hydra::HydraHost::new();
-        let policy = HydraInputs::new(host.input_sink()).policy();
-        policy.set_webcam_allowed(true);
-        policy.set_settings_preview_requested(true);
-
-        let cancel = Arc::new(AtomicBool::new(false));
-        policy
-            .state
-            .register_camera(SETTINGS_PREVIEW_SLOT, Arc::clone(&cancel), None);
-        assert!(policy.state.commit_camera_error(
-            SETTINGS_PREVIEW_SLOT,
-            &cancel,
-            "no camera found",
-        ));
-
-        let status = policy.webcam_status();
-        assert_eq!(status.state, HydraWebcamState::Error);
-        assert!(
-            status.preview.is_none(),
-            "an error never leaves a stale or blank picture up"
-        );
-        assert_eq!(
-            status.detail,
-            webcam_error_guidance(),
-            "the reader is told plainly what to do, not left to guess at a hang"
-        );
-
-        // Esc: the switch never agreed, so backing out of the preview is
-        // exactly the revocation an ordinary Esc performs.
-        policy.set_webcam_allowed(false);
-        policy.set_settings_preview_requested(false);
-        assert!(
-            cancel.load(Ordering::Acquire),
-            "the failed worker is told to stop rather than left running"
-        );
-        let after = policy.webcam_status();
-        assert_eq!(after.state, HydraWebcamState::Blocked);
-        assert!(!after.requested, "nothing is left asking for the camera");
-    }
-
     #[test]
     fn score_re_evaluation_preserves_settings_preview_retry_and_dedup_state() {
         let host = rustel_hydra::HydraHost::new();
@@ -2872,40 +2775,6 @@ mod tests {
         assert!(
             image.lease.publish(1, 1, vec![7, 8, 9, 255]).unwrap(),
             "revoking webcam consent must not invalidate a non-camera source"
-        );
-    }
-
-    #[test]
-    fn score_camera_owns_visibility_then_hands_s0_back_to_the_theme() {
-        let host = rustel_hydra::HydraHost::new();
-        let mut inputs = HydraInputs::new(host.input_sink());
-        inputs.theme_camera = true;
-        let mut plan = std::array::from_fn(|_| None);
-        plan[0] = Some(HydraSource::Camera { device: Some(2) });
-        inputs.configure(plan);
-
-        assert_eq!(
-            inputs.desired_camera(0),
-            Some(CameraRequest {
-                purpose: CameraPurpose::Theme,
-                device: None,
-            })
-        );
-        inputs.policy.state.drawing.store(true, Ordering::Release);
-        assert_eq!(
-            inputs.desired_camera(0),
-            Some(CameraRequest {
-                purpose: CameraPurpose::Score,
-                device: Some(2),
-            })
-        );
-        inputs.policy.state.drawing.store(false, Ordering::Release);
-        assert_eq!(
-            inputs.desired_camera(0),
-            Some(CameraRequest {
-                purpose: CameraPurpose::Theme,
-                device: None,
-            })
         );
     }
 

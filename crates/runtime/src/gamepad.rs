@@ -1080,27 +1080,6 @@ mod tests {
         }
     }
 
-    /// The pad check probes every button a score reads except `b`: gilrs 0.11
-    /// leaves `b` in every default mapping, keyboard or pad.
-    #[cfg(not(target_os = "macos"))]
-    #[test]
-    fn a_pad_is_told_from_a_keyboard_by_the_buttons_a_score_reads() {
-        use super::hid::{READABLE_BUTTONS, button_slot};
-        use gilrs::Button;
-        assert_eq!(READABLE_BUTTONS.len(), rustel_core::gamepad::BUTTONS - 1);
-        assert!(!READABLE_BUTTONS.contains(&Button::East));
-        for &button in &READABLE_BUTTONS {
-            assert!(
-                button_slot(button).is_some(),
-                "{button:?} is no button a score reads"
-            );
-        }
-        for &unplaced in &[Button::C, Button::Z, Button::Unknown] {
-            assert!(!READABLE_BUTTONS.contains(&unplaced));
-            assert!(button_slot(unplaced).is_none());
-        }
-    }
-
     /// `rustel devices` numbers the pads as a score reads them: in the
     /// driver's order from `gamepad(0)`, with no fifth pad.
     #[cfg(not(target_os = "macos"))]

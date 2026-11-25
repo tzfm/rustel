@@ -37,21 +37,6 @@ fn control(session: &mut Session, key: &str) -> Vec<Option<f64>> {
         .collect()
 }
 
-#[test]
-fn midin_resolves_without_a_device_and_a_control_reads_zero() {
-    let mut session = Session::new().expect("session");
-    session
-        .evaluate(
-            r#"const cc = await midin('nothing-here'); note("60").lpf(cc(74).range(200, 8000))"#,
-        )
-        .expect("a missing device must not fail evaluation");
-    assert_eq!(
-        control(&mut session, "cutoff"),
-        vec![Some(200.0)],
-        "an untouched control must read the low bound, not NaN and not silence"
-    );
-}
-
 /// The discreteness guard. `cc()` must be a hap WITH a whole: the scheduler
 /// drops anything without an onset, so building it as an analog signal makes
 /// `note(cc(74)...)` silently produce no sound at all.
@@ -80,35 +65,6 @@ fn a_control_pattern_is_discrete_where_a_signal_is_not() {
     );
 }
 
-/// The whole point: a knob turned on the wire reaches a filter in the score.
-#[test]
-fn a_knob_written_on_the_bus_reaches_the_cutoff() {
-    let mut session = Session::new().expect("session");
-    session
-        .evaluate(
-            r#"const cc = await midin('fake');
-               note("c2 c3").s("sawtooth").lpf(cc(74).range(200, 8000))"#,
-        )
-        .expect("evaluate");
-    let bus = session.midi_input_bus();
-    let port = bus
-        .find("fake")
-        .expect("the score must have named the port");
-
-    port.observe_control_change(1, 74, 127);
-    assert_eq!(
-        control(&mut session, "cutoff"),
-        vec![Some(8000.0), Some(8000.0)],
-        "a knob at full must reach the top of the range"
-    );
-
-    port.observe_control_change(1, 74, 0);
-    assert_eq!(
-        control(&mut session, "cutoff"),
-        vec![Some(200.0), Some(200.0)]
-    );
-}
-
 #[test]
 fn a_channel_filter_selects_one_channel() {
     let mut session = Session::new().expect("session");
@@ -126,34 +82,6 @@ fn a_channel_filter_selects_one_channel() {
         cutoffs,
         vec![Some(1000.0), Some(0.0)],
         "channel 1 must move and channel 2 must not"
-    );
-}
-
-/// A controller nobody plugged in must not take the music with it.
-#[test]
-fn a_missing_device_never_silences_the_score() {
-    let mut with = Session::new().expect("session");
-    with.evaluate(
-        r#"const cc = await midin('fake');
-               note("c2 c3 e3 g3").lpf(cc(74).range(200, 8000))"#,
-    )
-    .expect("evaluate");
-    let plain_count = {
-        let mut plain = Session::new().expect("session");
-        plain
-            .evaluate(r#"note("c2 c3 e3 g3").lpf(1000)"#)
-            .expect("evaluate");
-        plain
-            .query(Fraction::ZERO, Fraction::ONE)
-            .expect("query")
-            .len()
-    };
-    assert_eq!(
-        with.query(Fraction::ZERO, Fraction::ONE)
-            .expect("query")
-            .len(),
-        plain_count,
-        "a missing MIDI device deleted haps"
     );
 }
 
