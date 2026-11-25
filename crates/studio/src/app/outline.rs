@@ -34,6 +34,7 @@ impl App {
         let scene = self.scenes.current();
         let editor = &scene.editor;
         panel.refresh(scene.id, editor.revision(), || editor.source());
+        panel.light(editor.primary_selection().head.0);
     }
 
     /// The rows of nodes the column shows at once.

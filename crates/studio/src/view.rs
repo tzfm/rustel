@@ -800,8 +800,6 @@ pub struct StudioView<'a> {
     pub outline: Option<&'a super::outline_panel::OutlinePanel>,
     /// What ran the score last, for the outline's title.
     pub outline_native: Option<bool>,
-    /// The caret's byte in the score, for the outline's lit statement.
-    pub outline_caret: usize,
     /// A drag selection over the mixer's devices block, painted while its
     /// rows are still the ones on screen.
     pub mixer_selection: Option<&'a super::mixer_panel::MixerSelection>,
@@ -1346,7 +1344,6 @@ pub fn render(frame: &mut Frame<'_>, view: StudioView<'_>, chrome: StudioChrome<
                 focused: view.focused_panel == Some(PanelKind::Outline),
                 area: layout.outline,
                 native: view.outline_native,
-                caret: view.outline_caret,
             },
             area,
         );
@@ -3288,7 +3285,6 @@ mod tests {
                         knobs: None,
                         outline: None,
                         outline_native: None,
-                        outline_caret: 0,
                         mixer_selection: None,
                         reference_on_top: false,
                         theme_camera: None,
@@ -3418,7 +3414,6 @@ mod tests {
                         knobs: None,
                         outline: None,
                         outline_native: None,
-                        outline_caret: 0,
                         mixer_selection: None,
                         reference_on_top: false,
                         theme_camera: None,
@@ -3536,7 +3531,6 @@ mod tests {
                         knobs: None,
                         outline: None,
                         outline_native: None,
-                        outline_caret: 0,
                         mixer_selection: None,
                         reference_on_top: false,
                         theme_camera: None,
@@ -3675,7 +3669,6 @@ mod tests {
                         knobs: None,
                         outline: None,
                         outline_native: None,
-                        outline_caret: 0,
                         mixer_selection: None,
                         reference_on_top: false,
                         theme_camera: None,

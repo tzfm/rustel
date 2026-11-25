@@ -35,6 +35,9 @@ pub struct OutlinePanel {
     /// The text changed to one that does not parse, and the nodes are
     /// still those of the last text that did.
     pub stale: bool,
+    /// The rows of the statement that holds the caret. While the tree is
+    /// stale, those of the last text that parsed.
+    pub lit: std::ops::Range<usize>,
 }
 
 impl Default for OutlinePanel {
@@ -45,6 +48,7 @@ impl Default for OutlinePanel {
             read_of: None,
             nodes: Ok(Vec::new()),
             stale: false,
+            lit: 0..0,
         }
     }
 }
@@ -74,6 +78,18 @@ impl OutlinePanel {
             }
         }
         self.clamp();
+    }
+
+    /// Light the statement that holds the caret's byte. A stale tree keeps
+    /// its band: the caret's byte is one of the new text.
+    pub fn light(&mut self, caret: usize) {
+        if self.stale {
+            return;
+        }
+        self.lit = match &self.nodes {
+            Ok(nodes) => statement_rows(nodes, caret),
+            Err(_) => 0..0,
+        };
     }
 
     pub fn node_count(&self) -> usize {
@@ -176,8 +192,6 @@ pub struct OutlineView<'a> {
     pub area: Rect,
     /// What ran the score last, when the engine has said: native or not.
     pub native: Option<bool>,
-    /// The caret's byte in the score: its statement is lit.
-    pub caret: usize,
 }
 
 /// The rows of the top-level statement that holds `caret`: the statement's
@@ -272,7 +286,7 @@ impl Widget for OutlineView<'_> {
             }
             Ok(nodes) => {
                 let rows = usize::from(body.height);
-                let lit = statement_rows(nodes, self.caret);
+                let lit = &self.panel.lit;
                 let lane = theme.current_line.unwrap_or(theme.surface);
                 for (row, (index, node)) in nodes
                     .iter()
@@ -290,8 +304,10 @@ impl Widget for OutlineView<'_> {
                     let mut style = Style::default().fg(theme.engine(native(node)));
                     if lit.contains(&index) {
                         style = style.bg(lane);
-                        let blank = " ".repeat(usize::from(body.width));
-                        buffer.set_stringn(body.x, y, &blank, blank.len(), style);
+                        // From the rule to the edge.
+                        let x = parts.rule.x + 1;
+                        let blank = " ".repeat(usize::from(self.area.right() - x));
+                        buffer.set_stringn(x, y, &blank, blank.len(), style);
                     }
                     if chosen {
                         style = style.bg(theme.selection).add_modifier(Modifier::BOLD);
@@ -377,6 +393,18 @@ mod tests {
         assert_eq!(statement_rows(nodes, 0), 0..1);
         assert_eq!(statement_rows(nodes, 15), 1..4);
         assert_eq!(statement_rows(nodes, 999), 4..6);
+    }
+
+    #[test]
+    fn a_stale_tree_keeps_its_band() {
+        let mut panel = panel("$: s(\"bd\")\n$: n(\"0\")");
+        panel.light(0);
+        assert_eq!(panel.lit, 0..2);
+        panel.refresh(SceneId(1), Revision(2), || {
+            "$: s(\"bd\").fast(\n$: n(\"0\")".to_owned()
+        });
+        panel.light(20);
+        assert_eq!(panel.lit, 0..2);
     }
 
     #[test]
