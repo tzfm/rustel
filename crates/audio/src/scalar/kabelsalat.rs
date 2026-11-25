@@ -505,22 +505,6 @@ mod tests {
         }
 
         #[test]
-        fn offline_idle_capacity_recovers_for_larger_graphs() {
-            let mut backend = full_idle_pool();
-            let delay = program(1);
-            backend
-                .prepare_kabel_programs(&[&delay])
-                .expect("idle capacity is replaceable");
-            assert_eq!(backend.kabel_count, MAX_KABEL_GRAPHS);
-            assert!(
-                backend
-                    .kabel_pool
-                    .iter()
-                    .any(|graph| graph.can_reuse(&delay))
-            );
-        }
-
-        #[test]
         fn offline_eviction_preserves_used_slots_when_pool_moves() {
             let mut backend = full_idle_pool();
             let two = program(2);

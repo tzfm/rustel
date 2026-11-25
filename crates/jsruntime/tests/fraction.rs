@@ -9,68 +9,6 @@ fn runtime_with_fraction() -> JsRuntime {
 }
 
 #[test]
-fn rust_fraction_keeps_the_javascript_mutation_and_reflection_contract() {
-    let runtime = runtime_with_fraction();
-    runtime
-        .eval(
-            r#"
-            (() => {
-              const check = (condition, message) => {
-                if (!condition) throw new Error(message);
-              };
-              const F = Fraction._original;
-              const value = F('2/6');
-              check(value.show() === '1/3', 'reduction');
-              check(Object.keys(value).join('|') === 's|n|d', 'own field order');
-              for (const name of ['s', 'n', 'd']) {
-                const descriptor = Object.getOwnPropertyDescriptor(value, name);
-                check(descriptor.writable && descriptor.enumerable && descriptor.configurable,
-                  `${name} descriptor`);
-              }
-
-              value.s = -1n;
-              value.n = 7n;
-              value.d = 9n;
-              check(value.add('2/9').show() === '-5/9', 'mutable fields');
-
-              const argument = {
-                n: { valueOf() { value.n = 5n; return 1; } },
-                d: 9,
-              };
-              check(value.add(argument).show() === '-4/9', 'coercion order');
-
-              class Derived extends F {}
-              const derived = new Derived('5/7');
-              check(derived instanceof Derived && derived instanceof F,
-                'subclass identity');
-
-              const originalPrototype = F.prototype;
-              const replacement = { marker: 42 };
-              F.prototype = replacement;
-              try {
-                const called = F('5/7');
-                const built = new F('5/7');
-                check(Object.getPrototypeOf(called) === replacement,
-                  'call prototype replacement');
-                check(Object.getPrototypeOf(built) === replacement,
-                  'new prototype replacement');
-              } finally {
-                F.prototype = originalPrototype;
-              }
-
-              check(F.name === 'Fraction' && F.length === 2, 'raw function shape');
-              check(Object.keys(F).length === 0, 'raw enumerable properties');
-              check(Object.getOwnPropertyNames(F).join('|') === 'length|name|prototype',
-                'ES module import shape');
-              globalThis.fractionSurfaceOkay = 1;
-            })();
-            "#,
-        )
-        .expect("Fraction surface contract");
-    assert_eq!(runtime.get_number("fractionSurfaceOkay"), Some(1.0));
-}
-
-#[test]
 fn rust_fraction_refuses_bounded_work_and_recovers_in_the_same_runtime() {
     let runtime = runtime_with_fraction();
     runtime

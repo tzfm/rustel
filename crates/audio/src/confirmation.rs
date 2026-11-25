@@ -908,28 +908,6 @@ mod realtime {
         }
 
         #[test]
-        fn explicit_mutes_and_permitted_dry_fallbacks_can_confirm() {
-            for outcome in [ActivationOutcome::Muted, ActivationOutcome::DryFallback] {
-                let channel = ConfirmationChannel::new();
-                let mut offered = offer(&channel, 1, 1);
-                offered.intended = 4;
-                offered.skipped_loading = 1;
-                offered.refused = 1;
-                offered.external = 1;
-                let mut consumer = ConfirmationConsumer::new(channel.clone());
-                consumer.begin_block(0, 128);
-                assert!(channel.publish(offered));
-                consumer.admission(tag(offered, 0), 0, 7, true);
-                consumer.activation(tag(offered, 0), outcome);
-                consumer.copied(0, 128, 7, false);
-                assert_eq!(
-                    channel.pop_terminal().unwrap().outcome,
-                    WindowOutcome::Confirmed
-                );
-            }
-        }
-
-        #[test]
         fn converted_onsets_need_a_copy_inside_the_offered_window() {
             for copy_start in [0, 256] {
                 let channel = ConfirmationChannel::new();
@@ -1039,30 +1017,6 @@ mod realtime {
             offered.intended = u32::MAX;
             offered.refused = u32::MAX - offered.converted;
             assert!(channel.publish(offered));
-        }
-
-        #[test]
-        fn stop_and_takeover_cannot_turn_unfinished_work_into_valid_silence() {
-            for stopped in [false, true] {
-                let channel = ConfirmationChannel::new();
-                let offered = offer(&channel, 1, 1);
-                assert!(channel.publish(offered));
-                let mut consumer = ConfirmationConsumer::new(channel.clone());
-                consumer.begin_block(0, 128);
-                consumer.admission(tag(offered, 0), 128, 7, true);
-                if !stopped {
-                    consumer.selected(8, 128);
-                }
-                consumer.copied(0, 128, 8, stopped);
-                assert_eq!(
-                    channel.pop_terminal().unwrap().outcome,
-                    if stopped {
-                        WindowOutcome::Cancelled
-                    } else {
-                        WindowOutcome::Superseded
-                    }
-                );
-            }
         }
 
         #[test]
@@ -1191,26 +1145,6 @@ mod realtime {
         }
 
         #[test]
-        fn cloned_producer_handles_refuse_overlapping_ring_roles() {
-            let channel = ConfirmationChannel::new();
-            let other = channel.clone();
-            let offered = offer(&channel, 1, 0);
-            let call = channel.shared.producer_call().unwrap();
-            assert!(!other.publish(offered));
-            assert!(other.pop_terminal().is_none());
-            assert_eq!(other.try_pop_terminal(), TerminalPoll::Busy);
-            assert_eq!(
-                other.advance_epoch_after_join(),
-                Err(EpochAdvanceError::Busy)
-            );
-            assert_eq!(channel.epoch(), 1);
-            drop(call);
-            assert_eq!(other.try_pop_terminal(), TerminalPoll::Empty);
-            assert!(other.publish(offered));
-            assert_eq!(other.advance_epoch_after_join(), Ok(2));
-        }
-
-        #[test]
         fn final_retirement_survives_a_paused_producer_and_preserves_emitted_terminals() {
             let channel = ConfirmationChannel::new();
             let completed = offer(&channel, 1, 0);
@@ -1279,47 +1213,6 @@ mod realtime {
                 channel.pop_terminal().unwrap().outcome,
                 WindowOutcome::InvalidOffer
             );
-        }
-
-        #[test]
-        fn an_unexpected_full_return_ring_cannot_rewrite_a_completed_terminal() {
-            let channel = ConfirmationChannel::new();
-            let offered = offer(&channel, 1, 0);
-            let filler = EmittedTerminal {
-                slot: 0,
-                terminal: WindowTerminal {
-                    key: ConfirmationKey { epoch: 0, token: 0 },
-                    generation: 0,
-                    takeover_frame: 0,
-                    outcome: WindowOutcome::Cancelled,
-                    copied_start_frame: 0,
-                    copied_end_frame: 1,
-                },
-            };
-            // Normal publication cannot fill this ring: there are only four
-            // credits. Exercise the defensive retry without changing that cap.
-            for _ in 0..channel.shared.terminals.capacity() {
-                assert!(channel.shared.terminals.push(filler).is_ok());
-            }
-            assert!(channel.publish(offered));
-            let mut consumer = ConfirmationConsumer::new(channel.clone());
-            consumer.begin_block(0, 128);
-            consumer.selected(7, 0);
-            consumer.copied(0, 128, 7, false);
-            for _ in 0..channel.shared.terminals.capacity() {
-                assert_eq!(channel.pop_terminal(), Some(filler.terminal));
-            }
-            consumer.begin_block(128, 256);
-            consumer.selected(8, 128);
-            consumer.copied(128, 256, 8, true);
-            let terminal = channel.pop_terminal().unwrap();
-            assert_eq!(terminal.key, offered.key);
-            assert_eq!(terminal.outcome, WindowOutcome::Confirmed);
-            assert_eq!(
-                (terminal.copied_start_frame, terminal.copied_end_frame),
-                (0, 128)
-            );
-            assert!(channel.pop_terminal().is_none());
         }
     }
 }

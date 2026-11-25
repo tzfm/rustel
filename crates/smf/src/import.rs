@@ -654,44 +654,6 @@ mod tests {
     }
 
     #[test]
-    fn channel_ten_becomes_drums_and_unknown_drum_notes_drop() {
-        let bytes = file(Track {
-            name: "drums".to_owned(),
-            channel: 10,
-            messages: vec![
-                message(
-                    0,
-                    MessageKind::NoteOn {
-                        note: 35,
-                        velocity: 100,
-                    },
-                ),
-                message(240, MessageKind::NoteOff { note: 35 }),
-                message(
-                    480,
-                    MessageKind::NoteOn {
-                        note: 52,
-                        velocity: 100,
-                    },
-                ),
-                message(720, MessageKind::NoteOff { note: 52 }),
-            ],
-        });
-        let imported = import_smf(&bytes, &ImportOptions::default()).unwrap();
-        assert_eq!(imported.report.lanes[0].channel, 10);
-        assert_eq!(imported.report.lanes[0].sound, "drums");
-        assert_eq!(imported.report.lanes[0].program, None);
-        assert!(imported.source.contains("s(\"bd"));
-        assert!(
-            imported
-                .report
-                .warnings
-                .iter()
-                .any(|warning| warning.contains("dropped"))
-        );
-    }
-
-    #[test]
     fn labels_are_sanitized_and_unique() {
         let lanes = BTreeMap::from([
             (

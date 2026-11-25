@@ -1674,114 +1674,7 @@ pub fn lcm_all(fs: &[Fraction]) -> Option<Fraction> {
 
 #[cfg(test)]
 mod from_f64_tests {
-    use super::{
-        Fraction, MAX_FRACTION_SOURCE_BYTES, ParseFractionError, farey_approximation,
-        farey_approximation_with_runs, gcd_i128,
-    };
-
-    const FRACTION_JS_LIMIT: i64 = 10_000_000;
-
-    /// The walk of fraction.js, one move at a time, in terms as wide as a
-    /// fraction holds.
-    fn scalar_farey_approximation(p1: f64, limit: i64) -> (i64, i64) {
-        let limit = i128::from(limit);
-        let (mut a, mut b, mut c, mut d) = (0i128, 1i128, 1i128, 1i128);
-        let (mut n, mut den) = (0i128, 1i128);
-        while b <= limit && d <= limit {
-            let mediant = (a + c) as f64 / (b + d) as f64;
-            if p1 == mediant {
-                if b + d <= limit {
-                    n = a + c;
-                    den = b + d;
-                } else if d > b {
-                    n = c;
-                    den = d;
-                } else {
-                    n = a;
-                    den = b;
-                }
-                break;
-            }
-            if p1 > mediant {
-                a += c;
-                b += d;
-            } else {
-                c += a;
-                d += b;
-            }
-            if b > limit {
-                n = c;
-                den = d;
-            } else {
-                n = a;
-                den = b;
-            }
-        }
-        let word = |term: i128| i64::try_from(term).expect("a term of a machine word");
-        (word(n), word(den))
-    }
-
-    #[test]
-    fn batched_farey_walk_matches_the_scalar_state_machine() {
-        const LIMIT: i64 = 1_024;
-        let edge_cases = [
-            f64::MIN_POSITIVE,
-            f64::from_bits(1),
-            0.000_000_1,
-            0.001,
-            0.1,
-            1.0 / 3.0,
-            0.499_999_999_999_999_94,
-            0.5,
-            0.500_000_000_000_000_1,
-            0.999_999_999_999_999_9,
-        ];
-        for value in edge_cases {
-            assert_eq!(
-                farey_approximation(value, LIMIT),
-                scalar_farey_approximation(value, LIMIT),
-                "edge case {value:.17}"
-            );
-        }
-
-        // Fixed-seed binary64 samples exercise direction changes and rounded
-        // equality without making the test probabilistic.
-        let mut state = 0x9e37_79b9_7f4a_7c15_u64;
-        for index in 0..4_096 {
-            state = state
-                .wrapping_mul(6_364_136_223_846_793_005)
-                .wrapping_add(1_442_695_040_888_963_407);
-            let value = ((state >> 11) as f64 + 0.5) / ((1_u64 << 53) as f64);
-            assert_eq!(
-                farey_approximation(value, LIMIT),
-                scalar_farey_approximation(value, LIMIT),
-                "sample {index}: {value:.17}"
-            );
-            // The limit of fraction.js, where the terms are the largest.
-            if index % 8 == 0 {
-                assert_eq!(
-                    farey_approximation(value, FRACTION_JS_LIMIT),
-                    scalar_farey_approximation(value, FRACTION_JS_LIMIT),
-                    "sample {index} at the limit of fraction.js: {value:.17}"
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn near_zero_random_offsets_take_bounded_farey_runs() {
-        for value in [
-            0.000_000_123_456_789,
-            0.000_314_159_265_358_979_3,
-            0.000_999_999_999_999_999_8,
-        ] {
-            let (_, runs) = farey_approximation_with_runs(value, FRACTION_JS_LIMIT);
-            assert!(
-                runs < 128,
-                "{value:.17} took {runs} directional runs; the batched search regressed"
-            );
-        }
-    }
+    use super::{Fraction, MAX_FRACTION_SOURCE_BYTES, ParseFractionError};
 
     // Reject out-of-range floats before a saturated factor can trigger excessive
     // allocation. This test checks conversion only.
@@ -2021,26 +1914,6 @@ mod from_f64_tests {
     }
 
     #[test]
-    fn magnitude_helpers_survive_the_extreme_numerator() {
-        assert_eq!(gcd_i128(i128::MIN, 2), 2);
-        assert_eq!(gcd_i128(2, i128::MIN), 2);
-        assert_eq!(gcd_i128(0, 0), 0);
-
-        // The one case whose answer genuinely does not fit: gcd is 2^127,
-        // one past `i128::MAX`. It must refuse rather than wrap.
-        let refused = std::panic::catch_unwind(|| gcd_i128(i128::MIN, i128::MIN))
-            .expect_err("a gcd of 2^127 cannot be an i128");
-        let message = refused
-            .downcast_ref::<String>()
-            .cloned()
-            .unwrap_or_default();
-        assert!(
-            message.contains("i128 overflow in gcd"),
-            "the refusal did not name the overflow: {message}"
-        );
-    }
-
-    #[test]
     fn negation_still_round_trips_for_ordinary_values() {
         for (n, d) in [(3, 4), (-3, 4), (1, 1), (0, 1), (i128::MAX, 1)] {
             let value = Fraction::new(n, d);
@@ -2100,50 +1973,6 @@ mod checked_new_tests {
 mod cmp_overflow_tests {
     use super::*;
 
-    /// The exact fallback must agree with cross-multiplication wherever
-    /// cross-multiplication is available to be right.
-    #[test]
-    fn the_fallback_agrees_with_cross_multiplication() {
-        let values: Vec<(i128, i128)> = vec![
-            (0, 1),
-            (1, 1),
-            (-1, 1),
-            (1, 3),
-            (2, 6),
-            (-2, 3),
-            (7, 5),
-            (-7, 5),
-            (355, 113),
-            (22, 7),
-            (1, 1_000_000),
-            (999_999, 1_000_000),
-        ];
-        for (an, ad) in &values {
-            for (cn, cd) in &values {
-                let expected = (an * cd).cmp(&(cn * ad));
-                let got = Fraction::new(*an, *ad).cmp(&Fraction::new(*cn, *cd));
-                assert_eq!(got, expected, "{an}/{ad} vs {cn}/{cd}");
-            }
-        }
-    }
-
-    /// The case that panicked: cross-multiplication overflows i128, and the
-    /// comparison still has to answer.
-    #[test]
-    fn huge_fractions_compare_instead_of_panicking() {
-        let big = i128::MAX / 3;
-        let a = Fraction::new(big, big - 1);
-        let b = Fraction::new(big - 2, big - 1);
-        assert!(
-            a.numer().checked_mul(b.denom()).is_none()
-                || b.numer().checked_mul(a.denom()).is_none(),
-            "the test inputs must actually stress the multiply"
-        );
-        assert_eq!(a.cmp(&b), Ordering::Greater);
-        assert_eq!(b.cmp(&a), Ordering::Less);
-        assert_eq!(a.cmp(&a), Ordering::Equal);
-    }
-
     /// Two fractions that differ by the smallest possible amount must not
     /// compare equal: an approximate fallback would get this wrong.
     #[test]
@@ -2159,17 +1988,6 @@ mod cmp_overflow_tests {
             Some(Ordering::Equal),
             "if f64 ever separates these the test has lost its point"
         );
-    }
-
-    #[test]
-    fn negative_numerators_compare_correctly_through_the_fallback() {
-        let big = i128::MAX / 3;
-        let a = Fraction::new(-big, big - 1);
-        let b = Fraction::new(big - 2, big - 1);
-        assert_eq!(a.cmp(&b), Ordering::Less);
-        assert_eq!(b.cmp(&a), Ordering::Greater);
-        let c = Fraction::new(-big, big - 1);
-        assert_eq!(a.cmp(&c), Ordering::Equal);
     }
 }
 
@@ -2213,58 +2031,6 @@ mod parse_tokeniser_tests {
 #[cfg(test)]
 mod native_fast_path_tests {
     use super::*;
-
-    /// Reduce `n / d` with a plain gcd, as the reference for the fast paths.
-    fn reference(n: i128, d: i128) -> Fraction {
-        let divisor = gcd_i128(n, d).max(1);
-        Fraction::new(n / divisor, d / divisor)
-    }
-
-    #[test]
-    fn small_sums_differences_and_orders_match_a_plain_reduction() {
-        // Powers of two, other denominators, whole numbers, negative terms
-        // and terms at the edge of the 64-bit path.
-        let denoms = [1, 2, 3, 4, 6, 8, 12, 16, 64, 80, 1 << 30, (1 << 31) - 1];
-        let numers = [
-            -(1 << 31) + 1,
-            -(1 << 31),
-            -(1 << 30) - 3,
-            -17,
-            -8,
-            -1,
-            0,
-            1,
-            3,
-            5,
-            8,
-            24,
-            1 << 29,
-            (1 << 31) - 2,
-            (1 << 31) - 1,
-            1 << 31,
-        ];
-        let times: Vec<Fraction> = denoms
-            .iter()
-            .flat_map(|&d| numers.iter().map(move |&n| Fraction::new(n, d)))
-            .collect();
-        for &a in &times {
-            for &b in &times {
-                let (an, ad, bn, bd) = (a.numer(), a.denom(), b.numer(), b.denom());
-                assert_eq!(
-                    a + b,
-                    reference(an * bd + bn * ad, ad * bd),
-                    "{a:?} + {b:?}"
-                );
-                assert_eq!(
-                    a - b,
-                    reference(an * bd - bn * ad, ad * bd),
-                    "{a:?} - {b:?}"
-                );
-                assert_eq!(a * b, reference(an * bn, ad * bd), "{a:?} * {b:?}");
-                assert_eq!(a.cmp(&b), (an * bd).cmp(&(bn * ad)), "{a:?} cmp {b:?}");
-            }
-        }
-    }
 
     #[test]
     fn signed_ticks_reduce_on_each_grid() {

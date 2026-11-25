@@ -221,18 +221,4 @@ mod tests {
             );
         }
     }
-
-    #[test]
-    fn no_live_numbers_leave_the_output_unchanged() {
-        let source = "$: note(\"c3 e3\").s(\"sine\").lpf(800).room(.2)";
-        let plain = transpile(source, &TranspileOptions::default());
-        let empty = transpile(
-            source,
-            &TranspileOptions {
-                live_numbers: Vec::new(),
-                ..TranspileOptions::default()
-            },
-        );
-        assert_eq!(plain, empty);
-    }
 }

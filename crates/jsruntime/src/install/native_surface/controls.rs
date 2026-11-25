@@ -1,25 +1,6 @@
 use super::{patterns::choose_lookup, *};
-fn distort_pattern(pattern: Pattern, args: Pattern, algorithm: &'static str) -> Pattern {
-    let args = args.fmap(
-        move |value| match rustel_core::materialize_js_value(value) {
-            Value::List(values) => {
-                let mut out = values.to_vec();
-                out.push(Value::Str(algorithm.into()));
-                Value::list(out)
-            }
-            value => Value::list(vec![value, Value::F64(1.0), Value::Str(algorithm.into())]),
-        },
-    );
-    control_registry()
-        .get("distort")
-        .expect("distort control")
-        .apply(&pattern, Some(args))
-}
-
-/// A distortion of `pattern`: the first argument is the amount (or an
-/// `amount:volume` pair), and a second argument - the documented `volume` -
-/// sets `distortvol` on each event afterwards, as `.distortvol()` would, so
-/// a signal there is sampled per event.
+/// A distortion of `pattern` from the arguments of a script call, as
+/// [`distort_with_algorithm`] builds it.
 fn distort_with<'js>(
     ctx: &Ctx<'js>,
     pattern: Pattern,
@@ -34,16 +15,15 @@ fn distort_with<'js>(
         .unwrap_or_else(|| rquickjs::Value::new_undefined(ctx.clone()));
     let (amount, sidecar) = reify_bridged(ctx, &first)?;
     sidecars.push(sidecar);
-    let distorted = distort_pattern(pattern, amount, algorithm);
-    let Some(volume) = args.0.get(1).filter(|value| !value.is_undefined()) else {
-        return Ok(distorted);
+    let volume = match args.0.get(1).filter(|value| !value.is_undefined()) {
+        Some(volume) => {
+            let (volume, sidecar) = reify_bridged(ctx, volume)?;
+            sidecars.push(sidecar);
+            Some(volume)
+        }
+        None => None,
     };
-    let (volume, sidecar) = reify_bridged(ctx, volume)?;
-    sidecars.push(sidecar);
-    Ok(control_registry()
-        .get("distortvol")
-        .expect("distortvol control")
-        .apply(&distorted, Some(volume)))
+    Ok(distort_with_algorithm(pattern, amount, volume, algorithm))
 }
 
 pub(super) fn distort_method<'js>(

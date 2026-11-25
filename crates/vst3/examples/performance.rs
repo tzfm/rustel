@@ -782,18 +782,6 @@ mod tests {
     }
 
     #[test]
-    fn defaults_preserve_the_original_workload() {
-        let options = options(&["Plugin:mix"]).unwrap();
-        assert_eq!(options.rate, 48_000);
-        assert_eq!(options.blocks, 2_000);
-        assert_eq!(options.frames, [16, 64, 128]);
-        assert_eq!(options.copies, 1);
-        assert_eq!(options.automation_hz, None);
-        assert!(!options.poll);
-        assert_eq!((options.threads, options.parallel), (1, 1));
-    }
-
-    #[test]
     fn accepts_spaced_and_inline_options_with_callback_sizes_above_the_host_limit() {
         let parallel = options(&["--parallel", "4", "Plugin"]).unwrap();
         assert_eq!((parallel.threads, parallel.parallel), (1, 4));

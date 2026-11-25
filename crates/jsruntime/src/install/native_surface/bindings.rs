@@ -526,16 +526,7 @@ pub(super) fn install<'js>(
         .map_err(|error| error.to_string())?,
     )?;
 
-    for algorithm in [
-        "soft",
-        "hard",
-        "cubic",
-        "diode",
-        "asym",
-        "fold",
-        "sinefold",
-        "chebyshev",
-    ] {
+    for algorithm in DISTORTIONS {
         define_method(
             proto,
             algorithm,
@@ -544,6 +535,9 @@ pub(super) fn install<'js>(
             })
             .map_err(|error| error.to_string())?,
         )?;
+        let slot: rquickjs::Value = proto.get(algorithm).map_err(|error| error.to_string())?;
+        record_builtin_method(ctx, algorithm, slot, BuiltinMethod::Distort(algorithm))
+            .map_err(|error| error.to_string())?;
         let free = Function::new(ctx.clone(), move |ctx, args| {
             distort_free(ctx, args, algorithm)
         })

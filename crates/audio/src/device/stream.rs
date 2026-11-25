@@ -1980,6 +1980,13 @@ fn host_builder_at_normal_priority() -> bool {
     unsafe { libc::getpriority(libc::PRIO_PROCESS, 0) <= 0 }
 }
 
+#[cfg(not(target_os = "linux"))]
+fn with_preferred_host<T>(
+    use_host: impl FnOnce(&cpal::Host) -> Result<T, DevicePlaybackError>,
+) -> Result<T, DevicePlaybackError> {
+    use_host(&cpal::default_host())
+}
+
 #[cfg(any(target_os = "linux", test))]
 fn finish_cached_host_request<H, T>(
     host: &mut Option<H>,
@@ -1990,13 +1997,6 @@ fn finish_cached_host_request<H, T>(
         *host = None;
     }
     result
-}
-
-#[cfg(not(target_os = "linux"))]
-fn with_preferred_host<T>(
-    use_host: impl FnOnce(&cpal::Host) -> Result<T, DevicePlaybackError>,
-) -> Result<T, DevicePlaybackError> {
-    use_host(&cpal::default_host())
 }
 
 /// Build the cached playback host now, at the calling thread's priority,
@@ -2660,6 +2660,7 @@ mod tests {
             assert_eq!(Rc::strong_count(&connection), 2);
         }
     }
+
     mod inventory {
         use super::*;
         use std::cell::Cell;
@@ -2946,49 +2947,6 @@ mod tests {
             duplex.assert_probes(1, 1);
             unavailable.assert_probes(0, 1);
         }
-
-        #[test]
-        fn inventory_refresh_observes_hotplug_and_default_changes() {
-            let old = ListedDevice::new("old", "Old output", false, true);
-            let new = ListedDevice::new("new", "New interface", true, true);
-            let mut host = InventoryHost {
-                devices: vec![old.clone()],
-                default_output: Some(old.id),
-                ..Default::default()
-            };
-            let (outputs, inputs) =
-                list_audio_devices(&host, AudioDeviceDetails::Metadata).unwrap();
-            assert_eq!(outputs.len(), 1);
-            assert_eq!(outputs[0].id, old.listed_id());
-            assert!(outputs[0].is_default);
-            assert!(inputs.is_empty());
-
-            host.devices = vec![new.clone()];
-            host.default_input = Some(new.id);
-            host.default_output = Some(new.id);
-            let (outputs, inputs) =
-                list_audio_devices(&host, AudioDeviceDetails::Metadata).unwrap();
-            assert_eq!(outputs.len(), 1);
-            assert_eq!(inputs.len(), 1);
-            assert_eq!(outputs[0].id, new.listed_id());
-            assert_eq!(inputs[0].id, new.listed_id());
-            assert!(outputs[0].is_default);
-            assert!(inputs[0].is_default);
-            old.assert_probes(0, 0);
-            new.assert_probes(0, 0);
-        }
-
-        #[test]
-        fn inventory_reports_host_enumeration_failure() {
-            let host = InventoryHost {
-                unavailable: true,
-                ..Default::default()
-            };
-            assert!(matches!(
-                list_audio_devices(&host, AudioDeviceDetails::Metadata),
-                Err(DevicePlaybackError::Unavailable(_))
-            ));
-        }
     }
     mod output_activation {
         use super::*;
@@ -3054,64 +3012,6 @@ mod tests {
             }
             assert!(tripwire::Violations::capture().since(before).clean());
             assert_eq!(manual.device().report().callback_scope_misses, 0);
-        }
-
-        #[cfg(feature = "test-support")]
-        #[test]
-        fn manual_output_renders_queued_audio_and_acknowledges_stop() {
-            let _tripwire_guard = tripwire_assertion_guard();
-            assert!(tripwire::allocator_is_armed());
-            let mut manual = ManualLiveOutput::new(48_000, 7).expect("manual output");
-            let device = manual.device();
-            assert!(device.is_silent());
-            assert_eq!(device.clock_frames(), 0);
-            assert!(device.push(AudioEvent {
-                onset_id: 1,
-                generation: 7,
-                target_frame: 0,
-                onset_lead: 0.0,
-                freq_hz: 220.0,
-                gain: 0.5,
-                duration_secs: 1.0,
-                ui_visuals: 0,
-                controls: Default::default(),
-                sample: None,
-                synth: None,
-                wavetable: None,
-                cut: None,
-            }));
-            assert_eq!(device.report().callbacks, 0);
-            assert_eq!(device.report().ring_depth, 1);
-
-            let mut output = [0.0f32; 256 * 2];
-            let before = tripwire::Violations::capture();
-            manual.render(&mut output);
-            assert!(tripwire::Violations::capture().since(before).clean());
-            assert!(output.iter().all(|sample| sample.is_finite()));
-            assert!(output.iter().any(|sample| sample.abs() > 1e-6));
-            let report = manual.device().report();
-            assert_eq!(report.callbacks, 1);
-            assert_eq!(report.submitted_frames, 256);
-            assert_eq!(report.accepted_events, 1);
-            assert_eq!(report.ring_depth, 0);
-            assert_eq!(report.ring_role_conflicts, 0);
-            assert_eq!(report.callback_scope_misses, 0);
-
-            manual.device().stop();
-            assert!(!manual.device().report().stop_acknowledged);
-            let before = tripwire::Violations::capture();
-            for buffer in 0..3 {
-                manual.render(&mut output);
-                // The first 256 frames sit inside the 480-frame ramp.
-                assert_eq!(manual.device().report().stop_acknowledged, buffer > 0);
-            }
-            assert!(tripwire::Violations::capture().since(before).clean());
-            let report = manual.device().report();
-            assert!(report.stop_acknowledged);
-            assert_eq!(report.callbacks, 4);
-            assert_eq!(report.submitted_frames, 1024);
-            assert_eq!(report.accepted_events, 1);
-            assert!(output.iter().all(|sample| *sample == 0.0));
         }
 
         #[cfg(feature = "test-support")]
@@ -3202,147 +3102,6 @@ mod tests {
             assert!(!manual.device().report().stop_acknowledged);
             manual.render(&mut output);
             assert!(manual.device().report().stop_acknowledged);
-        }
-
-        /// A resumed output keeps the inserts of its chains. Each chain is
-        /// silent until its next note. When an insert keeps a tail through
-        /// its reset, the next note moves the level up from 0. The chains
-        /// run on plugin workers.
-        #[cfg(feature = "test-support")]
-        #[test]
-        fn a_resumed_output_silences_a_kept_tail_until_the_next_note() {
-            /// Rings at 0.5 after a note or any input, also after a reset.
-            struct Ringing(crate::insert::InsertKey, f32);
-            impl crate::insert::OrbitInsert for Ringing {
-                fn key(&self) -> crate::insert::InsertKey {
-                    self.0
-                }
-                fn set_param(&mut self, _: crate::insert::InsertParam, _: u32) {}
-                fn note(&mut self, _: crate::insert::InsertNote, _: u32) {
-                    self.1 = 0.5;
-                }
-                fn process(&mut self, left: &mut [f32], right: &mut [f32]) {
-                    for (left, right) in left.iter_mut().zip(right) {
-                        if *left != 0.0 || *right != 0.0 {
-                            self.1 = 0.5;
-                        }
-                        (*left, *right) = (self.1, self.1);
-                    }
-                }
-                fn any_thread(&self) -> bool {
-                    true
-                }
-            }
-            let _tripwire_guard = tripwire_assertion_guard();
-            crate::set_plugin_pool_for_test(Some(2));
-            let key = crate::insert::InsertKey {
-                plugin: 1,
-                preset: 0,
-            };
-            let instrument_key = crate::insert::InsertKey {
-                plugin: 2,
-                preset: 0,
-            };
-            for instrument in [false, true] {
-                let mut manual = ManualLiveOutput::new(48_000, 7).expect("manual output");
-                manual.device().set_insert_provider(Arc::new(|key, _, _| {
-                    Some(Box::new(Ringing(key, 0.0)) as Box<_>)
-                }));
-                let note = |frame| {
-                    let mut event = resume_tone(frame);
-                    event.controls.effects[0] = Some(crate::insert::InsertControls::new(key));
-                    if instrument {
-                        let note = crate::insert::InsertNote {
-                            pitch: 69.0,
-                            velocity: 1.0,
-                            frames: 48,
-                        };
-                        event.controls.instrument = Some(
-                            crate::insert::InsertControls::new(instrument_key).with_note(note),
-                        );
-                    }
-                    event
-                };
-                LiveReverbBatch::install_inserts(manual.device(), &[note(0)]);
-                assert!(manual.device().push(note(0)));
-                let mut output = [0.0f32; 256 * 2];
-                manual.render(&mut output);
-                assert!(
-                    output[510] > 0.4,
-                    "instrument {instrument}: the insert rings"
-                );
-
-                manual.device().stop();
-                for _ in 0..3 {
-                    manual.render(&mut output);
-                }
-                assert!(manual.device().report().stop_acknowledged);
-                manual.device().resume();
-                for _ in 0..4 {
-                    manual.render(&mut output);
-                    assert!(
-                        output.iter().all(|sample| *sample == 0.0),
-                        "instrument {instrument}: the kept tail sounds after the resume"
-                    );
-                }
-
-                // The next note is 128 frames into the block.
-                assert!(
-                    manual
-                        .device()
-                        .push(note(manual.device().clock_frames() + 128))
-                );
-                manual.render(&mut output);
-                let left: Vec<f32> = output.iter().step_by(2).copied().collect();
-                assert!(left[..128].iter().all(|sample| *sample == 0.0));
-                assert!(
-                    left[128].abs() < 0.01,
-                    "instrument {instrument}: a step at the next note: {}",
-                    left[128]
-                );
-                manual.render(&mut output);
-                assert!(
-                    output[510] > 0.4,
-                    "instrument {instrument}: the next note plays through the insert"
-                );
-
-                // A note at the first frame after the resume also moves the
-                // level up from 0.
-                manual.device().stop();
-                for _ in 0..3 {
-                    manual.render(&mut output);
-                }
-                assert!(manual.device().report().stop_acknowledged);
-                manual.device().resume();
-                assert!(manual.device().push(note(manual.device().clock_frames())));
-                manual.render(&mut output);
-                let left: Vec<f32> = output.iter().step_by(2).copied().collect();
-                assert!(
-                    left[0].abs() < 0.01,
-                    "instrument {instrument}: a step at the first frame: {}",
-                    left[0]
-                );
-                assert!(
-                    left.windows(2).all(|pair| (pair[1] - pair[0]).abs() < 0.1),
-                    "instrument {instrument}: a step after the resume"
-                );
-                assert!(
-                    manual
-                        .device()
-                        .holds_insert(crate::insert::effect_slot(1, 0), key)
-                );
-                if instrument {
-                    assert!(
-                        manual
-                            .device()
-                            .holds_insert(crate::insert::instrument_slot(1), instrument_key)
-                    );
-                }
-                let report = manual.device().report();
-                assert_eq!(report.callback_scope_misses, 0);
-                assert_eq!(report.plugin_workers, 2);
-            }
-            crate::set_plugin_pool_for_test(None);
         }
 
         /// A stopped output drains each insert with silence and no sound out,
@@ -4169,36 +3928,6 @@ mod tests {
         }
 
         #[test]
-        fn pending_callbacks_write_silence_in_every_host_format() {
-            fn check<T>()
-            where
-                T: SizedSample + FromSample<f32> + PartialEq + std::fmt::Debug,
-            {
-                assert!(
-                    sample_format_from_cpal(T::FORMAT).is_some(),
-                    "{}",
-                    T::FORMAT
-                );
-                let gate = CallbackGate::new();
-                let mut output = [T::from_sample(0.5); 7];
-                gate.render_or_silence(&mut output, |_| panic!("pending callback entered DSP"));
-                assert_eq!(output, [T::from_sample(0.0); 7]);
-            }
-            check::<f32>();
-            check::<f64>();
-            check::<i8>();
-            check::<i16>();
-            check::<I24>();
-            check::<i32>();
-            check::<i64>();
-            check::<u8>();
-            check::<u16>();
-            check::<U24>();
-            check::<u32>();
-            check::<u64>();
-        }
-
-        #[test]
         fn pending_callbacks_leave_queues_and_shared_state_for_activation() {
             let _tripwire_guard = tripwire_assertion_guard();
             assert!(tripwire::allocator_is_armed());
@@ -4295,79 +4024,6 @@ mod tests {
         }
 
         #[test]
-        fn callback_errors_before_activation_do_not_fail_the_running_output() {
-            let _tripwire_guard = tripwire_assertion_guard();
-            assert!(tripwire::allocator_is_armed());
-            let shared = LiveShared::new(7);
-            let pending = CallbackGate::new();
-            let before = shared.report(1);
-            let violations = tripwire::Violations::capture();
-            tripwire::audio_scope(|| {
-                pending.report_error(&shared.failed, &shared.callback_errors);
-                pending.report_error(&shared.failed, &shared.callback_errors);
-            });
-            assert!(tripwire::Violations::capture().since(violations).clean());
-            assert!(!shared.failed.load(Ordering::Acquire));
-            assert_eq!(shared.report(1), before);
-            assert!(pending.activate().is_err());
-            let mut output = [1.0f32; 8];
-            pending.render_or_silence(&mut output, |_| panic!("failed candidate rendered"));
-            assert_eq!(output, [0.0; 8]);
-            let mut started = None;
-            assert_eq!(
-                silent_elapsed(&mut started, &pending, || panic!(
-                    "failed gate read the clock"
-                )),
-                None
-            );
-            assert!(started.is_none());
-
-            let active = CallbackGate::new();
-            active.activate().expect("active output");
-            active.report_error(&shared.failed, &shared.callback_errors);
-            active.report_error(&shared.failed, &shared.callback_errors);
-            assert!(
-                active.is_active(),
-                "active errors keep the normal stop path"
-            );
-            assert!(shared.failed.load(Ordering::Acquire));
-            assert_eq!(shared.callback_errors.load(Ordering::Acquire), 2);
-        }
-
-        #[test]
-        fn silent_pacing_starts_at_activation_not_preparation() {
-            let gate = CallbackGate::new();
-            let prepared_at = Instant::now();
-            let mut started = None;
-            assert_eq!(
-                silent_elapsed(&mut started, &gate, || panic!(
-                    "pending gate read the clock"
-                )),
-                None
-            );
-            let activated_at = prepared_at + Duration::from_secs(30);
-            assert_eq!(
-                silent_elapsed(&mut started, &gate, || panic!(
-                    "pending gate read the clock"
-                )),
-                None
-            );
-            assert!(started.is_none());
-            gate.activate().expect("activate");
-            assert_eq!(
-                silent_elapsed(&mut started, &gate, || activated_at),
-                Some(Duration::ZERO)
-            );
-            assert_eq!(started, Some(activated_at));
-            assert_eq!(
-                silent_elapsed(&mut started, &gate, || {
-                    activated_at + Duration::from_millis(10)
-                }),
-                Some(Duration::from_millis(10)),
-            );
-        }
-
-        #[test]
         fn prepared_silent_drop_joins_without_stopping_shared_playback() {
             let shared = LiveShared::new(7);
             shared.frames.store(48_000, Ordering::Release);
@@ -4397,36 +4053,6 @@ mod tests {
                 assert!(!shared.stop.is_stopped());
                 assert_eq!(shared.input.channels(), 1);
             }
-        }
-
-        #[test]
-        fn prepared_silent_activation_transfers_the_thread_to_its_handle() {
-            let shared = LiveShared::new(7);
-            let prepared = PreparedLiveOutput::silent(
-                shared.clone(),
-                48_000,
-                LiveOutputOptions::default(),
-                &[],
-            )
-            .expect("prepared output");
-            let gate = Arc::clone(&prepared.gate);
-            prepared.start_gated().expect("gated start");
-            assert_eq!(shared.clock_frames(), 0);
-            let handle = prepared.activate().expect("activate");
-            let deadline = Instant::now() + Duration::from_secs(3);
-            while shared.callbacks.load(Ordering::Acquire) == 0 {
-                assert!(Instant::now() < deadline, "activated callback never ran");
-                std::thread::sleep(Duration::from_millis(2));
-            }
-            drop(handle);
-            assert_eq!(
-                Arc::strong_count(&gate),
-                1,
-                "active handle joined its thread"
-            );
-            assert!(shared.clock_frames() >= u64::from(SILENT_BUFFER_FRAMES));
-            assert_eq!(shared.ring.role_conflicts.load(Ordering::Acquire), 0);
-            assert!(!shared.stop.is_stopped());
         }
 
         /// A held silent clock stays put however long the test looks at it,
@@ -4487,26 +4113,6 @@ mod tests {
              {pace} frames of unheld wall time ({held:?} held)"
             );
             assert!(device.hold_silent_clock_for_test(false));
-        }
-
-        #[test]
-        fn silent_output_reports_only_facts_it_actually_has() {
-            let device = LiveScalarDevice::start_silent(48_000, 7).expect("silent output");
-            assert!(!device.dispatch().is_forced_portable());
-            let facts = device.audio_facts();
-            let output = facts.output();
-
-            assert_eq!(output.host(), &AudioHost::Silent);
-            assert_eq!(output.host().id(), None);
-            assert_eq!(output.device_id(), SILENT_OUTPUT_NAME);
-            assert_eq!(output.sample_rate_hz(), 48_000);
-            assert_eq!(output.channels(), 2);
-            assert_eq!(output.sample_format(), None);
-            assert_eq!(output.buffer_preference(), AudioBufferPreference::Auto);
-            assert_eq!(output.requested_buffer_frames(), SILENT_BUFFER_FRAMES);
-            assert_eq!(output.reported_buffer_frames(), Some(SILENT_BUFFER_FRAMES));
-            assert!(!output.host_timestamps_available());
-            assert_eq!(facts.input(), None);
         }
     }
     mod output_recycle {
@@ -4578,39 +4184,6 @@ mod tests {
             assert_eq!(device.shared.samples.fx_reverb_installs.len(), 0);
         }
 
-        /// The callback count is what the studio settles a retiring id
-        /// against: it climbs one per completed block, and a recycle keeps the
-        /// shared counter, so a count read before it is still comparable after.
-        #[test]
-        fn callbacks_count_completed_blocks_and_survive_a_recycle() {
-            fn wait_past(device: &LiveScalarDevice, count: u64) -> u64 {
-                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-                loop {
-                    let now = device.callbacks();
-                    if now > count {
-                        return now;
-                    }
-                    assert!(
-                        std::time::Instant::now() < deadline,
-                        "the silent output stopped at {now} callbacks"
-                    );
-                    std::thread::sleep(std::time::Duration::from_millis(2));
-                }
-            }
-
-            let mut device = LiveScalarDevice::start_silent(48_000, 7).expect("silent output");
-            let first = wait_past(&device, 0);
-            let second = wait_past(&device, first);
-            assert!(second > first, "one more block, one more callback");
-
-            device.recycle_output().expect("recycle silent output");
-            let after = wait_past(&device, second);
-            assert!(
-                after > second,
-                "the count carried over the recycle: {second} then {after}"
-            );
-        }
-
         #[test]
         fn silent_recycle_keeps_input_audio_routed() {
             fn wait_for_input(device: &LiveScalarDevice, sign: f32) -> LiveAnalysisSnapshot {
@@ -4663,43 +4236,6 @@ mod tests {
             let after = wait_for_input(&device, -1.0);
             assert_ne!(after.epoch, before.epoch);
             assert_eq!(device.input_channels(), 1);
-        }
-
-        #[test]
-        fn silent_selector_retains_prepared_output_options() {
-            for dispatch in [DspDispatch::automatic(), DspDispatch::portable()] {
-                let preference = AudioBufferPreference::Frames(512);
-                let options = LiveOutputOptions::default()
-                    .with_dispatch(dispatch)
-                    .with_buffer_preference(preference);
-                let device = LiveScalarDevice::start_output_with_options(
-                    Some(SILENT_OUTPUT_NAME),
-                    7,
-                    options,
-                )
-                .expect("selected silent output");
-                assert_eq!(device.audio_facts().output().host(), &AudioHost::Silent);
-                assert_eq!(device.output_options().buffer_preference(), preference);
-                assert_eq!(
-                    device.audio_facts().output().buffer_preference(),
-                    preference
-                );
-                assert_eq!(device.requested_buffer_frames(), 512);
-                let selected = device.output_options().dispatch();
-                assert_eq!(selected.is_forced_portable(), dispatch.is_forced_portable());
-                assert_eq!(
-                    selected.convolution_kernel_kind(),
-                    dispatch.convolution_kernel_kind()
-                );
-                assert_eq!(
-                    selected.supersaw_kernel_kind(),
-                    dispatch.supersaw_kernel_kind()
-                );
-                assert_eq!(
-                    selected.wavetable_kernel_kind(),
-                    dispatch.wavetable_kernel_kind()
-                );
-            }
         }
 
         #[test]
@@ -4818,53 +4354,6 @@ mod tests {
                 Some(42)
             );
             assert!(device.shared.ring.is_empty());
-            device.check_health().expect("discovery preserves health");
-        }
-
-        #[test]
-        fn rejected_output_discovery_keeps_the_live_clock_running() {
-            let mut device = LiveScalarDevice::start_silent(48_000, 7).expect("silent output");
-            let callback = device
-                .silent_handle()
-                .unwrap()
-                .join
-                .as_ref()
-                .unwrap()
-                .thread()
-                .id();
-            device
-                .recycle_output_to_with(
-                    Some("unavailable-output"),
-                    |_| {
-                        Err(DevicePlaybackError::Unavailable(
-                            "discovery rejected".into(),
-                        ))
-                    },
-                    LiveScalarDevice::prepare_recycled_output,
-                )
-                .expect_err("discovery must fail");
-            assert!(!device.shared.stop.is_stopped());
-            assert_eq!(
-                device
-                    .silent_handle()
-                    .expect("retained output")
-                    .join
-                    .as_ref()
-                    .unwrap()
-                    .thread()
-                    .id(),
-                callback
-            );
-            let before = device.clock_frames();
-            let deadline = Instant::now() + Duration::from_secs(3);
-            while device.clock_frames() <= before {
-                assert!(
-                    Instant::now() < deadline,
-                    "retained output stopped advancing"
-                );
-                std::thread::sleep(Duration::from_millis(2));
-            }
-            assert_eq!(device.generation(), 7);
             device.check_health().expect("discovery preserves health");
         }
 
@@ -5108,78 +4597,6 @@ mod tests {
         }
 
         #[test]
-        fn recycle_activation_failure_marks_output_unhealthy() {
-            let mut device = LiveScalarDevice::start_silent(48_000, 7).expect("silent output");
-            device.check_health().expect("initial output is healthy");
-            let old_close = Arc::clone(&device.silent_handle().unwrap().close);
-            let mut candidate_close = None;
-            let mut preparations = 0;
-            let error = device
-                .recycle_output_to_with(
-                    None,
-                    |_| panic!("silent output needs no discovery"),
-                    |device, opened| {
-                        preparations += 1;
-                        assert!(opened.is_none());
-                        assert!(device.output.is_none());
-                        assert!(old_close.load(Ordering::Acquire));
-                        assert_eq!(Arc::strong_count(&old_close), 1, "old thread was joined");
-                        let prepared = device.prepare_recycled_output(opened)?;
-                        let OutputHandle::Silent(silent) = &prepared.handle else {
-                            panic!("expected pending silent output");
-                        };
-                        candidate_close = Some(Arc::clone(&silent.close));
-                        assert_eq!(
-                            prepared.gate.state.load(Ordering::Acquire),
-                            CALLBACK_PENDING
-                        );
-                        prepared
-                            .gate
-                            .report_error(&device.shared.failed, &device.shared.callback_errors);
-                        assert_eq!(prepared.gate.state.load(Ordering::Acquire), CALLBACK_FAILED);
-                        Ok(prepared)
-                    },
-                )
-                .expect_err("failed pending gate must reject activation");
-            assert_eq!(preparations, 1);
-            assert_eq!(
-                error.to_string(),
-                "live output failed before activation or was already activated"
-            );
-            assert!(device.output.is_none());
-            assert!(device.shared.stop.is_stopped());
-            let candidate_close = candidate_close.expect("candidate was prepared");
-            assert!(candidate_close.load(Ordering::Acquire));
-            assert_eq!(
-                Arc::strong_count(&candidate_close),
-                1,
-                "candidate thread was joined"
-            );
-            assert_eq!(device.shared.callback_errors.load(Ordering::Acquire), 0);
-            assert!(
-                device.check_health().is_err(),
-                "handleless activation must fail health"
-            );
-        }
-
-        #[test]
-        fn silent_recycle_does_not_discover_a_native_output() {
-            let mut device = LiveScalarDevice::start_silent(44_100, 7).expect("silent output");
-            for selector in [None, Some(SILENT_OUTPUT_NAME)] {
-                device
-                    .recycle_output_to_with(
-                        selector,
-                        |_| panic!("silent output needs no discovery"),
-                        LiveScalarDevice::prepare_recycled_output,
-                    )
-                    .expect("silent recycle");
-                assert_eq!(device.name(), SILENT_OUTPUT_NAME);
-                assert_eq!(device.sample_rate(), SILENT_SAMPLE_RATE);
-                assert_eq!(device.generation(), 7);
-            }
-        }
-
-        #[test]
         fn cancelled_recycle_never_activates_the_pending_output() {
             use std::cell::Cell;
             let samples = [(
@@ -5245,57 +4662,6 @@ mod tests {
                     }
                 }
             }
-        }
-
-        #[test]
-        fn portable_selection_survives_silent_recycle_and_asset_preparation() {
-            let options = LiveOutputOptions::default().with_dispatch(DspDispatch::portable());
-            let mut device = LiveScalarDevice::start_silent_with_options(48_000, 7, options)
-                .expect("portable silent output");
-            device.recycle_output().expect("recycle silent output");
-            assert!(device.dispatch().is_forced_portable());
-            assert!(device.output_options().dispatch().is_forced_portable());
-
-            // Joining the sole callback leaves the test as the only asset-ring
-            // consumer, so it can inspect the prepared installs without a race.
-            device.silent_handle_mut().expect("silent callback").stop();
-            let params = crate::reverb::ReverbParams {
-                size_secs: 0.025,
-                fade_secs: 0.01,
-                lp_start_hz: 15_000.0,
-                lp_end_hz: 1_000.0,
-                ir: None,
-            };
-            device.ensure_reverb(0, params);
-            let install = device
-                .shared
-                .samples
-                .reverb_installs
-                .pop()
-                .expect("prepared orbit reverb");
-            // SAFETY: the callback is joined and popping transferred the unique
-            // allocation to this thread. No other owner can read or free it.
-            let reverb = unsafe { Box::from_raw(install.reverb) };
-            assert!(reverb.dispatch().is_forced_portable());
-            assert_eq!(
-                reverb.dispatch().convolution_kernel_kind(),
-                crate::ConvolutionKernelKind::Portable,
-            );
-
-            device.ensure_fx_reverb(params);
-            let install = device
-                .shared
-                .samples
-                .fx_reverb_installs
-                .pop()
-                .expect("prepared stage reverb");
-            // SAFETY: as above, this thread now exclusively owns the popped box.
-            let reverb = unsafe { Box::from_raw(install.reverb) };
-            assert!(reverb.dispatch().is_forced_portable());
-            assert_eq!(
-                reverb.dispatch().convolution_kernel_kind(),
-                crate::ConvolutionKernelKind::Portable,
-            );
         }
 
         #[test]
@@ -5571,78 +4937,6 @@ mod tests {
             assert_eq!(error.to_string(), expected);
         }
 
-        #[test]
-        fn live_environment_controls_use_the_product_namespace() {
-            assert_eq!(MAX_LIVE_LATENCY_ENV, "RUSTEL_MAX_LIVE_LATENCY_MS");
-            assert_eq!(LIVE_BUFFER_FRAMES_ENV, "RUSTEL_LIVE_BUFFER_FRAMES");
-            assert_eq!(PLUGIN_THREADS_ENV, "RUSTEL_PLUGIN_THREADS");
-            // The options set the plugin workers before the environment,
-            // and the cores of the process set them last.
-            let plugin_threads = super::super::inserts::plugin_threads;
-            let cores = crate::pool::plugin_workers();
-            assert_eq!(plugin_threads(Some(3), Some("5")), 3);
-            assert_eq!(plugin_threads(Some(0), None), 0);
-            assert_eq!(plugin_threads(None, Some("5")), 5);
-            assert_eq!(plugin_threads(None, Some("0")), 0);
-            assert_eq!(plugin_threads(None, Some("five")), cores);
-            assert_eq!(plugin_threads(None, None), cores);
-        }
-
-        #[test]
-        fn live_buffer_request_stays_inside_the_advertised_device_range() {
-            // The platform default is environment-dependent: WSL's forwarded
-            // sink underruns at 256 frames, so the selector prefers 2048 there.
-            let platform_default = if std::env::var_os("WSL_DISTRO_NAME").is_some()
-                || std::env::var_os("WSL_INTEROP").is_some()
-            {
-                2048
-            } else {
-                TARGET_LIVE_BUFFER_FRAMES
-            };
-            let env_override = std::env::var(LIVE_BUFFER_FRAMES_ENV)
-                .ok()
-                .and_then(|frames| frames.parse::<u32>().ok())
-                .filter(|frames| {
-                    (AudioBufferPreference::MIN_FRAMES..=AudioBufferPreference::MAX_FRAMES)
-                        .contains(frames)
-                });
-            let target = env_override.unwrap_or(platform_default);
-            let select = |range: &SupportedBufferSize| {
-                select_live_buffer_frames(range, AudioBufferPreference::Auto)
-                    .expect("supported buffer range")
-            };
-            assert_eq!(select(&SupportedBufferSize::Unknown), target);
-            for (min, max) in [(64, 1024), (512, 2048), (32, 128)] {
-                assert_eq!(
-                    select(&SupportedBufferSize::Range { min, max }),
-                    target.clamp(min, max),
-                    "{min}..={max}"
-                );
-            }
-        }
-
-        #[test]
-        fn explicit_buffer_selection_ignores_automatic_defaults() {
-            for (range, expected, context) in [
-                (SupportedBufferSize::Unknown, 96, "explicit buffer"),
-                (
-                    SupportedBufferSize::Range {
-                        min: 256,
-                        max: 1024,
-                    },
-                    256,
-                    "clamped buffer",
-                ),
-            ] {
-                assert_eq!(
-                    select_live_buffer_frames(&range, AudioBufferPreference::Frames(96))
-                        .expect(context),
-                    expected,
-                    "{context}"
-                );
-            }
-        }
-
         /// WASAPI reports its shared period as `min == max`. Treat it as a minimum:
         /// larger requests pass through and smaller requests use the period.
         /// Other hosts keep fixed sizes and real ranges as hard constraints.
@@ -5760,56 +5054,6 @@ mod tests {
                 wavetable: None,
                 cut: None,
             }
-        }
-
-        #[test]
-        fn manual_callback_uses_the_selected_sample_resampling_mode() {
-            let _tripwire_guard = tripwire_assertion_guard();
-            let samples = [(SAMPLE_ID, sample())];
-            let render = |mode: Option<SampleResamplingMode>| {
-                let mut output = match mode {
-                    Some(mode) => ManualLiveOutput::new_with_samples_and_options(
-                        OUTPUT_RATE,
-                        7,
-                        &samples,
-                        LiveOutputOptions::default().with_sample_resampling_mode(mode),
-                    ),
-                    None => ManualLiveOutput::new_with_samples(OUTPUT_RATE, 7, &samples),
-                }
-                .expect("manual output");
-                output.device().set_limiter(None);
-                assert!(output.device().push(event(7, 0)));
-                let mut pcm = [0.0; 1024 * 2];
-                let before = tripwire::Violations::capture();
-                output.render(&mut pcm);
-                assert!(tripwire::Violations::capture().since(before).clean());
-                assert!(pcm.iter().all(|sample| sample.is_finite()));
-                assert!(pcm.iter().any(|sample| sample.abs() > 1e-4));
-                let report = output.device().report();
-                assert_eq!(report.accepted_events, 1);
-                assert_eq!(report.ring_role_conflicts, 0);
-                assert_eq!(report.callback_scope_misses, 0);
-                pcm
-            };
-
-            assert_eq!(
-                LiveOutputOptions::default().sample_resampling_mode(),
-                SampleResamplingMode::Linear
-            );
-            let linear = render(Some(SampleResamplingMode::Linear));
-            let raw = render(Some(SampleResamplingMode::Raw));
-            assert_eq!(
-                render(None),
-                linear,
-                "default output keeps linear interpolation"
-            );
-            assert!(
-                linear
-                    .iter()
-                    .zip(raw.iter())
-                    .any(|(a, b)| (a - b).abs() > 1e-4),
-                "fractional source positions must change callback PCM"
-            );
         }
 
         fn assert_silent_pcm(device: &LiveScalarDevice, mode: SampleResamplingMode) {

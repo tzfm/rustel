@@ -161,6 +161,7 @@ pub use render::{
 };
 pub use rustel_audio::TakeoverCut;
 pub use rustel_jsruntime::forget_mini_literals;
+pub use rustel_scheduler::LaneControls;
 pub use samples::{
     BUILTIN_SOURCES, DEFAULT_VIDEO_FILE_BYTES, LOCAL_FILES, MAX_VIDEO_FILE_BYTES,
     SCORE_SAMPLE_CACHE_MAX_BYTES, SCORE_SAMPLE_CACHE_MAX_ENTRIES,

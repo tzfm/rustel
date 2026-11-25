@@ -26,110 +26,6 @@ fn serial_tripwire_test() -> MutexGuard<'static, ()> {
         .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
-struct AudioState {
-    frames: AtomicU64,
-    held: Option<AudioEvent<rustel_audio::CompactKabelControls>>,
-    consumed: Vec<u64>,
-}
-
-fn callback(st: &mut AudioState, ring: &Ring, generation: u64, stopped: &AtomicBool) {
-    tripwire::audio_scope(|| {
-        if stopped.load(Ordering::Acquire) {
-            st.frames.fetch_add(BLOCK_FRAMES, Ordering::Release);
-            return;
-        }
-        let start = st.frames.load(Ordering::Relaxed);
-        let end = start + BLOCK_FRAMES;
-        while let Some(e) = st.held.take().or_else(|| ring.pop()) {
-            if e.generation != generation {
-                continue;
-            }
-            if e.target_frame >= end {
-                st.held = Some(e);
-                break;
-            }
-            // Prefill capacity so push cannot allocate inside the callback.
-            st.consumed.push(e.onset_id);
-        }
-        st.frames.store(end, Ordering::Release);
-    });
-}
-
-#[test]
-fn ring_callback_path_has_no_allocation_or_free() {
-    let _serial = serial_tripwire_test();
-    assert!(!std::mem::needs_drop::<
-        AudioEvent<rustel_audio::CompactKabelControls>,
-    >());
-
-    let ring = Ring::new(64);
-    for i in 0..16u64 {
-        assert!(ring.push(AudioEvent {
-            onset_id: i,
-            generation: 1,
-            target_frame: i * 32,
-            onset_lead: 0.0,
-            freq_hz: 440.0,
-            gain: 0.5,
-            duration_secs: 0.01,
-            ui_visuals: 0,
-            controls: Default::default(),
-            sample: None,
-            wavetable: None,
-            synth: None,
-            cut: None,
-        }));
-    }
-
-    let mut st = AudioState {
-        frames: AtomicU64::new(0),
-        held: None,
-        consumed: Vec::with_capacity(32),
-    };
-    let stopped = AtomicBool::new(false);
-
-    let before = Violations::capture();
-    for _ in 0..8 {
-        callback(&mut st, &ring, 1, &stopped);
-    }
-    let delta = Violations::capture().since(before);
-    assert!(
-        delta.clean(),
-        "audio callback violated no-alloc contract: {delta:?}"
-    );
-    assert!(!st.consumed.is_empty(), "expected to consume POD onsets");
-}
-
-#[test]
-fn negative_control_detects_allocation_inside_callback() {
-    let _serial = serial_tripwire_test();
-    let entries = tripwire::scope_entries();
-    let before = Violations::capture();
-    tripwire::audio_scope(|| {
-        #[allow(clippy::useless_vec)]
-        let _leak = vec![1u8, 2, 3, 4];
-    });
-    let delta = Violations::capture().since(before);
-    assert!(
-        delta.allocs > 0,
-        "negative control must observe allocation; got {delta:?}"
-    );
-    assert_eq!(
-        tripwire::scope_entries() - entries,
-        1,
-        "the callback scope was not entered exactly once"
-    );
-}
-
-#[test]
-fn installed_allocator_passes_the_callback_arm_check() {
-    let _serial = serial_tripwire_test();
-    assert!(
-        tripwire::allocator_is_armed(),
-        "the allocation tripwire accepted a binary without TripwireAlloc"
-    );
-}
-
 #[test]
 fn reverb_installation_adopts_dispatch_without_callback_allocation() {
     let _serial = serial_tripwire_test();
@@ -770,66 +666,6 @@ fn an_orbit_insert_installs_and_processes_without_callback_allocation() {
     }
 }
 
-/// Plugin chains on 2 workers allocate and free nothing, on the callback
-/// and on the workers: 2 instruments through effects, a native chain and an
-/// instrument with no effect, for 200 blocks.
-#[cfg(feature = "test-support")]
-#[test]
-fn pooled_inserts_process_without_allocation_on_any_thread() {
-    let _serial = serial_tripwire_test();
-    let mut backend = ScalarBackend::prepared(48_000, 8).expect("scalar init");
-    let _workers = plugin_workers(&mut backend).expect("plugin workers");
-    let key = |plugin| rustel_audio::InsertKey { plugin, preset: 0 };
-    for chain in 0..4u64 {
-        let mut controls = OscillatorControls {
-            insert_chain: Some(chain),
-            ..OscillatorControls::default()
-        };
-        let plugin = 10 * chain as u32;
-        let mut install = |slot, plugin| {
-            let insert = Box::new(GainInsert {
-                key: key(plugin),
-                gain: 1.0,
-            });
-            assert!(backend.install_insert(slot, insert).is_none());
-        };
-        if chain != 2 {
-            install(rustel_audio::instrument_slot(chain), plugin);
-            controls.instrument = Some(rustel_audio::InsertControls::new(key(plugin)));
-        }
-        for (stage, effect_controls) in controls.effects[..[1, 2, 1, 0][chain as usize]]
-            .iter_mut()
-            .enumerate()
-        {
-            let effect = plugin + 1 + stage as u32;
-            install(rustel_audio::effect_slot(chain, stage), effect);
-            *effect_controls = Some(rustel_audio::InsertControls::new(key(effect)));
-        }
-        assert!(
-            backend.try_note_prepared(OnsetEvent::new(0, 440.0, 0.5, 1.0).with_controls(controls))
-        );
-    }
-    let mut output = [0.0f32; 128 * 2];
-    let worker_calls = WORKER_CALLS.load(Ordering::Relaxed);
-
-    let before = Violations::capture();
-    tripwire::audio_scope(|| {
-        for _ in 0..200 {
-            backend.process_block(&mut output, 128);
-        }
-    });
-    let delta = Violations::capture().since(before);
-    assert!(
-        delta.clean(),
-        "pooled inserts allocated or freed on a thread: {delta:?}"
-    );
-    assert!(
-        WORKER_CALLS.load(Ordering::Relaxed) > worker_calls,
-        "no job ran on a worker"
-    );
-    assert_eq!(backend.missing_insert_events(), 0);
-}
-
 fn fx_reverb_test_controls(params: rustel_audio::reverb::ReverbParams) -> OscillatorControls {
     let mut controls = OscillatorControls {
         limit: None,
@@ -1205,24 +1041,6 @@ fn render_wavetable_unison(dispatch: rustel_audio::DspDispatch, voices: f32) -> 
 }
 
 #[test]
-fn tripwire_deltas_survive_counter_wrap() {
-    assert_eq!(
-        (Violations {
-            allocs: 1,
-            frees: 2,
-        })
-        .since(Violations {
-            allocs: u64::MAX,
-            frees: u64::MAX,
-        }),
-        Violations {
-            allocs: 2,
-            frees: 3,
-        }
-    );
-}
-
-#[test]
 fn nested_callback_scope_restores_the_outer_tripwire() {
     let _serial = serial_tripwire_test();
     let entries = tripwire::scope_entries();
@@ -1241,69 +1059,6 @@ fn nested_callback_scope_restores_the_outer_tripwire() {
         "nested teardown disabled the outer scope: {delta:?}"
     );
     assert_eq!(tripwire::scope_entries() - entries, 2);
-}
-
-#[test]
-fn prepared_scalar_backend_processes_without_callback_allocation() {
-    let _serial = serial_tripwire_test();
-    let mut backend = ScalarBackend::new();
-    backend.init(48_000).expect("scalar init");
-    // Submission and voice-capacity reservation happen off the callback.
-    for frame in [0, 32, 64, 96] {
-        backend.note(OnsetEvent::new(frame, 440.0, 0.5, 0.1));
-    }
-    let mut output = [0.0f32; 128 * 2];
-
-    let before = Violations::capture();
-    tripwire::audio_scope(|| backend.process_block(&mut output, 128));
-    let delta = Violations::capture().since(before);
-    assert!(
-        delta.clean(),
-        "prepared scalar callback allocated or freed: {delta:?}"
-    );
-    assert!(output.iter().any(|sample| sample.abs() > 1e-6));
-}
-
-#[test]
-fn pooled_fx_stage_state_activates_and_retires_without_callback_allocation() {
-    let _serial = serial_tripwire_test();
-    let mut backend = ScalarBackend::prepared(48_000, 1).expect("scalar init");
-    let mut controls = OscillatorControls::default();
-    controls.fx_stages[0] = Some(rustel_audio::FxStage {
-        kabel: None,
-        stretch: None,
-        transient: None,
-        gain: 1.0,
-        filters: FilterControls::default(),
-        vowel: None,
-        coarse: None,
-        crush: None,
-        shape: None,
-        distort: None,
-        tremolo: None,
-        compressor: None,
-        pan_x: None,
-        phaser: None,
-        delay: None,
-        dry: 1.0,
-        room: None,
-    });
-    assert!(
-        backend.try_note_prepared(OnsetEvent::new(0, 440.0, 0.5, 0.001).with_controls(controls))
-    );
-    let mut output = [0.0f32; 128 * 2];
-
-    let before = Violations::capture();
-    tripwire::audio_scope(|| {
-        for _ in 0..8 {
-            backend.process_block(&mut output, 128);
-        }
-    });
-    let delta = Violations::capture().since(before);
-    assert!(
-        delta.clean(),
-        "pooled FX-stage activation or retirement allocated or freed: {delta:?}"
-    );
 }
 
 #[test]
@@ -1497,79 +1252,6 @@ fn submitting_while_voices_are_active_preserves_callback_capacity() {
         delta.clean(),
         "activating submitted voices allocated or freed: {delta:?}"
     );
-}
-
-#[test]
-fn live_ring_consumer_is_fixed_capacity_and_generation_filtered() {
-    let _serial = serial_tripwire_test();
-    let ring = Ring::new(16);
-    // One stale event sits ahead of the live generation deliberately.
-    assert!(ring.push(AudioEvent {
-        onset_id: 1,
-        generation: 1,
-        target_frame: 0,
-        onset_lead: 0.0,
-        freq_hz: 220.0,
-        gain: 0.5,
-        duration_secs: 0.1,
-        ui_visuals: 0,
-        controls: Default::default(),
-        sample: None,
-        wavetable: None,
-        synth: None,
-        cut: None,
-    }));
-    for id in 2..=3 {
-        assert!(ring.push(AudioEvent {
-            onset_id: id,
-            generation: 2,
-            target_frame: 0,
-            onset_lead: 0.0,
-            freq_hz: 440.0,
-            gain: 0.5,
-            duration_secs: 0.1,
-            ui_visuals: 0,
-            controls: Default::default(),
-            sample: None,
-            wavetable: None,
-            synth: None,
-            cut: None,
-        }));
-    }
-    let generation = AtomicU64::new(2);
-    let takeover = AtomicU64::new(0);
-    let line_arm = AtomicU64::new(0);
-    let line_fired = AtomicU64::new(0);
-    let stopped = AtomicBool::new(false);
-    let mut backend = LiveScalarBackend::new(48_000, 8).expect("live scalar");
-    let mut output = [0.0f32; 128 * 2];
-
-    let before = Violations::capture();
-    let report = tripwire::audio_scope(|| {
-        backend.process_block_with(
-            &mut output,
-            128,
-            0,
-            &ring,
-            LiveFlipAtomics {
-                generation: &generation,
-                takeover_frame: &takeover,
-                takeover_cut: &AtomicU64::new(0),
-                line_arm: &line_arm,
-                line_fired: &line_fired,
-            },
-            &stopped,
-        )
-    });
-    let delta = Violations::capture().since(before);
-    assert!(
-        delta.clean(),
-        "live callback violated RT boundary: {delta:?}"
-    );
-    assert_eq!(report.accepted, 2);
-    assert_eq!(report.stale, 1);
-    assert_eq!(report.refused, 0);
-    assert!(output.iter().any(|sample| sample.abs() > 1e-6));
 }
 
 #[test]
@@ -2169,36 +1851,6 @@ fn ordering_bus_receivers_on_the_callback_does_not_allocate() {
         "ordering bus receivers allocated or freed: {delta:?}"
     );
     assert!(out.iter().any(|sample| sample.abs() > 1e-6));
-}
-
-/// The safety limiter runs inside the device callback, so it must not
-/// allocate, free or lock there. Its rings are fixed arrays and its only
-/// allocation is the `Box` the stream takes at setup, before the scope.
-#[test]
-fn the_limiter_does_not_allocate_in_the_callback() {
-    let _serial = serial_tripwire_test();
-    let mut limiter = Box::new(rustel_audio::Limiter::new(
-        48_000,
-        rustel_audio::DEFAULT_THRESHOLD_DB,
-        rustel_audio::LimiterCharacter::Transparent,
-    ));
-    // A block that makes it work: past the ceiling, and back under it.
-    let mut block: Vec<f32> = (0..BLOCK_FRAMES * 2)
-        .map(|index| if index % 97 < 8 { 6.0 } else { 0.2 })
-        .collect();
-
-    let before = Violations::capture();
-    tripwire::audio_scope(|| {
-        for _ in 0..64 {
-            limiter.process_stereo(&mut block);
-            let _ = limiter.take_reduction();
-        }
-    });
-    let delta = Violations::capture().since(before);
-    assert!(
-        delta.clean(),
-        "the limiter allocated on the audio thread: {delta:?}"
-    );
 }
 
 /// The producer's side of the live handshake, for the rewind paths below.

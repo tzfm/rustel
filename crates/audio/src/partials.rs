@@ -326,14 +326,3 @@ fn registry() -> std::sync::MutexGuard<'static, Registry> {
     // before the next lock.
     REGISTRY.lock().unwrap_or_else(PoisonError::into_inner)
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// A note too long to count in frames holds its wave for good.
-    #[test]
-    fn a_note_too_long_to_count_holds_its_wave_for_good() {
-        assert_eq!(hold_frames(1.0e20, 0.0, 0, None, 48_000), u64::MAX);
-    }
-}

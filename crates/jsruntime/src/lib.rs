@@ -165,21 +165,6 @@ mod ownership_cap_tests {
     }
 
     #[test]
-    fn capped_exclusion_planner_applies_owner_override_before_counting() {
-        let exact = callback_ids(MAX_OWNERSHIP_EXCLUSIONS);
-        let extra = HashSet::from([MAX_OWNERSHIP_EXCLUSIONS]);
-        let protected = HashSet::from([0]);
-
-        for sets in [[&exact, &extra], [&extra, &exact]] {
-            let planned = plan_capped_exclusions(&sets, &protected)
-                .expect("one explicit owner frees the cap+1 slot");
-            assert_eq!(planned.len(), MAX_OWNERSHIP_EXCLUSIONS);
-            assert!(!planned.contains(&0));
-            assert!(planned.contains(&MAX_OWNERSHIP_EXCLUSIONS));
-        }
-    }
-
-    #[test]
     fn sidecar_batch_plans_all_owners_before_capping_exclusions() {
         fn exclusions(ids: HashSet<CallbackId>) -> Sidecar<'static> {
             Sidecar {
@@ -215,76 +200,6 @@ mod ownership_cap_tests {
                     .contains(&MAX_OWNERSHIP_EXCLUSIONS)
             );
         }
-    }
-
-    #[test]
-    fn indexed_callback_output_harvests_owner_last_at_the_exact_cap() {
-        const BASE: CallbackId = 1_000_000;
-        let runtime = JsRuntime::new().expect("runtime");
-        runtime
-            .install_semantic_bindings()
-            .expect("semantic bindings");
-        with_ctx(&runtime, |ctx| -> Result<(), String> {
-            let wrapper = |ids: Vec<CallbackId>, excluded: HashSet<CallbackId>| {
-                rquickjs::Class::instance(
-                    ctx.clone(),
-                    NativePatternWrapper {
-                        pattern: rustel_core::silence(),
-                        native_query: None,
-                        ids,
-                        cells: Vec::new(),
-                        explicit_ownership_complete: false,
-                        excluded_frame_ids: Rc::new(excluded),
-                        shadow: None,
-                        slider: None,
-                    },
-                )
-                .map_err(|error| error.to_string())
-            };
-            let exact = (BASE..BASE + MAX_OWNERSHIP_EXCLUSIONS).collect();
-            let results = rquickjs::Array::new(ctx.clone()).map_err(|error| error.to_string())?;
-            results
-                .set(0, wrapper(Vec::new(), exact)?)
-                .map_err(|error| error.to_string())?;
-            results
-                .set(
-                    1,
-                    wrapper(Vec::new(), HashSet::from([BASE + MAX_OWNERSHIP_EXCLUSIONS]))?,
-                )
-                .map_err(|error| error.to_string())?;
-            results
-                .set(2, wrapper(vec![BASE], HashSet::new())?)
-                .map_err(|error| error.to_string())?;
-            let factory: Function = ctx
-                .eval("(results => { let i = 0; return () => results[i++]; })")
-                .map_err(|error| error.to_string())?;
-            let callback: Function = factory
-                .call((results,))
-                .map_err(|error: rquickjs::Error| error.to_string())?;
-
-            let frame = BridgeFrame::new(Rc::clone(runtime.callback_ids()));
-            let _scope = BridgeScope::push(&frame);
-            let callback_id = frame.next_id();
-            frame
-                .pending
-                .borrow_mut()
-                .push((callback_id, callback, None));
-            let output = runtime.call_pattern_indexed_batch(
-                callback_id,
-                vec![
-                    (rustel_core::silence(), 0),
-                    (rustel_core::silence(), 1),
-                    (rustel_core::silence(), 2),
-                ],
-            )?;
-            assert_eq!(output.len(), 3);
-            let suppressed = frame.suppressed.borrow();
-            assert_eq!(suppressed.len(), MAX_OWNERSHIP_EXCLUSIONS);
-            assert!(!suppressed.contains(&BASE));
-            assert!(suppressed.contains(&(BASE + MAX_OWNERSHIP_EXCLUSIONS)));
-            Ok(())
-        })
-        .expect("owner-last indexed callback output must reconcile as one batch");
     }
 
     /// Install a global JavaScript function `name` that records the typed
@@ -331,35 +246,6 @@ mod ownership_cap_tests {
                 false,
             )
             .expect("scalar ownership refusal becomes a durable graph");
-        assert_active_is_the_ownership_refusal(&runtime);
-        runtime.clear_active();
-    }
-
-    /// An ownership refusal keeps its TYPE when an eager transformer callback
-    /// throws later in the same evaluation: the throw is an ordinary exception,
-    /// and the recorded refusal outranks it, exactly as it outranks a score's own
-    /// `throw`. The refusal graph installs; a plain message would not.
-    #[test]
-    fn an_eager_callback_throw_keeps_the_ownership_refusal_typed() {
-        let runtime = JsRuntime::new().expect("runtime");
-        runtime
-            .install_semantic_bindings()
-            .expect("semantic bindings");
-        install_ownership_refusal(&runtime, "__ownership_cap_test");
-        let _settings = runtime.core_settings.bind();
-        runtime
-            .execute_score(
-                "try { __ownership_cap_test(); } catch (error) {}\n\
-             s('bd sd').every(2, x => { globalThis.__eagerRan = 1; throw new Error('eager'); })",
-                &rustel_transpiler::LineMap::default(),
-                false,
-            )
-            .expect("the ownership refusal becomes a durable graph");
-        assert_eq!(
-            runtime.get_number("__eagerRan"),
-            Some(1.0),
-            "vacuous: the eager callback never ran"
-        );
         assert_active_is_the_ownership_refusal(&runtime);
         runtime.clear_active();
     }

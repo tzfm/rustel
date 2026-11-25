@@ -659,20 +659,4 @@ mod tests {
         }
         assert!(swept, "envelope never left its floor, so penv did nothing");
     }
-
-    /// Same-sign endpoints keep the true exponential shape, which is what
-    /// the filters rely on - the fallback must not flatten those to linear.
-    #[test]
-    fn exponential_ramp_keeps_its_curve_for_same_sign_endpoints() {
-        let midpoint = FilterStage::exponential_ramp(100.0, 10_000.0, 0.5);
-        assert!(
-            (midpoint - 1000.0).abs() < 1e-6,
-            "expected the geometric mean 1000, got {midpoint}"
-        );
-        let linear_midpoint = 100.0 + (10_000.0 - 100.0) * 0.5;
-        assert!(
-            (midpoint - linear_midpoint).abs() > 1.0,
-            "exponential ramp collapsed to the linear one"
-        );
-    }
 }

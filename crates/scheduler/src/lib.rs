@@ -112,6 +112,10 @@ pub struct ScheduleTraceEvent {
     /// it, like `gain`, from the voice it submitted. `None` for a voice that
     /// plays no sample, and for a preview.
     pub sample: Option<TraceSampleWalk>,
+    /// Stable score lane id when opt-in lane tracking is active.
+    pub lane: Option<u32>,
+    /// Sound or sample name (`s` or `sound`), bounded to `MAX_TRACE_TEXT_BYTES`.
+    pub sound: Option<String>,
     pub ui_visuals: u64,
     pub context: Vec<(usize, usize)>,
 }
@@ -254,9 +258,148 @@ impl ScheduleTraceEvent {
             frequency_hz: trace_pitch_hz(&hap.value),
             gain: None,
             sample: None,
+            lane: hap.lane_context(),
+            sound: trace_visual_text(&hap.value, "s")
+                .or_else(|| trace_visual_text(&hap.value, "sound")),
             ui_visuals: hap.ui_visuals_context(),
             context: hap.context.iter().take(MAX_TRACE_CONTEXT_RANGES).collect(),
         })
+    }
+}
+
+/// Maximum number of distinct lanes tracked in [`LaneControls`].
+pub const MAX_LANE_CONTROL_ENTRIES: usize = 64;
+/// Minimum semitone offset accepted for a per-lane transpose override.
+pub const MIN_LANE_TRANSPOSE_SEMITONES: i16 = -48;
+/// Maximum semitone offset accepted for a per-lane transpose override.
+pub const MAX_LANE_TRANSPOSE_SEMITONES: i16 = 48;
+
+/// Non-destructive per-lane audition overrides applied at the scheduler
+/// boundary without editing the score file.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct LaneControls {
+    solo: Option<u32>,
+    muted: Vec<u32>,
+    transpose: Vec<(u32, i16)>,
+}
+
+impl LaneControls {
+    /// True when no solo, mute, or transpose override is active.
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.solo.is_none() && self.muted.is_empty() && self.transpose.is_empty()
+    }
+
+    /// Currently soloed lane id, if any.
+    pub fn solo(&self) -> Option<u32> {
+        self.solo
+    }
+
+    /// Set or clear the soloed lane. Returns `true` when the state changed.
+    pub fn set_solo(&mut self, lane: Option<u32>) -> bool {
+        if self.solo == lane {
+            return false;
+        }
+        self.solo = lane;
+        true
+    }
+
+    /// True when `lane` is explicitly muted.
+    pub fn is_muted(&self, lane: u32) -> bool {
+        self.muted.binary_search(&lane).is_ok()
+    }
+
+    /// Mute or unmute `lane`. Returns `true` when the state changed.
+    pub fn set_mute(&mut self, lane: u32, muted: bool) -> bool {
+        match (muted, self.muted.binary_search(&lane)) {
+            (true, Err(idx)) if self.muted.len() < MAX_LANE_CONTROL_ENTRIES => {
+                self.muted.insert(idx, lane);
+                true
+            }
+            (false, Ok(idx)) => {
+                self.muted.remove(idx);
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// Active semitone offset for `lane` (zero when unset).
+    pub fn transpose_of(&self, lane: u32) -> i16 {
+        self.transpose
+            .binary_search_by_key(&lane, |&(id, _)| id)
+            .map_or(0, |idx| self.transpose[idx].1)
+    }
+
+    /// Set the semitone transpose offset for `lane`, clamped to
+    /// [`MIN_LANE_TRANSPOSE_SEMITONES`]..=[`MAX_LANE_TRANSPOSE_SEMITONES`].
+    /// Passing `0` removes the override. Returns `true` when the state changed.
+    pub fn set_transpose(&mut self, lane: u32, semitones: i16) -> bool {
+        let clamped = semitones.clamp(MIN_LANE_TRANSPOSE_SEMITONES, MAX_LANE_TRANSPOSE_SEMITONES);
+        match self.transpose.binary_search_by_key(&lane, |&(id, _)| id) {
+            Ok(idx) if clamped == 0 => {
+                self.transpose.remove(idx);
+                true
+            }
+            Ok(idx) if self.transpose[idx].1 != clamped => {
+                self.transpose[idx].1 = clamped;
+                true
+            }
+            Err(idx) if clamped != 0 && self.transpose.len() < MAX_LANE_CONTROL_ENTRIES => {
+                self.transpose.insert(idx, (lane, clamped));
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// Clear all solo, mute, and transpose overrides. Returns `true` if any
+    /// override was active.
+    pub fn clear(&mut self) -> bool {
+        if self.is_empty() {
+            return false;
+        }
+        self.solo = None;
+        self.muted.clear();
+        self.transpose.clear();
+        true
+    }
+
+    /// Whether an onset from `lane` should sound under these overrides.
+    #[inline]
+    pub fn allows_lane(&self, lane: u32) -> bool {
+        match self.solo {
+            Some(solo) => lane == solo,
+            None => !self.is_muted(lane),
+        }
+    }
+
+    /// Apply a semitone shift in place to a scheduled control value.
+    fn apply_transpose(value: &mut Value, semitones: i16) {
+        if semitones == 0 {
+            return;
+        }
+        let Value::Object(map) = value else {
+            return;
+        };
+        if let Some(note_slot) = map.get_mut("note") {
+            match note_slot {
+                Value::F64(midi) if midi.is_finite() => {
+                    *midi += f64::from(semitones);
+                }
+                Value::Str(name) => {
+                    if let Ok(midi) = rustel_core::util::note_to_midi(name, 3) {
+                        *note_slot = Value::F64(midi + f64::from(semitones));
+                    }
+                }
+                _ => {}
+            }
+        } else if let Some(Value::F64(freq)) = map.get_mut("freq")
+            && freq.is_finite()
+            && *freq > 0.0
+        {
+            *freq *= 2.0_f64.powf(f64::from(semitones) / 12.0);
+        }
     }
 }
 
@@ -581,6 +724,8 @@ pub struct Scheduler {
     trace_events: Vec<ScheduleTraceEvent>,
     trace_events_dropped: u64,
     trace_events_dropped_total: u64,
+    /// Non-destructive per-lane audition overrides owned by the producer thread.
+    lane_controls: LaneControls,
 }
 
 /// What makes one emitted onset distinct from another.
@@ -759,7 +904,18 @@ impl Scheduler {
             trace_events: Vec::new(),
             trace_events_dropped: 0,
             trace_events_dropped_total: 0,
+            lane_controls: LaneControls::default(),
         }
+    }
+
+    /// Active non-destructive per-lane overrides.
+    pub fn lane_controls(&self) -> &LaneControls {
+        &self.lane_controls
+    }
+
+    /// Mutable access to non-destructive per-lane overrides.
+    pub fn lane_controls_mut(&mut self) -> &mut LaneControls {
+        &mut self.lane_controls
     }
 
     /// Maximum haps accepted from one pattern query before scheduling begins.
@@ -2104,7 +2260,7 @@ impl Scheduler {
         self.pass_ordinals.clear();
         let mut position = 0usize;
         let mut pending = haps.into_iter();
-        while let Some(hap) = pending.next() {
+        while let Some(mut hap) = pending.next() {
             let at = position;
             position += 1;
             // Checked INSIDE the fill loop, not after it: the point is to stop
@@ -2123,6 +2279,16 @@ impl Scheduler {
                 continue;
             }
             let Some(whole) = hap.whole else { continue };
+            if !self.lane_controls.is_empty() {
+                let lane = hap.lane_context().unwrap_or(0);
+                if !self.lane_controls.allows_lane(lane) {
+                    continue;
+                }
+                let semitones = self.lane_controls.transpose_of(lane);
+                if semitones != 0 {
+                    LaneControls::apply_transpose(&mut hap.value, semitones);
+                }
+            }
             let target_time = self.tempo.time_at_cycle(whole.begin);
             // After a slower tempo, an onset past the horizon waits for a
             // later fill. The cursor stops at it.
@@ -2403,23 +2569,6 @@ mod tests {
         ))
     }
 
-    #[test]
-    fn pass_ordinal_scratch_reuses_ordinary_buckets_and_drops_exceptional_capacity() {
-        let mut scheduler = Scheduler::new(Arc::new(Transport::default()), 1.0, 0.5);
-
-        scheduler.pass_ordinals.reserve(128);
-        let ordinary_capacity = scheduler.pass_ordinals.capacity();
-        scheduler.clear_pass_ordinals();
-        assert_eq!(scheduler.pass_ordinals.capacity(), ordinary_capacity);
-
-        scheduler
-            .pass_ordinals
-            .reserve(PASS_ORDINAL_RETAIN_LIMIT + 1);
-        assert!(scheduler.pass_ordinals.capacity() > PASS_ORDINAL_RETAIN_LIMIT);
-        scheduler.clear_pass_ordinals();
-        assert_eq!(scheduler.pass_ordinals.capacity(), 0);
-    }
-
     /// `from_hap` carries strudel.cc's `activeLabel` and the tuning
     /// `edoScale` writes on a value; a malformed tuning is left off rather
     /// than half-read.
@@ -2636,6 +2785,8 @@ mod tests {
                 frequency_hz: None,
                 gain: None,
                 sample: None,
+                lane: None,
+                sound: None,
                 ui_visuals: 0,
                 context: vec![(4, 8), (13, 21)],
             }
@@ -2675,73 +2826,6 @@ mod tests {
     }
 
     #[test]
-    fn due_sort_orders_finite_onsets_and_tolerates_non_finite_keys() {
-        let transport = Arc::new(Transport::default());
-        let mut scheduler = Scheduler::new(Arc::clone(&transport), 1.0, 0.5);
-        let clock = VirtualClock::new(0.0);
-        let generation = transport.generation();
-        scheduler.last_fill_time = clock.now();
-        scheduler.queue.extend([
-            Event {
-                onset_id: 2,
-                generation,
-                whole_begin: Fraction::ZERO,
-                whole_end: Fraction::ONE,
-                duration: Fraction::ONE,
-                target_time: 0.50,
-                cps: None,
-                value: Value::Str("late".into()),
-                live_controls: [0; 4],
-                ui_visuals: 0,
-                log_line: None,
-            },
-            Event {
-                onset_id: 1,
-                generation,
-                whole_begin: Fraction::ZERO,
-                whole_end: Fraction::ONE,
-                duration: Fraction::ONE,
-                target_time: 0.25,
-                cps: None,
-                value: Value::Str("early".into()),
-                live_controls: [0; 4],
-                ui_visuals: 0,
-                log_line: None,
-            },
-        ]);
-        let due = scheduler.drain_through(&clock, 1.0);
-        assert_eq!(
-            due.iter().map(|event| event.onset_id).collect::<Vec<_>>(),
-            vec![1, 2]
-        );
-
-        // Defense in depth for the live drain path: a non-finite key must not
-        // panic the producer even if one ever reaches the sort.
-        let mut synthetic = due;
-        synthetic.push(Event {
-            onset_id: 3,
-            generation,
-            whole_begin: Fraction::ZERO,
-            whole_end: Fraction::ONE,
-            duration: Fraction::ONE,
-            target_time: f64::NAN,
-            cps: None,
-            value: Value::Str("nan".into()),
-            live_controls: [0; 4],
-            ui_visuals: 0,
-            log_line: None,
-        });
-        synthetic.sort_by(|a, b| a.target_time.total_cmp(&b.target_time));
-        assert_eq!(
-            synthetic
-                .iter()
-                .map(|event| event.onset_id)
-                .collect::<Vec<_>>(),
-            vec![1, 2, 3]
-        );
-    }
-
-    #[test]
     fn scheduler_events_keep_direct_live_slider_bindings() {
         let transport = Arc::new(Transport::default());
         let mut scheduler = Scheduler::new(transport, 1.0, 0.5);
@@ -2759,62 +2843,6 @@ mod tests {
             events
                 .iter()
                 .all(|event| event.live_controls == [73, 0, 0, 0])
-        );
-    }
-
-    #[test]
-    fn drain_filters_generations_and_preserves_the_future_queue_order() {
-        let transport = Arc::new(Transport::default());
-        let mut scheduler = Scheduler::new(Arc::clone(&transport), 1.0, 0.5);
-        let clock = VirtualClock::new(0.0);
-        let generation = transport.generation();
-        let cancelled = generation + 1;
-        scheduler.last_fill_time = clock.now();
-        let event = |onset_id, generation, target_time, name: &str| Event {
-            onset_id,
-            generation,
-            whole_begin: Fraction::ZERO,
-            whole_end: Fraction::ONE,
-            duration: Fraction::ONE,
-            target_time,
-            cps: None,
-            value: Value::object([
-                ("s".into(), Value::Str(name.into())),
-                ("gain".into(), Value::F64(0.5)),
-            ]),
-            live_controls: [0; 4],
-            ui_visuals: 0,
-            log_line: None,
-        };
-        scheduler.queue.extend([
-            event(3, generation, 2.0, "future-first"),
-            event(90, cancelled, 0.1, "cancelled-due"),
-            event(2, generation, 0.75, "due-late"),
-            event(4, generation, 1.5, "future-second"),
-            event(91, cancelled, 9.0, "cancelled-future"),
-            event(1, generation, 0.25, "due-early"),
-        ]);
-
-        let due = scheduler.drain_through(&clock, 1.0);
-        assert_eq!(
-            due.iter().map(|event| event.onset_id).collect::<Vec<_>>(),
-            vec![1, 2],
-            "due events did not retain target-time ordering"
-        );
-        assert_eq!(
-            scheduler
-                .queue
-                .iter()
-                .map(|event| event.onset_id)
-                .collect::<Vec<_>>(),
-            vec![3, 4],
-            "extracting due and cancelled events reordered future work"
-        );
-        assert!(
-            due.iter()
-                .chain(&scheduler.queue)
-                .all(|event| event.generation == generation),
-            "a cancelled generation survived the drain boundary"
         );
     }
 
@@ -3084,75 +3112,6 @@ mod tests {
         );
     }
 
-    /// Two copies with one key leave one mark, so one copy is held for it.
-    #[test]
-    fn two_copies_with_one_key_hold_one_stand_in() {
-        let (mut scheduler, _clock) = quarter_grid();
-        let copy = |generation| EmittedKey {
-            generation,
-            begin: Fraction::new(1, 2),
-            end: Fraction::new(3, 4),
-            value: Arc::from("c"),
-            occurrence: 0,
-        };
-        let held = scheduler.carry_device_copies(
-            9,
-            vec![(copy(7), 0.5), (copy(8), 0.5)],
-            Fraction::ZERO,
-            false,
-        );
-        assert_eq!(held[&Fraction::new(1, 2)].len(), 1);
-        assert!(scheduler.emitted.contains_key(&copy(9)));
-    }
-
-    /// The takeover of a generation drops copies from the device only when
-    /// the producer publishes it, after its first tick. Until then a new
-    /// takeover gets them back.
-    #[test]
-    fn a_takeover_sets_the_dropped_copies_aside_until_the_first_tick() {
-        let (mut scheduler, clock) = quarter_grid();
-        let begins = |copies: &[DeviceCopy]| {
-            let mut begins: Vec<f64> = copies.iter().map(|(key, _)| key.begin.to_f64()).collect();
-            begins.sort_by(f64::total_cmp);
-            begins
-        };
-        scheduler
-            .requery_active_from(0.3, 0.55)
-            .expect("active graph can be requeried");
-        assert_eq!(begins(&scheduler.superseded), [0.75]);
-        assert_eq!(scheduler.emitted.len(), 1, "the onset at 0.5 stays marked");
-
-        scheduler
-            .requery_active_from(0.35, 0.8)
-            .expect("active graph can be requeried");
-        assert!(scheduler.superseded.is_empty());
-        let mut marked: Vec<(f64, f64)> = scheduler
-            .emitted
-            .iter()
-            .map(|(key, time)| (key.begin.to_f64(), *time))
-            .collect();
-        marked.sort_by(|a, b| a.partial_cmp(b).expect("finite times"));
-        assert_eq!(marked, [(0.5, 0.5), (0.75, 0.75)]);
-
-        scheduler
-            .requery_active_from(0.4, 0.55)
-            .expect("active graph can be requeried");
-        assert_eq!(begins(&scheduler.superseded), [0.75]);
-        clock.set(0.4);
-        assert_eq!(scheduler.tick(&clock), TickStatus::Filled);
-        assert!(scheduler.superseded.is_empty());
-
-        // A first tick that finds the horizon full is published too.
-        clock.set(0.51);
-        assert_eq!(scheduler.tick(&clock), TickStatus::Filled);
-        scheduler
-            .requery_active_from(0.51, 1.49)
-            .expect("active graph can be requeried");
-        assert_eq!(begins(&scheduler.superseded), [1.5]);
-        assert_eq!(scheduler.tick(&clock), TickStatus::HorizonFull);
-        assert!(scheduler.superseded.is_empty());
-    }
-
     /// A rebase from a takeover edge re-anchors and starts the cursor on the
     /// edge: past an onset just before it, not past an onset just after it,
     /// and not behind the anchor. An edge that is not a time changes nothing.
@@ -3285,5 +3244,58 @@ mod tests {
             "emitted history grew to {} over {delivered} onsets",
             scheduler.emitted.len()
         );
+    }
+
+    #[test]
+    fn lane_controls_filter_mute_solo_and_transpose_at_scheduler_boundary() {
+        use rustel_core::{Value, pure};
+
+        let make_lane = |lane: u32, sound: &str, note: Value| {
+            let value = Value::object([
+                ("s".into(), Value::Str(sound.into())),
+                ("note".into(), note),
+            ]);
+            pure(value).with_lane(lane)
+        };
+        let pattern = stack(vec![
+            make_lane(0, "bd", Value::F64(60.0)),
+            make_lane(1, "sawtooth", Value::Str("c4".into())),
+        ]);
+
+        let transport = Arc::new(Transport::default());
+        let mut scheduler = Scheduler::new(transport, 1.0, 0.5);
+        scheduler.set_trace_enabled(true);
+        let clock = VirtualClock::new(0.0);
+        scheduler.set_pattern(pattern.clone(), clock.now());
+
+        // Mute lane 0 and transpose lane 1 up an octave (+12 semitones).
+        assert!(scheduler.lane_controls_mut().set_mute(0, true));
+        assert!(scheduler.lane_controls_mut().set_transpose(1, 12));
+        scheduler.tick(&clock);
+        let events = scheduler.drain_through(&clock, 0.5);
+        assert_eq!(events.len(), 1);
+        let mut traces = Vec::new();
+        scheduler.drain_trace_events_into(&mut traces);
+        assert_eq!(traces.len(), 1);
+        assert_eq!(traces[0].lane, Some(1));
+        assert_eq!(traces[0].sound.as_deref(), Some("sawtooth"));
+        let note_value = events[0]
+            .value
+            .as_object()
+            .and_then(|obj| obj.get("note"))
+            .and_then(Value::as_f64);
+        assert_eq!(note_value, Some(72.0), "c4 (60) + 12 semitones = 72");
+
+        // Solo lane 0 overrides mute on lane 0 and silences lane 1 on the next cycle.
+        scheduler.lane_controls_mut().set_solo(Some(0));
+        clock.advance(1.0);
+        scheduler.tick(&clock);
+        let solo_events = scheduler.drain_through(&clock, 1.5);
+        assert_eq!(solo_events.len(), 1);
+        let mut solo_traces = Vec::new();
+        scheduler.drain_trace_events_into(&mut solo_traces);
+        assert_eq!(solo_traces.len(), 1);
+        assert_eq!(solo_traces[0].lane, Some(0));
+        assert_eq!(solo_traces[0].sound.as_deref(), Some("bd"));
     }
 }

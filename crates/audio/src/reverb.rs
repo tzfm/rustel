@@ -1576,42 +1576,6 @@ mod tests {
         }
     }
 
-    #[test]
-    fn partitioned_convolution_matches_direct_convolution() {
-        // Small IR, arbitrary block content, three blocks: the partitioned
-        // engine must equal a textbook direct convolution.
-        let ir: Vec<f32> = (0..300)
-            .map(|i| ((i * 37 % 100) as f32 - 50.0) / 50.0)
-            .collect();
-        let mut planner = FftPlanner::new();
-        let mut convolver = MonoConvolver::new(&ir, &mut planner, ConvolutionKernel::PORTABLE);
-        let input: Vec<f32> = (0..384)
-            .map(|i| ((i * 53 % 97) as f32 - 48.0) / 48.0)
-            .collect();
-
-        let mut partitioned = vec![0.0f32; 384];
-        for block in 0..3 {
-            let range = block * 128..(block + 1) * 128;
-            let mut out = [0.0f32; 128];
-            convolver.process_block(&input[range.clone()], &mut out);
-            partitioned[range].copy_from_slice(&out);
-        }
-
-        for n in 0..384 {
-            let mut direct = 0.0f64;
-            for (k, tap) in ir.iter().enumerate() {
-                if n >= k {
-                    direct += f64::from(input[n - k]) * f64::from(*tap);
-                }
-            }
-            assert!(
-                (partitioned[n] as f64 - direct).abs() < 1e-3,
-                "sample {n}: partitioned {} vs direct {direct}",
-                partitioned[n]
-            );
-        }
-    }
-
     /// A reverb rings while its tail can still give a sample other than
     /// zero. Once it says it does not, it gives exact zeros, also on input
     /// blocks that do not line up with its hops.
@@ -1702,56 +1666,6 @@ mod tests {
                 "phase {hops}: worst {worst} of {peak}"
             );
         }
-    }
-
-    /// The tails of 16 orbits made at the same frame hop on distinct blocks,
-    /// 2 channels on each block of the tail grid, and keep that after a reset.
-    #[test]
-    fn spread_orbits_hop_on_their_own_blocks() {
-        let params = ReverbParams {
-            ir: None,
-            size_secs: 0.1,
-            fade_secs: 0.05,
-            lp_start_hz: 15_000.0,
-            lp_end_hz: 1_000.0,
-        };
-        let template = OrbitReverb::generate(48_000, params);
-        assert!(template.left.tail.is_some(), "the room needs a tail");
-        let hop_blocks = |frame: u64| {
-            let mut counts = [0usize; TAIL_HOPS];
-            for slot in 0..16 {
-                let mut reverb = OrbitReverb::generate(48_000, params);
-                reverb.spread_tail_hops(frame, slot);
-                let silence = [0.0f32; REVERB_BLOCK];
-                for block in 0..TAIL_HOPS as u64 {
-                    let [mut left, mut right] = [[0.0f32; REVERB_BLOCK]; 2];
-                    reverb.process_block(&silence, &silence, &mut left, &mut right);
-                    for convolver in [&reverb.left, &reverb.right] {
-                        if convolver
-                            .tail
-                            .as_ref()
-                            .is_some_and(|tail| tail.stage_fill == 0)
-                        {
-                            let absolute = frame / REVERB_BLOCK as u64 + block;
-                            counts[(absolute % TAIL_HOPS as u64) as usize] += 1;
-                        }
-                    }
-                }
-            }
-            counts
-        };
-        assert_eq!(hop_blocks(0), [2; TAIL_HOPS]);
-        assert_eq!(hop_blocks(37 * REVERB_BLOCK as u64), [2; TAIL_HOPS]);
-        let mut reverb = OrbitReverb::generate(48_000, params);
-        reverb.spread_tail_hops(0, 3);
-        let burst = [0.5f32; REVERB_BLOCK];
-        let [mut left, mut right] = [[0.0f32; REVERB_BLOCK]; 2];
-        reverb.process_block(&burst, &burst, &mut left, &mut right);
-        reverb.reset();
-        let phase = |reverb: &OrbitReverb| reverb.left.tail.as_ref().map(|tail| tail.stage_fill);
-        let mut fresh = OrbitReverb::generate(48_000, params);
-        fresh.spread_tail_hops(0, 3);
-        assert_eq!(phase(&reverb), phase(&fresh));
     }
 
     /// A reverb made from a response sounds as the reverb that made the

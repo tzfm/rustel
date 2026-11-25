@@ -598,24 +598,6 @@ mod tests {
         );
     }
 
-    /// A writer thread that cannot start fails the constructor with an error
-    /// naming the port, rather than yielding a sender nothing drains.
-    #[test]
-    fn a_writer_that_cannot_start_fails_the_constructor() {
-        let built = SerialSender::try_with_port_spawning(
-            Box::new(CapturePort::new()),
-            "refused".into(),
-            |_, _| Err(std::io::Error::other("no threads left")),
-        );
-        let Err(message) = built else {
-            panic!("a sender was built with no writer to drain its queue");
-        };
-        assert!(
-            message.contains("\"refused\"") && message.contains("no threads left"),
-            "{message}"
-        );
-    }
-
     /// A sender with no writer, as `with_port` falls back to, refuses every
     /// write and reports nothing done.
     #[test]

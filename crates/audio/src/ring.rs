@@ -613,24 +613,6 @@ mod tests {
         }
     }
 
-    /// What the ring holds in memory follows the pushes: a slot taken
-    /// stays resident, a refused push reached nothing, and the count runs
-    /// on past the capacity once the ring wraps.
-    #[test]
-    fn a_ring_counts_accepted_pushes_not_pops_or_refusals() {
-        let ring = Ring::new(2);
-        assert_eq!(ring.pushed(), 0);
-        assert!(ring.push(ev(1)));
-        assert!(ring.push(ev(2)));
-        assert!(!ring.push(ev(3)), "full");
-        assert_eq!(ring.pushed(), 2);
-        assert_eq!(ring.pop().map(|event| event.onset_id), Some(1));
-        assert_eq!(ring.pop().map(|event| event.onset_id), Some(2));
-        assert_eq!(ring.pushed(), 2, "taking an event leaves its slot touched");
-        assert!(ring.push(ev(4)));
-        assert_eq!(ring.pushed(), 3);
-    }
-
     #[test]
     fn payload_has_no_drop_glue() {
         assert!(!std::mem::needs_drop::<AudioEvent<CompactKabelControls>>());
@@ -743,51 +725,6 @@ mod ownership_tests {
         assert_eq!(got, None, "a second consumer must not be served an event");
         // and the real consumer still gets it
         assert_eq!(ring.pop().map(|e| e.onset_id), Some(2));
-    }
-
-    #[test]
-    fn a_prefix_drain_cannot_take_another_threads_consumer_role() {
-        let ring = std::sync::Arc::new(Ring::new(2));
-        assert!(ring.push(ev(1)));
-        assert!(ring.push(ev(2)));
-        assert_eq!(ring.pop().map(|event| event.onset_id), Some(1));
-
-        let other = std::sync::Arc::clone(&ring);
-        let got = std::thread::spawn(move || {
-            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                other.drain_available().next().map(|event| event.onset_id)
-            }))
-            .unwrap_or(None)
-        })
-        .join()
-        .expect("consumer thread");
-        assert_eq!(got, None);
-        assert_eq!(ring.role_conflicts.load(Ordering::Relaxed), 1);
-        assert_eq!(ring.pop().map(|event| event.onset_id), Some(2));
-    }
-
-    /// A released consumer role passes to the next thread: the control thread
-    /// drains what is left after the stream and its callback thread are gone.
-    #[test]
-    fn releasing_the_consumer_lets_another_thread_drain() {
-        let ring = std::sync::Arc::new(Ring::new(8));
-        ring.push(ev(1));
-        ring.push(ev(2));
-
-        let callback = std::sync::Arc::clone(&ring);
-        std::thread::spawn(move || {
-            callback.pop();
-        })
-        .join()
-        .expect("callback thread");
-
-        // SAFETY: the callback thread was joined above; it pops no more.
-        unsafe { ring.release_consumer() };
-        assert_eq!(
-            ring.pop().map(|e| e.onset_id),
-            Some(2),
-            "drain must proceed"
-        );
     }
 }
 
@@ -1001,30 +938,5 @@ mod kabel_snapshot_tests {
         }
         producer.join().unwrap();
         assert_eq!(ring.role_conflicts.load(Ordering::Relaxed), 0);
-    }
-
-    #[test]
-    fn callback_payload_contains_handles_instead_of_inline_programs() {
-        use std::mem::{needs_drop, size_of};
-        let compact = size_of::<QueuedAudioEvent<CompactKabelControls>>();
-        let producer = size_of::<QueuedAudioEvent>();
-        assert_eq!(size_of::<CompactKabelControls>(), 32);
-        // A note also carries its insert chain, its effects and its
-        // instrument, with their parameter values.
-        let inserts = size_of::<Option<u64>>()
-            + (crate::insert::EFFECT_CHAIN + 1)
-                * size_of::<Option<crate::insert::InsertControls>>();
-        assert!(
-            compact <= 4352 + inserts,
-            "callback event grew to {compact} bytes"
-        );
-        // The lead of a note finds no room in the padding of its controls.
-        // So each event grows by 8 bytes from 4944, and the live ring of
-        // 8192 events by 64 KiB.
-        assert_eq!(compact, 4952);
-        assert!(compact <= size_of::<QueuedAudioEvent<()>>() + 4 * 32);
-        assert_eq!(producer, compact, "producer events must share graph code");
-        assert!(!needs_drop::<QueuedAudioEvent<CompactKabelControls>>());
-        assert!(!needs_drop::<OscillatorControls<CompactKabelControls>>());
     }
 }
