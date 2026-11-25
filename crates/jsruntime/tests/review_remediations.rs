@@ -142,3 +142,38 @@ fn a_lingered_note_across_a_cycle_keeps_its_onset_under_add() {
     let source = "note(\"c e\").slow(1.5).linger(0.5).add(note(\"0 7\"))";
     assert_eq!(onsets_over(source, 3).len(), 8);
 }
+
+#[test]
+fn stacked_voices_with_segmented_lfo_keep_every_voice_and_do_not_panic() {
+    let chord = onsets_over(
+        "stack(note(\"c3\"), note(\"e3\"), note(\"g3\")).lpf(sine.range(200, 2000).segment(16))",
+        1,
+    );
+    let mut notes: Vec<&str> = chord
+        .iter()
+        .filter_map(|hap| hap.value.get("note").and_then(|v| v.as_str()))
+        .collect();
+    notes.sort();
+    notes.dedup();
+    assert_eq!(notes, ["c3", "e3", "g3"]);
+
+    let uneven = onsets_over(
+        "stack(note(\"c3\").s(\"piano\"), note(\"<e3 g3>\").s(\"sawtooth\")).lpf(sine.range(200, 2000).segment(16))",
+        2,
+    );
+    let mut pairs: Vec<(&str, &str)> = uneven
+        .iter()
+        .filter_map(|hap| {
+            Some((
+                hap.value.get("note")?.as_str()?,
+                hap.value.get("s")?.as_str()?,
+            ))
+        })
+        .collect();
+    pairs.sort();
+    pairs.dedup();
+    assert_eq!(
+        pairs,
+        [("c3", "piano"), ("e3", "sawtooth"), ("g3", "sawtooth")]
+    );
+}

@@ -681,23 +681,32 @@ impl LaneTable {
         &self.playing
     }
 
-    /// Active lanes as bounded protocol metadata, keeping the lane table's
-    /// edit-stable lane ids.
+    /// Active lanes as bounded protocol metadata, matching the exact lane ids
+    /// tagged onto scheduled events (lane 0 for unlabeled scores, 0-based place
+    /// when transpiled by place, otherwise edit-stable lane numbers).
     pub(crate) fn ui_lanes(&self) -> Vec<crate::ui_events::UiLane> {
         let mut out = Vec::new();
-        for (number, label, line, _) in self
+        for (place, (number, label, line, _)) in self
             .playing
             .lanes()
             .take(crate::ui_events::MAX_UI_LAYOUT_LANES)
+            .enumerate()
         {
-            if let Ok(id) = u32::try_from(number) {
-                let label_trimmed = crate::ui_events::truncate_lane_label(label);
-                out.push(crate::ui_events::UiLane {
-                    id,
-                    label: label_trimmed.to_owned(),
-                    line: u32::try_from(line).unwrap_or(u32::MAX),
-                });
-            }
+            let id = if label.is_empty() {
+                0
+            } else if self.playing.places {
+                place as u32
+            } else if let Ok(id) = u32::try_from(number) {
+                id
+            } else {
+                continue;
+            };
+            let label_trimmed = crate::ui_events::truncate_lane_label(label);
+            out.push(crate::ui_events::UiLane {
+                id,
+                label: label_trimmed.to_owned(),
+                line: u32::try_from(line).unwrap_or(u32::MAX),
+            });
         }
         out
     }
@@ -1378,5 +1387,40 @@ pub(super) mod tests {
         lanes.set_reading(3);
         assert!(lanes.adopt_read(&text));
         assert_eq!(lanes.read(&text), [0, 3]);
+    }
+
+    #[test]
+    fn ui_lanes_reports_lane_zero_for_unlabeled_score_and_places_when_written_by_place() {
+        let play_in = |lanes: &mut LaneTable, document: u64, source: &str| {
+            lanes.set_reading(document);
+            let numbers = lanes.read(source);
+            lanes.install(source);
+            numbers
+        };
+        let mut lanes = LaneTable::default();
+        assert_eq!(play_in(&mut lanes, 1, "$: s(\"bd\")\n$: s(\"sd\")"), [0, 1]);
+        assert_eq!(
+            lanes.ui_lanes().iter().map(|l| l.id).collect::<Vec<_>>(),
+            [0, 1]
+        );
+
+        // Switching to an unlabeled score increments internal lane.number, but
+        // both JS and native evaluators tag unlabeled events with lane 0.
+        assert_eq!(play_in(&mut lanes, 1, "s(\"hh*4\")"), Vec::<u64>::new());
+        let unlabeled = lanes.ui_lanes();
+        assert_eq!(unlabeled.len(), 1);
+        assert_eq!(unlabeled[0].id, 0);
+        assert_eq!(unlabeled[0].label, "");
+
+        // When transpiled by place, ui_lanes reports 0-based statement places.
+        let by_place = "$: s(\"cp\")\n$: s(\"rim\")";
+        lanes.set_reading(2);
+        let _ = lanes.read(by_place);
+        lanes.wrote_places();
+        lanes.install(by_place);
+        assert_eq!(
+            lanes.ui_lanes().iter().map(|l| l.id).collect::<Vec<_>>(),
+            [0, 1]
+        );
     }
 }

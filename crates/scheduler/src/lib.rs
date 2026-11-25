@@ -662,6 +662,10 @@ pub struct Scheduler {
     /// Whether a hap's `cps` control changes the tempo. An outside clock
     /// that owns the tempo turns this off.
     pattern_tempo: bool,
+    /// A continuous live replacement without `setcps` checks covering `cps`
+    /// haps on its first fill so edits keep an active pattern tempo lane
+    /// while removing that lane returns immediately to the session tempo.
+    sync_covering_tempo: bool,
     /// A fill changed the tempo, so the horizon it covered can be short.
     tempo_changed: bool,
     /// Cycle position already queried up to.
@@ -884,6 +888,7 @@ impl Scheduler {
             moves_past_fixed_refusals: false,
             tempo: TempoMap::new(cps),
             pattern_tempo: true,
+            sync_covering_tempo: false,
             tempo_changed: false,
             queried_to: Fraction::ZERO,
             query_start: None,
@@ -1082,7 +1087,10 @@ impl Scheduler {
             if cps.is_finite() && cps > 0.0 {
                 self.tempo.set_cps(cps);
             }
+        } else {
+            self.tempo.restore_session_cps();
         }
+        self.sync_covering_tempo = false;
         let generation = self.transport.bump();
         self.pattern = Some(pattern);
         // Re-anchor so the new generation continues from the current time
@@ -1320,8 +1328,7 @@ impl Scheduler {
     /// keeps the tempo that plays and drops each change still ahead.
     pub fn set_pattern_tempo(&mut self, enabled: bool) {
         if !enabled {
-            let cps = self.tempo.cps();
-            self.tempo.set_cps(cps);
+            self.tempo.freeze_tempo();
         }
         self.pattern_tempo = enabled;
     }
@@ -1388,11 +1395,26 @@ impl Scheduler {
     /// an explicit outside-clock [`Self::retime`] releases it.
     pub fn rebase_start_anchor(&mut self, now: f64) {
         self.query_start = Some(Fraction::ZERO);
+        self.sync_covering_tempo = false;
+        self.tempo.restore_session_cps();
         // No device holds an outgoing copy for a new lifetime. The marks and
         // held copies of the lifetime before it would drop its first onsets.
         self.queue.clear();
         self.forget_device_copies();
         self.rebase_anchor(now, 0.0);
+    }
+
+    /// Restart the active graph from cycle zero at `anchor` under a fresh
+    /// generation without advancing past cycle zero on a takeover edge.
+    pub fn restart_active_from_zero(&mut self, anchor: f64) -> Option<Generation> {
+        if self.pattern.is_none() || !anchor.is_finite() {
+            return None;
+        }
+        let generation = self.transport.bump();
+        self.rebase_start_anchor(anchor);
+        self.clear_trace();
+        self.refused = None;
+        Some(generation)
     }
 
     fn at_or_after_start(&self, cycle: Fraction) -> Fraction {
@@ -1626,6 +1648,7 @@ impl Scheduler {
         self.queried_to = from;
         let retimed = self.retimed;
         let generation = self.replace_pattern(pattern, now, cps);
+        self.sync_covering_tempo = cps.is_none();
         // The explicit-start boundary still holds: a preroll edit before the
         // transport's first cycle must not re-query into it. Clamp only the
         // cursor, and only after the replace. The pre-replace value above
@@ -2243,6 +2266,43 @@ impl Scheduler {
         let mut queue_full = false;
         // Earliest onset the cap left unqueued; the cursor stops there.
         let mut unprocessed_begin: Option<Fraction> = None;
+        // Apply lane controls before takeover stand-in matching and tempo
+        // scanning so muted/non-soloed lanes cannot steal stand-ins, transposed
+        // values match emitted keys, and soloing a musical lane does not mute a
+        // separate pure `cps(...)` tempo lane.
+        if !self.lane_controls.is_empty() {
+            let lane_controls = &self.lane_controls;
+            haps.retain_mut(|hap| {
+                let lane = hap.lane_context().unwrap_or(0);
+                let is_pure_tempo = hap_tempo(&hap.value).is_some()
+                    && matches!(&hap.value, Value::Object(map) if map.len() == 1);
+                if !lane_controls.allows_lane(lane)
+                    && !(is_pure_tempo && !lane_controls.is_muted(lane))
+                {
+                    return false;
+                }
+                let semitones = lane_controls.transpose_of(lane);
+                if semitones != 0 {
+                    LaneControls::apply_transpose(&mut hap.value, semitones);
+                }
+                true
+            });
+        }
+        let mut tempo_changed = false;
+        if self.sync_covering_tempo {
+            self.sync_covering_tempo = false;
+            if self.pattern_tempo {
+                for hap in &haps {
+                    if let Some(whole) = hap.whole
+                        && whole.begin < self.queried_to
+                        && whole.end > self.queried_to
+                        && let Some(cps) = hap_tempo(&hap.value)
+                    {
+                        tempo_changed |= self.tempo.change_at(self.queried_to, cps);
+                    }
+                }
+            }
+        }
         // A tempo change times the onsets after it, so they come in order.
         let has_tempo = self.pattern_tempo
             && haps
@@ -2251,7 +2311,6 @@ impl Scheduler {
         if has_tempo {
             sort_for_tempo(&mut haps);
         }
-        let mut tempo_changed = false;
         // Inside a continued replacement's takeover window: the changed or
         // moved haps the device's outgoing copies stand in for.
         let mut stand_ins = self.overlap_stand_ins(&haps, generation, end);
@@ -2260,7 +2319,7 @@ impl Scheduler {
         self.pass_ordinals.clear();
         let mut position = 0usize;
         let mut pending = haps.into_iter();
-        while let Some(mut hap) = pending.next() {
+        while let Some(hap) = pending.next() {
             let at = position;
             position += 1;
             // Checked INSIDE the fill loop, not after it: the point is to stop
@@ -2279,16 +2338,6 @@ impl Scheduler {
                 continue;
             }
             let Some(whole) = hap.whole else { continue };
-            if !self.lane_controls.is_empty() {
-                let lane = hap.lane_context().unwrap_or(0);
-                if !self.lane_controls.allows_lane(lane) {
-                    continue;
-                }
-                let semitones = self.lane_controls.transpose_of(lane);
-                if semitones != 0 {
-                    LaneControls::apply_transpose(&mut hap.value, semitones);
-                }
-            }
             let target_time = self.tempo.time_at_cycle(whole.begin);
             // After a slower tempo, an onset past the horizon waits for a
             // later fill. The cursor stops at it.

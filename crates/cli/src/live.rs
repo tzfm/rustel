@@ -370,6 +370,7 @@ pub(super) fn read_ui_controls_with_commands(
 pub(super) struct UiDiscreteApplyOutcome {
     pub(super) ack: Option<rustel_runtime::ui_events::UiControlAckEnvelope>,
     pub(super) needs_requery: bool,
+    pub(super) needs_restart: bool,
 }
 
 #[cfg(feature = "device-audio")]
@@ -378,7 +379,7 @@ pub(super) fn apply_ui_discrete_control(
     layout: &UiLayoutDelivery,
     command: UiDiscreteControl,
     clock_seconds: f64,
-    schedule_lead_seconds: f64,
+    _schedule_lead_seconds: f64,
     corrective_generation: Option<u64>,
 ) -> UiDiscreteApplyOutcome {
     let UiDiscreteControl {
@@ -410,6 +411,7 @@ pub(super) fn apply_ui_discrete_control(
                     session.generation(),
                 ),
                 needs_requery: false,
+                needs_restart: false,
             };
         }
     }
@@ -424,19 +426,27 @@ pub(super) fn apply_ui_discrete_control(
                 session.generation(),
             ),
             needs_requery: false,
+            needs_restart: false,
         };
     }
 
-    let (accepted, needs_requery, message) = match kind {
+    let (accepted, needs_requery, needs_restart, message) = match kind {
         UiDiscreteControlKind::LaneSolo { lane } => {
-            session.set_lane_solo(lane);
-            (true, true, None)
+            let changed = session.set_lane_solo(lane);
+            (true, changed, false, None)
         }
         UiDiscreteControlKind::LaneMute { lane, muted } => {
             if session.set_lane_mute(lane, muted) {
-                (true, true, None)
+                (true, true, false, None)
+            } else if session.lane_controls().is_muted(lane) == muted {
+                (true, false, false, None)
             } else {
-                (false, false, Some("lane control limit reached".into()))
+                (
+                    false,
+                    false,
+                    false,
+                    Some("lane control limit reached".into()),
+                )
             }
         }
         UiDiscreteControlKind::LaneTranspose { lane, semitones } => {
@@ -444,12 +454,20 @@ pub(super) fn apply_ui_discrete_control(
                 (
                     false,
                     false,
+                    false,
                     Some("semitones must be within -48..=48".into()),
                 )
             } else if session.set_lane_transpose(lane, semitones) {
-                (true, true, None)
+                (true, true, false, None)
+            } else if session.lane_controls().transpose_of(lane) == semitones {
+                (true, false, false, None)
             } else {
-                (false, false, Some("lane control limit reached".into()))
+                (
+                    false,
+                    false,
+                    false,
+                    Some("lane control limit reached".into()),
+                )
             }
         }
         UiDiscreteControlKind::Tempo { cps, bpm } => {
@@ -462,9 +480,10 @@ pub(super) fn apply_ui_discrete_control(
                 Some(cps) if cps.is_finite() && cps > 0.0 && cps <= MAX_UI_CONTROL_CPS => {
                     let cycle = session.cycle_at_time(clock_seconds);
                     session.retime(clock_seconds, cps, cycle);
-                    (true, true, None)
+                    (true, true, false, None)
                 }
                 _ => (
+                    false,
                     false,
                     false,
                     Some("provide a single positive finite cps or bpm".into()),
@@ -474,19 +493,16 @@ pub(super) fn apply_ui_discrete_control(
         UiDiscreteControlKind::Transport { action } => match action {
             UiTransportAction::Stop => {
                 session.transport().stop();
-                (true, false, None)
+                (true, false, false, None)
             }
-            UiTransportAction::Restart => {
-                let anchor = clock_seconds + schedule_lead_seconds.max(0.0);
-                session.restart_transport_at(anchor);
-                (true, true, None)
-            }
+            UiTransportAction::Restart => (true, false, true, None),
         },
     };
 
     UiDiscreteApplyOutcome {
         ack: make_ack(request, accepted, message, session.generation()),
         needs_requery,
+        needs_restart,
     }
 }
 
@@ -2190,6 +2206,8 @@ pub(super) fn play_live(
         // Session mutations happen here on the sole Session/producer thread.
         // No control path can run on or wait for the audio callback.
         let mut control_changed = false;
+        let mut restart_requested = false;
+        let mut deferred_acks = Vec::new();
         let mut slider_runtime_failure: Option<String> = None;
         if let Some(controls) = ui_controls.as_ref() {
             for control in controls.drain() {
@@ -2228,8 +2246,15 @@ pub(super) fn play_live(
                 if outcome.needs_requery {
                     control_changed = true;
                 }
-                if let (Some(ack), Some(sink)) = (outcome.ack, ui_sink.as_ref()) {
-                    let _ = sink.try_send_control_ack(ack);
+                if outcome.needs_restart {
+                    restart_requested = true;
+                }
+                if let Some(ack) = outcome.ack {
+                    if outcome.needs_requery || outcome.needs_restart {
+                        deferred_acks.push(ack);
+                    } else if let Some(sink) = ui_sink.as_ref() {
+                        let _ = sink.try_send_control_ack(ack);
+                    }
                 }
             }
         }
@@ -2251,8 +2276,13 @@ pub(super) fn play_live(
         } else if slider_runtime_failure.is_none() {
             last_slider_runtime_error = None;
         }
-        if control_changed {
-            match session.requery_active_at(device.clock_seconds()) {
+        if restart_requested || control_changed {
+            let transition = if restart_requested {
+                session.restart_active_at(device.clock_seconds())
+            } else {
+                session.requery_active_at(device.clock_seconds())
+            };
+            match transition {
                 Ok(Some((generation_before, generation_after))) => {
                     producer.arm_control_requery(generation_before, generation_after);
                     pending_ui_control_cutover = Some(PendingUiControlCutover {
@@ -2274,6 +2304,13 @@ pub(super) fn play_live(
                         }),
                     );
                 }
+            }
+        }
+        if let Some(sink) = ui_sink.as_ref() {
+            let current_generation = session.generation();
+            for mut ack in deferred_acks {
+                ack.ui_control_ack.generation = current_generation;
+                let _ = sink.try_send_control_ack(ack);
             }
         }
         if let Err(error) = device.check_health() {

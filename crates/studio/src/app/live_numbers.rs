@@ -250,9 +250,10 @@ impl App {
 
     /// The number at `literal`, a range of `source`, the scene's current
     /// text, as the playing score holds it. `held`, the text from the
-    /// call's name to the number, is the same text there, which the edits
-    /// since moved to where it is now. A number typed or retyped since, or
-    /// a call renamed since, is not in the playing score.
+    /// call's name to the number, is the same text there (modulo any earlier
+    /// live numbers in the same call moved by rails), which the edits since
+    /// moved to where it is now. A number typed or retyped since, or a call
+    /// renamed since, is not in the playing score.
     fn playing_literal(
         &self,
         scene: SceneId,
@@ -263,13 +264,80 @@ impl App {
         let installed = self.evaluated_source.as_deref()?;
         let at = self.visual_revision?;
         let editor = &self.scenes.get(scene)?.editor;
-        let text = source.get(held.clone())?;
-        let offset = literal.start.checked_sub(held.start)?;
-        installed
-            .match_indices(text)
-            .map(|(start, _)| start..start + text.len())
-            .find(|range| editor.map_range_since(at, range.clone()).as_ref() == Some(&held))
-            .map(|range| range.start + offset..range.start + offset + literal.len())
+        if let Some(text) = source.get(held.clone())
+            && let Some(offset) = literal.start.checked_sub(held.start)
+            && let Some(range) = installed
+                .match_indices(text)
+                .map(|(start, _)| start..start + text.len())
+                .find(|range| editor.map_range_since(at, range.clone()).as_ref() == Some(&held))
+        {
+            return Some(range.start + offset..range.start + offset + literal.len());
+        }
+        // When an earlier parameter in the same call was moved live, `held`
+        // differs from `installed` at that earlier literal. Verify `literal`
+        // and every untouched segment around those moved live numbers still
+        // map verbatim from `installed`.
+        let lit_text = source.get(literal.clone())?;
+        let installed_lit = installed
+            .match_indices(lit_text)
+            .map(|(start, _)| start..start + lit_text.len())
+            .find(|range| editor.map_range_since(at, range.clone()).as_ref() == Some(&literal))?;
+        let mut prior: Vec<(Range<usize>, Range<usize>)> = self
+            .live_numbers_now(scene)
+            .into_iter()
+            .filter(|number| number.range.start >= held.start && number.range.end <= literal.start)
+            .filter_map(|number| {
+                let cell = live_number_range(&number.id)?;
+                let now = source.get(number.range.clone())?;
+                let expected = number
+                    .written
+                    .as_deref()
+                    .or_else(|| installed.get(cell.clone()))?;
+                (now == expected).then_some((cell, number.range))
+            })
+            .collect();
+        if prior.is_empty() {
+            return None;
+        }
+        prior.sort_by_key(|(_, range)| range.start);
+        let first_gap = held.start..prior[0].1.start;
+        let first_cell_start = prior[0].0.start;
+        let installed_held_start = first_cell_start.checked_sub(first_gap.len())?;
+        if installed.get(installed_held_start..first_cell_start) != source.get(first_gap.clone())
+            || editor
+                .map_range_since(at, installed_held_start..first_cell_start)
+                .as_ref()
+                != Some(&first_gap)
+        {
+            return None;
+        }
+        let mut prev_cell_end = prior[0].0.end;
+        let mut prev_cur_end = prior[0].1.end;
+        for (cell, cur) in prior.into_iter().skip(1) {
+            if cur.start < prev_cur_end || cell.start < prev_cell_end {
+                return None;
+            }
+            let cur_gap = prev_cur_end..cur.start;
+            let inst_gap = prev_cell_end..cell.start;
+            if installed.get(inst_gap.clone()) != source.get(cur_gap.clone())
+                || editor.map_range_since(at, inst_gap).as_ref() != Some(&cur_gap)
+            {
+                return None;
+            }
+            prev_cell_end = cell.end;
+            prev_cur_end = cur.end;
+        }
+        if prev_cell_end > installed_lit.start || prev_cur_end > literal.start {
+            return None;
+        }
+        let tail_cur = prev_cur_end..literal.end;
+        let tail_inst = prev_cell_end..installed_lit.end;
+        if installed.get(tail_inst.clone()) != source.get(tail_cur.clone())
+            || editor.map_range_since(at, tail_inst).as_ref() != Some(&tail_cur)
+        {
+            return None;
+        }
+        Some(installed_lit)
     }
 
     /// The number at `literal`, a range of `source`, the current text,
@@ -606,15 +674,23 @@ impl App {
         let Some(scene) = self.audible_scene else {
             return;
         };
-        let owed: Vec<(String, f64)> = self
-            .live_numbers_now(scene)
-            .into_iter()
-            .filter_map(|number| {
-                let span = self.sliders.iter().find(|span| span.id == number.id)?;
-                let moved = number.moved?;
-                (moved != span.value).then(|| (span.id.clone(), moved))
-            })
-            .collect();
+        let mut owed = Vec::new();
+        for number in self.live_numbers_now(scene) {
+            let Some(moved) = number.moved else {
+                continue;
+            };
+            let Some(span) = self.sliders.iter().find(|span| span.id == number.id) else {
+                continue;
+            };
+            let needs_send = moved != span.value;
+            if needs_send {
+                // Both `owed` and `moved_slider_values` own the control id.
+                self.moved_slider_values.insert(number.id.clone(), moved);
+                owed.push((number.id, moved));
+            } else {
+                self.moved_slider_values.insert(number.id, moved);
+            }
+        }
         for (id, value) in owed {
             if let Some(span) = self.sliders.iter_mut().find(|span| span.id == id) {
                 span.value = value;
@@ -1126,5 +1202,132 @@ mod tests {
         assert!(!app.editor().source().contains("4000"));
         assert!(sent(&app).is_empty());
         assert!(app.live_numbers.is_empty());
+    }
+
+    /// Moving one parameter live in a multi-parameter call (such as a VST
+    /// options object) keeps every later parameter in that call live.
+    #[test]
+    fn moving_a_plugin_option_keeps_later_options_live() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let installed = "$: s(\"sine\").seg(4).vsti(\"Diva\", { output: 0.25, cutoff: 0.5 })\n";
+        let mut app = playing_with_an_unevaluated_edit(directory.path(), installed, "0.25");
+        app.ui_settings.auto_evaluate = false;
+        let rail = Rect::new(0, 0, 24, 1);
+        app.refresh_knobs(Rect::default());
+        let rows = app.knobs_rows.as_ref().expect("knobs");
+        let output_row = rows
+            .knobs
+            .iter()
+            .position(|knob| knob.label == "output")
+            .expect("output knob");
+        let cutoff_row = rows
+            .knobs
+            .iter()
+            .position(|knob| knob.label == "cutoff")
+            .expect("cutoff knob");
+
+        // Move the first option live and let its layout land.
+        app.drag_knob(output_row, rail, 20);
+        let at = |needle: &str| {
+            let start = installed.find(needle).expect("literal");
+            start..start + needle.len()
+        };
+        let (output_cell, cutoff_cell) = (at("0.25"), at("0.5"));
+        app.worker.wait_until_taken();
+        app.inflight.clear();
+        app.pending_evaluation = None;
+        let layout = rustel_runtime::ui_events::visual_layout_with_live_numbers(
+            installed,
+            2,
+            &as_written(std::slice::from_ref(&output_cell)),
+        )
+        .expect("layout");
+        app.handle_control(StudioControlEvent::Layout(layout));
+
+        // The second option must stay live (not marked waiting) and move live.
+        app.refresh_knobs(Rect::default());
+        assert!(
+            !app.knobs_rows.as_ref().expect("knobs").knobs[cutoff_row].waits,
+            "later option in the same call must remain live"
+        );
+        app.drag_knob(cutoff_row, rail, 4);
+        assert_eq!(
+            sent(&app)
+                .iter()
+                .map(|source| source.as_ref())
+                .collect::<Vec<_>>(),
+            [installed],
+            "dragging the second option reinstalls the playing score with a live cell"
+        );
+        app.worker.wait_until_taken();
+        app.inflight.clear();
+        app.pending_evaluation = None;
+        let layout = rustel_runtime::ui_events::visual_layout_with_live_numbers(
+            installed,
+            3,
+            &as_written(&[output_cell, cutoff_cell.clone()]),
+        )
+        .expect("layout");
+        app.handle_control(StudioControlEvent::Layout(layout));
+        let cutoff_id = live_number_id(cutoff_cell);
+        assert!(
+            app.sliders.iter().any(|span| span.id == cutoff_id),
+            "cutoff became a live cell"
+        );
+    }
+
+    /// Undoing a moved live number back to the evaluated text is not redundant:
+    /// the engine still plays the moved cell value until re-evaluated.
+    #[test]
+    fn undoing_a_moved_live_number_is_not_redundant_on_evaluate() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let (mut app, scene, _) =
+            build_app(directory.path(), "$: s(\"sawtooth\").lpf(4000)\n", None);
+        let installed = app.editor().source();
+        app.evaluation_revisions.remember(
+            source_revision(&installed),
+            app.editor().revision(),
+            Arc::from(installed.as_str()),
+            scene,
+            None,
+        );
+        let layout = rustel_runtime::ui_events::visual_layout(&installed, 1).expect("layout");
+        app.handle_control(StudioControlEvent::Layout(layout));
+        app.snapshot = Some(sounding(true, false));
+        let caret = app.editor().source().find("4000").expect("cutoff");
+        app.editor_mut()
+            .set_selection(Selection::caret(ByteOffset(caret)))
+            .expect("caret");
+        app.open_knobs_panel(true);
+
+        let rail = Rect::new(0, 0, 24, 1);
+        app.drag_knob(0, rail, 4);
+        let start = installed.find("4000").expect("4000");
+        let cell = start..start + 4;
+        app.worker.wait_until_taken();
+        app.inflight.clear();
+        app.pending_evaluation = None;
+        let layout = rustel_runtime::ui_events::visual_layout_with_live_numbers(
+            &installed,
+            2,
+            &as_written(std::slice::from_ref(&cell)),
+        )
+        .expect("layout");
+        app.handle_control(StudioControlEvent::Layout(layout));
+
+        // Undo returns the buffer to `lpf(4000)` while the engine plays the moved value.
+        app.editor_mut()
+            .dispatch(
+                Command::Undo,
+                HistoryMoment(2),
+                &mut MemoryClipboard::default(),
+            )
+            .expect("undo");
+        let reverted = app.editor().source();
+        assert_eq!(reverted, installed);
+        assert!(
+            !app.install_would_be_redundant(scene, &reverted),
+            "re-evaluating after undoing a moved live number must not be skipped"
+        );
     }
 }

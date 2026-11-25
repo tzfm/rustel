@@ -41,6 +41,9 @@ impl Anchor {
 /// Converts between cycle positions and clock seconds.
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct TempoMap {
+    /// The session tempo (`setcps`, `--cps`, or the default), kept separate
+    /// from pattern-set tempos so restarts and replacement scores return to it.
+    session_cps: f64,
     anchor: Anchor,
     /// Tempo changes ahead of the anchor, in cycle order. Each starts at a
     /// later cycle than the one before it. Usually empty.
@@ -51,6 +54,7 @@ impl TempoMap {
     /// Cycle zero at time zero, at `cps`.
     pub(crate) fn new(cps: f64) -> Self {
         Self {
+            session_cps: cps,
             anchor: Anchor {
                 time: 0.0,
                 cycle: Fraction::ZERO,
@@ -134,7 +138,23 @@ impl TempoMap {
     /// Run at the session tempo `cps` from the anchor point. It replaces
     /// each tempo a pattern set.
     pub(crate) fn set_cps(&mut self, cps: f64) {
+        self.session_cps = cps;
         self.anchor.cps = cps;
+        self.anchor.from_pattern = false;
+        self.ahead.clear();
+    }
+
+    /// Return to the session tempo from the anchor point, forgetting any
+    /// pattern-set tempo that took over or sits ahead.
+    pub(crate) fn restore_session_cps(&mut self) {
+        self.anchor.cps = self.session_cps;
+        self.anchor.from_pattern = false;
+        self.ahead.clear();
+    }
+
+    /// Keep the playing tempo without adopting further pattern changes ahead,
+    /// preserving the underlying session tempo.
+    pub(crate) fn freeze_tempo(&mut self) {
         self.anchor.from_pattern = false;
         self.ahead.clear();
     }
@@ -142,6 +162,7 @@ impl TempoMap {
     /// Put `cycle` at `time` and run at the session tempo `cps` from there.
     /// It replaces each tempo a pattern set.
     pub(crate) fn retime(&mut self, time: f64, cycle: Fraction, cps: f64) {
+        self.session_cps = cps;
         self.anchor = Anchor {
             time,
             cycle,

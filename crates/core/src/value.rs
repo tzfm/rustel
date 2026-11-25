@@ -983,10 +983,7 @@ impl PatchedBase {
     pub(crate) fn same_source(&self, other: &Self) -> bool {
         match (self, other) {
             (Self::Table(a), Self::Table(b)) => Arc::ptr_eq(a, b),
-            (Self::SeqLayer(a, ai), Self::SeqLayer(b, bi)) => {
-                Arc::ptr_eq(a, b)
-                    && (ai == bi || a[usize::from(*ai)].seq_same_key_layout(&b[usize::from(*bi)]))
-            }
+            (Self::SeqLayer(a, ai), Self::SeqLayer(b, bi)) => Arc::ptr_eq(a, b) && ai == bi,
             (Self::Builtin(a), Self::Builtin(b)) => Arc::ptr_eq(a, b),
             (Self::Patched(a), Self::Patched(b)) => PooledPatched::ptr_eq(a, b),
             _ => false,

@@ -337,6 +337,7 @@ impl App {
         self.worker.discard_visual_updates();
         self.visual.stop();
         self.pending_sliders.clear();
+        self.moved_slider_values.clear();
         // No layout is owed by a set that stopped.
         self.layout_due = None;
         self.layout_generation = None;
@@ -476,6 +477,30 @@ impl App {
             && !self.is_stopping()
             && self.audible_scene == Some(scene)
             && self.installed_revision.as_deref() == Some(source_revision(source).as_str())
+            && !self.controls_diverged_from(source)
+    }
+
+    /// Whether any live-number or inline-slider cell was moved away from the
+    /// literal written in `source`, so evaluating `source` must still run to
+    /// restore the written value in the engine.
+    pub(super) fn controls_diverged_from(&self, source: &str) -> bool {
+        if self.moved_slider_values.is_empty() {
+            return false;
+        }
+        let mut inline_sliders: Option<Vec<rustel_runtime::ui_events::LiveSlider>> = None;
+        self.moved_slider_values.iter().any(|(id, moved)| {
+            let literal = if let Some(range) = rustel_transpiler::live_number_range(id) {
+                source.get(range).and_then(|text| text.parse::<f64>().ok())
+            } else {
+                let sliders = inline_sliders
+                    .get_or_insert_with(|| rustel_runtime::ui_events::literal_sliders(source));
+                sliders
+                    .iter()
+                    .find(|slider| slider.slider.id == *id)
+                    .map(|slider| slider.slider.value)
+            };
+            literal.is_none_or(|value| (*moved - value).abs() > 1e-12)
+        })
     }
 
     pub(super) fn is_playing(&self) -> bool {

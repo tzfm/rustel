@@ -538,11 +538,29 @@ fn speed_remains_a_strudel_control_and_hydra_clock_assignments_are_recorded() {
             r#"
             await initHydra()
             speed = 0.5
-            osc(10).out()
-            $: s("bd*4").speed(2)
+            time = 0
+            osc(10).rotate(time).out()
+            $: speed(2).s("bd*4")
             "#,
         )
-        .expect("the Strudel speed control remains callable");
+        .expect("the Strudel speed control remains callable after speed = 0.5");
+    let haps = session
+        .query(
+            rustel_fraction::Fraction::ZERO,
+            rustel_fraction::Fraction::ONE,
+        )
+        .expect("query speed(2) lane");
+    assert_eq!(
+        haps[0].value.get("speed"),
+        Some(&rustel_core::Value::F64(2.0))
+    );
+    let time_update = program("await initHydra()\ntime = 0\nosc(10).rotate(time).out()");
+    assert_eq!(time_update.program.clock().time, Some(0.0));
+    let time_json = format!("{:?}", time_update.program);
+    assert!(
+        time_json.contains("head: \"time\""),
+        "bare `time` after `time = 0` must keep the live Hydra time expression: {time_json}"
+    );
     let update =
         program("await initHydra()\nspeed = 2\nbpm = 120\nfps = 12\ntime = 0\nosc(10).out()");
     assert_eq!(
