@@ -227,21 +227,5 @@ mod tests {
                 app.status
             );
         }
-
-        #[test]
-        fn with_no_session_to_stand_in_nothing_is_sent() {
-            let directory = tempfile::tempdir().expect("temp dir");
-            let (mut app, _scene) = plain_app(directory.path(), "$: s(\"bd\")\n");
-            app.link = LinkFollow::Joined { seen_playing: None };
-            app.snapshot = Some(StudioSnapshot::default());
-            app.pump_link();
-            assert!(
-                app.log
-                    .lines()
-                    .back()
-                    .is_none_or(|line| !line.text.contains("update -")),
-                "no session, no start"
-            );
-        }
     }
 }

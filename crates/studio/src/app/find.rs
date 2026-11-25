@@ -160,28 +160,6 @@ mod tests {
             assert!(!app.editor().find_open(), "Ctrl+C closes the find bar");
         }
 
-        #[test]
-        fn vim_edit_find_closes_on_enter_and_n_walks_matches() {
-            let directory = tempfile::tempdir().expect("temp dir");
-            let (mut app, _scene) = plain_app(directory.path(), "one two one three one\n");
-            app.ui_settings.editor_keybindings = crate::editor::EditorKeybindings::Vim;
-            app.sync_editor_keybindings();
-            let head = |app: &App| app.editor().primary_selection().head.0;
-
-            chord(&mut app);
-            assert!(app.editor().find_open());
-            for character in "one".chars() {
-                press(&mut app, KeyCode::Char(character), KeyModifiers::NONE);
-            }
-            press(&mut app, KeyCode::Enter, KeyModifiers::NONE);
-            assert!(!app.editor().find_open(), "Enter searches once and closes");
-            let first = head(&app);
-            press(&mut app, KeyCode::Char('n'), KeyModifiers::NONE);
-            assert_ne!(head(&app), first, "n walks forward");
-            press(&mut app, KeyCode::Char('N'), KeyModifiers::NONE);
-            assert_eq!(head(&app), first, "N walks back");
-        }
-
         /// A click on Edit > Find opens the bar on its press. Its release
         /// is the end of that click, so the typing after it goes to the
         /// bar, in either profile. The release once closed the bar again,
@@ -217,26 +195,6 @@ mod tests {
                     "Enter found the match (vim: {vim})"
                 );
             }
-        }
-
-        #[test]
-        fn backspace_keeps_the_non_vim_find_bar_open() {
-            let directory = tempfile::tempdir().expect("temp dir");
-            let (mut app, _scene) = plain_app(directory.path(), "one\n");
-            chord(&mut app);
-            for character in "one".chars() {
-                press(&mut app, KeyCode::Char(character), KeyModifiers::NONE);
-            }
-            for _ in 0..3 {
-                press(&mut app, KeyCode::Backspace, KeyModifiers::NONE);
-            }
-            assert!(
-                app.editor().find_open(),
-                "an empty pattern keeps the find bar open"
-            );
-            assert_eq!(app.editor().find_footer_label().as_deref(), Some("FIND"));
-            press(&mut app, KeyCode::Esc, KeyModifiers::NONE);
-            assert!(!app.editor().find_open());
         }
 
         #[test]

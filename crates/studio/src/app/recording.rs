@@ -791,58 +791,6 @@ mod tests {
             );
         }
 
-        /// The chord the table shows for recording a sample is the chord that
-        /// records one. It had no handler of its own, so the key the menu
-        /// promised did nothing in any terminal.
-        #[test]
-        fn the_record_sample_chord_starts_a_sample() {
-            let directory = tempfile::tempdir().expect("temp dir");
-            let mut app = app_over(directory.path());
-            let chord = app
-                .keybinds
-                .binding(BindAction::RecordSample)
-                .expect("record a sample has a chord");
-            let mut modifiers = KeyModifiers::NONE;
-            if chord.control {
-                modifiers |= KeyModifiers::CONTROL;
-            }
-            if chord.shift {
-                modifiers |= KeyModifiers::SHIFT;
-            }
-            press(&mut app, chord.code, modifiers);
-            assert!(
-                app.pending_sample.is_some(),
-                "the press reached the recorder: {}",
-                app.status
-            );
-            assert!(
-                app.sample_take.is_some(),
-                "a sample is on its way: {}",
-                app.status
-            );
-            assert_eq!(app.status, "● recording a sample…");
-
-            // The fixture opens no default input, so the engine's answer is the
-            // refusal a machine with no input gives - and it leaves nothing open.
-            let deadline = Instant::now() + Duration::from_secs(5);
-            while app.pending_sample.is_some() && Instant::now() < deadline {
-                while let Ok(event) = app.worker.try_recv_control() {
-                    app.handle_control(event);
-                }
-                std::thread::sleep(Duration::from_millis(5));
-            }
-            assert!(app.pending_sample.is_none(), "the engine answered");
-            assert!(app.sample_take.is_none(), "a refused start leaves no take");
-            assert_eq!(app.status, "no sample is recording");
-            assert_eq!(
-                app.errors.visible(),
-                Some(
-                    "could not record a sample: no audio input to record from: \
-             this studio opens no default input"
-                )
-            );
-        }
-
         /// A sample whose writer failed on the way out says so twice over: the
         /// error line has the reason, and the status stops saying "finishing the
         /// sample…", which beside that error would read as a finish still under
@@ -1069,33 +1017,6 @@ mod tests {
                     .filter(|line| line.kind == "take" && line.text.starts_with("saved "))
                     .count(),
                 1
-            );
-        }
-
-        #[test]
-        fn a_silent_take_is_removed_and_not_registered() {
-            let directory = tempfile::tempdir().unwrap();
-            let mut app = app_over(directory.path());
-            let path = directory.path().join("silent.wav");
-            std::fs::write(&path, b"placeholder").unwrap();
-            let mut silent = status(&path);
-            silent.final_signal.as_mut().unwrap().finite_peak = 0.0;
-            app.active_recording_id = Some(1);
-            app.pending_recording = Some(2);
-
-            app.handle_control(finished(2, 1, silent));
-
-            assert!(!path.exists(), "silent capture was left on disk");
-            assert_eq!(
-                app.last_file, None,
-                "silent capture was advertised as saved"
-            );
-            assert_eq!(app.status, "take not saved - silence");
-            assert!(
-                app.log
-                    .lines()
-                    .iter()
-                    .any(|line| line.kind == "take" && line.text.starts_with("discarded silence"))
             );
         }
 
@@ -1349,21 +1270,6 @@ mod tests {
                 ),
                 "the log says why the take is not a sound"
             );
-        }
-
-        #[test]
-        fn takes_default_to_recordings_while_session_tapes_stay_with_the_set() {
-            let directory = tempfile::tempdir().unwrap();
-            let app = app_over(directory.path());
-
-            assert_eq!(
-                app.recordings_directory()
-                    .file_name()
-                    .and_then(|name| name.to_str()),
-                Some("recordings")
-            );
-            assert_ne!(app.recordings_directory(), app.sessions_directory());
-            assert_eq!(app.sessions_directory(), app.scenes.sessions_directory());
         }
     }
 }

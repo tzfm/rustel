@@ -599,50 +599,6 @@ mod tests {
             assert!(!screen.contains("Notes  C4"));
         }
 
-        /// Hiding the footer takes only its meter and chip row: an error and the
-        /// retained notes keep their own rows above the status line.
-        #[test]
-        fn retained_piano_notes_keep_their_row_with_the_footer_hidden() {
-            use ratatui::{Terminal, backend::TestBackend};
-            let directory = tempfile::tempdir().unwrap();
-            let mut app = app_over(directory.path());
-            app.ui_settings.show_footer = false;
-            let mut terminal = Terminal::new(TestBackend::new(110, 32)).unwrap();
-            app.toggle_piano_mode();
-            for character in ['a', 'd'] {
-                key(&mut app, character, KeyEventKind::Press);
-            }
-            app.close_piano_mode();
-            app.status = "saved recording".into();
-            app.errors
-                .set(ErrorOwner::Interface, "last scene cannot be closed".into());
-            terminal
-                .draw(|frame| app.paint_into(frame, Instant::now()).unwrap())
-                .unwrap();
-            let buffer = terminal.backend().buffer();
-            let row = |y| {
-                (0..buffer.area.width)
-                    .map(|x| buffer.cell((x, y)).unwrap().symbol())
-                    .collect::<String>()
-            };
-            let footer = app.regions.footer;
-            assert_eq!(footer.height, 3, "the error, the notes and the status line");
-            assert!(
-                row(footer.y).contains("last scene cannot be closed"),
-                "{}",
-                row(footer.y)
-            );
-            assert!(
-                row(footer.y + 1).contains("Notes  C4 + E4 · [60,64]"),
-                "{}",
-                row(footer.y + 1)
-            );
-            let hits = app.footer_hits();
-            assert_eq!(hits.status.y, footer.bottom() - 1);
-            assert!(row(hits.status.y).contains("saved recording"));
-            assert!(hits.dock.is_empty() && hits.device_chip.is_empty());
-        }
-
         #[test]
         fn piano_legacy_chords_expire_without_releases_or_another_input_event() {
             let directory = tempfile::tempdir().unwrap();

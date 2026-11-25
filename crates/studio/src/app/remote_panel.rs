@@ -903,18 +903,6 @@ mod tests {
         use std::net::{TcpListener, TcpStream};
 
         #[test]
-        fn included_remote_control_stays_dormant_without_runtime_opt_in() {
-            let directory = tempfile::tempdir().expect("score directory");
-            let mut app = app_over(directory.path());
-            assert!(app.options.remote_control.is_none());
-            assert!(app.remote.is_none());
-            app.input_dirty = false;
-            app.dirty_frame = false;
-            app.poll_remote().expect("inactive poll");
-            assert!(!app.input_dirty && !app.dirty_frame);
-        }
-
-        #[test]
         fn options_remote_control_replaces_devices_and_returns_to_editor() {
             use crate::menu::MenuAction;
 

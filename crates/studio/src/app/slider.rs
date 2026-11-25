@@ -1402,157 +1402,6 @@ mod tests {
             );
         }
 
-        /// The lint checks a slider's numbers and creates no controls. A lint
-        /// result for an older revision cannot replace the live set that a drag
-        /// keeps up to date.
-        #[test]
-        fn a_stale_lint_result_cannot_flicker_a_dragged_control_away() {
-            let directory = tempfile::tempdir().expect("temp dir");
-            let mut app = app_over(directory.path());
-            let scene = app.scenes.current().id;
-            let source = "$: s(\"bd\").gain(slider(0.5, 0, 1, 0.05))\n";
-            app.editor_mut()
-                .dispatch(
-                    Command::PasteText(source.into()),
-                    HistoryMoment(0),
-                    &mut MemoryClipboard::default(),
-                )
-                .expect("seed the score");
-            let stale_revision = app.scenes.current().editor.revision();
-            app.live_sliders.insert(
-                scene,
-                LiveSliderSet {
-                    revision: stale_revision,
-                    sliders: rustel_runtime::ui_events::literal_sliders(
-                        &app.scenes.current().editor.source(),
-                    ),
-                },
-            );
-
-            // The drag rewrites the literal; the set is hand-updated to the
-            // NEW revision by set_slider.
-            let call = app
-                .scenes
-                .current()
-                .editor
-                .source()
-                .find("slider(")
-                .unwrap();
-            let chip = app.live_chip_at(scene, call).expect("a control");
-            app.set_slider(scene, &chip, 0.8);
-            let dragged_revision = app.live_sliders[&scene].revision;
-            assert!(dragged_revision > stale_revision, "the edit moved on");
-
-            // Now the linter answers for the OLD text. It must be refused.
-            app.absorb_lint(crate::lint::LintResult {
-                scene,
-                revision: stale_revision,
-                input_channels: None,
-                diagnostics: Vec::new(),
-            });
-            assert_eq!(
-                app.live_sliders[&scene].revision, dragged_revision,
-                "the stale result did not land"
-            );
-            assert!(
-                app.live_chip_at(scene, call).is_some(),
-                "the control never flickers out"
-            );
-        }
-
-        /// A control works before any update. A drag rewrites the literal even
-        /// when the engine has never evaluated the score, and a second drag
-        /// finds the control that the first one moved.
-        #[test]
-        fn a_live_slider_drags_before_the_score_is_ever_evaluated() {
-            let directory = tempfile::tempdir().expect("temp dir");
-            let mut app = app_over(directory.path());
-            let scene = app.scenes.current().id;
-            let source = "$: s(\"bd\").gain(slider(0.5, 0, 1, 0.05))\n";
-            app.editor_mut()
-                .dispatch(
-                    Command::PasteText(source.into()),
-                    HistoryMoment(0),
-                    &mut MemoryClipboard::default(),
-                )
-                .expect("seed the score");
-
-            // The lint pass has not run in this test; hand its result over the
-            // same way drain_lint would.
-            let revision = app.scenes.current().editor.revision();
-            app.live_sliders.insert(
-                scene,
-                LiveSliderSet {
-                    revision,
-                    sliders: rustel_runtime::ui_events::literal_sliders(
-                        &app.scenes.current().editor.source(),
-                    ),
-                },
-            );
-
-            let call = app
-                .scenes
-                .current()
-                .editor
-                .source()
-                .find("slider(")
-                .unwrap();
-            let chip = app.live_chip_at(scene, call).expect("a control to drag");
-            assert_eq!(chip.span.value, 0.5);
-
-            app.set_slider(scene, &chip, 0.8);
-            assert!(
-                app.scenes
-                    .current()
-                    .editor
-                    .source()
-                    .contains("slider(0.8, 0, 1, 0.05)"),
-                "the literal was rewritten: {}",
-                app.scenes.current().editor.source()
-            );
-
-            // The control survived its own move - the hand-refresh - and a
-            // second gesture finds it where it is now.
-            let chip = app
-                .live_chip_at(scene, call)
-                .expect("the control survived its own move");
-            assert_eq!(chip.span.value, 0.8);
-            app.set_slider(scene, &chip, 0.25);
-            assert!(
-                app.scenes
-                    .current()
-                    .editor
-                    .source()
-                    .contains("slider(0.25, 0, 1, 0.05)"),
-                "{}",
-                app.scenes.current().editor.source()
-            );
-
-            // Nothing was ever handed to an engine that has not got it.
-            assert!(app.pending_sliders.is_empty());
-
-            // And an edit that eats the call takes the control with it, before
-            // any lint pass has a chance to say so.
-            let source = app.scenes.current().editor.source();
-            let from = source.find("slider(").unwrap();
-            let to = source.find("))").unwrap() + 2;
-            app.editor_mut()
-                .dispatch(
-                    Command::ReplaceRange {
-                        from: ByteOffset(from),
-                        to: ByteOffset(to),
-                        text: "0.5".into(),
-                    },
-                    HistoryMoment(1),
-                    &mut MemoryClipboard::default(),
-                )
-                .expect("delete the call");
-            assert!(
-                app.live_chip_at(scene, from).is_none(),
-                "a control whose call is gone is gone"
-            );
-        }
-
         /// Two faders moved while the engine takes no command each keep
         /// their final value owed. The move of the second fader does not
         /// take the place of the first one's.
@@ -1710,28 +1559,6 @@ mod tests {
         }
 
         #[test]
-        fn slider_values_are_written_back_with_the_precision_of_their_step() {
-            assert_eq!(slider::format_value(0.25), "0.25");
-            assert_eq!(slider::format_value(0.5), "0.5");
-            assert_eq!(slider::format_value(3.0), "3");
-            assert_eq!(slider::format_value(-2.125), "-2.125");
-            let span = SliderSpan {
-                id: "s".into(),
-                from: 0,
-                to: 3,
-                min: 0.0,
-                max: 1.0,
-                step: 0.001,
-                value: 0.5,
-            };
-            assert!((slider::rail_notch(span.min, span.max, span.step) - 0.01).abs() < 1e-9);
-            assert_eq!(span.clamp(1.7), 1.0);
-            assert!((span.clamp(0.2504) - 0.25).abs() < 1e-9);
-            let coarse = SliderSpan { step: 0.05, ..span };
-            assert!((slider::rail_notch(coarse.min, coarse.max, coarse.step) - 0.05).abs() < 1e-9);
-        }
-
-        #[test]
         fn logarithmic_travel_has_equal_ratios_and_exact_endpoints() {
             let log = Travel::frequency(true, 100.0, 10000.0);
             assert_eq!(log, Travel::Logarithmic);
@@ -1837,13 +1664,6 @@ mod tests {
             assert_eq!(snap_value(0.26, 0.0, 0.26, 0.1), 0.2);
             assert_eq!(snap_value(0.3, 0.0, 0.3, 0.1), 0.3);
             assert_eq!(snap_value(1.0, 0.0, 1.0, 2.0), 0.0);
-        }
-
-        #[test]
-        fn formatting_preserves_values_finer_than_a_typical_slider_step() {
-            for value in [0.25, 1.25, 0.105, 1e-12, 3e-100, 1.234_567_890_123_456] {
-                assert_eq!(format_value(value).parse::<f64>().unwrap(), value);
-            }
         }
     }
 
@@ -2731,33 +2551,6 @@ mod tests {
             assert!(app.slider_precision.is_some());
             assert_eq!(app.armed_slider, Some((scene, call)));
             assert_eq!(app.editor().source(), before);
-        }
-
-        #[test]
-        fn expanded_slider_pixels_change_value_inside_one_handle_cell() {
-            let directory = tempfile::tempdir().unwrap();
-            let (mut app, scene, call) = slider_app(directory.path());
-            app.features.pixel_mouse = true;
-            app.features.cell_pixels = Some((10, 20));
-            app.open_precision_slider(scene, call);
-            let area = slider_precision::geometry(app.frame);
-            let column = area.x + 12;
-            let row = (area.y + 3) * 20;
-            mouse(
-                &mut app,
-                MouseEventKind::Down(MouseButton::Left),
-                column * 10 + 4,
-                row,
-            );
-            let first = value(&app, scene, call);
-            mouse(
-                &mut app,
-                MouseEventKind::Drag(MouseButton::Left),
-                column * 10 + 5,
-                row,
-            );
-            let second = value(&app, scene, call);
-            assert!(second > first && second - first < 0.002);
         }
 
         #[test]

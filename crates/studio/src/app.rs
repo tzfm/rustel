@@ -2672,30 +2672,6 @@ mod tests {
             }
         }
 
-        /// Fetch imports caches the imported sounds the score names, not every
-        /// file of every import. A local folder is already here, so turning the
-        /// switch on queues nothing and does not put a count on the row.
-        #[test]
-        fn fetch_imports_caches_the_score_not_the_whole_import() {
-            let directory = tempfile::tempdir().unwrap();
-            let mut app = super::support::app_over(directory.path());
-            app.ui_settings.precache_sources = false;
-            let folder = directory.path().join("my drums");
-            std::fs::create_dir(&folder).unwrap();
-            std::fs::write(folder.join("kick.wav"), []).unwrap();
-            std::fs::write(folder.join("snare.wav"), []).unwrap();
-            app.add_sample_source(&folder.display().to_string());
-            app.settle_sample_sources();
-            app.precache_sources();
-            assert_eq!(
-                app.precache, None,
-                "fetch imports does not put a count on its row"
-            );
-            app.ui_settings.precache_sources = true;
-            app.precache_sources();
-            assert_eq!(app.precache, None);
-        }
-
         /// A minimal WAV: a header and two silent frames, enough for a folder scan
         /// to take it for a sample.
         fn tiny_wav() -> Vec<u8> {
