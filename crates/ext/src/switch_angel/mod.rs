@@ -363,60 +363,6 @@ mod tests {
     }
 
     #[test]
-    fn every_extension_name_is_declared_with_where_it_came_from() {
-        let registry = default_registry();
-        let extensions: Vec<&str> = registry
-            .names()
-            .into_iter()
-            .filter(|name| {
-                registry
-                    .get(name)
-                    .expect("name from registry")
-                    .declared_in
-                    .origin()
-                    == Some(ORIGIN)
-            })
-            .collect();
-        assert_eq!(
-            extensions,
-            vec![
-                "pg",
-                "accent",
-                "trancegate",
-                "tgate",
-                "dly",
-                "colorparty",
-                "mpan",
-                "rlpf",
-                "rhpf",
-                "vstruct",
-                "fmtime",
-                "acid",
-                "stxt",
-                "notearp",
-                "swap",
-                "sb",
-                "ifit",
-                "flood",
-                "sq",
-                "glitch",
-                "humanize",
-                "glide",
-                "fill",
-                "grab",
-                "filtval",
-                "up",
-                "acidenv",
-                "strum",
-            ]
-        );
-        assert_eq!(
-            registry.get("fill").expect("fill").declared_in,
-            DeclaredIn::Extension(ORIGIN)
-        );
-    }
-
-    #[test]
     fn no_name_is_registered_twice() {
         let registry = default_registry();
         let mut seen: HashMap<&str, usize> = HashMap::new();

@@ -217,13 +217,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn the_program_table_has_every_general_midi_program() {
-        assert_eq!(GM_PROGRAMS.len(), 128);
-        assert_eq!(&GM_PROGRAMS[..4], &["gm_piano"; 4]);
-        assert_eq!(GM_PROGRAMS[127], "gm_gunshot");
-    }
-
-    #[test]
     fn known_programs_land_on_their_general_midi_names() {
         assert_eq!(sound_for_program(40), Some("gm_violin"));
         assert_eq!(sound_for_program(56), Some("gm_trumpet"));

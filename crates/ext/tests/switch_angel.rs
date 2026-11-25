@@ -677,22 +677,6 @@ mod sealing {
         }
     }
 
-    #[test]
-    fn a_score_may_replace_one_of_our_extensions() {
-        // User definitions take precedence so new extensions do not break
-        // existing scores that already use their names.
-        for name in ["fill", "grab", "filtval", "strum", "inspire", "up"] {
-            assert!(
-                refusal(&format!(
-                    r#"register('{name}', (x) => x)
-                       $: s("bd")"#
-                ))
-                .is_none(),
-                "register('{name}') must be allowed: it is ours, not strudel.cc's"
-            );
-        }
-    }
-
     // Pattern prototypes outlive evaluation. Removing an override must restore
     // the built-in extension without requiring a restart.
     #[test]

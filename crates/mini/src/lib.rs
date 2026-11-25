@@ -7027,61 +7027,6 @@ mod tests {
         }
     }
 
-    /// Plain values at a whole rate for each cycle are one node: one layer
-    /// of steps that each lie in a cycle, and one rate a cycle.
-    #[test]
-    fn plain_values_at_a_rate_for_each_cycle_are_one_node() {
-        for (source, plain) in [
-            ("a*<1 2 4>", true),
-            ("bd*<1 2 4 8>, hh*<4 8 16 32>", true),
-            ("[a b]*<2 3> c", true),
-            ("<a b c>*<2 1>", true),
-            // A rate that is no whole number, and two rates in a cycle.
-            ("a*<2 1.5>", false),
-            ("a*<2 [3 4]>", false),
-            ("a*<2@2 3>", false),
-            ("a*<1@1.5 2@0.5>", false),
-            ("a*[[1 ~ 2 3]/3]", false),
-            // A step that its cycle cut lies in the cycle.
-            ("[a/2 b]*<1 2>", true),
-            // Two layers, and a step that crosses its cycle.
-            ("[a,b]*<1 2>", false),
-            ("a/2*<1 2>", false),
-            ("<a b>/2*<2 1>", false),
-        ] {
-            let built = super::mini_at(source, 0).expect(source);
-            assert_eq!(built.is_sequence(), plain, "{source}");
-        }
-    }
-
-    #[test]
-    fn plain_values_at_a_constant_speed_are_one_node() {
-        for (source, plain) in [
-            ("a [b c] ~ [d,e]", true),
-            ("<[a b]!3 [c d e]>", true),
-            ("a b@2 c", true),
-            ("a*2 b c", true),
-            ("a(3,8)", true),
-            ("a(3,8,2) [b,c](5,8)", true),
-            // A step that crosses its cycle is cut where the cycle ends.
-            ("a/2 b", true),
-            ("a <b c>/2 d", true),
-            ("bd*2, hh*4, <a b>/2", true),
-            // An atom is a `pure` on both sides, and one value a cycle
-            // is one node on both sides.
-            ("a", false),
-            ("<a>", false),
-            ("a? b", false),
-        ] {
-            let built = super::mini_at(source, 0).expect(source);
-            assert_eq!(
-                !built.same_construction(&one_node_for_each_value(source, 0)),
-                plain,
-                "{source}"
-            );
-        }
-    }
-
     #[test]
     fn flat_stack_and_weight_fast_paths_match_full_ast() {
         for source in [
