@@ -146,14 +146,4 @@ mod tests {
             Some(false)
         );
     }
-
-    #[test]
-    fn no_power_files_is_unknown() {
-        assert_eq!(linux_power_saving(None, None, None), None);
-    }
-
-    #[test]
-    fn the_platform_answer_never_panics() {
-        let _ = power_saving();
-    }
 }

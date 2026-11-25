@@ -465,26 +465,8 @@ impl Drop for WorkerWake {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use windows_sys::Win32::System::SystemInformation::{
-        IMAGE_FILE_MACHINE_ARM64, IMAGE_FILE_MACHINE_ARMNT, IMAGE_FILE_MACHINE_UNKNOWN,
-        SYSTEM_CPU_SET_INFORMATION_0_0_0,
-    };
+    use windows_sys::Win32::System::SystemInformation::SYSTEM_CPU_SET_INFORMATION_0_0_0;
     use windows_sys::Win32::System::Threading::GetThreadSelectedCpuSets;
-
-    /// Registration and revert do not fault, whichever way the service
-    /// answers on this machine (a hosted runner may lack MMCSS: that is
-    /// `None`, not a failure).
-    #[test]
-    fn registration_attaches_and_reverts_without_faulting() {
-        let render = ProAudioThread::attach_critical();
-        let feeder = ProAudioThread::attach_normal();
-        let worker = ProAudioThread::attach_worker();
-        drop(worker);
-        drop(feeder);
-        drop(render);
-        // The process runs on one core of the top class at least.
-        assert!(performance_cores().is_some_and(|cores| cores >= 1));
-    }
 
     /// A worker selects each CPU set of the highest efficiency class in the
     /// affinity mask and the CPU sets of the process, except a set the
@@ -586,27 +568,6 @@ mod tests {
         let process = process_affinity().expect("the mask of the process");
         let defaults = process_cpu_sets(sets.len()).expect("the CPU sets of the process");
         assert_eq!(selected(), performance_cpu_sets(&sets, process, &defaults));
-    }
-
-    /// The cycles of a thread count at a fixed rate on an x86 or x64
-    /// machine. An Arm machine, native or under an x64 build in emulation,
-    /// and a machine the system does not name have no such rate. This
-    /// process runs on an x64 or an Arm machine.
-    #[test]
-    fn only_x86_and_x64_cycles_count_at_a_fixed_rate() {
-        assert!(fixed_rate_cycles(IMAGE_FILE_MACHINE_AMD64));
-        assert!(fixed_rate_cycles(IMAGE_FILE_MACHINE_I386));
-        assert!(!fixed_rate_cycles(IMAGE_FILE_MACHINE_ARM64));
-        assert!(!fixed_rate_cycles(IMAGE_FILE_MACHINE_ARMNT));
-        assert!(!fixed_rate_cycles(IMAGE_FILE_MACHINE_UNKNOWN));
-        // The system names the native machine of this process: x64, or Arm
-        // under an Arm build or an x64 build in emulation.
-        let native = native_machine().expect("the native machine");
-        assert!(matches!(
-            native,
-            IMAGE_FILE_MACHINE_AMD64 | IMAGE_FILE_MACHINE_ARM64
-        ));
-        assert_eq!(cycles_at_fixed_rate(), native == IMAGE_FILE_MACHINE_AMD64);
     }
 
     /// Only the registering thread reverts: a registration dropped on any

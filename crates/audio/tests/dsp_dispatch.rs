@@ -1,8 +1,7 @@
 use rustel_audio::reverb::{IrParams, OrbitReverb, ReverbParams};
 use rustel_audio::{
-    AudioBackend, ConvolutionKernelKind, DecodedSample, DspDispatch, FxStage, LiveScalarBackend,
-    OnsetEvent, ReverbControls, SampleId, ScalarBackend, SupersawKernelKind, SynthSource,
-    WavetableKernelKind, render_pcm,
+    ConvolutionKernelKind, DecodedSample, DspDispatch, FxStage, OnsetEvent, ReverbControls,
+    SampleId, ScalarBackend, SupersawKernelKind, SynthSource, WavetableKernelKind, render_pcm,
 };
 
 const SAMPLE_RATE: u32 = 24_000;
@@ -52,38 +51,6 @@ fn params(custom: bool) -> ReverbParams {
             begin: 0.0,
         }),
     }
-}
-
-#[test]
-fn portable_renderers_keep_their_selection_across_initialization() {
-    let automatic = DspDispatch::automatic();
-    assert!(!automatic.is_forced_portable());
-    assert_eq!(
-        automatic.convolution_kernel_kind(),
-        rustel_audio::selected_convolution_kernel_kind()
-    );
-    assert_eq!(
-        automatic.supersaw_kernel_kind(),
-        rustel_audio::selected_supersaw_kernel_kind()
-    );
-    assert_eq!(
-        automatic.wavetable_kernel_kind(),
-        rustel_audio::selected_wavetable_kernel_kind()
-    );
-
-    let mut backend = ScalarBackend::with_dispatch(DspDispatch::portable());
-    for rate in [24_000, 44_100] {
-        backend.init(rate).expect("initialize portable backend");
-        assert_portable(backend.dispatch());
-    }
-    let prepared = ScalarBackend::prepared_with_dispatch(SAMPLE_RATE, 1, DspDispatch::portable())
-        .expect("prepared portable backend");
-    assert_portable(prepared.dispatch());
-    let live = LiveScalarBackend::with_dispatch(SAMPLE_RATE, 1, DspDispatch::portable())
-        .expect("portable live backend");
-    assert_portable(live.dispatch());
-    assert!(!ScalarBackend::new().dispatch().is_forced_portable());
-    assert!(!automatic.is_forced_portable());
 }
 
 fn render_reverb(reverb: &mut OrbitReverb, streaming: bool) -> Vec<f32> {

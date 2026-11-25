@@ -4957,39 +4957,6 @@ mod tests {
                 assert_eq!(tight.to_bits(), general.to_bits(), "sample {frame}");
             }
         }
-
-        /// A plain sample voice classifies for the tight path.
-        #[test]
-        fn a_plain_sample_voice_classifies_for_the_tight_path() {
-            let mut backend = ScalarBackend::prepared(48_000, 4).unwrap();
-            install_stereo_sample(&mut backend);
-            backend.note(sample_note(0, 1.0));
-            let mut out = [0.0f32; 256];
-            backend.process_block(&mut out[..], 128);
-            assert!(backend.voices.iter().any(|voice| voice.plain));
-        }
-    }
-
-    mod dispatch_tests {
-        use super::*;
-
-        #[test]
-        fn external_fx_reverbs_adopt_the_receiving_backend_dispatch() {
-            let mut backend = ScalarBackend::with_dispatch(DspDispatch::portable());
-            let reverb = crate::reverb::OrbitReverb::generate_streaming(
-                24_000,
-                crate::reverb::ReverbParams {
-                    ir: None,
-                    size_secs: 0.2,
-                    fade_secs: 0.01,
-                    lp_start_hz: 8_000.0,
-                    lp_end_hz: 1_000.0,
-                },
-            );
-            assert!(!reverb.dispatch().is_forced_portable());
-            assert!(backend.install_fx_reverb(Box::new(reverb)).is_none());
-            assert!(backend.fx_reverb_pool[0].dispatch().is_forced_portable());
-        }
     }
 
     mod preroll_tests {

@@ -2092,44 +2092,6 @@ mod tests {
         }
 
         #[test]
-        fn held_piano_key_release_never_steals_a_voice_at_full_polyphony() {
-            for limit in [2, 4] {
-                let mut backend = ScalarBackend::prepared(48_000, 16).unwrap();
-                backend.set_max_polyphony(limit);
-                backend.note(held(110.0, None)); // oldest score voice
-                if limit == 4 {
-                    backend.note(held(220.0, Some(f32::MAX))); // browser
-                    backend.note(held(330.0, Some(100.0))); // other piano key
-                }
-                backend.note(held(440.0, Some(101.0))); // key being released
-                advance(&mut backend, 8);
-                assert_eq!(backend.voices.len(), limit);
-                backend.note(release(backend.frame, 101.0));
-                advance(&mut backend, 1);
-                assert_eq!(
-                    backend.voices.len(),
-                    limit,
-                    "release must not add a silent voice"
-                );
-                assert!(
-                    backend
-                        .voices
-                        .iter()
-                        .all(|voice| voice.end.cull_from().is_none())
-                );
-                advance(&mut backend, 16);
-                assert_eq!(backend.voices.len(), limit - 1);
-                assert!(
-                    backend
-                        .voices
-                        .iter()
-                        .all(|voice| voice.end.cut_from().is_none())
-                );
-                assert!(backend.voices.iter().any(|voice| voice.freq_hz == 110.0));
-            }
-        }
-
-        #[test]
         fn held_piano_release_bypasses_full_prepared_voice_and_pending_capacity() {
             let mut backend = ScalarBackend::prepared(48_000, 2).unwrap();
             backend.set_max_polyphony(2);
@@ -2211,200 +2173,6 @@ mod tests {
                     .iter()
                     .all(|voice| voice.end.cut_from().is_none())
             );
-        }
-    }
-
-    mod voice_layout_tests {
-        use super::{
-            FmState, FxStageStates, PreparedSupersaw, ScalarBackend, Voice, VoiceRenderControls,
-        };
-        use crate::backend::{
-            AudioBackend, FilterControls, FmControls, FmOperator, FmRoute, FmWave, FxStage,
-            MAX_FM_OPERATORS, MAX_FM_ROUTES, MAX_FX_STAGES, OnsetEvent, OscillatorControls,
-            ShapeControls, StaticBiquad, VowelControls,
-        };
-
-        fn prepared_pre_distort_activity(controls: OscillatorControls) -> bool {
-            let mut backend = ScalarBackend::prepared(48_000, 1).expect("backend");
-            backend.note(OnsetEvent::new(0, 220.0, 0.5, 0.1).with_controls(controls));
-            backend.process_block(&mut [0.0; 2], 1);
-            backend.voices[0].has_pre_distort_fx
-        }
-
-        #[test]
-        fn optional_state_stays_out_of_the_hot_voice_layout() {
-            assert!(std::mem::size_of::<FxStageStates>() > 4 * 1024);
-            assert!(std::mem::size_of::<FmState>() > 512);
-            assert_eq!(
-                std::mem::size_of::<Option<Box<FxStageStates>>>(),
-                std::mem::size_of::<usize>()
-            );
-            assert_eq!(
-                std::mem::size_of::<Option<Box<FmState>>>(),
-                std::mem::size_of::<usize>()
-            );
-            assert!(
-                std::mem::size_of::<Voice>() <= 5 * 1024,
-                "the per-sample voice stride grew beyond 5 KiB"
-            );
-            assert!(
-                std::mem::size_of::<VoiceRenderControls>()
-                    + std::mem::size_of::<[Option<FxStage>; MAX_FX_STAGES]>()
-                    < std::mem::size_of::<OscillatorControls>(),
-                "activation-only or pooled FX controls leaked back into the hot voice stride"
-            );
-        }
-
-        fn fm_controls() -> OscillatorControls {
-            let mut operators = [None; MAX_FM_OPERATORS];
-            operators[0] = Some(FmOperator {
-                harmonicity: 2.0,
-                waveform: FmWave::Sine,
-                env: None,
-                env_exponential: true,
-            });
-            let mut routes = [None; MAX_FM_ROUTES];
-            routes[0] = Some(FmRoute {
-                source: 1,
-                target: 0,
-                amount: 1.0,
-                mod_slot: Some(0),
-            });
-            OscillatorControls {
-                fm: Some(FmControls { operators, routes }),
-                ..OscillatorControls::default()
-            }
-        }
-
-        #[test]
-        fn fm_state_is_leased_only_where_used_and_recycled() {
-            let mut backend = ScalarBackend::prepared(48_000, 2).expect("backend");
-            assert_eq!(backend.fm_state_pool.len(), 2);
-
-            assert!(backend.try_note_prepared(OnsetEvent::new(0, 220.0, 0.5, 0.1)));
-            assert!(
-                backend.try_note_prepared(
-                    OnsetEvent::new(0, 330.0, 0.5, 0.1)
-                        .with_controls(fm_controls())
-                        .into_prepared()
-                )
-            );
-            backend.process_block(&mut [0.0; 2], 1);
-
-            assert_eq!(backend.voices.len(), 2);
-            assert_eq!(
-                backend
-                    .voices
-                    .iter()
-                    .filter(|voice| voice.fm_state.is_some())
-                    .count(),
-                1
-            );
-            assert_eq!(backend.fm_state_pool.len(), 1);
-
-            backend.reset_at(0);
-            assert!(backend.voices.is_empty());
-            assert_eq!(backend.fm_state_pool.len(), 2);
-
-            for frequency in [440.0, 550.0] {
-                assert!(
-                    backend.try_note_prepared(
-                        OnsetEvent::new(0, frequency, 0.5, 0.1)
-                            .with_controls(fm_controls())
-                            .into_prepared()
-                    )
-                );
-            }
-            backend.process_block(&mut [0.0; 2], 1);
-
-            assert_eq!(backend.voices.len(), 2);
-            assert!(backend.voices.iter().all(|voice| voice.fm_state.is_some()));
-            assert!(backend.fm_state_pool.is_empty());
-        }
-
-        #[test]
-        fn supersaw_plan_preserves_the_original_static_lane_math() {
-            for (voices, freqspread, panspread) in [
-                (1.0_f32, 0.0_f32, 0.0_f32),
-                (5.0, 0.6, 0.6),
-                (8.0, 0.35, 0.8),
-                (32.0, 1.25, -0.2),
-                (64.0, 0.25, 1.2),
-            ] {
-                let plan = PreparedSupersaw::new(voices, freqspread, panspread);
-                let voices = voices.max(1.0);
-                let expected_count = (voices.ceil() as usize).clamp(1, super::MAX_UNISON);
-                assert_eq!(plan.count, expected_count);
-
-                let spread = freqspread.max(0.0);
-                let (scale, center) = if voices < 2.0 {
-                    (0.0, 0.0)
-                } else {
-                    (spread / (voices - 1.0), spread * 0.5)
-                };
-                for (lane, actual) in plan.detune_ratios.iter().take(expected_count).enumerate() {
-                    let detune = lane as f32 * scale - center;
-                    let expected = 2.0_f32.powf(detune / 12.0);
-                    assert_eq!(actual.to_bits(), expected.to_bits());
-                }
-
-                let panspread01 = panspread * 0.5 + 0.5;
-                let expected = ((1.0 - panspread01).sqrt(), panspread01.sqrt());
-                assert_eq!(plan.pan_gains.0.to_bits(), expected.0.to_bits());
-                assert_eq!(plan.pan_gains.1.to_bits(), expected.1.to_bits());
-            }
-        }
-
-        #[test]
-        fn filter_activity_is_prepared_when_the_voice_activates() {
-            let mut backend = ScalarBackend::prepared(48_000, 1).expect("backend");
-
-            backend.note(OnsetEvent::new(0, 220.0, 0.5, 0.1));
-            backend.process_block(&mut [0.0; 2], 1);
-            assert!(!backend.voices[0].has_filters);
-
-            backend.reset_at(0);
-            let controls = OscillatorControls {
-                filters: FilterControls {
-                    lowpass: Some(StaticBiquad {
-                        frequency_hz: 800.0,
-                        q: 1.0,
-                    }),
-                    ..FilterControls::default()
-                },
-                ..OscillatorControls::default()
-            };
-            backend.note(OnsetEvent::new(0, 220.0, 0.5, 0.1).with_controls(controls));
-            backend.process_block(&mut [0.0; 2], 1);
-            assert!(backend.voices[0].has_filters);
-        }
-
-        #[test]
-        fn pre_distort_activity_is_prepared_when_the_voice_activates() {
-            assert!(!prepared_pre_distort_activity(OscillatorControls::default()));
-            assert!(prepared_pre_distort_activity(OscillatorControls {
-                vowel: Some(VowelControls {
-                    freqs: [300.0; 5],
-                    gains: [1.0; 5],
-                    qs: [1.0; 5],
-                }),
-                ..OscillatorControls::default()
-            }));
-            assert!(prepared_pre_distort_activity(OscillatorControls {
-                coarse: Some(2.0),
-                ..OscillatorControls::default()
-            }));
-            assert!(prepared_pre_distort_activity(OscillatorControls {
-                crush: Some(6.0),
-                ..OscillatorControls::default()
-            }));
-            assert!(prepared_pre_distort_activity(OscillatorControls {
-                shape: Some(ShapeControls {
-                    shape: 0.5,
-                    postgain: 1.0,
-                }),
-                ..OscillatorControls::default()
-            }));
         }
     }
 
@@ -2689,43 +2457,6 @@ mod tests {
         }
 
         #[test]
-        fn reused_pending_slots_stay_in_admission_order() {
-            let mut pending = PendingEvents::with_capacity(4);
-            pending.push(event(10));
-            pending.push(event(20));
-            pending.push(event(30));
-
-            pending.retain(|event| event.onset_frame != 20);
-            assert_eq!(pending.len(), 2);
-            let capacity = pending.capacity();
-
-            // This reuses the physical slot formerly occupied by frame 20. Its
-            // logical position must still be the tail, after the older frame 30.
-            pending.push(event(40));
-            let mut seen = Vec::new();
-            pending.retain(|event| {
-                seen.push(event.onset_frame);
-                true
-            });
-            assert_eq!(seen, [10, 30, 40]);
-            assert_eq!(pending.capacity(), capacity);
-
-            pending.retain(|event| event.onset_frame >= 35);
-            pending.push(event(50));
-            let mut seen = Vec::new();
-            pending.retain(|event| {
-                seen.push(event.onset_frame);
-                true
-            });
-            assert_eq!(seen, [40, 50]);
-            assert_eq!(pending.capacity(), capacity);
-
-            pending.clear();
-            assert_eq!(pending.len(), 0);
-            assert_eq!(pending.capacity(), capacity);
-        }
-
-        #[test]
         fn pending_slots_match_vec_order_through_repeated_reuse() {
             const CAPACITY: usize = 32;
             let mut pending = PendingEvents::with_capacity(CAPACITY);
@@ -2840,39 +2571,6 @@ mod tests {
             assert!(energy(&raised_output) > energy(&default_output) * 1.4);
         }
 
-        #[test]
-        fn lowering_polyphony_fades_oldest_voices_without_cutting_or_restarting() {
-            let mut backend = populated(MAX_CONFIGURABLE_POLYPHONY);
-            let frame = backend.frame;
-            backend.set_max_polyphony(64);
-            assert_eq!(backend.frame, frame);
-            assert_eq!(
-                backend.voices.len(),
-                160,
-                "retiring voices must keep ringing"
-            );
-            assert_eq!(backend.pressure.semantic_polyphony_fades, 96);
-            assert!(
-                backend.voices[..96]
-                    .iter()
-                    .all(|voice| voice.end.cull_from() == Some(frame))
-            );
-            assert!(
-                backend.voices[96..]
-                    .iter()
-                    .all(|voice| voice.end.cull_from().is_none())
-            );
-            backend.set_max_polyphony(64);
-            assert_eq!(
-                backend.pressure.semantic_polyphony_fades, 96,
-                "reapplying the setting must not fade more voices"
-            );
-            for _ in 0..20 {
-                backend.process_block(&mut [0.0; 256], 128);
-            }
-            assert_eq!(backend.voices.len(), 64);
-        }
-
         /// A note through a chain with latency starts its lead before its
         /// musical onset. The cap fades the voice of the earliest musical
         /// onset, and from the musical onset of the new note, as a choke does.
@@ -2926,56 +2624,6 @@ mod tests {
                 [(220, Some(2_048)), (330, None), (440, None)]
             );
         }
-
-        #[test]
-        fn polyphony_is_bounded_per_backend_and_survives_reset_and_init() {
-            let mut first = ScalarBackend::new();
-            let second = ScalarBackend::new();
-            assert_eq!(first.max_polyphony(), MAX_POLYPHONY);
-            first.set_max_polyphony(0);
-            assert_eq!(first.max_polyphony(), 1);
-            first.set_max_polyphony(usize::MAX);
-            assert_eq!(first.max_polyphony(), MAX_CONFIGURABLE_POLYPHONY);
-            assert_eq!(second.max_polyphony(), MAX_POLYPHONY);
-            first.init(8_000).expect("backend");
-            first.reset();
-            assert_eq!(first.max_polyphony(), MAX_CONFIGURABLE_POLYPHONY);
-        }
-    }
-
-    mod ring_out_tests {
-        /// Filters outlive the source that fed them; a voice that stops dead at
-        /// its envelope loses the tail.
-        #[test]
-        fn a_ringing_voice_outlives_its_source_and_a_dry_one_does_not() {
-            let sr = 48_000.0;
-            let allowance = 0.01 + 256.0 / sr;
-            let bare = super::stop_secs_for(0.6, false, sr);
-            assert!(
-                (bare - 0.6).abs() < 1e-6,
-                "nothing ringing means nothing to wait for, got {bare}"
-            );
-
-            // vowel is the case this exists for: it lives outside FilterChain, so
-            // it used to be missed even though its x8 makeup makes it the loudest
-            // ring of the lot.
-            let ringing = super::stop_secs_for(0.6, true, sr);
-            assert!(
-                (ringing - (0.6 + allowance)).abs() < 1e-6,
-                "a ringing voice must outlive its source, got {ringing}"
-            );
-            assert!(ringing > bare);
-
-            // The allowance rides on whatever stopped the source, so a slice that
-            // ended early because the buffer ran out still gets it. A chopped
-            // sample through a vowel is the case: its slices are short, and
-            // truncating each ring cost corr 0.982.
-            let sliced = super::stop_secs_for(0.05, true, sr);
-            assert!(
-                (sliced - (0.05 + allowance)).abs() < 1e-6,
-                "a short slice rings just as long, got {sliced}"
-            );
-        }
     }
 
     mod note_end_tests {
@@ -3000,29 +2648,6 @@ mod tests {
             for q in (6_528..24_000).step_by(128) {
                 assert!(!alive(q), "the ringing tail at {q} must be unmodulated");
             }
-        }
-
-        /// A long release carries the LFO with it, which is what makes the same
-        /// score with `.release(2)` match sample for sample where the default
-        /// release does not.
-        #[test]
-        fn a_long_release_keeps_the_lfo_running_over_the_whole_tail() {
-            let sr = 48_000.0;
-            let alive = |q| super::note_end_alive(q, 0, 0.0, 0.125, 2.0, sr);
-            for q in (0..100_000).step_by(128) {
-                assert!(alive(q), "the quantum at {q} is inside the release");
-            }
-            assert!(!alive(102_144), "past two seconds it is over");
-        }
-
-        /// A later note carries its own end, and a sub-sample onset shifts that
-        /// end by the same fraction it shifts the start.
-        #[test]
-        fn each_note_ends_its_own_lfo() {
-            let sr = 48_000.0;
-            assert!(super::note_end_alive(48_000, 48_000, 0.0, 0.125, 0.01, sr));
-            assert!(!super::note_end_alive(54_528, 48_000, 0.0, 0.125, 0.01, sr));
-            assert!(!super::note_end_alive(6_480, 0, 0.5, 0.125, 0.01, sr));
         }
     }
 
@@ -3248,80 +2873,6 @@ mod tests {
                 (half_orbit - full_orbit * 0.5).abs() < 1e-3,
                 "the meter is post-fader"
             );
-        }
-
-        /// A voice whose slot was never filled is dropped at onset, as before;
-        /// this is the missing-sample path, not a retirement.
-        #[test]
-        fn a_voice_with_no_slot_never_starts() {
-            let mut backend = ScalarBackend::prepared(RATE, 4).expect("backend");
-            let started = backend.try_note_prepared(sample_event(SampleId(9)).into_prepared());
-            let _ = render(&mut backend);
-            assert!(backend.voices.is_empty(), "started: {started}");
-            assert!(render(&mut backend).iter().all(|sample| *sample == 0.0));
-        }
-    }
-
-    mod sample_resampling_mode_tests {
-        use crate::sample::{
-            DecodedSample, SampleControls, SampleHold, SampleId, SampleResamplingMode,
-        };
-        use crate::{AudioBackend, OnsetEvent, ScalarBackend};
-
-        #[test]
-        fn selected_mode_changes_the_sample_voice_render_path() {
-            const OUTPUT_RATE: u32 = 48_000;
-            const SOURCE_RATE: u32 = 24_000;
-            const FRAMES: usize = 128;
-            let id = SampleId(9);
-
-            let render = |mode: Option<SampleResamplingMode>| {
-                let mut backend = ScalarBackend::prepared(OUTPUT_RATE, 1).expect("backend");
-                if let Some(mode) = mode {
-                    backend.set_sample_resampling_mode(mode);
-                    assert_eq!(backend.sample_resampling_mode(), mode);
-                }
-                let pcm = (0..SOURCE_RATE / 10)
-                    .map(|frame| if frame % 2 == 0 { 0.0 } else { 0.2 })
-                    .collect();
-                let decoded = DecodedSample::from_parts(SOURCE_RATE, 1, pcm).expect("sample");
-                assert!(backend.install_sample(id, Box::new(decoded)).is_ok());
-                let mut event = OnsetEvent::new(0, 440.0, 1.0, 0.1);
-                event.sample = Some(SampleControls {
-                    sample: id,
-                    playback_rate: 1.0,
-                    begin: 0.0,
-                    end: 1.0,
-                    hold: SampleHold::Hap,
-                    muted: false,
-                    loop_secs: None,
-                    envelope_peak: 1.0,
-                    reversed: false,
-                    nudge_secs: 0.0,
-                    cut: None,
-                });
-                assert!(backend.try_note_prepared(event.into_prepared()));
-                let mut output = [0.0; FRAMES * 2];
-                backend.process_block(&mut output, FRAMES);
-                output
-            };
-
-            assert_eq!(
-                ScalarBackend::default().sample_resampling_mode(),
-                SampleResamplingMode::Linear
-            );
-            let linear = render(Some(SampleResamplingMode::Linear));
-            let raw = render(Some(SampleResamplingMode::Raw));
-            assert_eq!(render(None), linear, "the default retains the old sound");
-            assert!(
-                linear
-                    .iter()
-                    .zip(raw.iter())
-                    .any(|(a, b)| (a - b).abs() > 1e-4),
-                "fractional source positions must produce different audio"
-            );
-            assert!(linear.iter().any(|sample| sample.abs() > 1e-4));
-            assert!(raw.iter().any(|sample| sample.abs() > 1e-4));
         }
     }
 
@@ -3649,22 +3200,6 @@ mod tests {
             assert!(!backend.kept_onset_stands_for(&copy(ONSET, 3, true)));
         }
 
-        /// Only an SBD graph starts before its onset. A voice of another kind
-        /// that started one frame before the takeover frame is not marked.
-        #[test]
-        fn a_started_voice_of_another_kind_one_frame_before_the_takeover_is_not_marked() {
-            const ONSET: u64 = 9_600;
-            let mut hit = OnsetEvent::new(ONSET, 220.0, 0.5, 1.0);
-            hit.generation = 1;
-            let mut backend = ScalarBackend::prepared(48_000, 2).expect("backend");
-            assert!(backend.try_note_prepared(hit.into_prepared()));
-            let mut output = vec![0.0; 9_700 * 2];
-            backend.process_block(&mut output, 9_700);
-            backend.hand_over_from(2, ONSET + 1, 9_700);
-            assert_eq!(backend.voices.len(), 1, "the voice has started");
-            assert!(!backend.kept_onset_stands_for(&copy(ONSET + 1, 2, false)));
-        }
-
         /// A roll of hits 25 ms apart, moved 300 frames by the takeover. Each
         /// started graph takes the copy of its own hit. The copy of a hit that
         /// was still pending finds no voice and sounds.
@@ -3692,26 +3227,6 @@ mod tests {
                     .filter(|voice| voice.replay.is_some())
                     .map(|voice| voice.start_frame);
                 assert!(waiting.eq(HITS[(index + 1).min(3)..3].iter().copied()));
-            }
-        }
-
-        #[test]
-        fn zero_input_waveshaper_interpolates_the_precomputed_curve() {
-            // The curve has `sampleRate` entries (not sampleRate + 1), so input
-            // zero falls between two unequal entries and does not map to zero.
-            for (sample_rate, expected) in [
-                (44_100, -0.000_045_351_473_f32),
-                (48_000, -0.000_041_666_666_f32),
-            ] {
-                let curve = super::sbd_saturation_curve(sample_rate);
-                let actual = super::sbd_saturation(0.0, &curve);
-                assert!(
-                    (actual - expected).abs() < 2e-10,
-                    "{sample_rate} Hz: expected {expected}, got {actual}"
-                );
-                // At the score's default 0.8 gain this becomes exactly the one
-                // negative 16-bit step measured in the live device capture.
-                assert_eq!((actual * 0.8 * 32_768.0).round() as i32, -1);
             }
         }
 

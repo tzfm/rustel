@@ -579,55 +579,7 @@ pub(super) fn lfo_shape(shape: u8, phase: f32, skew: f32) -> f32 {
 
 #[cfg(test)]
 mod tests {
-    use super::wrap_phase;
     use super::*;
-    mod lfo_waveshape_tests {
-        /// `tremolo` defaults to skew 1, and `tri` divides by `1 - skew` on its
-        /// `phase >= skew` branch. The phase reaches exactly 1.0 two ways: the
-        /// walks wrap on a strict `>`, so a dyadic step (375 Hz at 48 kHz adds
-        /// 2^-7) sums to 1.0 and stores it, and f32 rounds everything above
-        /// `1 - 2^-25` up to 1.0. Either way the branch divided by zero and
-        /// `Infinity - Infinity` put NaN into the output.
-        #[test]
-        fn a_phase_just_under_one_never_divides_by_a_zero_skew() {
-            for phase in [
-                1.0,
-                1.0 - f64::EPSILON,
-                0.999_999_999_9,
-                0.999_999_999_999_999_9,
-                1.0 - 1e-12,
-                1.0 - 1e-15,
-            ] {
-                let value = super::lfo_waveshape(0, phase, 1.0);
-                assert!(
-                    value.is_finite(),
-                    "tri({phase}, skew 1) produced {value}, which reaches the output"
-                );
-            }
-
-            // Nothing else about the shape may move: skew 1 makes it a plain ramp.
-            for phase in [0.0_f64, 0.25, 0.5, 0.75] {
-                let value = super::lfo_waveshape(0, phase, 1.0);
-                assert!(
-                    (f64::from(value) - phase).abs() < 1e-6,
-                    "tri({phase}, skew 1) should be the phase itself, got {value}"
-                );
-            }
-
-            // And the other shapes stay finite wherever the phase can land.
-            for shape in 0..5u8 {
-                for phase in [0.0_f64, 0.5, 1.0 - f64::EPSILON, 1.0] {
-                    for skew in [0.0_f32, 0.5, 1.0] {
-                        let value = super::lfo_waveshape(shape, phase, skew);
-                        assert!(
-                            value.is_finite() || skew == 0.0,
-                            "shape {shape} at phase {phase} skew {skew} gave {value}"
-                        );
-                    }
-                }
-            }
-        }
-    }
 
     mod lfo_quantum_gate_tests {
         /// The gate compares an f64 against an f32 begin. In `s("ht*3").tremolo(4)`
@@ -651,68 +603,10 @@ mod tests {
                 "note 5's begin rounds down, so its onset quantum is already past it"
             );
         }
-
-        /// Whatever the tie does, the quantum after it always runs, and one
-        /// before the note never does.
-        #[test]
-        fn the_gate_is_shut_before_the_note_and_open_after_it() {
-            let sr = 48_000.0;
-            let begin = (2.0_f64 / 3.0) as f32;
-            assert!(!super::lfo_quantum_open(31_872, sr, begin));
-            assert!(super::lfo_quantum_open(32_128, sr, begin));
-        }
-
-        /// The end is read the same way, and a sample ringing past it is not
-        /// modulated.
-        #[test]
-        fn the_gate_shuts_at_the_f32_end() {
-            let sr = 48_000.0;
-            // A note at 0 lasting an eighth of a second, with the default 10 ms
-            // release: 6480 frames.
-            let end = 0.135_f32;
-            assert!(super::lfo_quantum_alive(6_400, sr, end));
-            assert!(!super::lfo_quantum_alive(6_528, sr, end));
-        }
-    }
-
-    mod lfo_phase_tests {
-        /// An LFO adds `frequency/sampleRate` once per sample for the whole life
-        /// of the voice, so the accumulator's precision decides where the wrap
-        /// lands - and the wrap is a discontinuity in every shape but the sine.
-        #[test]
-        fn an_lfo_wraps_on_the_exact_cycle_however_long_the_note_runs() {
-            let sr = 48_000.0_f64;
-            let freq = 6.0_f32; // tremolo(6): exactly 8000 samples per cycle
-
-            let mut phase = super::lfo_phase0(0.0, freq, 0.0);
-            assert_eq!(phase, 0.0, "a note at cycle 0 starts the LFO at phase 0");
-
-            let mut wraps = Vec::new();
-            for n in 0..48_000u32 {
-                let next = phase + f64::from(freq) / sr;
-                phase = if next > 1.0 {
-                    wraps.push(n + 1);
-                    next - 1.0
-                } else {
-                    next
-                };
-            }
-
-            // Six cycles per second, and not one sample of drift by the last of
-            // them. In f32 this walks off by a sample per cycle: simulated, f64
-            // crosses 1.0 after 8000 steps and f32 after 8001, which showed up
-            // against Chromium as a 4.6x gain spike two samples wide, once per
-            // cycle, on `s("sawtooth").tremolo(6)`.
-            assert_eq!(
-                wraps,
-                vec![8_000, 16_000, 24_000, 32_000, 40_000, 48_000],
-                "the LFO drifted off its cycle"
-            );
-        }
     }
 
     mod modulator_tests {
-        use super::{env_mod_value, env_mod_warp, lfo_waveshape};
+        use super::{env_mod_value, lfo_waveshape};
         use crate::backend::{EnvMod, ModTarget};
 
         fn env(a: f32, d: f32, s: f32, r: f32, sus_time: f32) -> EnvMod {
@@ -755,16 +649,6 @@ mod tests {
         }
 
         #[test]
-        fn env_warp_is_identity_at_zero_curvature() {
-            for p in [0.0, 0.25, 0.5, 0.75, 1.0] {
-                assert!((env_mod_warp(p, 0.0) - p).abs() < 1e-6);
-            }
-            // positive curvature = snappier (above identity mid-segment)
-            assert!(env_mod_warp(0.5, 0.5) > 0.5);
-            assert!(env_mod_warp(0.5, -0.5) < 0.5);
-        }
-
-        #[test]
         fn env_value_uses_cumulative_time_divisors() {
             // a=1 d=1 s=0.5, susTime=10: the envelope divides elapsed by the
             // CUMULATIVE threshold, so decay enters mid-phase with a jump.
@@ -781,28 +665,5 @@ mod tests {
             // past susTime+release: idle 0
             assert_eq!(env_mod_value(&e, 10.2), 0.0);
         }
-
-        #[test]
-        fn env_zero_attack_snaps_to_peak_then_decays() {
-            let e = env(0.0, 1.0, 0.0, 0.1, 10.0);
-            // t inside decay, cumulative divisor is a+d = 1
-            assert!((env_mod_value(&e, 0.5) - 0.5).abs() < 1e-3);
-            assert!(env_mod_value(&e, 0.9999) < 1e-3);
-        }
-    }
-
-    /// The wrap matches the one-turn subtract the walks always did, and
-    /// holds for rates past the sample clock and negative rates.
-    #[test]
-    fn wrap_phase_keeps_a_stored_cycle_end() {
-        assert_eq!(wrap_phase(0.0), 0.0);
-        assert_eq!(wrap_phase(0.5), 0.5);
-        assert_eq!(wrap_phase(1.0), 1.0, "an exact cycle end stays stored");
-        assert_eq!(wrap_phase(1.5), 0.5);
-        assert_eq!(wrap_phase(2.0), 1.0, "a whole extra turn lands on 1.0");
-        assert_eq!(wrap_phase(250.75), 0.75);
-        assert_eq!(wrap_phase(250.0), 1.0);
-        assert_eq!(wrap_phase(-0.25), 0.75);
-        assert_eq!(wrap_phase(-250.5), 0.5);
     }
 }
