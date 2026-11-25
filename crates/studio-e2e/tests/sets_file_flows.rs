@@ -405,7 +405,6 @@ fn export_patterns_writes_the_sets_scores_beside_the_sets() {
     row_containing(&rows, "Strudel export - 2 patterns");
 }
 
-
 /// File ▸ Open recent…: the set just left is offered, and Enter goes back
 /// to it - with the score exactly as it was left, because the set was
 /// written when the studio moved away from it.

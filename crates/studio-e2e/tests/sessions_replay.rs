@@ -15,7 +15,6 @@ use crossterm::event::{KeyCode, KeyModifiers};
 use rustel_runtime::session_log::encode_base64;
 use rustel_studio_e2e::{PanelKind, hermetic, hermetic_recording, row_containing};
 
-
 /// Editing a block marks it with a filled dot; ^S starts the run from the
 /// block and writes the view's edits back to the tape.
 #[test]

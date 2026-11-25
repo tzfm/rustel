@@ -107,7 +107,6 @@ fn value_of(studio: &mut Hermetic, label: &str) -> String {
         .unwrap_or_else(|| panic!("the row has no value segment: {row}"))
 }
 
-
 /// Open the sheet on its first page.
 fn open_sheet(studio: &mut Hermetic) {
     studio.chord("ctrl+o");
@@ -132,7 +131,6 @@ fn open_about(studio: &mut Hermetic) {
     studio.press(KeyCode::BackTab, KeyModifiers::SHIFT);
     studio.settle();
 }
-
 
 /// The row's percentage, as the opacity rows print it.
 fn percent(row: &str) -> u32 {
