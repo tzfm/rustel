@@ -33,6 +33,8 @@ The server reads the engine reference catalogue and runs the static linter witho
 
 Any LSP client that speaks stdio (GNU Emacs with Eglot or lsp-mode, Neovim, Helix, Zed, or a VS Code client) can register `rustel lsp --stdio` for `.strudel` files.
 
+For VS Code, install the [rustel-vscode](https://github.com/tzfm/rustel-vscode) extension. It starts `rustel lsp --stdio` for you and adds live playback with note highlighting. Set `rustel.serverPath` if `rustel` is not on your `PATH`.
+
 Trade-off: static linting checks syntax, mini-notation, and built-in names in milliseconds without starting QuickJS or downloading remote sample manifests. Sample names loaded dynamically by `samples("...")` are checked only when a score runs or through `rustel check`.
 
 ## Reference catalogue export

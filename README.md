@@ -40,7 +40,7 @@ devices, add live visuals, and export audio. No browser is required.
 | **Strudel patterns** | Patterns, samples, synths, and effects from the Strudel language. See [compatibility](docs/compatibility.md) for the exceptions. |
 | **Studio** | A terminal editor with live update, visuals, a mixer, and a key reference. A bad update leaves the last good score playing. |
 | **Auto evaluate** | Apply valid edits after a typing pause while the set plays. Off by default. See [auto evaluate](docs/studio.md#auto-evaluate). |
-| **Your editor** | Run `rustel play song.strudel --watch` in any editor, with built-in `rustel lsp --stdio`, `rustel doc --all --json`, and live `--ui-events` telemetry and controls. See [integrations](docs/integrations.md). |
+| **Your editor** | Run `rustel play song.strudel --watch` in any editor, with built-in `rustel lsp --stdio` (used by the [VS Code extension](https://github.com/tzfm/rustel-vscode)), `rustel doc --all --json`, and live `--ui-events` telemetry and controls. See [integrations](docs/integrations.md). |
 | **Session tapes** | Studio logs each installed update with its time. See [sessions](docs/sessions.md). |
 | **Hardware** | Speakers, audio input, MIDI, OSC, and serial. MIDI clock can follow or lead. See [hardware](docs/hardware.md). |
 | **Ableton Link** | Sync tempo with Ableton Live and other Link apps. Link also shares play and stop states. See [Link setup](docs/hardware.md#link). |
