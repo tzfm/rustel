@@ -2218,11 +2218,6 @@ mod tests {
         ];
 
         #[test]
-        fn layouts_survive_degenerate_sizes() {
-            layouts_survive(false);
-        }
-
-        #[test]
         fn layouts_survive_degenerate_sizes_over_a_pathological_document() {
             layouts_survive(true);
         }

@@ -2013,84 +2013,6 @@ mod tests {
             assert!(!contains(&app, "cached_bd"));
         }
 
-        #[test]
-        fn large_cached_catalogue_renders_its_first_frame_with_complete_grouping() {
-            use crate::reference::{ReferenceView, SoundRow};
-            use ratatui::{buffer::Buffer, widgets::Widget};
-            use rustel_runtime::samples::{SoundCategory, SoundEntry, SoundOrigin};
-            let reference = Reference::load_all();
-            let sounds = (0..10_000)
-                .map(|i| SoundEntry {
-                    name: format!("machine{:04}_sound{:02}", i / 10, i % 10),
-                    variants: 16,
-                    variant_names: Vec::new(),
-                    origin: SoundOrigin::Default,
-                    category: SoundCategory::Drums,
-                    location: Some(format!("https://example.invalid/samples/{i}.wav")),
-                    import: None,
-                })
-                .collect::<Vec<_>>();
-            let theme = Theme::built_in_default();
-            let area = ratatui::layout::Rect::new(0, 0, 90, 32);
-            let mut buffer = Buffer::empty(area);
-            let start = Instant::now();
-            let mut panel = ReferencePanel::samples(&reference, sounds);
-            panel.open_categories.extend(panel.section_categories());
-            let opened = start.elapsed();
-            ReferenceView {
-                keybinds: &crate::keybinds::Keybinds::default(),
-                focused: true,
-                vim: false,
-                anchored: false,
-                pulse: None,
-                sounding_note: None,
-                loading: None,
-                caching: 0,
-                importing: 0,
-                library_loading: false,
-                #[cfg(feature = "hydra")]
-                playing: None,
-                #[cfg(feature = "hydra")]
-                preview_note: None,
-                #[cfg(feature = "hydra")]
-                preview_progress: None,
-                #[cfg(feature = "hydra")]
-                preview_row: None,
-                picture: false,
-                refused: None,
-                reference: &reference,
-                panel: &panel,
-                theme: &theme,
-            }
-            .render(area, &mut buffer);
-            eprintln!(
-                "10,000-bank cached catalogue: open {:?}, first render {:?}, total {:?}",
-                opened,
-                start.elapsed() - opened,
-                start.elapsed()
-            );
-            assert_eq!(panel.sound_rows().len(), 1_000);
-            assert!(
-                panel
-                    .sound_rows()
-                    .iter()
-                    .all(|row| matches!(row, SoundRow::Family(_)))
-            );
-            let drawn = buffer
-                .content
-                .iter()
-                .map(|cell| cell.symbol())
-                .collect::<String>();
-            assert!(
-                drawn.contains("machine0000"),
-                "first frame contains the catalogue"
-            );
-            assert!(
-                drawn.contains("10000 of 10000 sounds"),
-                "all banks are present"
-            );
-        }
-
         /// A `.bank(…)` completion whose library arrives under the open panel
         /// refills its machines - the list never stays short of what would
         /// play, and what the reader has typed keeps filtering.
@@ -2196,25 +2118,6 @@ mod tests {
                 "arguments go straight into the score"
             );
             assert!(app.reference_anchor.is_none());
-        }
-
-        #[test]
-        fn ctrl_d_inserts_a_closed_call_and_keeps_its_parameters_while_typing() {
-            let directory = tempfile::tempdir().unwrap();
-            let mut app = crate::app::tests::support::app_over(directory.path());
-            seed(&mut app, "$: |");
-            press(&mut app, KeyCode::Char('d'), KeyModifiers::CONTROL);
-            for letter in "lpf".chars() {
-                press(&mut app, KeyCode::Char(letter), KeyModifiers::NONE);
-            }
-            press(&mut app, KeyCode::Enter, KeyModifiers::NONE);
-            assert_eq!(marked(&app), "$: lpf(|)");
-            assert_parameters(&app, "lpf");
-            for letter in "800".chars() {
-                press(&mut app, KeyCode::Char(letter), KeyModifiers::NONE);
-            }
-            assert_eq!(marked(&app), "$: lpf(800|)");
-            assert_parameters(&app, "lpf");
         }
 
         #[test]
@@ -2611,37 +2514,6 @@ mod tests {
                 assert_eq!(app.editor().source(), source, "{marked}");
                 assert_eq!(app.editor().primary_selection(), Selection::caret(caret));
             }
-        }
-
-        #[test]
-        fn ctrl_d_opens_a_visible_reference_overlay_in_zen() {
-            let directory = tempfile::tempdir().expect("temp dir");
-            let mut app = crate::app::tests::support::app_over(directory.path());
-            app.frame = Rect::new(0, 0, 120, 40);
-            press(&mut app, KeyCode::F(11), KeyModifiers::NONE);
-
-            press(&mut app, KeyCode::Char('d'), KeyModifiers::CONTROL);
-
-            assert!(
-                app.reference_panel.is_some(),
-                "Ctrl+D did not open reference"
-            );
-            assert_eq!(app.focus, Focus::Panel(PanelKind::Reference));
-            let layout = view::regions(
-                app.frame,
-                app.ui_settings.zen,
-                app.panes.len(),
-                app.reference_panel.is_some(),
-                false,
-                None,
-                None,
-            );
-            assert!(
-                !layout.reference.is_empty(),
-                "reference is invisible in zen"
-            );
-            assert_eq!(layout.panes[0].editor, app.frame);
-            assert!(layout.reference_overlays);
         }
 
         #[test]

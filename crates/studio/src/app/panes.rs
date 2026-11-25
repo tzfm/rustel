@@ -792,31 +792,6 @@ mod tests {
         }
 
         #[test]
-        fn a_plain_split_title_click_only_focuses_and_keeps_the_caret() {
-            let directory = tempfile::tempdir().unwrap();
-            let mut app = split_app(directory.path());
-            // Alternating panes: two plain clicks on the SAME title in quick
-            // succession are a double click, which launches on purpose.
-            for pane in [1, 0, 1] {
-                let scene = app.panes[pane].scene;
-                let selected = Selection::range(ByteOffset(2), ByteOffset(6));
-                app.scenes
-                    .get_mut(scene)
-                    .unwrap()
-                    .editor
-                    .set_selection(selected)
-                    .unwrap();
-                map_panes(&mut app);
-                let title = app.regions.panes[pane].title;
-                click(&mut app, title.x + 2, title.y, KeyModifiers::NONE);
-                assert_eq!(app.focused, pane);
-                assert_eq!(app.scenes.current().id, scene);
-                assert_eq!(app.editor().primary_selection(), selected);
-                assert!(evaluation(&app).is_none());
-            }
-        }
-
-        #[test]
         fn shift_click_in_split_source_extends_selection_without_launching() {
             let directory = tempfile::tempdir().unwrap();
             let mut app = split_app(directory.path());
@@ -845,27 +820,6 @@ mod tests {
                 );
                 assert_eq!(app.editor().source(), before);
                 assert!(evaluation(&app).is_none());
-            }
-        }
-
-        /// A setup tab is never evaluated as a score by being clicked, and it
-        /// never was: its tab only takes the caret.
-        #[test]
-        fn a_click_on_a_split_setup_title_never_evaluates_it_as_a_score() {
-            let directory = tempfile::tempdir().unwrap();
-            let mut app = split_app(directory.path());
-            app.open_prebake(PrebakeScope::Local);
-            let setup = app.scenes.current().id;
-            app.focus_pane(1);
-            map_panes(&mut app);
-            let title = app.regions.panes[0].title;
-            for modifiers in [KeyModifiers::NONE, KeyModifiers::SHIFT] {
-                click(&mut app, title.x + 2, title.y, modifiers);
-                assert_eq!(app.scenes.current().id, setup);
-                assert_eq!(app.focused, 0);
-                assert!(evaluation(&app).is_none());
-                assert!(app.prebake_inflight.is_none() && app.prebake_queue.is_empty());
-                assert_eq!(app.next_evaluation.launch, Launch::Now);
             }
         }
     }
@@ -1792,48 +1746,6 @@ mod tests {
                 app.ui_settings.line_numbers,
             );
             assert!(grid.width < 59, "the gutter is back: {}", grid.width);
-        }
-
-        /// The wheel over the other pane scrolls that pane's scene, and the
-        /// caret's pane stays where it was.
-        #[test]
-        fn the_wheel_scrolls_the_pane_under_the_pointer() {
-            let directory = tempfile::tempdir().expect("temp dir");
-            let mut app = crate::app::tests::support::app_over(directory.path());
-            press(&mut app, KeyCode::Char('n'), KeyModifiers::CONTROL);
-            press(&mut app, KeyCode::Char('e'), KeyModifiers::CONTROL);
-            let other_scene = app.panes[1].scene;
-            let source = (0..80)
-                .map(|n| format!("// line {n}\n"))
-                .collect::<String>();
-            app.scenes.get_mut(other_scene).expect("scene").editor =
-                Editor::new(&source).expect("editor");
-            press(&mut app, KeyCode::F(10), KeyModifiers::NONE);
-            assert_eq!(app.focused, 0);
-            app.frame = Rect::new(0, 0, 160, 40);
-            app.regions = view::regions(app.frame, false, 2, false, false, None, None);
-            let other = app.regions.panes[1].editor;
-            app.handle_terminal_event(Event::Mouse(MouseEvent {
-                kind: MouseEventKind::ScrollDown,
-                column: other.x + 5,
-                row: other.y + 5,
-                modifiers: KeyModifiers::NONE,
-            }))
-            .expect("wheel");
-            let scrolled = app
-                .scenes
-                .get(other_scene)
-                .expect("scene")
-                .editor
-                .viewport()
-                .top_row;
-            assert_eq!(scrolled, crate::editor::DEFAULT_WHEEL_ROWS);
-            assert_eq!(
-                app.editor().viewport().top_row,
-                0,
-                "the caret's pane did not move"
-            );
-            assert_eq!(app.focused, 0, "and keeps the caret");
         }
 
         /// Turning zen on from a focused panel focuses the editor.

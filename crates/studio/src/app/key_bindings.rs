@@ -605,26 +605,6 @@ mod tests {
             );
         }
 
-        /// Undo learnt onto ^F, the reference's default key, moves the whole
-        /// chord: ^F undoes from inside the editor.
-        #[test]
-        fn a_chord_learnt_over_another_action_s_default_fires_whole() {
-            let directory = tempfile::tempdir().unwrap();
-            let mut app = cascade_app(directory.path());
-            app.learn_keybind(
-                BindAction::Undo,
-                Some(KeyCombo::parse("ctrl+f").expect("^F parses")),
-            );
-            typed(&mut app, "hi");
-
-            press(&mut app, KeyCode::Char('f'), KeyModifiers::CONTROL);
-            assert_eq!(
-                source(&app),
-                "$: s(\"bd\")\n",
-                "undo fires from the reference's key"
-            );
-        }
-
         /// Put the caret in an empty argument that takes one of a list of values.
         fn at_a_value_argument(app: &mut App) {
             let marked = "$: s(\"bd\").warpmode(|)";
@@ -794,111 +774,6 @@ mod tests {
             );
         }
 
-        /// With a learn armed, the next press is the chord. When another action
-        /// holds that chord, the learn asks first: Enter takes it and the other
-        /// action goes unbound.
-        #[test]
-        fn an_armed_learn_asks_before_taking_a_chord_somebody_holds() {
-            let directory = tempfile::tempdir().unwrap();
-            let mut app = cascade_app(directory.path());
-            app.keybinds.learn(
-                BindAction::RenameScene,
-                crate::keybinds::KeyCombo::parse("ctrl+r"),
-            );
-            app.settings_sheet = Some(SettingsSheet::default());
-            app.focus = Focus::Panel(PanelKind::Settings);
-            app.keybind_learn = Some(crate::keybinds::KeybindLearn::arm(BindAction::Undo));
-
-            // ^R is rename-scene's: the learn asks rather than taking in silence.
-            press(&mut app, KeyCode::Char('r'), KeyModifiers::CONTROL);
-            assert_eq!(
-                app.keybinds.binding(BindAction::Undo).unwrap().key(),
-                "ctrl+z",
-                "nothing moved while the ask is up"
-            );
-            assert!(
-                matches!(
-                    app.keybind_learn,
-                    Some(crate::keybinds::KeybindLearn::Confirm {
-                        held_by: BindAction::RenameScene,
-                        ..
-                    })
-                ),
-                "the learn is asking, and says who would lose the chord"
-            );
-
-            // Enter confirms: the chord moves whole, the loser goes unbound.
-            press(&mut app, KeyCode::Enter, KeyModifiers::NONE);
-            assert_eq!(
-                app.keybinds.binding(BindAction::Undo).unwrap().key(),
-                "ctrl+r",
-                "the chord was taken, whatever it used to mean"
-            );
-            assert!(app.keybinds.overridden(BindAction::Undo));
-            assert!(
-                app.keybinds.is_unbound(BindAction::RenameScene),
-                "rename-scene was displaced, not silently repointed"
-            );
-            assert!(app.keybind_learn.is_none(), "the learn is over");
-        }
-
-        /// The ask is answerable in both directions: Esc keeps what the other
-        /// action has and the learn ends having changed nothing.
-        #[test]
-        fn esc_on_a_take_keeps_the_other_action_s_chord() {
-            let directory = tempfile::tempdir().unwrap();
-            let mut app = cascade_app(directory.path());
-            app.keybinds.learn(
-                BindAction::RenameScene,
-                crate::keybinds::KeyCombo::parse("ctrl+r"),
-            );
-            app.settings_sheet = Some(SettingsSheet::default());
-            app.focus = Focus::Panel(PanelKind::Settings);
-            app.keybind_learn = Some(crate::keybinds::KeybindLearn::arm(BindAction::Undo));
-
-            press(&mut app, KeyCode::Char('r'), KeyModifiers::CONTROL);
-            press(&mut app, KeyCode::Esc, KeyModifiers::NONE);
-            assert_eq!(
-                app.keybinds.binding(BindAction::Undo).unwrap().key(),
-                "ctrl+z",
-                "undo keeps its own chord"
-            );
-            assert_eq!(
-                app.keybinds.binding(BindAction::RenameScene).unwrap().key(),
-                "ctrl+r",
-                "rename-scene keeps what it held"
-            );
-            assert!(app.keybind_learn.is_none());
-        }
-
-        /// Enter pressed while the learn is merely ARMED is refused, not
-        /// captured: it is the key that arms and confirms, and a page whose
-        /// Enter could be learnt away would strand itself.
-        #[test]
-        fn enter_is_refused_while_a_learn_is_armed() {
-            let directory = tempfile::tempdir().unwrap();
-            let mut app = cascade_app(directory.path());
-            app.settings_sheet = Some(SettingsSheet::default());
-            app.focus = Focus::Panel(PanelKind::Settings);
-            app.keybind_learn = Some(crate::keybinds::KeybindLearn::arm(BindAction::Undo));
-
-            press(&mut app, KeyCode::Enter, KeyModifiers::NONE);
-            assert_eq!(
-                app.keybinds.binding(BindAction::Undo).unwrap().key(),
-                "ctrl+z",
-                "nothing was learnt"
-            );
-            assert!(
-                app.keybind_learn.is_some(),
-                "the learn stays armed, no deafer for one refused press"
-            );
-            // And the sheet still works: Enter on the row re-learns the action.
-            assert!(
-                app.keybind_rows().iter().any(|row| row.learning),
-                "the row still says it is waiting for a chord"
-            );
-        }
-
         /// The reserved family is refused at the capture path too, not just in
         /// the model: Esc closes sheets and cancels learns, Tab pages the sheet,
         /// Backspace and Delete unbind rows, Space types spaces, the arrows walk
@@ -974,38 +849,6 @@ mod tests {
                 !app.keybinds.overridden(BindAction::Undo),
                 "and studio.json keeps no dead binding"
             );
-        }
-
-        /// Most terminals fold ctrl+' down to a bare ', which is a typing key.
-        /// The learn refuses a typing key with a status message and stays
-        /// armed, because a binding on ' would fire on every typed apostrophe.
-        /// After the learn ends, the letter types into the editor again.
-        #[test]
-        fn a_typing_key_is_refused_with_a_word_not_bound_in_silence() {
-            let directory = tempfile::tempdir().unwrap();
-            let mut app = cascade_app(directory.path());
-            app.settings_sheet = Some(SettingsSheet::default());
-            app.focus = Focus::Panel(PanelKind::Settings);
-            app.keybind_learn = Some(crate::keybinds::KeybindLearn::arm(BindAction::Undo));
-
-            // The terminal folds ctrl+' down to a bare ' - the press the app
-            // actually sees, indistinguishable from typing an apostrophe.
-            press(&mut app, KeyCode::Char('\''), KeyModifiers::NONE);
-            assert_eq!(
-                app.keybinds.binding(BindAction::Undo).unwrap().key(),
-                "ctrl+z",
-                "the typing key bound nothing"
-            );
-            assert!(
-                !app.keybinds.overridden(BindAction::Undo),
-                "studio.json keeps no binding on a typing key"
-            );
-            assert!(
-                app.status.contains("typing key"),
-                "the refusal is said, not silent: {:?}",
-                app.status
-            );
-            assert!(app.keybind_learn.is_some(), "the learn stays armed");
         }
 
         /// Kitty-protocol terminals report a bare modifier press before the

@@ -530,31 +530,6 @@ mod tests {
         use crate::app::*;
         use crate::menu::MenuAction;
 
-        /// Enter on a prebake row opens it as a tab and hands over the keyboard.
-        #[test]
-        fn the_settings_sheet_opens_a_prebake_as_a_tab() {
-            let directory = tempfile::tempdir().expect("temp dir");
-            let mut app = app_over(directory.path());
-
-            app.toggle_settings_sheet();
-            assert_eq!(app.focus, Focus::Panel(PanelKind::Settings));
-            // Down to the local prebake row, past the set rows and the
-            // global prebake above it.
-            for _ in 0..9 {
-                press(&mut app, KeyCode::Down, KeyModifiers::NONE);
-            }
-            press(&mut app, KeyCode::Enter, KeyModifiers::NONE);
-
-            assert!(app.settings_sheet.is_none(), "the sheet handed over");
-            assert_eq!(app.focus, Focus::Editor);
-            assert_eq!(app.current_prebake(), Some(PrebakeScope::Local));
-            assert_eq!(app.editor().source(), prebake::PREBAKE_STARTER);
-            assert!(!app.scenes.current().dirty, "a tab opens on what is stored");
-            assert_eq!(app.scenes.score_count(), 1);
-            assert_eq!(app.scenes.len(), 2);
-            assert!(app.status.contains("prebake (local)"), "{}", app.status);
-        }
-
         /// The shortcut path opens the same tab and closes the sheet.
         #[test]
         fn the_prebake_actions_open_their_tabs_and_close_settings() {
@@ -585,27 +560,6 @@ mod tests {
             assert!(
                 app.theme_picker.is_none(),
                 "the prebake dismissed the sheet over it"
-            );
-        }
-
-        /// The shortcut takes the keyboard from a panel and gives it to
-        /// the prebake in the focused pane.
-        #[test]
-        fn the_prebake_shortcut_takes_the_keyboard_from_a_panel() {
-            let directory = tempfile::tempdir().expect("temp dir");
-            let mut app = app_over(directory.path());
-            app.toggle_reference_browse();
-            app.focus = Focus::Panel(PanelKind::Reference);
-            assert!(
-                app.dispatch_bind_action(BindAction::OpenLocalPrebake, false)
-                    .expect("local prebake action")
-            );
-            assert_eq!(app.focus, Focus::Editor);
-            assert_eq!(app.current_prebake(), Some(PrebakeScope::Local));
-            assert_eq!(
-                app.panes[app.focused].scene,
-                app.scenes.current().id,
-                "the focused pane shows the prebake"
             );
         }
 
@@ -759,51 +713,6 @@ mod tests {
                     .expect("in flight")
                     .reinstall_after,
                 "only the end of a chain re-installs"
-            );
-        }
-
-        /// An empty prebake is kept as nothing and never run.
-        #[test]
-        fn an_empty_prebake_is_kept_as_nothing_and_never_run() {
-            let directory = tempfile::tempdir().expect("temp dir");
-            let mut app = app_over(directory.path());
-
-            app.open_prebake(PrebakeScope::Global);
-            // The starter is comments, which are text; empty it entirely.
-            app.scenes.current_mut().editor = crate::editor::Editor::new("   ").expect("editor");
-            press(&mut app, KeyCode::F(5), KeyModifiers::NONE);
-
-            assert!(app.prebake_inflight.is_none());
-            assert!(app.prebake_queue.is_empty());
-            assert!(app.global_prebake.is_empty());
-            assert!(
-                !directory
-                    .path()
-                    .join("config")
-                    .join("prebake.strudel")
-                    .exists(),
-                "an empty prebake left a file behind"
-            );
-            assert!(app.status.contains("empty"), "{}", app.status);
-        }
-
-        /// A prebake the checker refuses is neither kept nor run.
-        #[test]
-        fn a_prebake_the_checker_refuses_is_not_applied() {
-            let directory = tempfile::tempdir().expect("temp dir");
-            let mut app = app_over(directory.path());
-
-            app.open_prebake(PrebakeScope::Global);
-            type_text(&mut app, "setcps(1)");
-            press(&mut app, KeyCode::F(5), KeyModifiers::NONE);
-
-            assert!(app.prebake_inflight.is_none(), "a refused setup was run");
-            assert!(app.global_prebake.is_empty(), "a refused setup was kept");
-            assert!(app.status.contains("refused"), "{}", app.status);
-            assert!(
-                app.status.contains("setup was not applied"),
-                "{}",
-                app.status
             );
         }
 

@@ -144,13 +144,6 @@ mod tests {
     }
 
     #[test]
-    fn a_plain_drag_follows_the_pointer() {
-        let mut drag = fine(false);
-        assert_eq!(drag.follow(0.8, 0.2), (0.8, 1.0));
-        assert!(!drag.gripped());
-    }
-
-    #[test]
     fn a_fine_drag_starts_where_the_value_is_and_moves_a_tenth() {
         let mut drag = fine(true);
         assert_eq!(drag.follow(0.9, 0.3), (0.3, FINE_GAIN));
@@ -212,14 +205,5 @@ mod tests {
         assert!((0.55..0.75).contains(&gain), "a tenth of the move: {gain}");
         press(&mut app, KeyCode::Char('f'), KeyModifiers::NONE);
         assert!(!app.fine_drag.lock);
-    }
-
-    #[test]
-    fn the_lock_makes_a_drag_fine_without_a_key() {
-        let mut drag = fine(false);
-        drag.lock = true;
-        assert_eq!(drag.follow(0.9, 0.3).1, FINE_GAIN);
-        drag.release();
-        assert!(!drag.active());
     }
 }

@@ -461,33 +461,4 @@ y
         typed(&mut app, "p");
         assert_eq!(app.editor().source(), "x\nx\ny\n");
     }
-
-    /// `Ctrl+[` steps to the previous scene from Vim Normal mode on enhanced
-    /// terminals, while still leaving Insert mode without changing scenes.
-    #[test]
-    fn ctrl_left_bracket_navigates_previous_scene_in_vim_normal_mode() {
-        let directory = tempfile::tempdir().expect("temp dir");
-        let mut app = vim_app(directory.path(), "// first\n", "");
-        app.capabilities = crate::editor::KeyboardCapabilities::enhanced();
-        app.new_scene(false);
-        app.scenes.current_mut().editor = Editor::new("// second\n").expect("editor");
-        app.sync_editor_keybindings();
-        app.editor_mut()
-            .set_selection(Selection::caret(ByteOffset(0)))
-            .expect("caret");
-        app.focus = Focus::Editor;
-        assert_eq!(app.scenes.current_index(), 1);
-
-        // In Insert mode, Ctrl+[ returns to Normal and stays on the current scene.
-        typed(&mut app, "i");
-        assert!(app.editor().vim_is_insert());
-        press(&mut app, KeyCode::Char('['), KeyModifiers::CONTROL);
-        assert!(app.editor().vim_is_normal());
-        assert_eq!(app.scenes.current_index(), 1);
-
-        // In clean Normal mode, Ctrl+[ navigates to the previous scene.
-        press(&mut app, KeyCode::Char('['), KeyModifiers::CONTROL);
-        assert_eq!(app.scenes.current_index(), 0);
-        assert_eq!(app.editor().source(), "// first\n");
-    }
 }

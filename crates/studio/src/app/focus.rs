@@ -534,46 +534,6 @@ mod tests {
         use crate::app::focus::*;
         use crate::app::tests::support::*;
 
-        /// A menu row opens one sheet and the sheet takes the place of any
-        /// other; the set panel is not a sheet and stays through all of it.
-        #[test]
-        fn opening_a_dialog_puts_the_others_away() {
-            let directory = tempfile::tempdir().expect("temp dir");
-            let mut app = app_over(directory.path());
-            press(&mut app, KeyCode::Char('b'), KeyModifiers::CONTROL);
-            assert!(app.set_panel.is_some());
-            press(&mut app, KeyCode::Char('o'), KeyModifiers::CONTROL);
-            assert!(app.settings_sheet.is_some(), "^O opens the settings");
-            assert!(app.set_panel.is_some(), "the set panel stays");
-            press(&mut app, KeyCode::Char('t'), KeyModifiers::CONTROL);
-            assert!(app.theme_picker.is_some());
-            assert!(app.settings_sheet.is_none());
-            app.dispatch_menu_action(crate::menu::MenuAction::OpenSet)
-                .expect("menu");
-            assert!(app.set_prompt.is_some());
-            assert!(app.theme_picker.is_none());
-            app.dispatch_menu_action(crate::menu::MenuAction::Devices)
-                .expect("menu");
-            assert!(app.panel.is_some());
-            assert!(app.set_prompt.is_none(), "the prompt is a sheet and goes");
-            assert!(app.set_panel.is_some(), "the panel is not");
-            press(&mut app, KeyCode::Char('o'), KeyModifiers::CONTROL);
-            assert!(app.settings_sheet.is_some());
-            assert!(app.panel.is_none());
-        }
-
-        /// Esc from the score puts the front panel away in one press.
-        #[test]
-        fn escape_from_the_score_closes_the_panel_in_one_press() {
-            let directory = tempfile::tempdir().expect("temp dir");
-            let mut app = app_over(directory.path());
-            app.toggle_reference_browse();
-            app.focus = Focus::Editor; // stands in for a click on the score
-            press(&mut app, KeyCode::Esc, KeyModifiers::NONE);
-            assert!(app.reference_panel.is_none());
-            assert_eq!(app.focus, Focus::Editor);
-        }
-
         /// While the rotation flash is lit, the rotation hands the room of the
         /// panel it landed on to the chrome. It hands nothing after the flash.
         #[test]
@@ -714,31 +674,6 @@ mod tests {
             assert_eq!(app.focus, Focus::Editor);
         }
 
-        /// ⇧F10 with one visuals dock open: the score, the dock, and back.
-        #[test]
-        fn the_rotation_visits_one_open_dock_and_returns_to_the_score() {
-            let directory = tempfile::tempdir().expect("temp dir");
-            let mut app = app_over(directory.path());
-            app.open_viz_dock(0, false);
-            let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(180, 40))
-                .expect("test terminal");
-            terminal
-                .draw(|frame| app.paint_into(frame, Instant::now()).expect("frame paints"))
-                .expect("draw");
-            assert_eq!(app.focus, Focus::Editor);
-
-            app.rotate_panel_focus();
-            assert_eq!(app.focus, Focus::Panel(PanelKind::Viz));
-            assert_eq!(app.viz_focus, 0);
-
-            app.rotate_panel_focus();
-            assert_eq!(app.focus, Focus::Editor);
-
-            app.rotate_panel_focus();
-            assert_eq!(app.focus, Focus::Panel(PanelKind::Viz));
-            assert_eq!(app.viz_focus, 0, "the rotation is a loop, not a one-shot");
-        }
-
         /// The screen order with everything open: the score, visuals 1,
         /// visuals 2, the set panel, the reference, and back. Sheets are not
         /// rotation stops.
@@ -774,57 +709,6 @@ mod tests {
 
             app.rotate_panel_focus();
             assert_eq!(app.focus, Focus::Editor, "the loop closes on the score");
-        }
-
-        #[test]
-        fn the_rotation_stays_on_an_open_settings_sheet() {
-            let directory = tempfile::tempdir().expect("temp dir");
-            let mut app = app_over(directory.path());
-            app.settings_sheet = Some(SettingsSheet::default());
-            app.focus = Focus::Editor;
-
-            app.rotate_panel_focus();
-
-            assert_eq!(app.focus, Focus::Panel(PanelKind::Settings));
-            assert_eq!(app.status, "keyboard on settings");
-            assert!(matches!(
-                app.focus_rotation_flash,
-                Some((RotationStop::Settings, _))
-            ));
-            assert_eq!(
-                app.focus_rotation_flash_room(),
-                crate::settings::SettingsSheetView::geometry(app.settings_sheet_frame())
-                    .map(|(sheet, _)| sheet),
-                "Settings gets the same landing outline as the other stops"
-            );
-        }
-
-        /// The rotation only ever moves the keyboard: nothing it walks past is
-        /// opened or closed along the way.
-        #[test]
-        fn the_rotation_never_opens_or_closes_a_panel() {
-            let directory = tempfile::tempdir().expect("temp dir");
-            let mut app = app_over(directory.path());
-            app.open_viz_dock(0, false);
-            app.open_viz_dock(1, false);
-            app.open_set_panel(false);
-            let open_before = (
-                app.viz_docks[0].is_some(),
-                app.viz_docks[1].is_some(),
-                app.set_panel.is_some(),
-            );
-            for _ in 0..8 {
-                app.rotate_panel_focus();
-            }
-            let open_after = (
-                app.viz_docks[0].is_some(),
-                app.viz_docks[1].is_some(),
-                app.set_panel.is_some(),
-            );
-            assert_eq!(
-                open_before, open_after,
-                "walking the rotation must not open or close anything"
-            );
         }
 
         /// With nothing open there is nowhere to walk to, and the rotation

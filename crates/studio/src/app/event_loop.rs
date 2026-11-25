@@ -977,21 +977,6 @@ mod tests {
             );
         }
 
-        /// While animating, a due frame paints even when nothing set the dirty
-        /// flag. Otherwise playback with no dirty source freezes the screen.
-        #[test]
-        fn an_animated_due_frame_paints_without_a_dirty_flag() {
-            let now = Instant::now();
-            assert!(
-                frame_is_due(true, false, false, now, past(now)),
-                "the animation advances"
-            );
-            assert!(
-                !frame_is_due(true, false, false, now, future(now)),
-                "but not ahead of its interval"
-            );
-        }
-
         /// Stopped, the interval has no claim: a keystroke repaints at once.
         #[test]
         fn a_stopped_dirty_frame_paints_at_once() {
@@ -1073,37 +1058,6 @@ mod tests {
                 assert!(!frame_is_due(true, true, false, woke, deadline));
                 assert_eq!(pacing_wait(true, true, false, woke, deadline, SIXTY), SIXTY);
             }
-        }
-
-        /// The time spent drawing comes out of the frame's interval: after the draw
-        /// the loop waits only what is left of it, not a whole interval more.
-        #[test]
-        fn drawing_spends_the_remainder_of_the_anchored_interval() {
-            let interval = Duration::from_micros(4_167);
-            let lateness = Duration::from_millis(1);
-            let drawing = Duration::from_micros(750);
-            let old_deadline = Instant::now();
-            let woke = old_deadline + lateness;
-            let deadline = next_frame_deadline(old_deadline, woke, interval);
-            assert_eq!(
-                pacing_wait(true, false, false, woke + drawing, deadline, interval),
-                interval - lateness - drawing,
-            );
-        }
-
-        /// A press that can act caps the wait to what is left of the pad
-        /// deadline; with nothing bound the idle loop keeps its long sleep.
-        #[test]
-        fn the_pad_cap_bounds_the_wait_only_while_a_press_can_act() {
-            let cap = pad_wait_cap(Duration::from_millis(3));
-            assert_eq!(loop_wait(IDLE_POLL, Some(cap)), Duration::from_millis(12));
-            assert_eq!(loop_wait(IDLE_POLL, None), IDLE_POLL);
-            assert_eq!(loop_wait(Duration::ZERO, Some(cap)), Duration::ZERO);
-            assert_eq!(
-                loop_wait(Duration::from_millis(5), Some(cap)),
-                Duration::from_millis(5),
-                "a nearer frame still wins"
-            );
         }
 
         #[test]

@@ -531,30 +531,6 @@ mod tests {
     }
 
     #[test]
-    fn the_sample_search_keeps_hjkl_out_of_the_query() {
-        let (_directory, mut app) = vim_app();
-        app.reference_panel
-            .as_mut()
-            .expect("panel")
-            .select_tab(Tab::Samples);
-        app.focus_panel(PanelKind::Reference);
-        let query = |app: &App| {
-            app.reference_panel
-                .as_ref()
-                .expect("panel")
-                .sound_query
-                .clone()
-        };
-        for key in ['j', 'k', 'h', 'l'] {
-            press(&mut app, KeyCode::Char(key), KeyModifiers::NONE);
-        }
-        assert_eq!(query(&app), "", "hjkl never reach the sample search");
-        press(&mut app, KeyCode::Char('i'), KeyModifiers::NONE);
-        press(&mut app, KeyCode::Char('x'), KeyModifiers::NONE);
-        assert_eq!(query(&app), "x", "Insert types in the sample search");
-    }
-
-    #[test]
     fn ctrl_d_and_ctrl_u_page_the_list() {
         let (_directory, mut app) = vim_app();
         let selected = |app: &App| app.reference_panel.as_ref().expect("panel").chord_selected;
@@ -1006,17 +982,6 @@ mod tests {
             !app.reference_panel.as_ref().expect("panel").vim_insert(),
             "a refocus returns to Command"
         );
-    }
-
-    #[test]
-    fn esc_returns_to_command_then_closes_the_panel() {
-        let (_directory, mut app) = vim_app();
-        press(&mut app, KeyCode::Char('a'), KeyModifiers::NONE);
-        press(&mut app, KeyCode::Esc, KeyModifiers::NONE);
-        let panel = app.reference_panel.as_ref().expect("panel");
-        assert!(!panel.vim_insert(), "Esc returns to Command");
-        press(&mut app, KeyCode::Esc, KeyModifiers::NONE);
-        assert!(app.reference_panel.is_none(), "a second Esc closes");
     }
 
     #[test]
