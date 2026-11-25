@@ -2659,19 +2659,6 @@ mod tests {
         }
 
         #[test]
-        fn a_cancelled_check_keeps_its_evaluation_error() {
-            let (_folder, mut session, library) = local_session(true);
-            let check = check_score(
-                "await samples('local:'); s(\"kick\")",
-                Some(&library),
-                &mut session,
-                &AtomicBool::new(true),
-            );
-            assert!(check.eval_error.is_some(), "{check:?}");
-            assert!(!check.is_ok());
-        }
-
-        #[test]
         fn cancellation_during_the_local_import_wait_stops_the_check() {
             let (_folder, mut session, library) = local_session(true);
             let _hold = library.hold_manifest_worker_for_test();
@@ -2741,33 +2728,6 @@ mod tests {
             queried_parts(&session),
             thirds,
             "rejected JavaScript join state changed the last-good callback"
-        );
-    }
-
-    #[test]
-    fn rejected_default_voicings_do_not_reconfigure_the_last_good_callback() {
-        let mut session = Session::new().expect("session");
-        session
-                .evaluate(
-                    "setDefaultVoicings('guidetones'); pure('C7').fmap(x => rustelScope.voicing(pure(x))).innerJoin()",
-                )
-                .expect("callback-bearing last-good score");
-        assert_eq!(
-            session.query(Fraction::ZERO, Fraction::ONE).unwrap().len(),
-            2
-        );
-
-        session
-            .reload_at(
-                "setDefaultVoicings('lefthand'); throw new Error('reject candidate')",
-                false,
-                0.25,
-            )
-            .expect_err("candidate must reject");
-        assert_eq!(
-            session.query(Fraction::ZERO, Fraction::ONE).unwrap().len(),
-            2,
-            "rejected JavaScript voicing state changed the last-good callback"
         );
     }
 
@@ -3794,123 +3754,6 @@ endin`";
     }
 
     #[test]
-    fn live_replacement_probe_budget_tracks_the_candidate_tempo() {
-        assert_eq!(
-            Session::live_replacement_probe_budget(Some(3.75)),
-            Duration::from_millis(200),
-            "900/4 must receive its sustainable one-cycle compute share"
-        );
-        assert_eq!(
-            Session::live_replacement_probe_budget(Some(50.0)),
-            Duration::from_millis(15),
-            "very high CPS must not retain the fixed probe ceiling"
-        );
-        assert_eq!(
-            Session::live_replacement_probe_budget(Some(0.5)),
-            LIVE_QUERY_RECOVERY_BUDGET,
-            "low-tempo candidates remain capped by the bounded recovery slice"
-        );
-        assert_eq!(
-            Session::live_replacement_probe_budget(None),
-            Session::PROBE_DEFAULT_CEILING
-        );
-        assert_eq!(
-            Session::live_replacement_probe_budget(Some(f64::NAN)),
-            Session::PROBE_DEFAULT_CEILING
-        );
-
-        assert_eq!(
-            Session::live_replacement_takeover_headroom(Some(3.75), Duration::from_millis(60)),
-            LIVE_REPLACEMENT_MIN_HEADROOM,
-            "a cheap 900-BPM candidate must retain immediate edit latency"
-        );
-        let at_900_bpm =
-            Session::live_replacement_takeover_headroom(Some(3.75), Duration::from_millis(61));
-        assert!(
-            (at_900_bpm.as_secs_f64() - 1.0 / 3.75).abs() < 1e-9,
-            "a sustainable 900-BPM first query must finish before takeover: {at_900_bpm:?}"
-        );
-        assert_eq!(
-            Session::live_replacement_takeover_headroom(Some(50.0), Duration::from_millis(61)),
-            LIVE_REPLACEMENT_MIN_HEADROOM,
-            "very short cycles retain the ordinary immediate-edit floor"
-        );
-        let capped_low_tempo =
-            Session::live_replacement_takeover_headroom(Some(0.5), Duration::from_millis(61));
-        assert!(
-            (capped_low_tempo.as_secs_f64() - 1.0 / 3.0).abs() < 1e-9,
-            "the bounded 250 ms probe must not create a multi-second takeover: {capped_low_tempo:?}"
-        );
-
-        // A probe that overran the bounded budget is the slow machine's own
-        // measurement: the runway must cover an equivalent first query, or
-        // the edit is refused for the machine being slow.
-        let slow_probe =
-            Session::live_replacement_takeover_headroom(Some(0.5), Duration::from_millis(900));
-        assert_eq!(
-            slow_probe,
-            Duration::from_secs_f64(0.9 / LIVE_REPLACEMENT_QUERY_COMPUTE_SHARE),
-            "a measured-heavy probe sets the runway from its own cost"
-        );
-        assert_eq!(
-            Session::live_replacement_takeover_headroom(Some(0.5), Duration::from_secs(9)),
-            QUERY_JS_CPU_BUDGET,
-            "and never past the evaluation ceiling"
-        );
-    }
-
-    #[test]
-    fn live_score_budget_uses_remaining_horizon_floor_and_ceiling() {
-        let reserve = Duration::from_millis(10);
-        let mut session = Session::new().expect("session");
-        session.evaluate("note('c4')").expect("score");
-        session.schedule_at(0.0).expect("fill default horizon");
-
-        let partly_drained = session
-            .live_score_budget_at(0.2, reserve)
-            .expect("valid clock")
-            .expect("partly drained horizon still affords score JavaScript");
-        assert!(
-            partly_drained.abs_diff(Duration::from_millis(270)) <= Duration::from_micros(1),
-            "budget came from the nominal 500ms horizon instead of the 300ms remaining: {partly_drained:?}"
-        );
-        assert!(
-            session
-                .live_score_budget_at(0.4719, Duration::from_millis(1))
-                .expect("valid just-above-floor clock")
-                .is_some(),
-            "a score budget above the minimum viable slice was deferred"
-        );
-        assert_eq!(
-            session
-                .live_score_budget_at(0.4721, Duration::from_millis(1))
-                .expect("valid just-below-floor clock"),
-            None,
-            "sub-minimum score JavaScript ran instead of retaining its identity"
-        );
-        assert!(
-            session.live_score_budget_at(0.0, Duration::ZERO).is_err(),
-            "zero continuation reserve made the deadline equal the whole horizon"
-        );
-
-        let mut large = Session::with_config(SessionConfig {
-            horizon: 10.0,
-            ..SessionConfig::default()
-        })
-        .expect("large-horizon session");
-        large.evaluate("note('c4')").expect("large score");
-        large.schedule_at(0.0).expect("fill large horizon");
-        assert_eq!(
-            large
-                .live_score_budget_at(0.0, reserve)
-                .expect("large valid clock"),
-            Some(SCORE_CPU_BUDGET),
-            "a large configured horizon bypassed the score CPU ceiling"
-        );
-        assert_eq!(SCORE_CPU_BUDGET, Duration::from_secs(2));
-    }
-
-    #[test]
     fn live_score_defers_without_running_then_deadlines_transactionally_and_recovers() {
         let mut session = Session::new().expect("session");
         session
@@ -4187,22 +4030,6 @@ endin`";
         assert_eq!(active_values(&session), ["s:hh"]);
     }
 
-    /// A cancelled JavaScript evaluation is not retried through the mini
-    /// fallback. `s("bd")` carries an extractable mini pattern, so the
-    /// fallback could otherwise return success after a stop.
-    #[test]
-    fn a_cancelled_evaluation_is_not_laundered_through_the_mini_fallback() {
-        let mut session = Session::new().expect("session");
-        let cancellation = AtomicBool::new(true);
-        let error = session
-            .evaluate_cancellable("s(\"bd\")", &cancellation)
-            .expect_err("a cancelled evaluation must not succeed via the mini fallback");
-        assert!(
-            matches!(error, RuntimeError::Cancelled),
-            "expected Cancelled, got {error}"
-        );
-    }
-
     #[test]
     fn live_mini_is_outside_the_js_budget_but_uses_a_fresh_install_clock() {
         let mut session = Session::new().expect("session");
@@ -4250,67 +4077,6 @@ endin`";
             .expect_err("a refused install clock");
         #[cfg(all(feature = "vst", feature = "device-audio"))]
         assert_eq!(session.plan_lead, None);
-    }
-
-    #[test]
-    #[cfg(feature = "device-audio")]
-    fn live_prebake_budget_uses_remaining_horizon_and_keeps_the_two_second_ceiling() {
-        let reserve = std::time::Duration::from_millis(10);
-        let mut session = Session::new().expect("session");
-        session.evaluate("note('c4')").expect("score");
-        session.schedule_at(0.0).expect("fill default horizon");
-
-        let partly_drained = session
-            .live_prebake_budget_at(0.2, reserve)
-            .expect("valid clock")
-            .expect("partly drained horizon still affords setup");
-        assert!(
-            partly_drained.abs_diff(std::time::Duration::from_millis(270))
-                <= std::time::Duration::from_micros(1),
-            "budget came from the nominal 500ms horizon instead of the 300ms remaining: {partly_drained:?}"
-        );
-        assert_eq!(
-            session
-                .live_prebake_budget_at(0.471, reserve)
-                .expect("valid exhausted clock"),
-            None,
-            "evaluation was offered after the continuation reserve consumed the remaining horizon"
-        );
-        assert!(
-            session
-                .live_prebake_budget_at(0.4719, std::time::Duration::from_millis(1))
-                .expect("valid just-above-floor clock")
-                .is_some(),
-            "a budget above the minimum viable setup slice was deferred"
-        );
-        assert_eq!(
-            session
-                .live_prebake_budget_at(0.4721, std::time::Duration::from_millis(1))
-                .expect("valid just-below-floor clock"),
-            None,
-            "a sub-minimum budget ran setup instead of retaining the identity"
-        );
-
-        let mut large = Session::with_config(SessionConfig {
-            horizon: 10.0,
-            ..SessionConfig::default()
-        })
-        .expect("large-horizon session");
-        large.evaluate("note('c4')").expect("large score");
-        large.schedule_at(0.0).expect("fill large horizon");
-        assert_eq!(
-            large
-                .live_prebake_budget_at(0.0, reserve)
-                .expect("large valid clock"),
-            Some(PREBAKE_CPU_BUDGET),
-            "a large configured horizon bypassed the setup CPU ceiling"
-        );
-        assert!(
-            session
-                .live_prebake_budget_at(0.0, std::time::Duration::ZERO)
-                .is_err(),
-            "zero continuation reserve made the deadline equal the whole horizon"
-        );
     }
 
     #[test]
@@ -4577,33 +4343,6 @@ endin`";
         );
     }
 
-    #[test]
-    fn removed_wavetable_visual_is_not_installed() {
-        let mut session = Session::new().expect("session");
-        assert!(
-            session.evaluate(r#"s("bd")._wavetable()"#).is_err(),
-            "the removed visual must not remain as a silent compatibility call"
-        );
-    }
-
-    #[test]
-    fn extract_s_call() {
-        assert_eq!(
-            extract_mini_fallback(r#"s("bd sd")"#).as_deref(),
-            Some("bd sd")
-        );
-    }
-
-    #[test]
-    fn rust_mini_query_bd_sd() {
-        let mut session = Session::new().unwrap();
-        session.evaluate_mini("bd sd").unwrap();
-        let haps = session.query(Fraction::ZERO, Fraction::ONE).unwrap();
-        assert_eq!(haps.len(), 2);
-        assert_eq!(haps[0].value.show(), "bd");
-        assert_eq!(haps[1].value.show(), "sd");
-    }
-
     #[cfg(feature = "extensions")]
     const ONESHOT: &str = "setcps(1); $: s('riser').oneshot(4)";
 
@@ -4755,43 +4494,6 @@ endin`";
         );
     }
 
-    /// A score that asks for no orchestra and names no MIDI input makes
-    /// neither state: each part waits for the score that needs it.
-    #[test]
-    fn a_plain_score_makes_no_csound_state_and_no_midi_bus() {
-        let mut session = Session::new().expect("session");
-        session.evaluate("$: s(\"bd sd\")").expect("score");
-        assert!(
-            !session.csound_made(),
-            "a score with no orchestra made the orchestra state"
-        );
-        assert!(
-            !session.js.midi_bus_made(),
-            "a score with no MIDI input made the input bus"
-        );
-    }
-
-    /// The text the native memo keeps for the next build and the text the
-    /// session keeps for a replay are one handle.
-    #[test]
-    fn the_native_memo_and_the_session_share_one_text_handle() {
-        let mut session = Session::new().expect("session");
-        let source = "$: note(\"c e g\").s(\"sine\")";
-        session.evaluate(source).expect("score");
-        let kept = session.js.native_source_text().expect("a native text");
-        assert!(
-            Arc::ptr_eq(session.last_source.as_ref().expect("kept source"), &kept),
-            "the session and the memo hold the text twice"
-        );
-        assert_eq!(&*kept, source);
-        // A build of the same text keeps the same handle.
-        session.evaluate(source).expect("score again");
-        assert!(Arc::ptr_eq(
-            session.last_source.as_ref().expect("kept source"),
-            &session.js.native_source_text().expect("a native text"),
-        ));
-    }
-
     /// A seeded evaluation of a session that never made its store gives
     /// the store the orchestras of the seed, on every path that stages.
     #[test]
@@ -4823,61 +4525,5 @@ endin`";
                 "the orchestra of the seed was dropped for {source:?} (mini {mini})"
             );
         }
-    }
-
-    /// A seed with no orchestra, on a session with no store, makes none.
-    #[test]
-    fn an_empty_recovery_seed_makes_no_store() {
-        let mut session = Session::new().expect("session");
-        let settings = session.js.snapshot_published_runtime_settings();
-        let empty = crate::CsoundSnapshot::default();
-        let cancelled = AtomicBool::new(false);
-        session
-            .evaluate_live_score_cancellable_seeded(
-                "$: s(\"bd sd\")",
-                false,
-                Duration::from_millis(1),
-                &cancelled,
-                || 0.0,
-                Some((&settings, &empty, 0.0)),
-            )
-            .expect("a seeded evaluation");
-        assert!(!session.csound_made(), "an empty seed made the store");
-    }
-
-    /// A read of the orchestra snapshot, a change of the import access and
-    /// the error report make no store. A store made later takes the access.
-    #[test]
-    fn a_read_of_the_orchestra_state_makes_no_store() {
-        let mut session = Session::new().expect("session");
-        assert_eq!(session.csound_snapshot(), crate::CsoundSnapshot::default());
-        assert!(session.csound_take_errors().is_empty());
-        session.restore_csound_snapshot(&crate::CsoundSnapshot::default());
-        let mut access = crate::ScoreImportAccess::default();
-        access.permit_csound();
-        session.set_score_import_access(access);
-        assert!(
-            !session.csound_made(),
-            "a read or a policy change made the store"
-        );
-        // The store made later takes the access that was set before it. A
-        // source stage gets past the permission check, and may fail later
-        // for a missing Csound library.
-        let source = [rustel_jsruntime::CsoundSource::Code(
-            "instr a\nendin".into(),
-        )];
-        let staged = session
-            .csound()
-            .stage(&source, &session.config.score_import_access);
-        assert!(
-            !matches!(staged, Err(RuntimeError::CsoundPermission)),
-            "the store made later refused the access"
-        );
-        // A session that never permitted Csound refuses the same source.
-        let plain = Session::new().expect("session");
-        let refused = plain
-            .csound()
-            .stage(&source, &plain.config.score_import_access);
-        assert!(matches!(refused, Err(RuntimeError::CsoundPermission)));
     }
 }

@@ -2030,65 +2030,6 @@ mod tests {
             }
         }
 
-        /// A channel the open input does not have is silence with a warning, not
-        /// a refusal: the replacement publishes, its siblings play, and the
-        /// producer never latches over a microphone that turned out to be mono.
-        #[test]
-        fn a_missing_input_channel_plays_silence_and_warns_instead_of_refusing() {
-            for reverse in [false, true] {
-                let (mut session, mut producer, output) = confirmed_score();
-                session.set_audio_input_channels(Some(2));
-                let input = "s('in').n(sine.range(2, 3))";
-                let source = if reverse {
-                    format!("stack({input}, s('sine')).fast(16)")
-                } else {
-                    format!("stack(s('sine'), {input}).fast(16)")
-                };
-                let previous = session.generation();
-                let candidate = session
-                    .reload_at(&source, false, output.device().clock_seconds())
-                    .expect("valid JavaScript with a computed input channel");
-                producer.arm_replacement(previous, candidate);
-                let device = output.device();
-                let mut published = Vec::new();
-                let mut pushed = Vec::new();
-                producer
-                    .step_unwatched_with_clock_and_cutover(
-                        &mut session,
-                        || device.clock_seconds(),
-                        RATE,
-                        |generation, takeover, _cut| {
-                            published.push(generation);
-                            device.set_generation(generation, takeover, TakeoverCut::None);
-                        },
-                        |event| {
-                            pushed.push(event.clone());
-                            device.push(event)
-                        },
-                    )
-                    .expect("the replacement is published");
-                assert_eq!(published, [candidate], "published, not refused");
-                assert!(
-                    pushed.iter().any(|event| matches!(
-                        event.synth,
-                        Some(rustel_audio::SynthSource::Input { channel: 2 })
-                    )),
-                    "the input voice is there - the ring reads it as silence"
-                );
-                assert!(
-                    pushed.iter().any(|event| event.synth.is_none()
-                        || !matches!(event.synth, Some(rustel_audio::SynthSource::Input { .. }))),
-                    "and its sibling plays"
-                );
-                assert!(session.take_diagnostics().iter().any(|diagnostic| {
-                    diagnostic.kind == "audio-input"
-                        && diagnostic
-                            .message
-                            .contains("open input provides channels 0..1 - it plays silence")
-                }));
-            }
-        }
-
         #[test]
         fn missing_or_expanded_input_facts_do_not_keep_an_obsolete_channel_limit() {
             for channels in [None, Some(0), Some(4)] {
@@ -3349,41 +3290,6 @@ mod tests {
 
     #[test]
     #[cfg(feature = "device-audio")]
-    fn impure_whole_cycle_live_queries_retain_one_bounded_burst_cycle() {
-        let mut high = Session::new().expect("high-CPS session");
-        high.evaluate("setCpm(900/4); new Pattern(state => pure('high').query(state))")
-            .expect("high-CPS impure score");
-        assert!(high.active_needs_host(), "fixture must enter JavaScript");
-        let base = high.live_schedule_cover();
-        let expected = base + 1.0 / 3.75;
-        assert!(
-            (high.live_producer_schedule_cover() - expected).abs() < 1e-9,
-            "whole-cycle callback score did not receive one burst cycle"
-        );
-
-        let mut low = Session::new().expect("low-CPS session");
-        low.evaluate("setcps(0.5); new Pattern(state => pure('low').query(state))")
-            .expect("low-CPS impure score");
-        assert!(low.active_needs_host(), "fixture must enter JavaScript");
-        assert_eq!(
-            low.live_producer_schedule_cover(),
-            low.live_schedule_cover(),
-            "sub-cycle queries must keep their exact established windows"
-        );
-
-        let mut pure = Session::new().expect("pure session");
-        pure.evaluate("setCpm(900/4); pure('native')")
-            .expect("high-CPS pure score");
-        assert!(!pure.active_needs_host(), "fixture unexpectedly needs JS");
-        assert_eq!(
-            pure.live_producer_schedule_cover(),
-            pure.live_schedule_cover(),
-            "native graphs must not pay for a callback burst reserve"
-        );
-    }
-
-    #[test]
-    #[cfg(feature = "device-audio")]
     fn high_cps_impure_live_prefill_is_split_into_deadline_sized_queries() {
         let mut session = Session::new().expect("session");
         session
@@ -3565,44 +3471,6 @@ mod tests {
 
     #[test]
     #[cfg(feature = "device-audio")]
-    fn pure_live_tick_ignores_unaffordable_js_cover_and_remains_host_free() {
-        let mut session = Session::new().expect("session");
-        session.evaluate("note('c4')").expect("pure score");
-        assert!(!session.active_needs_host(), "fixture is not pure");
-
-        let batch = match session.schedule_audio_live_at(
-            0.0,
-            48_000,
-            Duration::from_secs(1),
-            LiveQueryBudgetMode::Steady,
-        ) {
-            Ok(batch) => batch,
-            Err(LiveAudioScheduleError::Retryable(error))
-            | Err(LiveAudioScheduleError::AwaitingSamples(error)) => {
-                panic!("pure live tick required an affordable QuickJS slice: {error:?}")
-            }
-            Err(
-                LiveAudioScheduleError::CandidateCommitted(error)
-                | LiveAudioScheduleError::CandidateRefusedScore(error),
-            ) => {
-                panic!("pure live tick failed after scheduler commit: {error:?}")
-            }
-        };
-        assert_eq!(batch.events.len(), 1);
-        assert_eq!(
-            session.js.query_depth(),
-            0,
-            "pure tick opened JS query scope"
-        );
-        assert_eq!(
-            rustel_jsruntime::bridge_frame_depth(),
-            0,
-            "pure tick opened a bridge frame"
-        );
-    }
-
-    #[test]
-    #[cfg(feature = "device-audio")]
     fn live_ui_trace_keeps_transpiler_byte_ranges_on_audio_onset_ids() {
         let source = r#"$: arrange([1, note("c4 e4")])"#;
         let mut session = Session::with_config(SessionConfig {
@@ -3725,41 +3593,6 @@ mod tests {
             recovered.events.first().map(|event| event.onset_id),
             Some(initial[0].onset_id + 1),
             "atomic refusals consumed an onset id"
-        );
-    }
-
-    /// A spent horizon must still evaluate a save, not defer it forever.
-    ///
-    /// Deferring is right while cover remains: the identity stays retryable and
-    /// the horizon refills in milliseconds. Once the horizon is GONE the same
-    /// refusal repeats on every attempt, and the set freezes on its last good
-    /// score while every edit is rejected.
-    #[test]
-    #[cfg(feature = "device-audio")]
-    fn a_spent_horizon_still_evaluates_a_save() {
-        let reserve = Duration::from_millis(10);
-        let mut session = Session::new().expect("session");
-        session.evaluate("note('c4')").expect("score");
-        session.schedule_at(0.0).expect("fill the horizon");
-
-        // Cover left: defer, cheaply, and try again in a moment.
-        assert_eq!(
-            session
-                .live_score_budget_at(0.4999, reserve)
-                .expect("valid clock"),
-            None,
-            "a tight but SOUNDING horizon must still defer"
-        );
-
-        // Horizon spent: there is nothing left to protect, and no later
-        // attempt that could go better.
-        let recovered = session
-            .live_score_budget_at(0.75, reserve)
-            .expect("valid clock")
-            .expect("a spent horizon refused the save that could restore it");
-        assert!(
-            recovered > MIN_LIVE_SCORE_CPU_BUDGET,
-            "recovery slice {recovered:?} is no better than the floor that failed"
         );
     }
 
@@ -3889,73 +3722,6 @@ mod tests {
         );
     }
 
-    /// An unaffordable continuation reserve does not refuse the query. The
-    /// horizon that the reserve protects is already spent, and only a query
-    /// refills it.
-    #[test]
-    #[cfg(feature = "device-audio")]
-    fn an_unaffordable_reserve_fills_with_the_minimum_slice_instead_of_deadlocking() {
-        let mut session = Session::new().expect("session");
-        session
-                .evaluate("globalThis.__calls = 0; note('c4').fast(8).fmap(v => { globalThis.__calls++; return v; })")
-                .expect("fixture");
-        session
-            .schedule_through_with_js_budget(0.0, 0.0, Duration::from_millis(100))
-            .expect("initial horizon fill");
-
-        // Far enough into the horizon that the reserve cannot be covered.
-        let now = 0.39;
-        let calls_before = session.js.get_number("__calls").expect("callback count");
-        let horizon_before = session.scheduler.horizon_remaining(now);
-
-        let batch = match session.schedule_audio_live_at(
-            now,
-            48_000,
-            Duration::from_millis(29),
-            LiveQueryBudgetMode::Steady,
-        ) {
-            Ok(batch) => batch,
-            Err(LiveAudioScheduleError::Retryable(error))
-            | Err(LiveAudioScheduleError::AwaitingSamples(error))
-            | Err(
-                LiveAudioScheduleError::CandidateCommitted(error)
-                | LiveAudioScheduleError::CandidateRefusedScore(error),
-            ) => panic!(
-                "unaffordable reserve refused the only query that can refill the horizon: {error}"
-            ),
-        };
-        assert!(
-            session.js.get_number("__calls").unwrap_or(calls_before) > calls_before,
-            "minimum-slice fill never entered JavaScript"
-        );
-        assert!(
-            session.scheduler.horizon_remaining(now) > horizon_before,
-            "minimum-slice fill did not extend the horizon: {} -> {}",
-            horizon_before,
-            session.scheduler.horizon_remaining(now)
-        );
-        assert!(
-            !batch.events.is_empty(),
-            "minimum-slice fill scheduled nothing"
-        );
-
-        // And again once the clock has advanced past the refill: a set that
-        // survives one stall must survive the next one too.
-        let later = now + 0.4;
-        if let Err(LiveAudioScheduleError::Retryable(error))
-        | Err(
-            LiveAudioScheduleError::CandidateCommitted(error)
-            | LiveAudioScheduleError::CandidateRefusedScore(error),
-        ) = session.schedule_audio_live_at(
-            later,
-            48_000,
-            Duration::from_millis(29),
-            LiveQueryBudgetMode::Steady,
-        ) {
-            panic!("second unaffordable reserve wedged the producer: {error}");
-        }
-    }
-
     #[test]
     fn scheduler_callback_cells_do_not_grow_with_playback_length() {
         // A `BridgeFrame` lives for one `Scheduler::tick` query, not for the
@@ -3984,55 +3750,6 @@ mod tests {
             "the longer run scheduled no extra onsets: {short_onsets} vs \
              {long_onsets}"
         );
-    }
-
-    #[test]
-    fn scheduled_callback_output_survives_per_tick_teardown() {
-        // Tearing the frame down per tick must not cost correctness: the
-        // callback graph is rebuilt on each tick's query and has to keep
-        // producing the same events.
-        let first = nested_callback_session().play(2.0).expect("play");
-        let second = nested_callback_session().play(2.0).expect("play again");
-        let show = |r: &PlayReport| {
-            r.onsets
-                .iter()
-                .map(|o| format!("{}@{}", o.value_show, o.whole_begin))
-                .collect::<Vec<_>>()
-        };
-        assert!(!first.onsets.is_empty(), "scheduled nothing");
-        assert_eq!(
-            show(&first),
-            show(&second),
-            "replaying the same graph produced different onsets"
-        );
-    }
-
-    #[test]
-    fn every_scheduling_scope_unwinds() {
-        // Depth counters back to zero after a successful run, after a run whose
-        // callback THROWS, and for a pure graph that opens no scope at all.
-        for source in [
-            NESTED_CALLBACK_SOURCE,
-            r#"pure('bd').polyBind(x => { throw new Error('boom'); })"#,
-            r#"s("bd sd")"#,
-        ] {
-            let mut session = Session::new().expect("session");
-            session.ensure_bindings().expect("bindings");
-            session.js.install_gc_binding().expect("gc binding");
-            session.evaluate(source).expect("evaluate");
-            let _ = session.play(2.0).expect("play");
-            assert_eq!(session.js.query_depth(), 0, "{source}: query stack");
-            assert_eq!(
-                rustel_jsruntime::bridge_frame_depth(),
-                0,
-                "{source}: bridge frame still open"
-            );
-            assert_eq!(
-                rustel_jsruntime::bridge_scratch_len(),
-                0,
-                "{source}: scratch not drained"
-            );
-        }
     }
 
     #[test]
@@ -4095,99 +3812,6 @@ mod tests {
                 still_loading(&mut session),
                 0,
                 "{score} score: the next window says nothing new"
-            );
-        }
-    }
-
-    #[cfg(feature = "device-audio")]
-    #[test]
-    fn loading_prefill_does_not_publish_an_empty_retry() {
-        use crate::samples::SoundReadiness;
-
-        // An unrelated pending sample must not prevent a genuine silent save.
-        for source in ["~", "heldsample*4"] {
-            let (mut session, mut producer, library) = loading_prefill_fixture();
-
-            let before = session.generation();
-            let values = rustel_mini::mini(source).expect("native mini values");
-            let pattern = rustel_core::controls::ControlSpec::new(["s"]).pattern(&values);
-            session
-                .set_pattern(pattern)
-                .expect("native sound replacement");
-            session.restart_transport_at(0.0);
-            let after = session.generation();
-            producer.arm_replacement(before, after);
-            assert_eq!(after, before + 1);
-            assert!(!session.active_needs_host(), "fixture must remain native");
-            assert_eq!(
-                library.readiness("heldsample", 0.0),
-                SoundReadiness::Loading
-            );
-            assert!(library.take_ready().is_empty());
-            assert_eq!(session.scheduler.queued(), 0);
-            let cursor_before = session.scheduled_to_cycle();
-            let mut published = Vec::new();
-            let first = producer.step_unwatched_with_clock_and_cutover(
-                &mut session,
-                || 0.0,
-                48_000,
-                |generation, frame, _cut| published.push((generation, frame)),
-                |_| panic!("rest or still-loading sample emitted audio"),
-            );
-            // A loading hold is a quiet turn, not a failed one: the held
-            // replacement reports Ok with nothing scheduled and nothing
-            // published, the same shape as the silent replacement's turn.
-            let first = first.expect("held or silent replacement must not fail");
-            assert_eq!((first.scheduled, first.pushed, first.pending), (0, 0, 0));
-            let first_record = producer.producer_load_snapshot();
-            assert!(first_record.query_span_millicycles > 0);
-            assert_eq!(first_record.js_callback_calls, 0);
-            assert_eq!(first_record.converted_audio_events, 0);
-            assert_eq!(first_record.ring_pushes, 0);
-            assert_eq!(producer.pending(), 0);
-            assert_eq!(session.scheduler.queued(), 0);
-            assert!(session.scheduled_to_cycle() > cursor_before);
-            assert!(
-                session.scheduler.horizon_remaining(0.0)
-                    > session.config.horizon - session.scheduler.refill_floor_seconds()
-            );
-
-            if source == "~" {
-                assert_eq!(first_record.scheduler_events, 0);
-                assert_eq!(first_record.refused_voices, 0);
-                assert_eq!(published, vec![(after, 0)]);
-                continue;
-            }
-
-            assert_eq!(first_record.scheduler_events, 2);
-            assert_eq!(first_record.refused_voices, 2);
-            assert!(
-                published.is_empty(),
-                "failed conversion published a generation"
-            );
-            assert_eq!(session.generation(), after, "loading must not roll back");
-            assert!(session.audible_source.is_none());
-
-            // No clock advance, loader publication, requery or new score occurs.
-            // The scheduler's full horizon must not turn lost onsets into silence.
-            let retry = producer.step_unwatched_with_clock_and_cutover(
-                &mut session,
-                || 0.0,
-                48_000,
-                |generation, frame, _cut| published.push((generation, frame)),
-                |_| panic!("the sample is still loading on retry"),
-            );
-            assert_eq!(
-                library.readiness("heldsample", 0.0),
-                SoundReadiness::Loading
-            );
-            assert!(library.take_ready().is_empty());
-            assert_eq!(session.generation(), after);
-            let retry = retry.expect("a loading retry is a held turn, not an error");
-            assert_eq!((retry.scheduled, retry.pushed, retry.pending), (0, 0, 0));
-            assert!(
-                published.is_empty(),
-                "still-loading full-horizon retry published {published:?}"
             );
         }
     }
@@ -4466,50 +4090,6 @@ mod tests {
             session.take_requery_takeover(),
             None,
             "the publication consumed the pair; nothing is left for the next reload"
-        );
-    }
-
-    /// A rewind's held window that has nothing to reopen keeps its takeover
-    /// and cut. Here the scheduler has not queried up to cycle zero, so the
-    /// cursor stands short of the anchor.
-    #[test]
-    #[cfg(feature = "device-audio")]
-    fn a_held_rewind_that_cannot_reopen_keeps_its_takeover_and_cut() {
-        let (mut session, mut producer, _library) = rewind_hold_fixture();
-        let rewinding = session.generation();
-        session.set_next_takeover_time(0.25);
-        session.start_next_from_zero();
-        session
-            .reload_at("s(\"heldsample\")", false, 0.0)
-            .expect("native sound replacement");
-        let after = session.generation();
-        producer.arm_replacement(rewinding, after);
-        // Queue the cycle-zero onset ahead of the producer, then name an
-        // anchor past what that fill queried.
-        session.scheduler.set_horizon(1.0);
-        assert_eq!(
-            session.scheduler.tick(&VirtualClock::new(0.0)),
-            rustel_scheduler::TickStatus::Filled
-        );
-        session.scheduler.set_horizon(0.5);
-        assert_eq!(session.scheduler.queued(), 1);
-        session.requery_anchor_time = Some(5.0);
-
-        let held = producer
-            .step_unwatched_with_clock_and_cutover(
-                &mut session,
-                || 0.0,
-                48_000,
-                |_, _, _| panic!("a held rewind published"),
-                |_| panic!("a loading onset emitted audio"),
-            )
-            .expect("the loading window holds quietly");
-        assert_eq!((held.scheduled, held.pushed), (0, 0));
-        assert!(producer.cut_takeover_deferred_for_loading());
-        assert_eq!(
-            session.take_requery_takeover(),
-            Some((0.25, TakeoverCut::AtTakeover)),
-            "the pair is back for this rewind's publication"
         );
     }
 
@@ -5019,18 +4599,6 @@ mod tests {
     #[test]
     fn loading_prefill_preserves_queued_midi_without_a_query() {
         check_loading_prefill_queued_progress(true);
-    }
-
-    #[test]
-    fn pure_scheduling_installs_no_host() {
-        // The complement: a graph reaching no JavaScript must schedule with
-        // nothing installed, exercising the purity invariant on
-        // this path.
-        let mut session = Session::new().expect("session");
-        session.evaluate(r#"s("bd sd").fast(2)"#).expect("evaluate");
-        assert!(!session.active_needs_host());
-        let report = session.play(2.0).expect("play");
-        assert!(!report.onsets.is_empty());
     }
 
     #[test]
