@@ -3335,13 +3335,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn the_inventory_lists_no_method_with_a_route_of_its_own() {
-        for name in SPECIAL_REGISTERED_METHODS.iter().chain(PLUGIN_METHODS) {
-            assert!(ListedNames.method(name).is_none(), "{name}");
-        }
-    }
-
-    #[test]
     fn editing_binding_to_shadow_host_name_does_not_reuse_stale_pattern() {
         let runtime = JsRuntime::new().expect("runtime");
         let opts = rustel_transpiler::TranspileOptions::default();

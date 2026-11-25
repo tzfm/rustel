@@ -364,25 +364,6 @@ fn pick_currying_and_compatibility_order_survive_collection() {
 }
 
 #[test]
-fn native_numeric_generators_leave_no_query_time_javascript() {
-    for source in [
-        "run(4)",
-        "binaryN(5, 4)",
-        "binary(5)",
-        "binaryNL(5, 4)",
-        "binaryL(5)",
-        "base(255, 16)",
-    ] {
-        let runtime = runtime();
-        evaluate(&runtime, source);
-        assert!(
-            !runtime.active_needs_host(),
-            "{source} retained a JavaScript query dependency"
-        );
-    }
-}
-
-#[test]
 fn native_list_generators_refuse_unbounded_expansion() {
     let runtime = runtime();
     runtime

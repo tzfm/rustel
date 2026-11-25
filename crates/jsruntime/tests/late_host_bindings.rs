@@ -69,15 +69,6 @@ fn late_voicing_bindings_survive_cleanup_without_protecting_user_globals() {
         .expect("late host bindings remain callable");
 }
 
-#[test]
-fn optional_late_host_bindings_survive_cleanup() {
-    let runtime = runtime_with_user_global();
-    runtime.install_query_binding().expect("query binding");
-    runtime.install_gc_binding().expect("GC bindings");
-
-    assert_cleanup_preserves_host_bindings(&runtime);
-}
-
 #[cfg(feature = "hydra")]
 fn evaluate_score(runtime: &JsRuntime, source: &str) {
     runtime

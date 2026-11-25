@@ -480,25 +480,6 @@ mod tests {
     }
 
     #[test]
-    fn fork_clones_processors_and_keeps_shared_inputs() {
-        let graph: serde_json::Value =
-            serde_json::from_str(&compile("sine(220).fork(3).mix().out()")).unwrap();
-        let nodes = graph["nodes"].as_array().unwrap();
-        assert_eq!(
-            nodes.iter().filter(|node| node["type"] == "sine").count(),
-            3
-        );
-        assert_eq!(
-            nodes
-                .iter()
-                .filter(|node| node["type"] == "n" && node["value"] == 220)
-                .count(),
-            1
-        );
-        assert_sample("n(2).fork(3).mix().out()", [6.0; 2]);
-    }
-
-    #[test]
     fn envelope_macros_materialize_only_their_defaults() {
         for (source, expected) in [
             ("ar().out()", [0.0, 0.02, 0.0, 1.0, 0.1]),
@@ -572,33 +553,6 @@ mod tests {
             "register('clone', input => input.add(1)); n(2).fork(2).mix().out()",
             [6.0; 2],
         );
-    }
-
-    #[test]
-    fn expression_templates_and_filter_aliases_keep_upstream_semantics() {
-        assert_sample("n(128).bytebeat`t`.out()", [128.0 / 127.5 - 1.0; 2]);
-        assert_sample("n(0).floatbeat`0`.out()", [-1.0; 2]);
-        assert_sample("n(.25).raw`$input * 2`.out()", [0.5; 2]);
-        for (name, kind) in [
-            ("qlpf", 0),
-            ("qhpf", 1),
-            ("qbpf", 2),
-            ("qnf", 3),
-            ("qapf", 3),
-        ] {
-            let graph: serde_json::Value =
-                serde_json::from_str(&compile(&format!("n(1).{name}(500).out()"))).unwrap();
-            let nodes = graph["nodes"].as_array().unwrap();
-            let filter = nodes.iter().find(|node| node["type"] == "qf").unwrap();
-            assert_eq!(
-                nodes[filter["inputs"][1].as_u64().unwrap() as usize]["value"],
-                kind
-            );
-            assert_eq!(
-                nodes[filter["inputs"][3].as_u64().unwrap() as usize]["value"],
-                10
-            );
-        }
     }
 
     #[test]

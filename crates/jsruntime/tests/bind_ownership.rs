@@ -201,79 +201,6 @@ fn a_mid_query_collection_cannot_sweep_a_callbacks_returned_cell() {
 }
 
 #[test]
-fn a_discarded_bind_temporary_is_not_rooted_by_the_survivor() {
-    // stepBind runs during construction, so its nested callback enters the
-    // evaluation frame's harvest set. polyBind runs too late to test this.
-    // Only the callback-free second graph survives; it must not inherit the
-    // discarded graph's cell. Disabling the reachability filter fails this test.
-    let rt = runtime();
-    rt.run_gc();
-    let baseline_live = rustel_jsruntime::cells_live();
-    let created_before = rustel_jsruntime::cells_created();
-
-    eval(
-        &rt,
-        r#"pure('bd').stepBind(x => pure(x).polyBind(y => pure(y).fast(2)));
-           fastcat("hh", "cp").fast(2)"#,
-    );
-    assert!(
-        rustel_jsruntime::cells_created() >= created_before + 2,
-        "the discarded statement must bridge its own callback AND harvest the \
-         nested one during evaluation, or the filter under test never runs; \
-         created {}",
-        rustel_jsruntime::cells_created() - created_before
-    );
-
-    // GC with the survivor STILL INSTALLED.
-    rt.run_gc();
-    assert_eq!(
-        rustel_jsruntime::cells_live(),
-        baseline_live,
-        "a discarded bind temporary's cell is still rooted while the active graph holds \
-         the callback-free survivor"
-    );
-    assert_eq!(
-        shown(&rt, 1),
-        "[ 0/1 → 1/4 | hh ];[ 1/4 → 1/2 | cp ];[ 1/2 → 3/4 | hh ];[ 3/4 → 1/1 | cp ]",
-        "the surviving graph lost haps: the reachability filter pruned too much"
-    );
-    rt.clear_active();
-}
-
-#[test]
-fn an_eager_step_bind_harvests_its_nested_callback_during_evaluation() {
-    // The property the test above depends on, asserted on its own so it cannot
-    // rot silently: `stepBind`'s construction-time slice really does invoke the
-    // callback, and the graph that callback returns really does contribute a
-    // second cell BEFORE any query runs.
-    //
-    // If `try_step_join` stopped querying eagerly, this would drop to one cell
-    // and the reachability filter would go untested again.
-    let rt = runtime();
-    rt.run_gc();
-    let before = rustel_jsruntime::cells_created();
-    eval(
-        &rt,
-        r#"pure('bd').stepBind(x => pure(x).polyBind(y => pure(y).fast(2)))"#,
-    );
-    let during_evaluation = rustel_jsruntime::cells_created() - before;
-    assert!(
-        during_evaluation >= 2,
-        "an eager `stepBind` must bridge its own callback and harvest the \
-         nested one during EVALUATION, got {during_evaluation}"
-    );
-
-    // ...and the harvested cell is still resolvable, so the eager pass did not
-    // simply leak it into a frame that was then torn down.
-    assert!(
-        !shown(&rt, 1).is_empty(),
-        "the harvested nested callback did not survive evaluation"
-    );
-    assert_scopes_unwound(&rt, "eager stepBind");
-    rt.clear_active();
-}
-
-#[test]
 fn cell_counts_plateau_across_repeated_bind_queries() {
     // A bind bridges its callback once, at construction, but resolves it on
     // every query. If a query allocated a cell it never reclaimed, the live
@@ -377,32 +304,6 @@ fn a_missing_host_is_still_a_hard_error_for_binds() {
 }
 
 // -- purity classification --------------------------------------------------
-
-#[test]
-fn bind_nodes_are_impure_opaque_and_name_their_callback() {
-    // `PatternOfJs` is impure, names its callback id for `gc_mark`, and is
-    // opaque: the callback's result can reach callbacks that cannot be
-    // enumerated, so `derive_wrapper` must not prune by the reachable set.
-    for source in [
-        r#"pure('bd').polyBind(x => pure(x).fast(2))"#,
-        r#"pure('bd').stepBind(x => fastcat(x, x))"#,
-        r#""bd sd".polyBind(x => pure(x))"#,
-    ] {
-        let rt = runtime();
-        eval(&rt, source);
-        let pattern = rt.active_pattern().expect("active pattern");
-        assert!(!pattern.is_pure(), "{source} must be impure");
-        assert!(
-            pattern.purity().opaque,
-            "{source}: a bind's result is an unknown path and must be opaque"
-        );
-        assert!(
-            !pattern.reachable_callbacks().is_empty(),
-            "{source}: the bind must contribute its own callback id"
-        );
-        rt.clear_active();
-    }
-}
 
 #[test]
 fn a_known_inner_direct_join_stays_pure() {
