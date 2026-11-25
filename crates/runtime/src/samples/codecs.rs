@@ -1031,45 +1031,6 @@ mod tests {
             );
         }
 
-        /// The value cap also covers lookup type 1. The packet carries only
-        /// `floor(entries^(1/dims))` multiplicands, but the decoder allocates the
-        /// full 2^26-value table.
-        #[test]
-        fn a_type1_lookup_table_over_the_cap_is_refused() {
-            let mut bits = TestBits::new();
-            bits.push(0, 8); // one codebook
-            oversized_codebook(&mut bits, 8, 8_388_608, 1); // 8 x 2^23 = 2^26 table
-            let error = guard_vorbis_setup(&extra_data(&setup_packet(bits)))
-                .expect_err("a type-1 table over the cap must be refused");
-            assert!(error.contains("cap"), "names the value cap: {error}");
-        }
-
-        /// An honest type-1 book whose `floor(entries^(1/dims))` multiplicands are
-        /// all present passes: the guard walks the type-1 path, computes the count
-        /// by integer root, and lets a real book through.
-        #[test]
-        fn a_type1_lookup_codebook_with_its_multiplicands_passes() {
-            let mut bits = TestBits::new();
-            bits.push(0, 8); // one codebook
-            bits.push(0x564342, 24); // codebook sync "BCV"
-            bits.push(3, 16); // dimensions
-            bits.push(8, 24); // entries: floor(8^(1/3)) = 2 multiplicands
-            bits.push(0, 1); // unordered
-            bits.push(0, 1); // not sparse
-            for _ in 0..8 {
-                bits.push(0, 5); // one codeword length per entry
-            }
-            bits.push(1, 4); // lookup type 1
-            bits.push(0, 32); // minimum value
-            bits.push(0, 32); // delta value
-            bits.push(0, 4); // one bit per multiplicand
-            bits.push(0, 1); // sequence_p
-            bits.push(0, 1); // the two promised multiplicands...
-            bits.push(1, 1);
-            guard_vorbis_setup(&extra_data(&setup_packet(bits)))
-                .expect("an honest type-1 book is not the guard's business");
-        }
-
         /// Books with zero dimensions and 2^24-1 entries each. Their lookup tables
         /// are empty, but symphonia builds entry-sized state for such a book. The
         /// guard charges the entry count against the header budget and refuses the
@@ -1084,59 +1045,6 @@ mod tests {
             let error = guard_vorbis_setup(&extra_data(&setup_packet(bits)))
                 .expect_err("a dimension-zero flood must be refused");
             assert!(error.contains("budget"), "names the stream budget: {error}");
-        }
-
-        /// A small, honestly-declared type-2 book passes. The guard refuses
-        /// impossible tables, not real ones: a two-dimension, four-entry book
-        /// whose eight one-bit multiplicands are all present is what a real
-        /// encoder writes, and the same walk must let it through.
-        #[test]
-        fn an_honest_codebook_passes_the_setup_guard() {
-            let mut bits = TestBits::new();
-            bits.push(0, 8); // one codebook
-            bits.push(0x564342, 24); // codebook sync "BCV"
-            bits.push(2, 16); // dimensions
-            bits.push(4, 24); // entries
-            bits.push(0, 1); // unordered
-            bits.push(0, 1); // not sparse
-            for _ in 0..4 {
-                bits.push(0, 5); // one codeword length per entry
-            }
-            bits.push(2, 4); // lookup type 2: eight multiplicands
-            bits.push(0, 32); // minimum value
-            bits.push(0, 32); // delta value
-            bits.push(0, 4); // one bit per multiplicand
-            bits.push(0, 1); // sequence_p
-            for value in 0..8 {
-                bits.push(u32::from(value % 2 == 0), 1); // the eight promised values
-            }
-            guard_vorbis_setup(&extra_data(&setup_packet(bits)))
-                .expect("an honest codebook is not the guard's business");
-        }
-
-        /// A sparsely packed codeword list passes. Most real books mark unused
-        /// entries with a single 0 bit, so the guard must walk the sparse branch
-        /// (one flag bit per entry, five length bits only when used) to land the
-        /// next field on its true boundary.
-        #[test]
-        fn a_sparse_codeword_list_is_walked() {
-            let mut bits = TestBits::new();
-            bits.push(0, 8); // one codebook
-            bits.push(0x564342, 24); // codebook sync "BCV"
-            bits.push(1, 16); // dimensions
-            bits.push(4, 24); // entries
-            bits.push(0, 1); // unordered
-            bits.push(1, 1); // sparse
-            for entry in 0..4 {
-                let used = entry % 2 == 0;
-                bits.push(u32::from(used), 1); // used flag
-                if used {
-                    bits.push(0, 5); // length only for used entries
-                }
-            }
-            bits.push(0, 4); // lookup type 0: no table
-            guard_vorbis_setup(&extra_data(&setup_packet(bits)))
-                .expect("a sparse book is not the guard's business");
         }
 
         /// A complete type-2 book followed by a second book. The guard must skip

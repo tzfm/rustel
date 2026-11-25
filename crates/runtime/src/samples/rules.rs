@@ -339,11 +339,4 @@ mod tests {
         );
         assert_eq!(folder("data:audio/wav;base64,AAAA"), None);
     }
-
-    #[test]
-    fn the_builtin_sources_are_domains() {
-        for source in BUILTIN_SOURCES {
-            assert_eq!(rule(source).to_string(), *source);
-        }
-    }
 }

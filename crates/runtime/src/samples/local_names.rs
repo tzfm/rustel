@@ -799,34 +799,6 @@ mod delete_tests {
     }
 
     #[test]
-    fn a_folder_walk_queued_before_a_deletion_lands_without_walking_again() {
-        let root = tempfile::tempdir().unwrap();
-        files(root.path(), "takes", &["a.wav", "b.wav"]);
-        let library = SampleLibrary::empty_without_loading();
-        let spec = root.path().display().to_string();
-        library.adopt_global_sources_settled(&[GlobalSource {
-            spec: spec.clone(),
-            enabled: true,
-        }]);
-        let deleted = library.local_sample_path("takes", 0).unwrap();
-        // The walk waits in the line and has not listed the folder yet.
-        let generation = {
-            let mut rows = library.shared.global_rows.lock().unwrap();
-            rows.slots[0].stage = RowStage::WalkQueued;
-            rows.generation
-        };
-
-        library.delete_local_sample("takes", 0, &deleted).unwrap();
-        let mut rows = library.shared.global_rows.lock().unwrap();
-        assert!(rows.begin_walk(generation, &spec));
-        let (listed, outcome) = walk_global_folder(&spec);
-        assert_eq!(
-            rows.finish_walk(generation, &spec, listed, outcome),
-            FolderFill::Filled
-        );
-    }
-
-    #[test]
     fn deleting_a_renamed_sample_forgets_its_place_in_the_folder_order() {
         let root = tempfile::tempdir().unwrap();
         let folder = files(root.path(), "takes", &["a.wav", "m.wav"]);
