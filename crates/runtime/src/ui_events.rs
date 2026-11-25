@@ -59,6 +59,12 @@ pub const MAX_UI_LAYOUT_VISUALS: usize = 64;
 /// complete set without accepting an unbounded score-authored allocation.
 pub const MAX_UI_LAYOUT_SLIDERS: usize = 64;
 
+/// Maximum lanes listed in one layout snapshot.
+pub const MAX_UI_LAYOUT_LANES: usize = 64;
+
+/// Current schema version of the object nested below `ui_control_ack`.
+pub const UI_CONTROL_ACK_PROTOCOL_VERSION: u16 = 1;
+
 /// Maximum raw JavaScript option bytes retained for one visual call.
 pub const MAX_UI_LAYOUT_OPTIONS_BYTES: usize = 4 * 1024;
 
@@ -115,6 +121,62 @@ impl UiLayoutEnvelope {
     }
 }
 
+/// One lane of the active score, matching the `lane` id on scheduled events.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct UiLane {
+    pub id: u32,
+    pub label: String,
+    pub line: u32,
+}
+
+impl UiLane {
+    fn validate(&self, index: usize) -> Result<(), UiLayoutValidationError> {
+        if self.label.len() > MAX_UI_LAYOUT_ID_BYTES {
+            return Err(UiLayoutValidationError::InvalidLaneLabel {
+                index,
+                bytes: self.label.len(),
+            });
+        }
+        Ok(())
+    }
+}
+
+/// Truncate a lane label to the protocol byte ceiling on a valid UTF-8 boundary.
+pub(crate) fn truncate_lane_label(label: &str) -> &str {
+    if label.len() <= MAX_UI_LAYOUT_ID_BYTES {
+        return label;
+    }
+    let mut end = MAX_UI_LAYOUT_ID_BYTES;
+    while end > 0 && !label.is_char_boundary(end) {
+        end -= 1;
+    }
+    &label[..end]
+}
+
+/// Extract bounded lane metadata in source order from score text.
+pub fn lanes_in_source(source: &str) -> Vec<UiLane> {
+    let Some(statements) = rustel_transpiler::lane_statements(source) else {
+        return Vec::new();
+    };
+    statements
+        .into_iter()
+        .take(MAX_UI_LAYOUT_LANES)
+        .enumerate()
+        .map(|(index, statement)| {
+            let label = if statement.label.len() > MAX_UI_LAYOUT_ID_BYTES {
+                truncate_lane_label(&statement.label).to_owned()
+            } else {
+                statement.label
+            };
+            UiLane {
+                id: index as u32,
+                label,
+                line: u32::try_from(statement.line).unwrap_or(u32::MAX),
+            }
+        })
+        .collect()
+}
+
 /// Revision-gated layout metadata. It contains no evaluated values and no
 /// renderer state, so clients can replace the complete snapshot on reload.
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
@@ -126,6 +188,8 @@ pub struct UiLayout {
     #[serde(default)]
     pub sliders: Vec<UiSlider>,
     pub mini_locations: Vec<(usize, usize)>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub lanes: Vec<UiLane>,
 }
 
 impl UiLayout {
@@ -143,9 +207,17 @@ impl UiLayout {
             visuals,
             sliders,
             mini_locations,
+            lanes: Vec::new(),
         };
         layout.validate()?;
         Ok(layout)
+    }
+
+    /// Attach validated lane metadata to this layout.
+    pub fn with_lanes(mut self, lanes: Vec<UiLane>) -> Result<Self, UiLayoutValidationError> {
+        self.lanes = lanes;
+        self.validate()?;
+        Ok(self)
     }
 
     pub fn validate(&self) -> Result<(), UiLayoutValidationError> {
@@ -165,6 +237,9 @@ impl UiLayout {
                 self.mini_locations.len(),
             ));
         }
+        if self.lanes.len() > MAX_UI_LAYOUT_LANES {
+            return Err(UiLayoutValidationError::TooManyLanes(self.lanes.len()));
+        }
         for (index, visual) in self.visuals.iter().enumerate() {
             visual.validate(index)?;
         }
@@ -175,6 +250,9 @@ impl UiLayout {
             if start >= end {
                 return Err(UiLayoutValidationError::InvalidMiniLocation { index, start, end });
             }
+        }
+        for (index, lane) in self.lanes.iter().enumerate() {
+            lane.validate(index)?;
         }
         Ok(())
     }
@@ -340,6 +418,11 @@ pub enum UiLayoutValidationError {
         end: usize,
         source_bytes: usize,
     },
+    TooManyLanes(usize),
+    InvalidLaneLabel {
+        index: usize,
+        bytes: usize,
+    },
 }
 
 impl fmt::Display for UiLayoutValidationError {
@@ -413,6 +496,14 @@ impl fmt::Display for UiLayoutValidationError {
             } => write!(
                 formatter,
                 "UI layout range {index} ends at byte {end}, beyond the {source_bytes}-byte score"
+            ),
+            Self::TooManyLanes(count) => write!(
+                formatter,
+                "UI layout has {count} lanes; maximum is {MAX_UI_LAYOUT_LANES}"
+            ),
+            Self::InvalidLaneLabel { index, bytes } => write!(
+                formatter,
+                "UI layout lane {index} label has {bytes} bytes; maximum is {MAX_UI_LAYOUT_ID_BYTES}"
             ),
         }
     }
@@ -493,6 +584,16 @@ pub fn visual_layout(
     generation: u64,
 ) -> Result<UiLayoutEnvelope, UiLayoutValidationError> {
     visual_layout_with_live_numbers(source, generation, &[])
+}
+
+/// Build [`visual_layout`] with explicit lane metadata supplied by the session.
+pub fn visual_layout_with_lanes(
+    source: &str,
+    generation: u64,
+    lanes: Vec<UiLane>,
+) -> Result<UiLayoutEnvelope, UiLayoutValidationError> {
+    let envelope = visual_layout_with_live_numbers(source, generation, &[])?;
+    Ok(UiLayoutEnvelope::new(envelope.ui_layout.with_lanes(lanes)?))
 }
 
 /// The layout's sliders with the live numbers past the cap left out, so a
@@ -639,7 +740,8 @@ pub fn visual_layout_with_live_numbers(
         visuals,
         sliders,
         output.mini_locations,
-    )?;
+    )?
+    .with_lanes(lanes_in_source(source))?;
     for (index, visual) in layout.visuals.iter().enumerate() {
         if visual.to > source.len() {
             return Err(UiLayoutValidationError::SourceRangeOutsideScore {
@@ -1076,6 +1178,12 @@ pub struct UiScheduledEvent {
     /// the protocol.
     #[serde(skip)]
     pub sample: Option<TraceSampleWalk>,
+    /// Stable score lane id when opt-in lane tracking is active.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lane: Option<u32>,
+    /// Sound or sample name (`s` or `sound` control), bounded to `MAX_UI_EVENT_VALUE_BYTES`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sound: Option<String>,
     #[serde(default, skip_serializing_if = "is_zero")]
     pub ui_visuals: u64,
     /// Absolute UTF-8 byte ranges in the evaluated source.
@@ -1110,6 +1218,12 @@ impl UiScheduledEvent {
             frequency_hz: trace.frequency_hz,
             gain: trace.gain,
             sample: trace.sample,
+            lane: trace.lane,
+            sound: trace
+                .sound
+                .as_ref()
+                .filter(|sound| sound.len() <= MAX_UI_EVENT_VALUE_BYTES)
+                .cloned(),
             ui_visuals: trace.ui_visuals,
             context: trace
                 .context
@@ -1149,6 +1263,10 @@ impl UiScheduledEvent {
             frequency_hz: trace.frequency_hz,
             gain: trace.gain,
             sample: trace.sample,
+            lane: trace.lane,
+            sound: trace
+                .sound
+                .filter(|sound| sound.len() <= MAX_UI_EVENT_VALUE_BYTES),
             ui_visuals: trace.ui_visuals,
             context,
         };
@@ -1180,6 +1298,7 @@ impl UiScheduledEvent {
             ("color", &self.color),
             ("label", &self.label),
             ("active_label", &self.active_label),
+            ("sound", &self.sound),
         ] {
             if let Some(text) = text
                 && text.len() > MAX_UI_EVENT_VALUE_BYTES
@@ -1719,10 +1838,44 @@ struct UiEventSinkCounters {
     orphaned_dropped_events: AtomicU64,
 }
 
+/// Acknowledgement emitted for an inbound `ui_control` command that supplied a
+/// `request` identifier.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct UiControlAckEnvelope {
+    pub ui_control_ack: UiControlAck,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct UiControlAck {
+    pub version: u16,
+    pub request: String,
+    pub accepted: bool,
+    pub generation: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
+}
+
+impl UiControlAckEnvelope {
+    pub fn new(request: String, accepted: bool, generation: u64, message: Option<String>) -> Self {
+        Self {
+            ui_control_ack: UiControlAck {
+                version: UI_CONTROL_ACK_PROTOCOL_VERSION,
+                request,
+                accepted,
+                generation,
+                message,
+            },
+        }
+    }
+}
+
 #[derive(Debug)]
 enum UiEventWrite {
     Envelope(UiEventEnvelope),
-    Layout(UiLayoutEnvelope),
+    // Boxed so the bounded channel and its error recovery stay compact for all
+    // variants (onsets, acks, and traces).
+    Layout(Box<UiLayoutEnvelope>),
+    ControlAck(UiControlAckEnvelope),
     Traces {
         device_time: f64,
         cycle: f64,
@@ -1854,7 +2007,12 @@ impl UiEventSink {
     /// consumer progress. Validation and JSON serialization happen on the
     /// same background thread as onset records.
     pub fn try_send_layout(&self, layout: UiLayoutEnvelope) -> UiEventSendStatus {
-        self.try_send_write(UiEventWrite::Layout(layout))
+        self.try_send_write(UiEventWrite::Layout(Box::new(layout)))
+    }
+
+    /// Queue a control acknowledgement without waiting on the consumer.
+    pub fn try_send_control_ack(&self, ack: UiControlAckEnvelope) -> UiEventSendStatus {
+        self.try_send_write(UiEventWrite::ControlAck(ack))
     }
 
     /// Try to queue a layout while returning ownership when the queue cannot
@@ -1863,8 +2021,8 @@ impl UiEventSink {
     pub fn try_send_layout_recover(
         &self,
         layout: UiLayoutEnvelope,
-    ) -> Result<(), (UiEventSendStatus, UiLayoutEnvelope)> {
-        match self.try_send_write_recover(UiEventWrite::Layout(layout)) {
+    ) -> Result<(), (UiEventSendStatus, Box<UiLayoutEnvelope>)> {
+        match self.try_send_write_recover(UiEventWrite::Layout(Box::new(layout))) {
             Ok(()) => Ok(()),
             Err((status, UiEventWrite::Layout(layout))) => Err((status, layout)),
             Err(_) => unreachable!("layout send returned a different record kind"),
@@ -2121,8 +2279,9 @@ fn write_control_record(
                 counters.invalid_records.fetch_add(1, Ordering::Relaxed);
                 return true;
             }
-            serialize_record(&layout, counters)
+            serialize_record(layout.as_ref(), counters)
         }
+        UiEventWrite::ControlAck(ack) => serialize_record(&ack, counters),
         UiEventWrite::Traces {
             device_time,
             cycle,
@@ -2344,6 +2503,8 @@ mod tests {
             frequency_hz: None,
             gain: None,
             sample: None,
+            lane: None,
+            sound: None,
             ui_visuals: 0,
             context: vec![(4, 8), (11, 13)],
         }
@@ -3533,7 +3694,7 @@ unknown(slider(440, 20, 20000));"#;
             .try_send_layout_recover(pending.clone())
             .expect_err("full queue accepted layout");
         assert_eq!(status, UiEventSendStatus::DroppedFull);
-        assert_eq!(recovered, pending);
+        assert_eq!(*recovered, pending);
 
         let (release_lock, wake) = &*released;
         *release_lock.lock().expect("release lock") = true;
@@ -3593,7 +3754,7 @@ unknown(slider(440, 20, 20000));"#;
     fn timeout_race_takes_a_queued_layout_before_published_audio() {
         let (sender, receiver) = mpsc::sync_channel(1);
         sender
-            .try_send(UiEventWrite::Layout(layout()))
+            .try_send(UiEventWrite::Layout(Box::new(layout())))
             .expect("queue layout");
         let latest_audio = Mutex::new(Some(UiAudioWrite::Envelope(audio())));
         let mut control = Vec::new();
@@ -3939,5 +4100,40 @@ unknown(slider(440, 20, 20000));"#;
             ..sample
         };
         assert_eq!(walk(muted).map(|walk| walk.rate), Some(0.0), "speed(0)");
+    }
+
+    #[test]
+    fn lane_metadata_and_control_acks_roundtrip_over_ui_sink() {
+        let source = "drums: s(\"bd sd\")\nbass: note(\"c2 g1\").s(\"sawtooth\")";
+        let lanes = lanes_in_source(source);
+        assert_eq!(lanes.len(), 2);
+        assert_eq!(lanes[0].label, "drums");
+        assert_eq!(lanes[0].line, 1);
+        assert_eq!(lanes[1].label, "bass");
+        assert_eq!(lanes[1].line, 2);
+
+        let envelope = visual_layout_with_lanes(source, 4, lanes.clone()).expect("layout");
+        envelope.validate().expect("valid layout with lanes");
+        assert_eq!(envelope.ui_layout.lanes, lanes);
+
+        let writer = SharedWriter::default();
+        let captured = Arc::clone(&writer.0);
+        let sink = UiEventSink::with_writer(4, writer).expect("sink");
+        assert_eq!(sink.try_send_layout(envelope), UiEventSendStatus::Queued);
+        assert_eq!(
+            sink.try_send_control_ack(UiControlAckEnvelope::new("req-1".into(), true, 4, None,)),
+            UiEventSendStatus::Queued
+        );
+        sink.finish().expect("writer finished");
+
+        let text = String::from_utf8(captured.lock().expect("output").clone()).expect("utf-8");
+        let lines: Vec<serde_json::Value> = text
+            .lines()
+            .map(|line| serde_json::from_str(line).expect("valid JSON"))
+            .collect();
+        assert_eq!(lines.len(), 2);
+        assert_eq!(lines[0]["ui_layout"]["lanes"][0]["label"], "drums");
+        assert_eq!(lines[1]["ui_control_ack"]["request"], "req-1");
+        assert_eq!(lines[1]["ui_control_ack"]["accepted"], true);
     }
 }

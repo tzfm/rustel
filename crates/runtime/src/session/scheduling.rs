@@ -592,6 +592,60 @@ impl Session {
         self.scheduler.set_trace_enabled(enabled);
     }
 
+    /// Opt in to tagging each score lane's haps with its stable lane id.
+    /// Disabled by default so ordinary playback and exports pay no cost.
+    pub fn set_lane_tracking_enabled(&mut self, enabled: bool) {
+        self.js.set_lane_tagging(enabled);
+    }
+
+    /// Whether score evaluations tag haps with their lane id.
+    pub fn lane_tracking_enabled(&self) -> bool {
+        self.js.lane_tagging()
+    }
+
+    /// Active non-destructive per-lane overrides applied at scheduling.
+    pub fn lane_controls(&self) -> &rustel_scheduler::LaneControls {
+        self.scheduler.lane_controls()
+    }
+
+    /// Solo one lane or pass `None` to clear solo. Returns `true` if changed.
+    pub fn set_lane_solo(&mut self, lane: Option<u32>) -> bool {
+        self.scheduler.lane_controls_mut().set_solo(lane)
+    }
+
+    /// Mute or unmute one lane. Returns `true` if changed.
+    pub fn set_lane_mute(&mut self, lane: u32, muted: bool) -> bool {
+        self.scheduler.lane_controls_mut().set_mute(lane, muted)
+    }
+
+    /// Set a semitone transpose override for one lane (`0` clears). Returns
+    /// `true` if changed.
+    pub fn set_lane_transpose(&mut self, lane: u32, semitones: i16) -> bool {
+        self.scheduler
+            .lane_controls_mut()
+            .set_transpose(lane, semitones)
+    }
+
+    /// Clear all per-lane solo, mute, and transpose overrides.
+    pub fn clear_lane_controls(&mut self) -> bool {
+        self.scheduler.lane_controls_mut().clear()
+    }
+
+    /// Active lanes of the playing score with the exact lane ids tagged onto
+    /// scheduled events.
+    pub fn active_ui_lanes(&self) -> Vec<crate::ui_events::UiLane> {
+        #[cfg(feature = "vst")]
+        {
+            let lanes = self.lanes.ui_lanes();
+            if !lanes.is_empty() {
+                return lanes;
+            }
+        }
+        self.active_source()
+            .map(crate::ui_events::lanes_in_source)
+            .unwrap_or_default()
+    }
+
     /// Drain accepted onsets waiting for an editor/visualizer client.
     pub fn take_schedule_trace_events(&mut self) -> Vec<rustel_scheduler::ScheduleTraceEvent> {
         self.scheduler.take_trace_events()
@@ -5390,5 +5444,93 @@ mod tests {
             chained == plain,
             "the chain of 384 frames changes the samples"
         );
+    }
+
+    #[test]
+    fn opt_in_lane_tracking_tags_events_and_respects_lane_controls() {
+        let score = "$: s(\"bd\").note(60)\n$: s(\"sawtooth\").note(67)";
+        let mut session = Session::new().expect("session");
+        // Off by default: events carry no lane tag.
+        session.set_schedule_trace_enabled(true);
+        session.evaluate(score).expect("evaluate default");
+        session
+            .schedule_through(0.0, 0.5)
+            .expect("schedule default");
+        let mut untagged = Vec::new();
+        session.drain_schedule_trace_events_into(&mut untagged);
+        assert!(!untagged.is_empty());
+        assert!(untagged.iter().all(|event| event.lane.is_none()));
+
+        // Turn on opt-in lane tracking and re-evaluate on a fresh timeline.
+        session.set_lane_tracking_enabled(true);
+        session.evaluate(score).expect("evaluate tagged");
+        session.restart_transport_at(0.0);
+        let lanes = session.active_ui_lanes();
+        assert_eq!(lanes.len(), 2);
+        let first_lane = lanes[0].id;
+        let second_lane = lanes[1].id;
+        assert_ne!(first_lane, second_lane);
+
+        session.schedule_through(0.0, 0.5).expect("schedule tagged");
+        let mut tagged = Vec::new();
+        session.drain_schedule_trace_events_into(&mut tagged);
+        let seen_lanes: Vec<u32> = tagged.iter().filter_map(|event| event.lane).collect();
+        assert!(
+            seen_lanes.contains(&first_lane),
+            "expected first_lane={first_lane} in seen_lanes={seen_lanes:?}, lanes={lanes:?}"
+        );
+        assert!(
+            seen_lanes.contains(&second_lane),
+            "expected second_lane={second_lane} in seen_lanes={seen_lanes:?}, lanes={lanes:?}"
+        );
+        assert!(
+            tagged
+                .iter()
+                .any(|event| event.sound.as_deref() == Some("bd"))
+        );
+        assert!(
+            tagged
+                .iter()
+                .any(|event| event.sound.as_deref() == Some("sawtooth"))
+        );
+
+        // Solo second lane and transpose +5 semitones.
+        session.set_lane_solo(Some(second_lane));
+        assert!(session.set_lane_transpose(second_lane, 5));
+        session
+            .requery_active_at(0.0)
+            .expect("requery after lane control");
+        let solo_onsets = session.schedule_through(0.0, 0.5).expect("schedule solo");
+        let mut solo_traces = Vec::new();
+        session.drain_schedule_trace_events_into(&mut solo_traces);
+        assert!(!solo_traces.is_empty());
+        assert!(
+            solo_traces
+                .iter()
+                .all(|event| event.lane == Some(second_lane))
+        );
+        assert!(solo_onsets.iter().all(|onset| {
+            matches!(
+                &onset.value,
+                ValueJson::Raw(serde_json::Value::Object(map))
+                    if map.get("note").and_then(serde_json::Value::as_f64) == Some(72.0)
+            )
+        }));
+
+        // Verify the JS evaluation tier also tags lanes consistently.
+        session.clear_lane_controls();
+        let js_score = "const notes = [60, 64];\n$: s(\"bd\").note(notes[0])\n$: s(\"sawtooth\").note(notes[1])";
+        session.evaluate(js_score).expect("evaluate JS score");
+        session.restart_transport_at(0.0);
+        let js_lanes = session.active_ui_lanes();
+        assert_eq!(js_lanes.len(), 2);
+        session
+            .schedule_through(0.0, 0.5)
+            .expect("schedule JS tagged");
+        let mut js_traces = Vec::new();
+        session.drain_schedule_trace_events_into(&mut js_traces);
+        let js_seen: Vec<u32> = js_traces.iter().filter_map(|event| event.lane).collect();
+        assert!(js_seen.contains(&js_lanes[0].id));
+        assert!(js_seen.contains(&js_lanes[1].id));
     }
 }

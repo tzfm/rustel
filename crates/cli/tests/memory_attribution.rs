@@ -955,6 +955,8 @@ fn tui_visual_timeline_stays_bounded() {
                 frequency_hz: None,
                 gain: Some(1.0),
                 sample: None,
+                lane: None,
+                sound: None,
                 ui_visuals: 1,
                 context: vec![(0, 2)],
             });

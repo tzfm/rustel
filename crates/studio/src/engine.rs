@@ -603,7 +603,9 @@ impl StudioDiagnostic {
 /// replaceable and may simply be discarded by a full receiver.
 #[derive(Clone, Debug, PartialEq)]
 pub enum StudioUpdate {
-    Layout(UiLayoutEnvelope),
+    // Boxed so the channel and nonblocking send errors stay small across
+    // frequent trace and audio updates.
+    Layout(Box<UiLayoutEnvelope>),
     Traces(UiTraceBatchRequest),
     Audio {
         metadata: UiAudioMetadata,

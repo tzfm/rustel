@@ -404,6 +404,9 @@ pub struct JsRuntime {
     /// Whether score JavaScript may have run since the last check for a
     /// native panic it caught. See [`JsRuntime::raise_caught_native_panic`].
     pub(super) script_may_have_run: Cell<bool>,
+    /// Whether score evaluations tag each lane's haps with its lane id.
+    /// Off by default so ordinary playback and exports pay zero overhead.
+    pub(super) lane_tagging: Cell<bool>,
 }
 
 /// Effects staged by a successful Session-owned JavaScript score or setup.

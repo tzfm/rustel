@@ -70,6 +70,7 @@ pub(super) fn run_musician(
         &input.sample_access,
     )?)?;
     session.set_direct_diagnostic_logging(output.structured());
+    session.set_lane_tracking_enabled(ui_events);
     // Only a replay sets `anchored`. A replay plays each save at its time
     // on the tape.
     #[cfg(all(feature = "vst", feature = "device-audio"))]
@@ -246,23 +247,49 @@ pub(super) fn build_live_producer(
     )
 }
 
-#[cfg(feature = "device-audio")]
+#[cfg(all(test, feature = "device-audio"))]
 pub(super) fn observe_ui_layout_if_audible(
     delivery: &mut UiLayoutDelivery,
     source: &str,
     session_generation: u64,
     audible_generation: u64,
 ) -> Result<bool, rustel_runtime::ui_events::UiLayoutValidationError> {
-    if session_generation != audible_generation {
-        return Ok(false);
-    }
-    delivery.observe(source, session_generation)
+    observe_ui_layout_if_audible_with_lanes(
+        delivery,
+        source,
+        Vec::new(),
+        session_generation,
+        audible_generation,
+    )
 }
 
 #[cfg(feature = "device-audio")]
+pub(super) fn observe_ui_layout_if_audible_with_lanes(
+    delivery: &mut UiLayoutDelivery,
+    source: &str,
+    lanes: Vec<rustel_runtime::ui_events::UiLane>,
+    session_generation: u64,
+    audible_generation: u64,
+) -> Result<bool, rustel_runtime::ui_events::UiLayoutValidationError> {
+    if session_generation != audible_generation {
+        return Ok(false);
+    }
+    delivery.observe_with_lanes(source, session_generation, lanes)
+}
+
+#[cfg(all(test, feature = "device-audio"))]
 pub(super) fn read_ui_controls(
+    reader: impl std::io::Read,
+    pending: &std::sync::Mutex<std::collections::BTreeMap<String, UiSliderControl>>,
+) {
+    read_ui_controls_with_commands(reader, pending, None);
+}
+
+#[cfg(feature = "device-audio")]
+pub(super) fn read_ui_controls_with_commands(
     mut reader: impl std::io::Read,
     pending: &std::sync::Mutex<std::collections::BTreeMap<String, UiSliderControl>>,
+    commands: Option<&std::sync::mpsc::SyncSender<UiDiscreteControl>>,
 ) {
     let mut chunk = [0u8; 4096];
     let mut line = Vec::with_capacity(1024);
@@ -300,18 +327,28 @@ pub(super) fn read_ui_controls(
                     if line.last() == Some(&b'\r') {
                         line.pop();
                     }
-                    if let Ok(envelope) = serde_json::from_slice::<UiSliderControlEnvelope>(&line)
-                        && envelope.ui_control.wire_valid()
+                    if let Ok(envelope) = serde_json::from_slice::<UiControlEnvelope>(&line)
+                        && let Some(parsed) = envelope.ui_control.into_validated()
                     {
-                        let control = envelope.ui_control;
-                        let mut pending_guard = match pending.lock() {
-                            Ok(guard) => guard,
-                            Err(poisoned) => poisoned.into_inner(),
-                        };
-                        if pending_guard.contains_key(&control.id)
-                            || pending_guard.len() < MAX_PENDING_UI_SLIDERS
-                        {
-                            pending_guard.insert(control.id.clone(), control);
+                        match parsed {
+                            ParsedUiControl::Slider(control) => {
+                                let mut pending_guard = match pending.lock() {
+                                    Ok(guard) => guard,
+                                    Err(poisoned) => poisoned.into_inner(),
+                                };
+                                if pending_guard.contains_key(&control.id)
+                                    || pending_guard.len() < MAX_PENDING_UI_SLIDERS
+                                {
+                                    pending_guard.insert(control.id.clone(), control);
+                                }
+                            }
+                            ParsedUiControl::Discrete(command) => {
+                                if let Some(tx) = commands {
+                                    // Bounded backpressure: drop when the queue is full
+                                    // rather than blocking stdin reads or growing memory.
+                                    let _ = tx.try_send(command);
+                                }
+                            }
                         }
                     }
                 }
@@ -326,6 +363,130 @@ pub(super) fn read_ui_controls(
                 }
             }
         }
+    }
+}
+
+#[cfg(feature = "device-audio")]
+pub(super) struct UiDiscreteApplyOutcome {
+    pub(super) ack: Option<rustel_runtime::ui_events::UiControlAckEnvelope>,
+    pub(super) needs_requery: bool,
+}
+
+#[cfg(feature = "device-audio")]
+pub(super) fn apply_ui_discrete_control(
+    session: &mut Session,
+    layout: &UiLayoutDelivery,
+    command: UiDiscreteControl,
+    clock_seconds: f64,
+    schedule_lead_seconds: f64,
+    corrective_generation: Option<u64>,
+) -> UiDiscreteApplyOutcome {
+    let UiDiscreteControl {
+        kind,
+        generation: expected_generation,
+        source_revision: expected_revision,
+        request,
+    } = command;
+    let make_ack =
+        |request: Option<String>, accepted: bool, message: Option<String>, generation: u64| {
+            request.map(|request| {
+                rustel_runtime::ui_events::UiControlAckEnvelope::new(
+                    request, accepted, generation, message,
+                )
+            })
+        };
+
+    if let Some(expected_gen) = expected_generation {
+        let gen_ok =
+            expected_gen == session.generation() || corrective_generation == Some(expected_gen);
+        let delivered_ok = layout.delivered_generation == Some(expected_gen)
+            || corrective_generation == Some(expected_gen);
+        if !gen_ok || !delivered_ok {
+            return UiDiscreteApplyOutcome {
+                ack: make_ack(
+                    request,
+                    false,
+                    Some("stale generation".into()),
+                    session.generation(),
+                ),
+                needs_requery: false,
+            };
+        }
+    }
+    if let Some(expected_rev) = expected_revision.as_deref()
+        && layout.source_revision.as_deref() != Some(expected_rev)
+    {
+        return UiDiscreteApplyOutcome {
+            ack: make_ack(
+                request,
+                false,
+                Some("stale source revision".into()),
+                session.generation(),
+            ),
+            needs_requery: false,
+        };
+    }
+
+    let (accepted, needs_requery, message) = match kind {
+        UiDiscreteControlKind::LaneSolo { lane } => {
+            session.set_lane_solo(lane);
+            (true, true, None)
+        }
+        UiDiscreteControlKind::LaneMute { lane, muted } => {
+            if session.set_lane_mute(lane, muted) {
+                (true, true, None)
+            } else {
+                (false, false, Some("lane control limit reached".into()))
+            }
+        }
+        UiDiscreteControlKind::LaneTranspose { lane, semitones } => {
+            if !(-48..=48).contains(&semitones) {
+                (
+                    false,
+                    false,
+                    Some("semitones must be within -48..=48".into()),
+                )
+            } else if session.set_lane_transpose(lane, semitones) {
+                (true, true, None)
+            } else {
+                (false, false, Some("lane control limit reached".into()))
+            }
+        }
+        UiDiscreteControlKind::Tempo { cps, bpm } => {
+            let target_cps = match (cps, bpm) {
+                (Some(cps), None) => Some(cps),
+                (None, Some(bpm)) => Some(bpm / 240.0),
+                _ => None,
+            };
+            match target_cps {
+                Some(cps) if cps.is_finite() && cps > 0.0 && cps <= MAX_UI_CONTROL_CPS => {
+                    let cycle = session.cycle_at_time(clock_seconds);
+                    session.retime(clock_seconds, cps, cycle);
+                    (true, true, None)
+                }
+                _ => (
+                    false,
+                    false,
+                    Some("provide a single positive finite cps or bpm".into()),
+                ),
+            }
+        }
+        UiDiscreteControlKind::Transport { action } => match action {
+            UiTransportAction::Stop => {
+                session.transport().stop();
+                (true, false, None)
+            }
+            UiTransportAction::Restart => {
+                let anchor = clock_seconds + schedule_lead_seconds.max(0.0);
+                session.restart_transport_at(anchor);
+                (true, true, None)
+            }
+        },
+    };
+
+    UiDiscreteApplyOutcome {
+        ack: make_ack(request, accepted, message, session.generation()),
+        needs_requery,
     }
 }
 
@@ -1431,10 +1592,15 @@ pub(super) fn play_live(
         None
     };
     session.set_schedule_trace_enabled(ui_events_enabled);
+    session.set_lane_tracking_enabled(ui_events_enabled);
     let mut ui_layout_delivery = UiLayoutDelivery::default();
     if ui_events_enabled
         && let Some(source) = session.active_source()
-        && let Err(error) = ui_layout_delivery.observe(source, session.generation())
+        && let Err(error) = ui_layout_delivery.observe_with_lanes(
+            source,
+            session.generation(),
+            session.active_ui_lanes(),
+        )
     {
         output.event(
             LiveDetail::Essential,
@@ -1450,7 +1616,7 @@ pub(super) fn play_live(
     }
     if let Some(sink) = ui_sink.as_ref() {
         ui_layout_delivery.try_deliver(|layout| {
-            sink.try_send_layout_recover(layout)
+            sink.try_send_layout_recover(*layout)
                 .map_err(|(_, layout)| layout)
         });
     }
@@ -2029,10 +2195,10 @@ pub(super) fn play_live(
         if pending_ui_control_cutover.is_some() && corrective_generation.is_none() {
             pending_ui_control_cutover = None;
         }
-        // stdin is parsed and coalesced on a separate bounded reader, but the
-        // QuickJS cell mutation happens here on the sole Session/producer
-        // thread. No control path can run on or wait for the audio callback.
-        let mut slider_changed = false;
+        // stdin is parsed and coalesced on a separate bounded reader, but
+        // Session mutations happen here on the sole Session/producer thread.
+        // No control path can run on or wait for the audio callback.
+        let mut control_changed = false;
         let mut slider_runtime_failure: Option<String> = None;
         if let Some(controls) = ui_controls.as_ref() {
             for control in controls.drain() {
@@ -2045,18 +2211,34 @@ pub(super) fn play_live(
                     ))
                 });
                 match applied {
-                    Ok(UiSliderApplyStatus::Applied) => slider_changed = true,
+                    Ok(UiSliderApplyStatus::Applied) => control_changed = true,
                     Ok(UiSliderApplyStatus::RuntimeFailed(message)) => {
                         // The client stays silent per protocol v1, but the
                         // operator must learn that a drag did not take.
                         slider_runtime_failure.get_or_insert(message);
                     }
                     Err(error) => {
-                        slider_changed = false;
+                        control_changed = false;
                         slider_runtime_failure.get_or_insert(error.to_string());
                         break;
                     }
                     _ => {}
+                }
+            }
+            for command in controls.drain_commands() {
+                let outcome = apply_ui_discrete_control(
+                    session,
+                    &ui_layout_delivery,
+                    command,
+                    device.clock_seconds(),
+                    device.schedule_lead_seconds(),
+                    corrective_generation,
+                );
+                if outcome.needs_requery {
+                    control_changed = true;
+                }
+                if let (Some(ack), Some(sink)) = (outcome.ack, ui_sink.as_ref()) {
+                    let _ = sink.try_send_control_ack(ack);
                 }
             }
         }
@@ -2078,7 +2260,7 @@ pub(super) fn play_live(
         } else if slider_runtime_failure.is_none() {
             last_slider_runtime_error = None;
         }
-        if slider_changed {
+        if control_changed {
             match session.requery_active_at(device.clock_seconds()) {
                 Ok(Some((generation_before, generation_after))) => {
                     producer.arm_control_requery(generation_before, generation_after);
@@ -2575,9 +2757,11 @@ pub(super) fn play_live(
                     ));
                 }
                 if let Some(source) = session.active_source() {
-                    match observe_ui_layout_if_audible(
+                    let lanes = session.active_ui_lanes();
+                    match observe_ui_layout_if_audible_with_lanes(
                         &mut ui_layout_delivery,
                         source,
+                        lanes,
                         session_generation,
                         audible_generation,
                     ) {
@@ -2626,7 +2810,7 @@ pub(super) fn play_live(
             // Keep retrying it while an unpublished candidate is prefetched.
             if let Some(sink) = ui_sink.as_ref() {
                 ui_layout_delivery.try_deliver(|layout| {
-                    sink.try_send_layout_recover(layout)
+                    sink.try_send_layout_recover(*layout)
                         .map_err(|(_, layout)| layout)
                 });
             }

@@ -50,6 +50,9 @@ pub(crate) enum BuiltinMethod {
     /// `layer` or `superimpose`, given transformers: a stack of what each
     /// one makes of the receiver, with or without the receiver itself.
     Layer { keep_original: bool },
+    /// A distortion shortcut such as `diode`, given its algorithm: an
+    /// amount and an optional volume.
+    Distort(&'static str),
 }
 
 impl BuiltinMethod {
@@ -152,6 +155,13 @@ impl BuiltinMethod {
                     )
                 }
             },
+            Self::Distort(algorithm) => match arguments {
+                [amount] => distort_with_algorithm(receiver, amount.take()?, None, algorithm),
+                [amount, volume] => {
+                    distort_with_algorithm(receiver, amount.take()?, volume.take(), algorithm)
+                }
+                _ => return None,
+            },
             Self::Pick { .. } | Self::Visual | Self::Layer { .. } => return None,
         })
     }
@@ -207,6 +217,7 @@ impl BuiltinMethod {
                     rustel_core::compose::default_alignment(),
                 )
             }
+            Self::Distort(algorithm) => distort_arguments(receiver, arguments, algorithm)?,
             Self::Pick { .. } | Self::Visual | Self::Layer { .. } => return None,
         })
     }
@@ -328,9 +339,42 @@ impl BuiltinMethod {
                 // The accessor reads the default alignment when it is called.
                 Some(FunctionRef::compose(name, other, op, None, provable_pure))
             }
+            Self::Distort(algorithm) => {
+                let algorithm = *algorithm;
+                let provable_pure = arguments.as_slice().iter().all(Pattern::is_pure);
+                let (amount, volume) = match arguments {
+                    MethodArgs::One(amount) => (amount, None),
+                    MethodArgs::Two([amount, volume]) => (amount, Some(volume)),
+                    MethodArgs::Zero | MethodArgs::Many(_) => return None,
+                };
+                Some(FunctionRef::registered(
+                    name,
+                    std::sync::Arc::new(move |pattern| {
+                        distort_with_algorithm(pattern, amount.clone(), volume.clone(), algorithm)
+                    }),
+                    provable_pure,
+                ))
+            }
             Self::Pick { .. } | Self::Visual | Self::Layer { .. } => None,
         }
     }
+}
+
+/// What a distortion shortcut builds from one or two arguments. `None` for
+/// any other count, which the script tier owns.
+fn distort_arguments(
+    receiver: Pattern,
+    arguments: crate::MethodArgs,
+    algorithm: &'static str,
+) -> Option<Pattern> {
+    use crate::MethodArgs;
+    Some(match arguments {
+        MethodArgs::One(amount) => distort_with_algorithm(receiver, amount, None, algorithm),
+        MethodArgs::Two([amount, volume]) => {
+            distort_with_algorithm(receiver, amount, Some(volume), algorithm)
+        }
+        MethodArgs::Zero | MethodArgs::Many(_) => return None,
+    })
 }
 
 /// A global that a score can use without JavaScript.
@@ -675,6 +719,7 @@ impl BuiltinMethod {
             Self::Layer { keep_original } => {
                 format!("layer {}", if *keep_original { "over" } else { "alone" })
             }
+            Self::Distort(algorithm) => format!("distort {algorithm}"),
         })
     }
 
@@ -715,6 +760,9 @@ impl BuiltinMethod {
             ("layer", Some("alone"), None) => Self::Layer {
                 keep_original: false,
             },
+            ("distort", Some(algorithm), None) => {
+                Self::Distort(DISTORTIONS.into_iter().find(|known| *known == algorithm)?)
+            }
             _ => return None,
         })
     }

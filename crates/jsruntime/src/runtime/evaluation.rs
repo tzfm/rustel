@@ -697,7 +697,7 @@ impl JsRuntime {
                 runtime,
                 enabled: stage_candidate,
             };
-            let frame = BridgeFrame::evaluation(alloc);
+            let frame = BridgeFrame::evaluation(alloc, self.lane_tagging.get());
             let _scope = BridgeScope::push(&frame);
             rustel_core::with_callback_host(self, || {
                 let lane_host =
