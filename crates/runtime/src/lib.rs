@@ -160,8 +160,9 @@ pub use render::{
     write_silent_wav,
 };
 pub use rustel_audio::TakeoverCut;
-pub use rustel_jsruntime::forget_mini_literals;
+pub use rustel_jsruntime::{forget_mini_literals, outline_node_is_native};
 pub use rustel_scheduler::LaneControls;
+pub use rustel_transpiler::{OutlineForm, OutlineNode, outline};
 pub use samples::{
     BUILTIN_SOURCES, DEFAULT_VIDEO_FILE_BYTES, LOCAL_FILES, MAX_VIDEO_FILE_BYTES,
     SCORE_SAMPLE_CACHE_MAX_BYTES, SCORE_SAMPLE_CACHE_MAX_ENTRIES,

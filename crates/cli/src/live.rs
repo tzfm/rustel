@@ -3637,18 +3637,16 @@ pub(super) fn play(
 /// What evaluated the score in play, as a live event names it: `native`
 /// for a score that needs no JavaScript, `script` for one that the script
 /// engine runs. `None` before the first score.
+#[cfg(feature = "device-audio")]
 fn score_engine_name(session: &Session) -> Option<&'static str> {
-    session.score_engine().map(|engine| match engine {
-        rustel_runtime::ScoreEngine::Native => "native",
-        rustel_runtime::ScoreEngine::Script { .. } => "script",
-    })
+    session
+        .score_engine()
+        .map(rustel_runtime::ScoreEngine::name)
 }
 
 /// The line of the score in play that needs the script engine, when the
 /// session knows it.
+#[cfg(feature = "device-audio")]
 fn script_line(session: &Session) -> Option<usize> {
-    match session.score_engine()? {
-        rustel_runtime::ScoreEngine::Script { line } => line,
-        rustel_runtime::ScoreEngine::Native => None,
-    }
+    session.score_engine()?.script_line()
 }

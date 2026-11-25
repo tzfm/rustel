@@ -71,7 +71,7 @@ pub use runtime::*;
 pub use surface::effects::{MIDI_INPUT_SCOPE_POLICY, TEMPO_SCOPE_POLICY};
 pub use surface::patterns::forget_mini_literals;
 use surface::*;
-pub use surface::{native_global, native_method};
+pub use surface::{native_global, native_method, outline_node_is_native};
 use thread_state::*;
 use value::*;
 

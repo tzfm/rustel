@@ -244,6 +244,24 @@ pub enum ScoreEngine {
     Script { line: Option<usize> },
 }
 
+impl ScoreEngine {
+    /// Name used in reports and JSON events: `"native"` or `"script"`.
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Native => "native",
+            Self::Script { .. } => "script",
+        }
+    }
+
+    /// The 1-based line that needed the script engine, when known.
+    pub const fn script_line(self) -> Option<usize> {
+        match self {
+            Self::Native => None,
+            Self::Script { line } => line,
+        }
+    }
+}
+
 /// The kind of a refusal when the library has not finished loading the
 /// sound.
 ///

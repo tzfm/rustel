@@ -4,7 +4,7 @@
 
 ## v0.1.9
 
-- Studio: View ▸ Score outline shows the score as a tree.
+- Score outline and engine reporting: Studio View ▸ Score outline, and `rustel check` (with `--outline` and `--json`).
 - `rustel lsp --stdio` for editors, `rustel doc --all` for the full reference, and lane controls over `--ui-events`.
 - Studio can delete the last open score of a set, and marks empty scores with `○`.
 - A stopped Studio closes its idle audio output after 30 seconds, which frees its memory.

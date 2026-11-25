@@ -11,7 +11,7 @@ use ratatui::{
     style::{Modifier, Style},
     widgets::Widget,
 };
-use rustel_transpiler::{OutlineForm, OutlineNode};
+use rustel_transpiler::OutlineNode;
 
 use super::editor::Revision;
 use super::scenes::SceneId;
@@ -161,13 +161,7 @@ impl OutlinePanel {
 /// Whether the native tier can take `node`. A call is native when the
 /// score binds its name or the native tier lists it.
 pub fn native(node: &OutlineNode) -> bool {
-    match &node.form {
-        OutlineForm::Read => true,
-        OutlineForm::Script => false,
-        OutlineForm::Call { bound: true, .. } => true,
-        OutlineForm::Call { name, .. } => rustel_jsruntime::native_global(name),
-        OutlineForm::Method { name } => rustel_jsruntime::native_method(name),
-    }
+    rustel_runtime::outline_node_is_native(node)
 }
 
 /// The column's rooms: its rule, title, body and hint rows.
