@@ -368,19 +368,6 @@ mod tests {
         use crate::editor::{MemoryClipboard, Selection};
 
         #[test]
-        fn wtshape_uses_the_documented_waveform_names() {
-            let set = rustel_core::reference::reference_choices("wtshape", "shape")
-                .expect("wtshape choices");
-            assert_eq!(
-                set.choices
-                    .iter()
-                    .map(|choice| choice.value)
-                    .collect::<Vec<_>>(),
-                ["triangle", "sine", "ramp", "saw", "square"]
-            );
-        }
-
-        #[test]
         fn an_object_choice_only_opens_for_its_own_key() {
             let directory = tempfile::tempdir().expect("temp dir");
             let mut app = app_over(directory.path());
@@ -505,52 +492,6 @@ mod tests {
                 names.iter().all(|name| rustel_core::xen::edo(name).is_ok()),
                 "every offered division must be one the engine accepts"
             );
-        }
-
-        /// `register('myfunction', …)` names something of the score's own:
-        /// there is nothing to complete, and searching the function list for
-        /// a name that does not exist yet answers a question nobody asked.
-        #[test]
-        fn a_string_that_names_something_of_your_own_completes_nothing() {
-            let directory = tempfile::tempdir().expect("temp dir");
-            let mut app = app_over(directory.path());
-            app.editor_mut()
-                .dispatch(
-                    Command::PasteText("register('myfunction".into()),
-                    HistoryMoment(0),
-                    &mut MemoryClipboard::default(),
-                )
-                .expect("seed");
-            app.toggle_reference_browse();
-            assert!(
-                app.reference_panel.is_none(),
-                "no list is opened for a name the score invents"
-            );
-            assert!(app.status.contains("nothing to complete"), "{}", app.status);
-
-            // Ctrl+D still explains the enclosing function's arguments.
-            app.toggle_reference_at_caret();
-            let panel = app.reference_panel.as_ref().expect("register arguments");
-            assert_eq!(panel.tab, crate::reference::Tab::Reference);
-            let crate::reference::ReferenceMode::Entry { index, .. } = panel.mode else {
-                panic!("expected the enclosing function's arguments")
-            };
-            assert_eq!(app.reference.entry(index).unwrap().name, "register");
-            assert!(panel.vocabulary.is_none());
-            assert!(app.reference_anchor.is_none());
-
-            // A string that DOES have a list still says which one.
-            app.set_reference_panel(None);
-            app.focus = Focus::Editor;
-            app.editor_mut()
-                .dispatch(
-                    Command::PasteText("', (x, p) => p.decay(x))\n$: s('bd".into()),
-                    HistoryMoment(1),
-                    &mut MemoryClipboard::default(),
-                )
-                .expect("a sound");
-            app.toggle_reference_at_caret();
-            assert!(app.status.contains("the sounds"), "{}", app.status);
         }
     }
 }

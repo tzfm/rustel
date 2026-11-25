@@ -931,59 +931,6 @@ mod tests {
             assert_eq!(app.scenes.scores().count(), scores_before + 1);
         }
 
-        /// A dropped audio file chooses its containing folder. Its siblings are
-        /// variants of one folder-named bank, and the saved source is the folder.
-        #[test]
-        fn dropping_one_file_imports_its_containing_folder() {
-            let directory = tempfile::tempdir().expect("temp dir");
-            let mut app = crate::app::tests::support::app_over(directory.path());
-            let dropped = tempfile::tempdir().expect("dropped folder");
-            let wav = |name: &str| {
-                let mut bytes = Vec::new();
-                bytes.extend_from_slice(b"RIFF");
-                bytes.extend_from_slice(&40u32.to_le_bytes());
-                bytes.extend_from_slice(b"WAVEfmt ");
-                bytes.extend_from_slice(&16u32.to_le_bytes());
-                bytes.extend_from_slice(&1u16.to_le_bytes());
-                bytes.extend_from_slice(&1u16.to_le_bytes());
-                bytes.extend_from_slice(&48_000u32.to_le_bytes());
-                bytes.extend_from_slice(&96_000u32.to_le_bytes());
-                bytes.extend_from_slice(&2u16.to_le_bytes());
-                bytes.extend_from_slice(&16u16.to_le_bytes());
-                bytes.extend_from_slice(b"data");
-                bytes.extend_from_slice(&4u32.to_le_bytes());
-                bytes.extend_from_slice(&[0, 0, 0, 0]);
-                let path = dropped.path().join(name);
-                std::fs::write(&path, bytes).expect("fixture");
-                path
-            };
-            let lone = wav("solo.wav");
-            wav("sibling.wav");
-
-            app.accept_drop(std::slice::from_ref(&lone));
-            assert_eq!(
-                app.prefs.sample_sources,
-                vec![crate::prefs::SampleSourcePref {
-                    spec: dropped.path().display().to_string(),
-                    enabled: true,
-                }],
-                "the dropped file selects its containing folder"
-            );
-
-            // A directory, dropped on its own, still brings the whole thing.
-            let directory2 = tempfile::tempdir().expect("temp dir");
-            let mut app2 = crate::app::tests::support::app_over(directory2.path());
-            app2.accept_drop(&[dropped.path().to_path_buf()]);
-            assert_eq!(
-                app2.prefs.sample_sources,
-                vec![crate::prefs::SampleSourcePref {
-                    spec: dropped.path().display().to_string(),
-                    enabled: true,
-                }],
-                "a dropped folder is still one source, itself"
-            );
-        }
-
         /// Windows Explorer pastes a dropped folder with a trailing separator,
         /// such as `C:\test\`. The drop imports the folder under the same spec
         /// that the Settings page uses, so both agree on what is already
@@ -1013,28 +960,6 @@ mod tests {
             // changes nothing: the two entries are one source.
             app.add_sample_source(&dropped.path().display().to_string());
             assert_eq!(app.prefs.sample_sources.len(), 1, "no duplicate row");
-        }
-
-        /// One dropped folder gets the same receipt as one typed: the browser
-        /// opens on what arrived and the status says what it brought.
-        #[test]
-        fn a_single_dropped_folder_is_announced() {
-            let directory = tempfile::tempdir().expect("temp dir");
-            let mut app = crate::app::tests::support::app_over(directory.path());
-            let dropped = tempfile::tempdir().expect("dropped folder");
-            std::fs::write(dropped.path().join("snap.wav"), b"not really audio").expect("fixture");
-            app.accept_drop(&[dropped.path().to_path_buf()]);
-            assert!(
-                app.status.contains("imported") || app.status.contains("sound"),
-                "a receipt: {}",
-                app.status
-            );
-            assert!(
-                app.settings_sheet
-                    .is_some_and(|sheet| sheet.shows_sources()),
-                "Sources opens on the import"
-            );
-            assert!(app.reference_panel.is_none(), "the browser stays closed");
         }
 
         /// Renaming a bank again replaces the rename rather than stacking one

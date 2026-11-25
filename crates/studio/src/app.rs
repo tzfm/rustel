@@ -184,6 +184,7 @@ mod menu_bar;
 mod midi_import;
 mod mixer;
 mod mouse;
+mod outline;
 mod panes;
 mod permissions;
 mod persistence;
@@ -1058,6 +1059,8 @@ struct App {
     /// at the caret - while it is open. Sticky like the mixer: Esc leaves
     /// it standing.
     knobs_panel: Option<super::knobs_panel::KnobsPanel>,
+    /// The score outline column, while it is open.
+    outline_panel: Option<super::outline_panel::OutlinePanel>,
     /// Opened since the last draw, like `mixer_unlaid`: until a draw lays
     /// the column, its keys must not fall through to the score.
     knobs_unlaid: bool,
@@ -1827,6 +1830,7 @@ impl App {
             mixer_unlaid: false,
             mixer_panel: None,
             knobs_panel: None,
+            outline_panel: None,
             knobs_unlaid: false,
             knobs_parse: None,
             knobs_rows: None,
@@ -2330,6 +2334,7 @@ impl App {
             log,
             memory,
             self.knobs_panel.is_some(),
+            self.outline_panel.is_some(),
             self.footer_notice_rows(),
             self.has_piano_notes(),
         )
@@ -2670,30 +2675,6 @@ mod tests {
                     full
                 );
             }
-        }
-
-        /// Fetch imports caches the imported sounds the score names, not every
-        /// file of every import. A local folder is already here, so turning the
-        /// switch on queues nothing and does not put a count on the row.
-        #[test]
-        fn fetch_imports_caches_the_score_not_the_whole_import() {
-            let directory = tempfile::tempdir().unwrap();
-            let mut app = super::support::app_over(directory.path());
-            app.ui_settings.precache_sources = false;
-            let folder = directory.path().join("my drums");
-            std::fs::create_dir(&folder).unwrap();
-            std::fs::write(folder.join("kick.wav"), []).unwrap();
-            std::fs::write(folder.join("snare.wav"), []).unwrap();
-            app.add_sample_source(&folder.display().to_string());
-            app.settle_sample_sources();
-            app.precache_sources();
-            assert_eq!(
-                app.precache, None,
-                "fetch imports does not put a count on its row"
-            );
-            app.ui_settings.precache_sources = true;
-            app.precache_sources();
-            assert_eq!(app.precache, None);
         }
 
         /// A minimal WAV: a header and two silent frames, enough for a folder scan

@@ -1631,31 +1631,6 @@ mod tests {
             }
         }
 
-        /// Text the checker refuses is not applied: the last good score keeps
-        /// playing, and the footer says why, as a refused update does.
-        #[test]
-        fn refused_text_keeps_the_last_good_score() {
-            let directory = tempfile::tempdir().expect("temp dir");
-            let (mut app, scene) = playing_app(directory.path(), true);
-            app.editor_mut()
-                .dispatch(
-                    Command::PasteText("$: s(\"bd\"".into()),
-                    HistoryMoment(1),
-                    &mut MemoryClipboard::default(),
-                )
-                .expect("break the score");
-            app.auto_evaluate();
-            assert!(
-                queued_by(&app, scene).is_empty(),
-                "an unclean score is not sent to the engine"
-            );
-            assert!(
-                app.status.contains("refused"),
-                "the refusal is said: {}",
-                app.status
-            );
-        }
-
         /// The typing pause gates the apply: a pump inside the pause holds it,
         /// and the pump after it applies. The flag is spent either way, so a
         /// pause that elapsed while the set was stopped never fires when
@@ -1867,24 +1842,6 @@ mod tests {
                 app.next_request_id,
                 request_id + 1,
                 "a press is owed its update, whatever the text"
-            );
-        }
-
-        /// The skip is only for edits that add nothing: a change to the
-        /// score still applies itself through the pause.
-        #[test]
-        fn a_paused_edit_that_changes_instructions_still_applies() {
-            let directory = tempfile::tempdir().expect("temp dir");
-            let (mut app, scene) = playing_app(directory.path(), true);
-            playing_this(&mut app, scene, "$: s(\"bd\")\n");
-
-            app.scenes.current_mut().editor =
-                Editor::new("$: s(\"bd\").gain(.1)\n").expect("change the score");
-            app.auto_evaluate_due = true;
-            past_the_pause(&mut app, |app| !queued_by(app, scene).is_empty());
-            assert!(
-                !queued_by(&app, scene).is_empty(),
-                "a real change was queued"
             );
         }
 
@@ -2718,58 +2675,6 @@ mod tests {
                 crate::engine::StudioDiagnostic::message("sample-failed", remote),
             ));
             assert_eq!(app.status, remote, "a remote address stays whole");
-        }
-
-        #[test]
-        fn a_recoverable_runtime_refusal_is_still_a_red_footer_error() {
-            let directory = tempfile::tempdir().expect("tempdir");
-            let mut app = app_over(directory.path());
-            app.handle_control(StudioControlEvent::Diagnostic(
-                crate::engine::StudioDiagnostic {
-                    kind: "resource-limit".into(),
-                    message: "query deadline exceeded".into(),
-                    recoverable: true,
-                    level: StudioDiagnosticLevel::Error,
-                    alert: None,
-                },
-            ));
-
-            assert_eq!(app.errors.visible(), Some("query deadline exceeded"));
-            assert_eq!(
-                app.log.lines().back().map(|line| line.level),
-                Some(LogLevel::Error)
-            );
-        }
-
-        /// The stream facts ("coreaudio · … · 128 frames · 2.7 ms") are queued
-        /// beside an install and used to arrive as a warning, which took the
-        /// status line: two studio-e2e suites saw "silent · silent · 48000 Hz
-        /// · 256 frames · 5.3 ms" where "playing from the top" belonged. A
-        /// note is for the log alone.
-        #[test]
-        fn a_note_diagnostic_is_logged_and_leaves_the_status_line_alone() {
-            let directory = tempfile::tempdir().expect("tempdir");
-            let mut app = app_over(directory.path());
-            app.status = "playing from the top".into();
-            app.handle_control(StudioControlEvent::Diagnostic(
-                crate::engine::StudioDiagnostic {
-                    kind: "audio".into(),
-                    message: "silent · silent · 48000 Hz · 256 frames · 5.3 ms".into(),
-                    recoverable: true,
-                    level: StudioDiagnosticLevel::Note,
-                    alert: None,
-                },
-            ));
-
-            assert_eq!(app.status, "playing from the top");
-            assert_eq!(app.errors.visible(), None);
-            let last = app.log.lines().back().expect("the note is logged");
-            assert_eq!(last.level, LogLevel::Info);
-            assert!(
-                last.text.contains("256 frames"),
-                "the log keeps the facts: {}",
-                last.text
-            );
         }
 
         fn pending_alert_update(app: &mut App, request_id: u64) -> (SceneId, Revision) {

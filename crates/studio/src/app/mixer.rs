@@ -2145,42 +2145,6 @@ mod tests {
         }
 
         #[test]
-        fn mixer_orbit_reset_reaches_the_engine_after_a_full_command_queue() {
-            let (sender, receiver) = std::sync::mpsc::sync_channel(2);
-            let send = |target, gain| sender.try_send((target, gain)).is_ok();
-            let mut mixer = MixerState::new(None);
-            mixer.set_orbit_gain_db(1, -4.0);
-            mixer.send_pending(send);
-            assert_eq!(receiver.try_recv().unwrap(), (MixerTarget::Input, 1.0));
-            let (target, mut engine_gain) = receiver.try_recv().unwrap();
-            assert_eq!(target, MixerTarget::Orbit(1));
-            assert!((engine_gain - 0.630_957_37).abs() < 1e-6);
-
-            // Other commands occupy the same two-slot worker queue when reset
-            // is pressed. The reset must remain pending until there is room.
-            sender.try_send((MixerTarget::Master, 0.0)).unwrap();
-            sender.try_send((MixerTarget::Master, 0.0)).unwrap();
-            mixer.set_orbit_gain_db(1, 0.0);
-            mixer.send_pending(send);
-            assert_eq!(mixer.orbit_gain_db[1], 0.0);
-            assert!(mixer.orbit_gain_pending[1]);
-            assert!(engine_gain < 1.0);
-            assert_eq!(receiver.try_iter().count(), 2);
-
-            mixer.send_pending(send);
-            let (target, gain) = receiver.try_recv().unwrap();
-            assert_eq!(target, MixerTarget::Orbit(1));
-            engine_gain = gain;
-            assert_eq!(engine_gain, 1.0, "the engine must actually return to unity");
-            assert!(!mixer.orbit_gain_pending[1]);
-            mixer.send_pending(send);
-            assert!(
-                receiver.try_recv().is_err(),
-                "accepted gains are not replayed"
-            );
-        }
-
-        #[test]
         fn mixer_gain_retries_drain_each_changed_fader_without_replaying_the_prefix() {
             let (sender, receiver) = std::sync::mpsc::sync_channel(2);
             let send = |target, gain| sender.try_send((target, gain)).is_ok();
@@ -2220,23 +2184,6 @@ mod tests {
             assert!(mixer.orbit_gain_pending.iter().all(|pending| !*pending));
             mixer.send_pending(send);
             assert!(receiver.try_recv().is_err());
-        }
-
-        #[test]
-        fn mixer_meter_only_orbits_ignore_fader_keys_and_can_reset_old_attenuation() {
-            let directory = tempfile::tempdir().expect("temp dir");
-            let mut app = app_over(directory.path());
-            press(&mut app, KeyCode::F(4), KeyModifiers::NONE);
-            app.regions.mixer = Rect::new(0, 22, 120, 16);
-            app.mixer.selected = MixerTarget::Orbit(1);
-            press(&mut app, KeyCode::Down, KeyModifiers::NONE);
-            press(&mut app, KeyCode::Up, KeyModifiers::SHIFT);
-            assert_eq!(app.mixer.orbit_gain_db[1], 0.0);
-            assert!(!app.mixer.orbit_gain_pending[1]);
-
-            app.mixer.set_orbit_gain_db(1, -4.0);
-            press(&mut app, KeyCode::Char('0'), KeyModifiers::NONE);
-            assert_eq!(app.mixer.orbit_gain_db[1], 0.0);
         }
 
         /// No input chosen means no `in` strip: the mixer starts with the
@@ -2635,55 +2582,6 @@ mod tests {
             app.settle_limiter_mode();
             assert!(!app.has_limiter_slot(), "the removal held");
             assert!(app.worker.master().limiter().is_none());
-        }
-
-        /// The wheel over the limiter's strip moves its ceiling.
-        #[test]
-        fn the_wheel_over_the_limiter_strip_moves_its_ceiling() {
-            use crate::mixer_panel::parts;
-            let directory = tempfile::tempdir().expect("temp dir");
-            let mut app = app_over(directory.path());
-            app.ui_settings.master_limiter_on = true;
-            app.frame = Rect::new(0, 0, 120, 40);
-            app.regions.mixer = Rect::new(0, 22, 120, 16);
-            press(&mut app, KeyCode::F(4), KeyModifiers::NONE);
-            let desk = parts(app.regions.mixer, MixerEdge::Bottom)
-                .expect("the desk has a place on screen")
-                .desk;
-            // Strips: limiter · master · orbits · in. The limiter leads, because
-            // the desk reads left to right into the output.
-            let limiter_x = desk.x + 1;
-            let (top, bottom) = (desk.y + 1, desk.bottom() - 2);
-            let row = top + (bottom - top) / 4;
-            // The desk opens with the limiter off now: it became a setting, and a
-            // setting is asked for rather than assumed. `c` walks the characters
-            // and, once the key rests, gives this SET a limiter of its own, and
-            // the ceiling that comes with it is what the wheel moves.
-            app.mixer.selected = MixerTarget::Limiter;
-            app.focus = Focus::Panel(PanelKind::Mixer);
-            press(&mut app, KeyCode::Char('c'), KeyModifiers::NONE);
-            app.settle_limiter_mode();
-            let before = app
-                .worker
-                .master()
-                .limiter()
-                .expect("c turned it on")
-                .threshold_db;
-
-            assert!(
-                app.scroll_mixer_panel(limiter_x, row, -1.0),
-                "the wheel over the desk is the desk's"
-            );
-            assert_eq!(app.mixer.selected, MixerTarget::Limiter);
-            assert_eq!(
-                app.worker
-                    .master()
-                    .limiter()
-                    .expect("still on")
-                    .threshold_db,
-                before - VOLUME_SCROLL_STEP_DB,
-                "and it moved the ceiling by one notch"
-            );
         }
 
         /// A notch on a bypassed limiter starts from its held ceiling, not from

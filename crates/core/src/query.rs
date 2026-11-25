@@ -1455,7 +1455,9 @@ impl<'a> ValueSide<'a> {
         let asked = functions.len() >= REPAYS_FROM
             && self.values.is_discrete()
             && self.reading.of(self.values, state).is_none()
-            && functions.iter().all(|hf| hf.part.begin < hf.part.end);
+            && functions
+                .iter()
+                .all(|hf| hf.part.begin < hf.part.end && part_within_whole(hf));
         let all = asked
             .then(|| {
                 Some(TimeSpan::new(
@@ -4043,7 +4045,12 @@ impl Pattern {
     /// whole, cut, so it is asked over the part alone. Any other graph is
     /// asked over the whole, and so is each graph for a part of no width.
     fn asked_for(&self, whole: TimeSpan, part: TimeSpan) -> TimeSpan {
-        match part != whole && part.begin < part.end && self.is_discrete() {
+        match part != whole
+            && part.begin < part.end
+            && whole.begin <= part.begin
+            && part.end <= whole.end
+            && self.is_discrete()
+        {
             true => part,
             false => whole,
         }
@@ -4200,7 +4207,10 @@ impl Pattern {
         }
         // This graph answers for the part of a hap as for its whole, cut.
         let asked = |hv: &Hap| hv.part;
-        if values.iter().any(|hv| asked(hv).begin >= asked(hv).end) {
+        if values
+            .iter()
+            .any(|hv| asked(hv).begin >= asked(hv).end || !part_within_whole(hv))
+        {
             return false;
         }
         let Some(min_begin) = values.iter().map(|hv| asked(hv).begin).min() else {
@@ -7445,4 +7455,11 @@ fn query_app_both_onto(
     if !ok {
         out.truncate(from);
     }
+}
+
+/// Whether `hap`'s part lies inside its whole, so that a discrete side asked
+/// over the part answers as it does asked over the whole, cut to the part.
+fn part_within_whole(hap: &Hap) -> bool {
+    hap.whole
+        .is_none_or(|whole| whole.begin <= hap.part.begin && hap.part.end <= whole.end)
 }

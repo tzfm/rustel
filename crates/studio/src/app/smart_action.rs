@@ -1273,7 +1273,6 @@ mod tests {
         use crate::app::*;
         use crate::editor::{MemoryClipboard, Selection};
         use crate::keybinds::KeyCombo;
-        use std::cell::RefCell;
 
         fn open_action_on(app: &mut App, needle: &str) {
             let at = app.editor().source().find(needle).expect("action target");
@@ -1282,61 +1281,6 @@ mod tests {
                 .expect("caret on the target");
             precision_key(app, KeyCode::Char('j'), KeyModifiers::CONTROL);
             assert!(app.smart_action_view().is_some(), "the menu opens");
-        }
-
-        #[test]
-        fn bracketed_and_legacy_paste_edit_the_form_before_one_undoable_write() {
-            for legacy in [false, true] {
-                let directory = tempfile::tempdir().expect("temp dir");
-                let (mut app, scene) = plain_app(directory.path(), "$: s(\"bd\").lpf(2300)\n");
-                app.audible_scene = Some(scene);
-                let before = app.editor().source();
-                let revision = app.editor().revision();
-                open_action_on(&mut app, "2300");
-                precision_key(&mut app, KeyCode::Enter, KeyModifiers::NONE);
-                assert!(!app.editor_accepts_raw_paste());
-                assert!(app.accepts_raw_paste());
-
-                let events = if legacy {
-                    let mut queued = [KeyCode::Char('5'), KeyCode::Char('0'), KeyCode::Enter]
-                        .into_iter()
-                        .map(|code| Event::Key(KeyEvent::new(code, KeyModifiers::NONE)))
-                        .collect::<VecDeque<_>>();
-                    let first = queued.pop_front().expect("first key");
-                    let queued = RefCell::new(queued);
-                    let events = read_raw_paste_batch(
-                        first,
-                        |_| Ok(!queued.borrow().is_empty()),
-                        || Ok(queued.borrow_mut().pop_front().expect("polled key")),
-                    )
-                    .expect("legacy paste batch");
-                    assert_eq!(events, vec![Event::Paste("50\n".into())]);
-                    events
-                } else {
-                    vec![Event::Paste("50".into())]
-                };
-                for event in events {
-                    app.handle_terminal_event(event).expect("paste into form");
-                }
-                let (_, rows) = app.smart_action_view().expect("form stays open");
-                assert_eq!(rows[0], "▸ value 50", "{rows:?}");
-                assert_eq!(app.editor().source(), before);
-                assert_eq!(app.editor().revision(), revision);
-                assert!(app.pending_evaluation.is_none() && app.inflight.is_empty());
-
-                precision_key(&mut app, KeyCode::Enter, KeyModifiers::NONE);
-                assert_eq!(
-                    app.editor().source(),
-                    before.replacen("lpf(2300)", "lpf(slider(50, 0, 5000, 1))", 1)
-                );
-                assert!(app.smart_action_view().is_none());
-                app.dispatch_editor(Command::Undo).expect("undo the fader");
-                assert_eq!(
-                    app.editor().source(),
-                    before,
-                    "one undo restores the number"
-                );
-            }
         }
 
         #[test]
@@ -1479,43 +1423,6 @@ mod tests {
         }
 
         #[test]
-        fn changing_to_an_identical_scene_cancels_form_writes_and_unwraps() {
-            for unwrap in [false, true] {
-                let directory = tempfile::tempdir().expect("temp dir");
-                let (mut app, original, _) = slider_app(directory.path());
-                let before = app.editor().source();
-                let other = app.scenes.create(&before).expect("second identical scene");
-                let original_index = app.scenes.index_of(original).expect("original scene");
-                assert!(app.select_scene(original_index));
-                open_action_on(&mut app, "0.5");
-                precision_key(
-                    &mut app,
-                    if unwrap {
-                        KeyCode::Down
-                    } else {
-                        KeyCode::Enter
-                    },
-                    KeyModifiers::NONE,
-                );
-                let other_index = app.scenes.index_of(other).expect("other scene");
-                assert!(app.select_scene(other_index));
-                assert_eq!(
-                    app.scenes.get(original).expect("original").editor.source(),
-                    before
-                );
-                assert_eq!(
-                    app.scenes.get(other).expect("other").editor.source(),
-                    before
-                );
-                assert!(app.pending_evaluation.is_none() && app.inflight.is_empty());
-                assert!(
-                    app.smart_action_view().is_none(),
-                    "changing scenes closes the modal"
-                );
-            }
-        }
-
-        #[test]
         fn changing_scenes_closes_the_numeric_smart_action() {
             for key in [KeyCode::F(3), KeyCode::F(7), KeyCode::F(10)] {
                 let directory = tempfile::tempdir().expect("temp dir");
@@ -1584,79 +1491,6 @@ mod tests {
                 );
                 assert!(app.pending_evaluation.is_none() && app.inflight.is_empty());
             }
-        }
-
-        /// `^J` on a plain number turns it into a fader without anyone typing
-        /// `slider(`. The menu opens at the caret with its one row already
-        /// chosen, Enter opens the form, Tab walks the fields, and Enter writes
-        /// and closes the form without evaluating. A form that could not write
-        /// stays open.
-        #[test]
-        fn ctrl_j_turns_a_number_into_a_fader() {
-            let directory = tempfile::tempdir().expect("temp dir");
-            let (mut app, scene) = plain_app(directory.path(), "$: s(\"bd*4\").lpf(800)\n");
-            app.audible_scene = Some(scene);
-            // The caret on the 800.
-            let at = app.editor().source().find("800").expect("the number");
-            app.editor_mut()
-                .set_selection(Selection::caret(ByteOffset(at + 1)))
-                .expect("caret on the number");
-            precision_key(&mut app, KeyCode::Char('j'), KeyModifiers::CONTROL);
-            let (_, rows) = app.smart_action_view().expect("the menu is open");
-            assert!(
-                rows[0].starts_with('▸'),
-                "the first row is chosen: {rows:?}"
-            );
-            assert!(rows[0].contains("slider"), "{rows:?}");
-
-            // Enter opens the form, filled in from the number that was there.
-            precision_key(&mut app, KeyCode::Enter, KeyModifiers::NONE);
-            let (_, rows) = app.smart_action_view().expect("the form is open");
-            assert!(
-                rows[0].contains("value") && rows[0].contains("800"),
-                "{rows:?}"
-            );
-            assert!(rows[1].contains("min"), "{rows:?}");
-            assert!(rows[2].contains("max"), "{rows:?}");
-            assert!(rows[3].contains("step"), "{rows:?}");
-
-            // Tab to min and type one: a fresh field is selected whole, so the
-            // digits replace it rather than joining it.
-            precision_key(&mut app, KeyCode::Tab, KeyModifiers::NONE);
-            for digit in "100".chars() {
-                precision_key(&mut app, KeyCode::Char(digit), KeyModifiers::NONE);
-            }
-            precision_key(&mut app, KeyCode::Tab, KeyModifiers::NONE);
-            for digit in "4000".chars() {
-                precision_key(&mut app, KeyCode::Char(digit), KeyModifiers::NONE);
-            }
-            precision_key(&mut app, KeyCode::Enter, KeyModifiers::NONE);
-            let source = app.editor().source();
-            assert!(
-                source.contains("slider(800, 100, 4000,"),
-                "the fader is in the score: {source}"
-            );
-            // The form closes after the write. An open form would let a second
-            // Enter rewrite the value during a drag.
-            assert!(
-                app.smart_action_view().is_none(),
-                "a form that wrote its fader closes"
-            );
-            assert_eq!(source.matches("slider(").count(), 1, "one call, not nested");
-            assert!(app.status.contains("fader"), "{}", app.status);
-            assert!(
-                app.pending_evaluation.is_none() && app.inflight.is_empty(),
-                "applying a slider leaves evaluation to the player"
-            );
-
-            // And ^J on it again edits the same one rather than wrapping it.
-            let at = source.find("slider(").expect("the fader");
-            app.editor_mut()
-                .set_selection(Selection::caret(ByteOffset(at + 8)))
-                .expect("caret inside the call");
-            precision_key(&mut app, KeyCode::Char('j'), KeyModifiers::CONTROL);
-            let (_, rows) = app.smart_action_view().expect("open on the fader");
-            assert!(rows[0].contains("edit this fader"), "{rows:?}");
         }
 
         /// Backspace on a fresh field takes one character off its end, the

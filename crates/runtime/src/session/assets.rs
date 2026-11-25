@@ -629,8 +629,15 @@ impl Session {
             let crate::ValueJson::Raw(serde_json::Value::Object(object)) = &hap.value else {
                 continue;
             };
-            let Some(s) = object.get("s").and_then(|s| s.as_str()) else {
-                continue;
+            // `s("808")` is the number 808: name it as the voice does.
+            let spelled;
+            let s = match object.get("s") {
+                Some(serde_json::Value::String(s)) => s.as_str(),
+                Some(serde_json::Value::Number(number)) => {
+                    spelled = rustel_voice::js_number_spelling(number);
+                    spelled.as_str()
+                }
+                _ => continue,
             };
             let n = object.get("n").and_then(|n| n.as_f64()).unwrap_or(0.0);
             let midi = match object.get("note") {
@@ -799,5 +806,17 @@ mod tests {
             (2, 0),
             "one load each for hh and one"
         );
+    }
+
+    /// `s("808")` is a number in mini-notation, and its bank still warms.
+    #[test]
+    fn a_bank_named_by_digits_is_a_window_sound() {
+        let session = crate::session::test_support::quiet_session("s(\"808 bd\")");
+        let sounds: Vec<_> = session
+            .window_sounds(0.0, 1.0, Duration::from_secs(5))
+            .into_iter()
+            .map(|sound| sound.s)
+            .collect();
+        assert_eq!(sounds, ["808", "bd"]);
     }
 }
