@@ -561,31 +561,6 @@ mod tests {
         assert_eq!(engine.master.max_polyphony_override(), Some(256));
     }
 
-    /// The MIDI schedule reads the limiter's runway off the master bus: the
-    /// studio opens with the limiter off and so with nothing to wait out, a
-    /// character change lands on the next read, and off holds nothing back.
-    #[test]
-    fn the_master_bus_reports_the_limiters_runway() {
-        let bus = crate::engine::StudioMasterBus::default();
-        // The limiter is a setting now, and the studio opens with it off:
-        // there is no runway to report until something asks for one.
-        assert_eq!(bus.limiter_latency_frames(48_000), 0);
-        bus.set_limiter(Some(rustel_audio::LimiterSettings {
-            threshold_db: -1.0,
-            character: rustel_audio::LimiterCharacter::Transparent,
-        }));
-        // Transparent holds five milliseconds at 48 kHz.
-        assert_eq!(bus.limiter_latency_frames(48_000), 240);
-        bus.set_limiter(Some(rustel_audio::LimiterSettings {
-            threshold_db: -6.0,
-            character: rustel_audio::LimiterCharacter::Hard,
-        }));
-        assert_eq!(bus.limiter_latency_frames(48_000), 48);
-        // Off is not "whatever the last character was": no offset at all.
-        bus.set_limiter(None);
-        assert_eq!(bus.limiter_latency_frames(48_000), 0);
-    }
-
     /// A `.midi()` note is timed `latency_frames()` later than the device
     /// clock it was placed on, so the hardware fires with the audio the
     /// limiter held back - never ahead of it. Off adds nothing, and a

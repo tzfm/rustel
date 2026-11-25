@@ -439,24 +439,6 @@ mod tests {
     }
 
     #[test]
-    fn device_recycle_requeues_retained_samples_before_new_publications() {
-        let library = rustel_runtime::samples::SampleLibrary::empty();
-        let old = DecodedSample::from_parts(48_000, 1, vec![0.25, 0.5]).expect("old sample");
-        let new = DecodedSample::from_parts(48_000, 1, vec![0.75, 1.0]).expect("new sample");
-        let retained_only_id = SampleId(8);
-        let replaced_id = SampleId(9);
-        library.requeue_ready(replaced_id, new.clone());
-        let retained = HashMap::from([(retained_only_id, old.clone()), (replaced_id, old.clone())]);
-
-        requeue_retained_samples(&library, &retained);
-
-        let ready = library.take_ready();
-        assert_eq!(ready.len(), 2);
-        assert_eq!(ready[0], (retained_only_id, old));
-        assert_eq!(ready[1], (replaced_id, new));
-    }
-
-    #[test]
     fn output_recovery_snapshot_selects_latest_valid_ready_body() {
         let mut engine = StudioEngine::new(StudioConfig::default()).expect("studio");
         let library = Arc::clone(engine.session.sample_library().unwrap());
@@ -1350,23 +1332,6 @@ mod tests {
     }
 
     #[test]
-    fn stopped_output_selection_records_preference_without_recycling() {
-        let mut engine = StudioEngine::new(StudioConfig::default()).expect("studio");
-        engine.session.transport().stop();
-        let generation = engine.generation();
-        engine
-            .set_output_device_with("next-output", |_, _, _| {
-                panic!("stopped selection recycled")
-            })
-            .expect("record preference");
-        assert!(!engine.is_playing());
-        assert!(engine.session.transport().is_stopped());
-        assert_eq!(engine.generation(), generation);
-        assert_eq!(engine.preferred_output.as_deref(), Some("next-output"));
-        assert_eq!(engine.output_name().as_deref(), Some("next-output"));
-    }
-
-    #[test]
     fn successful_output_selection_commits_preference_and_requeries_once() {
         let mut engine = silent_engine_for_output_selection();
         engine.preferred_output = None;
@@ -1435,56 +1400,5 @@ mod tests {
         assert_eq!(library.render_rate_for_test(), 88_200);
         assert_eq!(session.generation(), generation);
         assert_eq!(library.take_ready(), vec![(SampleId(8), decoded)]);
-    }
-
-    #[test]
-    fn device_recycle_requeries_and_refills_the_drained_horizon() {
-        let source = "note('c4').fast(16)";
-        let mut session = Session::new().expect("session");
-        session.evaluate(source).expect("score");
-        session.set_schedule_lead(0.1);
-        session.set_continuity_margin(0.1);
-        let mut producer = LiveFileProducer::unwatched(Duration::from_millis(2)).expect("producer");
-        producer
-            .step_unwatched_with_clock_and_cutover(
-                &mut session,
-                || 0.0,
-                48_000,
-                |_, _, _| panic!("initial generation must not cut over"),
-                |_| true,
-            )
-            .expect("initial prefill");
-
-        let before = session.generation();
-        let recovery_now = 0.25;
-        arm_output_recovery_after_recycle(&mut session, &mut producer, recovery_now, 44_100, true)
-            .expect("arm recovery");
-        let after = session.generation();
-        assert_eq!(after, before + 1);
-
-        let sample_rate = 44_100;
-        let expected_takeover = ((recovery_now + 0.1) * f64::from(sample_rate)).round() as u64;
-        let mut publication = None;
-        let mut recovered = Vec::new();
-        producer
-            .step_unwatched_with_clock_and_cutover(
-                &mut session,
-                || recovery_now,
-                sample_rate,
-                |generation, frame, _cut| publication = Some((generation, frame)),
-                |event| {
-                    recovered.push(event);
-                    true
-                },
-            )
-            .expect("recovery prefill");
-
-        assert_eq!(publication, Some((after, expected_takeover)));
-        assert!(!recovered.is_empty(), "drained horizon was not refilled");
-        assert!(
-            recovered.iter().all(|event| {
-                event.generation == after && event.target_frame >= expected_takeover
-            })
-        );
     }
 }

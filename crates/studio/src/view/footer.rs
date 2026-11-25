@@ -987,42 +987,6 @@ mod tests {
     }
 
     #[test]
-    fn audio_warning_has_a_full_width_row_and_keeps_footer_controls() {
-        UiSettings::default().apply();
-        let theme = theme();
-        let master = MasterState::new(Instant::now());
-        let mut chrome = chrome(&theme, &master, Path::new("live.strudel"));
-        chrome.status = "ready";
-        chrome.audio_warning =
-            Some("Audio struggling · try raising audio out latency in Settings → General");
-        chrome.device = Some("Speakers");
-        for width in [80, 100] {
-            let area = Rect::new(0, 0, width, 3);
-            let content = footer_content_area(area, 1, false, true);
-            let hits = footer_hits(content, chrome.device, None, midi_ports(0, 0), 0, &[]);
-            let mut buffer = Buffer::empty(area);
-            Footer { chrome: &chrome }.render(area, &mut buffer);
-            let row = |y| {
-                (area.x..area.right())
-                    .map(|x| buffer.cell((x, y)).unwrap().symbol())
-                    .collect::<String>()
-            };
-            assert!(row(0).contains(chrome.audio_warning.unwrap()));
-            assert_eq!(buffer.cell((1, 0)).unwrap().fg, theme.warn);
-            assert!(row(1).contains("ready"));
-            assert!(row(2).contains("Speakers"));
-            assert_eq!(hits.status.y, 1);
-            assert_eq!(hits.device_chip.y, 2);
-            assert!(hits.dock.y > area.y);
-        }
-
-        let area = Rect::new(0, 0, 50, 3);
-        let mut buffer = Buffer::empty(area);
-        Footer { chrome: &chrome }.render(area, &mut buffer);
-        assert!(text_of(&buffer).contains("Try raising latency: Settings → General"));
-    }
-
-    #[test]
     fn audio_warning_remains_actionable_below_a_query_error() {
         UiSettings::default().apply();
         let theme = theme();

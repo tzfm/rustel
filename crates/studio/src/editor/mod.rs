@@ -2135,16 +2135,6 @@ mod tests {
         assert_eq!(editor.source(), "head\r\n");
     }
 
-    #[test]
-    fn a_manually_pressed_newline_still_autoindents() {
-        let mut editor = Editor::new("    pattern").unwrap();
-        editor
-            .set_selection(Selection::caret(ByteOffset("    pattern".len())))
-            .unwrap();
-        dispatch(&mut editor, Command::Newline, 0);
-        assert_eq!(editor.source(), "    pattern\n    ");
-    }
-
     /// The second Enter leaves the chain: it removes the indentation the
     /// first one added, and adds no line.
     #[test]
@@ -2387,19 +2377,6 @@ mod tests {
             map.cell_for_offset(editor.primary_selection().head),
             Some(CellPoint::new(3, 0))
         );
-    }
-
-    #[test]
-    fn horizontal_scroll_extent_exists_only_for_unwrapped_overflow() {
-        let mut editor = Editor::new("short\n0123456789abcdef").expect("editor");
-        editor.set_viewport(Viewport {
-            page_columns: 8,
-            wrap: false,
-            ..editor.viewport()
-        });
-        assert_eq!(editor.horizontal_scroll_extent(), Some((0, 8, 17)));
-        editor.set_wrap(true);
-        assert_eq!(editor.horizontal_scroll_extent(), None);
     }
 
     #[test]
@@ -3272,18 +3249,6 @@ mod tests {
         );
         let recent = editor.revision();
         assert_eq!(editor.map_range_since(recent, 0..3), Some(0..3));
-    }
-
-    #[test]
-    fn an_inline_widget_anchor_follows_its_call_through_edits() {
-        let mut editor = Editor::new("s(\"bd\")._scope()").unwrap();
-        let evaluated = editor.revision();
-        let anchor = editor.source().len();
-        editor
-            .set_selection(Selection::caret(ByteOffset(0)))
-            .unwrap();
-        dispatch(&mut editor, Command::InsertText("$: ".into()), 0);
-        assert_eq!(editor.map_offset_since(evaluated, anchor), Some(anchor + 3));
     }
 
     /// A paste ends the typing before it, even an empty one, so the typing

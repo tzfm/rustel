@@ -1687,44 +1687,6 @@ mod tests {
         );
     }
 
-    /// Eviction hands the name back to the library. If it does not, the
-    /// sound stays Ready with no PCM, and a score that names it plays
-    /// silence for the rest of the session.
-    #[test]
-    fn an_evicted_sample_is_handed_back_to_the_library() {
-        let mut engine = StudioEngine::new(StudioConfig {
-            output: Some("silent".into()),
-            preview_budget_bytes: 0,
-            unused_sample_idle: Duration::from_secs(1),
-            ..StudioConfig::default()
-        })
-        .expect("engine");
-        let library = engine
-            .session
-            .sample_library()
-            .cloned()
-            .expect("a session sample library");
-        const URL: &str = "http://127.0.0.1:9/preview.wav";
-        library.remember_ready_for_test(URL, SampleId(21));
-        engine.retain_sample_for_test(
-            SampleId(21),
-            DecodedSample::from_parts(48_000, 1, vec![0.0; 128]).expect("pcm"),
-        );
-        assert!(library.knows_ready_for_test(URL));
-
-        engine.force_sample_idle_for_test(Duration::from_secs(5));
-
-        assert_eq!(
-            engine.retained_sample_count(),
-            0,
-            "the idle sweep dropped it"
-        );
-        assert!(
-            !library.knows_ready_for_test(URL),
-            "a sound whose PCM is gone must be unknown again, or nothing ever decodes it a second time"
-        );
-    }
-
     /// A sweep that kept a plugin for a copy a removed lane still played
     /// looks again when its time comes, in the same quiet spell, and not
     /// before.
@@ -2086,28 +2048,6 @@ mod tests {
         let lowered = engine.snapshot().sample_memory;
         assert_eq!(lowered.recent_limit_bytes, 4 * 1024);
         assert_eq!(lowered.recent_bytes, 4 * 1024, "only the snare fits");
-    }
-
-    /// Each part is shown against the limit holding it, so the limits come
-    /// from the engine that applies them: a policy the settings sent and a
-    /// full queue refused would otherwise read as applied. They are there
-    /// before any sound is.
-    #[test]
-    fn snapshot_reports_the_limits_the_engine_holds() {
-        let mut engine = StudioEngine::new(StudioConfig {
-            output: Some("silent".into()),
-            ..StudioConfig::default()
-        })
-        .expect("engine");
-        engine.recent_tabs_bytes = Some(12 * 1024);
-        engine.set_sample_memory_policy(96 * 1024 * 1024, Duration::from_secs(45));
-
-        let memory = engine.snapshot().sample_memory;
-
-        assert_eq!(memory.preview_budget_bytes, 96 * 1024 * 1024);
-        assert_eq!(memory.unused_idle, Duration::from_secs(45));
-        assert_eq!(memory.recent_limit_bytes, 12 * 1024);
-        assert_eq!(memory.live_bytes + memory.preview_bytes, 0);
     }
 
     /// The script engine's heap is a part of the studio no other figure

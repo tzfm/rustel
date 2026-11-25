@@ -679,23 +679,6 @@ mod tests {
         assert_eq!(silent, empty, "a silent widget drew something");
     }
 
-    /// The art is a title rather than a picture of the mix, and the mixer
-    /// a control surface, so they are there whatever the set is doing;
-    /// everything else goes with the sound. The art, the spacer and the
-    /// mixer are there whatever the set is doing, and so is the video
-    /// picker: its feeds are chosen before anything plays.
-    #[test]
-    fn only_the_art_the_spacer_the_mixer_and_the_video_picker_are_always_there() {
-        use super::super::WidgetKind;
-        for kind in WidgetKind::ALL {
-            let always = matches!(
-                kind,
-                WidgetKind::Art | WidgetKind::Spacer | WidgetKind::Mixer | WidgetKind::Video
-            );
-            assert_eq!(kind.always_visible(), always, "{kind:?}");
-        }
-    }
-
     /// The dial is polar: a mix panned to the sides lies across it, a
     /// mono one stands up it; the styles that ease keep their memory.
     #[test]

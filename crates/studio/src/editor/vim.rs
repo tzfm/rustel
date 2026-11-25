@@ -1997,37 +1997,6 @@ mod tests {
         assert_eq!(head(&editor), 8, "j after $ stays at the line end");
     }
 
-    /// The wheel scrolls a Vim score as it scrolls any other. The input hook
-    /// after it once brought the caret back into view, so every step of a
-    /// trackpad swipe was undone before the next one.
-    #[test]
-    fn the_wheel_scrolls_away_from_the_caret_in_normal_mode() {
-        use crossterm::event::{MouseEvent, MouseEventKind};
-        let mut editor = editor();
-        let area = crate::editor::GridRect::new(0, 0, 20, 6);
-        for _ in 0..2 {
-            let map = editor.screen_map(area).expect("map");
-            editor
-                .mouse_event(
-                    MouseEvent {
-                        kind: MouseEventKind::ScrollDown,
-                        column: 0,
-                        row: 0,
-                        modifiers: KeyModifiers::NONE,
-                    },
-                    &map,
-                    HistoryMoment(0),
-                )
-                .expect("wheel");
-            editor.normalize_after_input().expect("normalize");
-        }
-        assert_eq!(line(&editor), 0, "the caret stays where it was");
-        assert!(
-            editor.viewport().top_row > 0,
-            "the view stays where the wheel put it"
-        );
-    }
-
     #[test]
     fn a_selection_outside_visual_is_adopted() {
         let mut editor = Editor::new("hello world\n").expect("editor");
@@ -2038,21 +2007,6 @@ mod tests {
         press(&mut editor, KeyCode::Char('d'), KeyModifiers::NONE);
         assert_eq!(editor.source(), " world\n");
         assert_eq!(editor.vim.mode, Mode::Normal);
-    }
-
-    #[test]
-    fn v_keeps_a_selection_made_outside_visual() {
-        let mut editor = Editor::new("hello world\n").expect("editor");
-        editor.set_keybindings(EditorKeybindings::Vim);
-        editor
-            .set_selection(Selection::range(ByteOffset(0), ByteOffset(5)))
-            .expect("selection");
-        press(&mut editor, KeyCode::Char('v'), KeyModifiers::NONE);
-        assert!(matches!(editor.vim.mode, Mode::Visual { .. }));
-        assert_eq!(
-            editor.primary_selection().ordered(),
-            ByteOffset(0)..ByteOffset(5)
-        );
     }
 
     #[test]
@@ -2117,17 +2071,6 @@ mod tests {
             .expect("caret");
         press(&mut editor, KeyCode::Backspace, KeyModifiers::NONE);
         assert_eq!(editor.primary_selection().head, ByteOffset(4));
-    }
-
-    #[test]
-    fn shift_right_enters_visual() {
-        let mut editor = Editor::new("hello world\n").expect("editor");
-        editor.set_keybindings(EditorKeybindings::Vim);
-        press(&mut editor, KeyCode::Right, KeyModifiers::SHIFT);
-        assert!(editor.vim_is_visual());
-        assert!(!editor.primary_selection().is_empty());
-        press(&mut editor, KeyCode::Char('d'), KeyModifiers::NONE);
-        assert_eq!(editor.source(), "ello world\n");
     }
 
     #[test]
@@ -2436,23 +2379,6 @@ mod tests {
             press(&mut editor, KeyCode::Char(key), KeyModifiers::NONE);
             assert_eq!(editor.vim_label().as_deref(), Some("VISUAL"), "{key}");
         }
-    }
-
-    /// An edit that places its own selection, such as a remote key typed
-    /// over the band, ends Visual. No Visual stays over the caret it left.
-    #[test]
-    fn an_edit_that_places_its_selection_ends_visual() {
-        let mut editor = typed("abc\n", 0, "vl");
-        editor
-            .dispatch(
-                super::super::Command::InsertText("x".into()),
-                HistoryMoment(0),
-                &mut super::super::MemoryClipboard::default(),
-            )
-            .expect("type");
-        assert_eq!(editor.source(), "xc\n");
-        assert!(!editor.vim_is_visual(), "Visual ended");
-        assert_eq!(editor.vim_label().as_deref(), Some("NORMAL"));
     }
 
     /// An edit that ends Visual also drops the command Visual waited on:

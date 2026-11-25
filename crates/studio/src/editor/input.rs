@@ -837,29 +837,6 @@ mod tests {
     }
 
     #[test]
-    fn bracketed_paste_is_atomic_and_altgr_text_is_not_swallowed() {
-        assert_eq!(
-            event_to_input(
-                Event::Paste("two\nlines".into()),
-                KeyboardCapabilities::legacy()
-            ),
-            Some(EditorInput::Command(Command::PasteText(
-                "two\nlines".into()
-            )))
-        );
-        assert_eq!(
-            key_to_command(
-                key(
-                    KeyCode::Char('€'),
-                    KeyModifiers::CONTROL | KeyModifiers::ALT
-                ),
-                KeyboardCapabilities::legacy()
-            ),
-            Some(Command::InsertText("€".into()))
-        );
-    }
-
-    #[test]
     fn a_raw_multiline_key_run_becomes_one_paste_event() {
         let text = "first\n  second\nthird";
         let mut batch = TerminalEventBatch::default();

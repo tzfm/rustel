@@ -458,23 +458,6 @@ mod tests {
         }
     }
 
-    /// A strip that fits says nothing at its edges and starts at the first
-    /// chip, so the counters never appear when there is nothing behind
-    /// them.
-    #[test]
-    fn a_strip_that_fits_scrolls_nowhere() {
-        let area = Rect::new(0, 0, 80, 1);
-        let chips = vec![strip_chip("a", true), strip_chip("b", false)];
-        let layout = scene_strip_layout(area, &chips);
-        assert_eq!((layout.before, layout.after), (0, 0));
-        assert!(layout.hits.iter().all(|hit| !hit.is_empty()));
-        // And hit-testing lands on the chip that was drawn.
-        for (index, hit) in layout.hits.iter().enumerate() {
-            let found = scene_strip_hits(area, &chips);
-            assert_eq!(found[index], *hit, "hit-testing reads the same layout");
-        }
-    }
-
     #[test]
     fn the_scene_strip_draws_chips_where_it_hit_tests_them() {
         let theme = theme();

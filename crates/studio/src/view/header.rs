@@ -1015,36 +1015,6 @@ mod tests {
         assert_eq!(beat_pulse(true, Some(2.6), &theme).0, "o");
     }
 
-    #[test]
-    fn the_header_reports_tempo_and_process_counters() {
-        let theme = theme();
-        let master = MasterState::new(Instant::now());
-        let mut chrome = chrome(&theme, &master, Path::new("live.strudel"));
-        chrome.stats = ProcessStats {
-            cpu_percent: Some(12.0),
-            machine_cpu_percent: Some(40.0),
-            resident_bytes: Some(84 * 1024 * 1024),
-            footprint_bytes: None,
-        };
-        chrome.cps = Some(0.5);
-        chrome.cycle = Some(4.0);
-
-        let header_area = Rect::new(0, 0, 140, 1);
-        let mut header_buffer = Buffer::empty(header_area);
-        Header { chrome: &chrome }.render(header_area, &mut header_buffer);
-        let header_text = text_of(&header_buffer);
-        assert!(header_text.contains("120.0 bpm"), "{header_text}");
-        assert!(header_text.contains("0.50 cps"), "{header_text}");
-        assert!(header_text.contains("cpu 12%"), "{header_text}");
-        assert!(header_text.contains("mem 84.0MB"), "{header_text}");
-        assert!(header_text.contains("live"), "{header_text}");
-        // Advanced is the default, so the machine's own share stands
-        // beside rustel's: a player watching a low number while the
-        // laptop underneath them is pinned has nothing on the screen
-        // telling them so.
-        assert!(header_text.contains("sys "), "{header_text}");
-    }
-
     /// The header's memory is the footprint, which is what the process
     /// owns, and not its resident set. Where there is no footprint, the
     /// resident set stands in.

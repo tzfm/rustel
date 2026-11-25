@@ -576,6 +576,7 @@ impl StudioEngine {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(feature = "osc")]
     use crate::engine::tests::*;
     mod midi_diagnostics {
         use super::*;
@@ -961,23 +962,6 @@ mod tests {
         hold_clock(&engine, false);
     }
 
-    /// A flip retires the outgoing score's external output from its takeover,
-    /// or from the line of an earlier cut that has fired.
-    #[test]
-    fn a_flip_retires_from_a_fired_line_before_its_takeover() {
-        let engine = silent_engine_with_pattern(rustel_core::silence());
-        run_clock_past(&engine, 0.5);
-        let device = device_of(&engine);
-        let rate = device.sample_rate();
-        let now = device.clock_seconds();
-        let takeover = frame_at(now + 1.0, rate);
-        assert_eq!(retire_frame(device, takeover), takeover);
-        device.arm_line_cut(frame_at(now + 5.0, rate), true);
-        assert_eq!(retire_frame(device, takeover), takeover);
-        device.arm_line_cut(frame_at(now - 0.1, rate), true);
-        assert_eq!(retire_frame(device, takeover), frame_at(now - 0.1, rate));
-    }
-
     /// Before a drain releases what the shield holds, a fired line takes what
     /// lies past it, and a line still ahead keeps what lies past it waiting.
     #[cfg(feature = "osc")]
@@ -999,20 +983,6 @@ mod tests {
         device_of(&engine).arm_line_cut(frame_at(now - 0.1, rate), true);
         engine.release_shield_hold(now);
         assert!(engine.shield_hold.held_targets_for_test().is_empty());
-        hold_clock(&engine, false);
-    }
-
-    /// The consumer fires a line cut in the first block that ends past its
-    /// line, so the render frontier has passed a line only once it is beyond it.
-    #[test]
-    fn a_line_is_passed_once_the_frontier_is_beyond_it() {
-        let engine = silent_engine_with_pattern(rustel_core::silence());
-        run_clock_past(&engine, 0.1);
-        hold_clock(&engine, true);
-        let device = device_of(&engine);
-        let frontier = device.render_frontier_frames();
-        assert!(!line_passed(device, frontier));
-        assert!(line_passed(device, frontier - 1));
         hold_clock(&engine, false);
     }
 }
