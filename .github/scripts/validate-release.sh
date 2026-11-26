@@ -29,6 +29,8 @@ git merge-base --is-ancestor "$sha" refs/remotes/origin/main || {
 }
 version=$(sed -n '/^\[workspace.package\]/,/^\[/s/^version = "\([^"]*\)"/\1/p' Cargo.toml)
 [ "$tag" = "v$version" ] || { echo 'Tag and workspace version differ' >&2; exit 1; }
-count=$(gh api "repos/tzfm/rustel/actions/workflows/ci.yml/runs?event=push&branch=main&head_sha=$sha&status=success&per_page=1" \
-  --jq '.workflow_runs | length')
-[ "$count" = 1 ] || { echo 'The release commit needs a successful CI push run on main' >&2; exit 1; }
+# Read each run's conclusion: the status=success filter can miss a run
+# that succeeded.
+count=$(gh api "repos/tzfm/rustel/actions/workflows/ci.yml/runs?event=push&branch=main&head_sha=$sha&per_page=100" \
+  --jq '[.workflow_runs[] | select(.conclusion == "success")] | length')
+[ "$count" -ge 1 ] || { echo 'The release commit needs a successful CI push run on main' >&2; exit 1; }
