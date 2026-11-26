@@ -3865,6 +3865,42 @@ fn bench_emits_metrics_json() {
     let json: serde_json::Value = serde_json::from_str(&out)
         .unwrap_or_else(|e| panic!("bench stdout is not JSON: {e}\n{out}"));
     assert!(json.is_object(), "bench must emit a metrics object: {json}");
+    assert_eq!(json["engine"], "native");
+    assert_eq!(json["iterations"], 5);
+    assert!(json["eval"]["wall_us"].as_f64().is_some());
+    assert!(json["eval"]["allocations"].as_u64().unwrap_or(0) > 0);
+    assert!(json["steady_query"]["wall_us"].as_f64().is_some());
+    assert!(json["steady_query"]["peak_bytes"].as_u64().unwrap_or(0) > 0);
+    assert!(json["session_held_bytes"].as_u64().unwrap_or(0) > 0);
+    #[cfg(unix)]
+    {
+        assert!(json["cpu_secs"].as_f64().is_some());
+        assert!(json["eval"]["cpu_us"].as_f64().is_some());
+        assert!(json["steady_query"]["cpu_us"].as_f64().is_some());
+    }
+}
+
+#[test]
+fn bench_human_output_reports_engine_cpu_and_memory() {
+    let out = ok_stdout(&[
+        "--plain",
+        "bench",
+        "-e",
+        r#"n("0 .. 7")"#,
+        "--begin",
+        "0",
+        "--end",
+        "2",
+        "--iterations",
+        "5",
+    ]);
+    assert!(out.contains("engine   native"), "missing engine: {out}");
+    assert!(out.contains("eval     "), "missing eval row: {out}");
+    assert!(out.contains("query    "), "missing query row: {out}");
+    assert!(out.contains("allocs/query"), "missing allocs: {out}");
+    assert!(out.contains("session held"), "missing session held: {out}");
+    #[cfg(unix)]
+    assert!(out.contains("cpu"), "missing cpu metric: {out}");
 }
 
 // -- failure modes ----------------------------------------------------------
