@@ -29,11 +29,10 @@ use rustel_runtime::{
     terminal_text,
 };
 
-// The live CPAL callback enters `rustel_audio::tripwire::audio_scope`; using
-// the matching allocator lets the device report callback allocations.
-// `play_live` verifies the allocator before trusting a zero. Other binaries
-// embedding the library choose their own allocator.
-#[cfg(feature = "device-audio")]
+// The live CPAL callback enters `rustel_audio::tripwire::audio_scope`, and
+// `rustel bench` enables opt-in allocation and memory counting on the same
+// allocator. `play_live` verifies the allocator before trusting a zero. Other
+// binaries embedding the library choose their own allocator.
 #[global_allocator]
 static AUDIO_CALLBACK_ALLOCATOR: rustel_audio::tripwire::TripwireAlloc =
     rustel_audio::tripwire::TripwireAlloc;
@@ -53,6 +52,7 @@ mod style;
 mod replay_plan;
 use replay_plan::{ReplayOpening, ReplayPlan};
 
+mod bench;
 mod completions;
 mod devices;
 mod live;
@@ -1395,7 +1395,10 @@ enum Command {
         #[arg(short = 'j', long)]
         json: bool,
     },
-    /// Microbench query throughput; prints JSON metrics.
+    /// Benchmark a score or `-e` pattern: wall time, CPU time, allocations, and memory.
+    ///
+    ///     rustel bench -e 'n("0 .. 63")' --begin 0 --end 16
+    ///     rustel bench song.strudel --json
     Bench {
         #[command(flatten)]
         input: SourceInput,
@@ -3039,34 +3042,7 @@ fn run_command(
             end,
             iterations,
             json,
-        } => {
-            let mut session = Session::with_config(with_sample_access(
-                session_config(dispatch),
-                &input.sample_access,
-            )?)?;
-            let _watcher = watch_for_interrupt(session.transport());
-            load_source(&mut session, &input, &EVALUATION_CANCELLED)?;
-            let begin = parse_fraction(&begin)?;
-            let end = parse_fraction(&end)?;
-            let metrics = session.bench(begin, end, iterations)?;
-            if json {
-                outln!(
-                    "{}",
-                    serde_json::to_string_pretty(&metrics).map_err(json_err)?
-                );
-            } else {
-                let on = style::stdout_on();
-                outln!(
-                    "{} queries in {:.3} s - {} queries/s, {} haps/s, {} haps a query",
-                    style::bold(on, &metrics.iterations.to_string()),
-                    metrics.elapsed_secs,
-                    style::bold(on, &format!("{:.0}", metrics.queries_per_sec)),
-                    style::bold(on, &format!("{:.0}", metrics.haps_per_sec)),
-                    metrics.haps_per_iteration,
-                );
-            }
-            Ok(())
-        }
+        } => bench::run_bench(dispatch, &input, &begin, &end, iterations, json),
         Command::Validate { input, json } => {
             let mut session = Session::with_config(with_sample_access(
                 session_config(dispatch),

@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- `rustel bench` now reports engine tier, CPU time, allocation counts, peak query memory, and held session memory for both score files and `-e` patterns (in human output and `--json`).
+
 ## v0.1.9
 
 - Score outline and engine reporting: Studio View ▸ Score outline, and `rustel check` (with `--outline` and `--json`).
