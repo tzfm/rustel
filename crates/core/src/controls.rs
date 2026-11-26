@@ -158,7 +158,7 @@ impl ControlSpec {
             };
         }
         let named = value.map_control_owned(self, false);
-        crate::compose::compose(&pattern, &named, crate::compose::ComposeOp::Set, alignment)
+        crate::compose::compose_owned(pattern, &named, crate::compose::ComposeOp::Set, alignment)
     }
 
     /// [`Self::apply_to`] of a `pure` of `value`, as a score writes a
@@ -347,12 +347,19 @@ pub(crate) fn named_value(names: &[Arc<str>], mut value: Value) -> Value {
 }
 
 /// The argument of one control call of a chain: a number as a score writes
-/// it, a constant value with inline locations, a validated inline wave, or a pattern.
+/// it, a constant value with inline locations, a flat numeric sequence or
+/// slow alternation, a validated inline wave, or a pattern.
 #[derive(Clone)]
 pub enum ChainArgument {
     Number(f64),
     Constant(Value, crate::Locations),
     ConstantPair(Value, Value, crate::Locations),
+    FlatNumbers {
+        values: [f64; 8],
+        locs: [(u32, u16); 8],
+        len: u8,
+        slowcat: bool,
+    },
     Wave(crate::fused::Wave, u32, bool, u8),
     Pattern(Pattern),
 }
@@ -364,7 +371,7 @@ impl ChainArgument {
             Self::Number(_) => true,
             Self::Constant(value, _) => value.is_data(0),
             Self::ConstantPair(a, b, _) => a.is_data(0) && b.is_data(0),
-            Self::Wave(..) => false,
+            Self::FlatNumbers { .. } | Self::Wave(..) => false,
             Self::Pattern(values) => crate::sequence::is_constant_value(values),
         }
     }
@@ -380,7 +387,7 @@ impl ChainArgument {
                 Value::List(Arc::from([a.clone(), b.clone()])),
                 locations.clone(),
             )),
-            Self::Wave(..) => None,
+            Self::FlatNumbers { .. } | Self::Wave(..) => None,
             Self::Pattern(values) => crate::sequence::constant_value_at(values),
         }
     }
@@ -392,7 +399,7 @@ impl ChainArgument {
             Self::Constant(_, locations) | Self::ConstantPair(_, _, locations) => {
                 Some(locations.clone())
             }
-            Self::Wave(..) => None,
+            Self::FlatNumbers { .. } | Self::Wave(..) => None,
             Self::Pattern(values) => crate::sequence::constant_value_at(values).map(|(_, l)| l),
         }
     }
@@ -478,6 +485,7 @@ pub fn chain_transformer(
         ChainArgument::Number(_)
         | ChainArgument::Constant(..)
         | ChainArgument::ConstantPair(..)
+        | ChainArgument::FlatNumbers { .. }
         | ChainArgument::Wave(..) => true,
         ChainArgument::Pattern(values) => values.is_pure(),
     };
@@ -743,7 +751,9 @@ fn set_row(pattern: Pattern, row: &[ChainCall<'_>]) -> Result<Pattern, Pattern> 
         // and a constant with locations directly through `union_of` + `with_row`.
         match argument {
             ChainArgument::Pattern(values) => return pattern.set_constant_control(spec, values),
-            ChainArgument::Number(_) | ChainArgument::Wave(..) => return Err(pattern),
+            ChainArgument::Number(_)
+            | ChainArgument::FlatNumbers { .. }
+            | ChainArgument::Wave(..) => return Err(pattern),
             ChainArgument::Constant(_, locations)
             | ChainArgument::ConstantPair(_, _, locations)
                 if locations.is_empty() =>
@@ -1002,6 +1012,32 @@ fn apply_argument(spec: &ControlSpec, pattern: Pattern, argument: &ChainArgument
             Value::List(Arc::from([a.clone(), b.clone()])),
             locations.clone(),
         ),
+        ChainArgument::FlatNumbers {
+            values,
+            locs,
+            len,
+            slowcat,
+        } => {
+            let n = usize::from(*len);
+            match crate::sequence::applied_flat_numbers(
+                pattern,
+                spec,
+                &values[..n],
+                &locs[..n],
+                *slowcat,
+            ) {
+                Ok(done) => done,
+                Err(pattern) => {
+                    let pat = crate::sequence::pattern_of_flat_numbers(
+                        &values[..n],
+                        &locs[..n],
+                        *slowcat,
+                    )
+                    .expect("flat numbers convert to sequence pattern");
+                    spec.apply_to(pattern, Some(pat))
+                }
+            }
+        }
         ChainArgument::Wave(wave, steps, math_inside, op_flags) => {
             if crate::compose::default_alignment() == crate::compose::Alignment::In
                 && spec.id != 0
@@ -1027,6 +1063,29 @@ fn apply_argument_owned(spec: &ControlSpec, pattern: Pattern, argument: ChainArg
         ChainArgument::Constant(value, locations) => spec.apply_constant(pattern, value, locations),
         ChainArgument::ConstantPair(a, b, locations) => {
             spec.apply_constant(pattern, Value::List(Arc::from([a, b])), locations)
+        }
+        ChainArgument::FlatNumbers {
+            values,
+            locs,
+            len,
+            slowcat,
+        } => {
+            let n = usize::from(len);
+            match crate::sequence::applied_flat_numbers(
+                pattern,
+                spec,
+                &values[..n],
+                &locs[..n],
+                slowcat,
+            ) {
+                Ok(done) => done,
+                Err(pattern) => {
+                    let pat =
+                        crate::sequence::pattern_of_flat_numbers(&values[..n], &locs[..n], slowcat)
+                            .expect("flat numbers convert to sequence pattern");
+                    spec.apply_to(pattern, Some(pat))
+                }
+            }
         }
         ChainArgument::Wave(wave, steps, math_inside, op_flags) => {
             if crate::compose::default_alignment() == crate::compose::Alignment::In

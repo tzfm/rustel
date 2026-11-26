@@ -47,6 +47,13 @@ pub fn dedup_score(
     dedup_score_with_reused(root, &[], remap_extras);
 }
 
+/// Whether `root` is small enough (`<= 20` nodes) to skip structural
+/// deduplication altogether.
+#[inline]
+pub fn is_tiny_graph_pattern(root: &Pattern) -> bool {
+    is_tiny_graph(root.node_arc())
+}
+
 /// Stack-only check for tiny graphs (`<= 20` nodes) with nothing worthwhile to
 /// deduplicate, avoiding all hash-table allocations on small scores.
 fn is_tiny_graph(root: &NodeCell) -> bool {
@@ -126,6 +133,11 @@ fn is_tiny_graph(root: &NodeCell) -> bool {
             }
             Node::Shift(node) => {
                 if !push(&mut stack, &mut top, node.0.node_arc()) {
+                    return false;
+                }
+            }
+            Node::Iter(node) => {
+                if !push(&mut stack, &mut top, node.inner.node_arc()) {
                     return false;
                 }
             }
@@ -231,7 +243,13 @@ fn is_tiny_graph(root: &NodeCell) -> bool {
                     return false;
                 }
             }
-            Node::Silence | Node::Pure(_) | Node::PureAt(_) | Node::Signal(_) => {}
+            Node::Silence
+            | Node::Pure(_)
+            | Node::PureAt(_)
+            | Node::IntRange { .. }
+            | Node::Signal(_)
+            | Node::NumberSignal(_)
+            | Node::SegmentSignal { .. } => {}
             _ => return false,
         }
     }
@@ -651,6 +669,8 @@ fn node_intern_tag(node: &Node) -> usize {
         Node::SlowCatPrimePure(_) => 16,
         Node::Constants(_) => 17,
         Node::AppWave(_) => 18,
+        Node::IntRange { .. } => 19,
+        Node::Iter(_) => 20,
         _ => 0,
     }
 }
@@ -683,7 +703,7 @@ struct ScanScratch {
     node_count: usize,
     seq_count: usize,
     layer_count: usize,
-    node_kind_counts: [u32; 19],
+    node_kind_counts: [u32; 21],
     seen_ptrs: PtrSet,
     /// `(src_idx, map_val_start, map_val_len)` for each unique built-in map.
     unique_maps: Vec<(u32, u32, u16)>,
@@ -702,7 +722,7 @@ impl ScanScratch {
         self.node_count = 0;
         self.seq_count = 0;
         self.layer_count = 0;
-        self.node_kind_counts = [0; 19];
+        self.node_kind_counts = [0; 21];
         self.seen_ptrs.clear();
         self.unique_maps.clear();
         self.map_table.clear();
@@ -1027,6 +1047,7 @@ fn collect_and_pool_builtins<'a>(
             | Node::CycleOnsetCount(p) => stack.push(p.node_arc()),
             Node::Fast(n) => stack.push(n.0.node_arc()),
             Node::Shift(n) => stack.push(n.0.node_arc()),
+            Node::Iter(n) => stack.push(n.inner.node_arc()),
             Node::AppWave(app) => stack.push(app.inner.node_arc()),
             Node::UiVisual(node) => stack.push(node.inner.node_arc()),
             Node::Degrade(b) => stack.push(b.0.node_arc()),
@@ -1096,9 +1117,12 @@ fn collect_and_pool_builtins<'a>(
                 }
             }
             Node::Silence
+            | Node::IntRange { .. }
             | Node::QueryError(_)
             | Node::QueryLimit(_)
             | Node::Signal(_)
+            | Node::NumberSignal(_)
+            | Node::SegmentSignal { .. }
             | Node::Extension(_)
             | Node::PurePickLookup(_)
             | Node::MidiKeys(_)
@@ -1455,7 +1479,7 @@ struct Deduper {
     plain_extras: FastMap<usize, Arc<PatternExtras>>,
     pooled_builtins: PtrMap<Arc<dyn BuiltinEntries>>,
     builtins_pre_deduped: bool,
-    node_kind_counts: [u32; 19],
+    node_kind_counts: [u32; 21],
     seq_count: usize,
     builtins: InternTable<Arc<dyn BuiltinEntries>>,
     keys: InternTable<Arc<Keys>>,
@@ -1479,7 +1503,7 @@ impl Deduper {
         self.plain_extras.clear();
         self.pooled_builtins.clear();
         self.builtins_pre_deduped = false;
-        self.node_kind_counts = [0; 19];
+        self.node_kind_counts = [0; 21];
         self.seq_count = 0;
         self.builtins.clear();
         self.keys.clear();
@@ -2170,6 +2194,11 @@ impl Deduper {
                 self.dedup_value_mut(&mut boxed.0);
                 true
             }
+            Node::IntRange { .. } => true,
+            Node::Iter(node) => {
+                self.dedup_pattern(&mut node.inner);
+                Arc::strong_count(node.inner.node_arc()) > 1
+            }
             Node::Stack(pats) | Node::SlowCat(pats) | Node::SlowCatPrime(pats) => {
                 let mut all_alias = true;
                 for pat in pats.iter_mut() {
@@ -2404,6 +2433,8 @@ impl Deduper {
             | Node::QueryError(_)
             | Node::QueryLimit(_)
             | Node::Signal(_)
+            | Node::NumberSignal(_)
+            | Node::SegmentSignal { .. }
             | Node::Extension(_)
             | Node::PurePickLookup(_)
             | Node::MidiKeys(_)
@@ -2607,6 +2638,14 @@ impl Deduper {
             Node::Shift(node) => self
                 .dedup_pat_child(&node.0)
                 .map(|p| Node::Shift(Box::new(ShiftNode(p, node.1, node.2)))),
+            Node::Iter(node) => self.dedup_pat_child(&node.inner).map(|inner| {
+                Node::Iter(Box::new(crate::IterNode {
+                    inner,
+                    times: node.times,
+                    parts: node.parts,
+                    back: node.back,
+                }))
+            }),
             Node::Degrade(boxed) => self
                 .dedup_pat_child(&boxed.0)
                 .map(|p| Node::Degrade(Box::new((p, boxed.1, boxed.2)))),
@@ -3145,9 +3184,12 @@ impl Deduper {
                 }
             }
             Node::Silence
+            | Node::IntRange { .. }
             | Node::QueryError(_)
             | Node::QueryLimit(_)
             | Node::Signal(_)
+            | Node::NumberSignal(_)
+            | Node::SegmentSignal { .. }
             | Node::Extension(_)
             | Node::PurePickLookup(_)
             | Node::MidiKeys(_)
@@ -3507,6 +3549,7 @@ fn node_children_can_alias(kind: &Node) -> bool {
         | Node::SplitQueries(inner, ..) => Arc::strong_count(inner) > 1,
         Node::Fast(n) => Arc::strong_count(n.0.node_arc()) > 1,
         Node::Shift(n) => Arc::strong_count(n.0.node_arc()) > 1,
+        Node::Iter(n) => Arc::strong_count(n.inner.node_arc()) > 1,
         Node::Degrade(b) => Arc::strong_count(b.0.node_arc()) > 1,
         Node::AppWave(app) => Arc::strong_count(app.inner.node_arc()) > 1,
         Node::Constants(c) => Arc::strong_count(c.0.node_arc()) > 1,
@@ -3527,6 +3570,7 @@ fn can_intern_node(node: &Node, flags: u8) -> bool {
     }
     match node {
         Node::Sequence(_)
+        | Node::IntRange { .. }
         | Node::FastSmall(..)
         | Node::ShiftSmall(..)
         | Node::ControlMap(..)
@@ -3534,6 +3578,7 @@ fn can_intern_node(node: &Node, flags: u8) -> bool {
         | Node::StackPure(_)
         | Node::SlowCatPure(_)
         | Node::SlowCatPrimePure(_) => true,
+        Node::Iter(n) => n.inner.has_internable_extras(),
         Node::Pure(v) => v.is_data(0),
         Node::PureAt(b) => b.0.is_data(0),
         Node::Fast(n) => n.0.has_internable_extras(),
@@ -3571,6 +3616,30 @@ fn hash_node_kind(kind: &Node) -> u64 {
             for range in b.1.iter() {
                 range.hash(state);
             }
+        }
+        Node::IntRange {
+            start,
+            count,
+            loc0,
+            loc1,
+            named_id,
+            step_neg,
+        } => {
+            19u8.hash(state);
+            start.hash(state);
+            count.hash(state);
+            loc0.hash(state);
+            loc1.hash(state);
+            named_id.hash(state);
+            step_neg.hash(state);
+        }
+        Node::Iter(n) => {
+            20u8.hash(state);
+            hash_pat_shallow(&n.inner, state);
+            n.times.numer().hash(state);
+            n.times.denom().hash(state);
+            n.parts.hash(state);
+            n.back.hash(state);
         }
         Node::FastSmall(cell, f, n, d, is_slow) => {
             3u8.hash(state);
@@ -3704,6 +3773,30 @@ fn same_node_kind(left: &Node, right: &Node) -> bool {
         (Node::Sequence(a), Node::Sequence(b)) => Arc::ptr_eq(a, b),
         (Node::Pure(a), Node::Pure(b)) => a.same_data(b),
         (Node::PureAt(a), Node::PureAt(b)) => a.1 == b.1 && a.0.same_data(&b.0),
+        (
+            Node::IntRange {
+                start: as_,
+                count: ac,
+                loc0: al0,
+                loc1: al1,
+                named_id: an,
+                step_neg: ag,
+            },
+            Node::IntRange {
+                start: bs,
+                count: bc,
+                loc0: bl0,
+                loc1: bl1,
+                named_id: bn,
+                step_neg: bg,
+            },
+        ) => as_ == bs && ac == bc && al0 == bl0 && al1 == bl1 && an == bn && ag == bg,
+        (Node::Iter(a), Node::Iter(b)) => {
+            a.parts == b.parts
+                && a.times == b.times
+                && a.back == b.back
+                && same_pat_shallow(&a.inner, &b.inner)
+        }
         (Node::FastSmall(ac, af, an, ad, as_), Node::FastSmall(bc, bf, bn, bd, bs)) => {
             Arc::ptr_eq(ac, bc) && af == bf && an == bn && ad == bd && as_ == bs
         }

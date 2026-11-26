@@ -1019,7 +1019,7 @@ impl JsRuntime {
                         .set(0, wrapper)
                         .map_err(|error| QueryError::Message(error.to_string()))?;
                     // The wrapper took the place of a native graph in play.
-                    self.native_active.borrow_mut().take();
+                    self.set_native_active(None);
                     Ok(())
                 }
             })
@@ -1043,7 +1043,7 @@ impl JsRuntime {
 
     /// Put the staged graph of the native tier in play. A wrapper in the
     /// active root goes, so one score is in play.
-    fn publish_native(&self, pattern: Pattern) {
+    pub(super) fn publish_native(&self, pattern: Pattern) {
         if self.realm.get().is_some() {
             with_ctx_running_no_script(self, |ctx| {
                 if let Ok(active) = host_active(&ctx) {
@@ -1051,7 +1051,7 @@ impl JsRuntime {
                 }
             });
         }
-        *self.native_active.borrow_mut() = Some(pattern);
+        self.set_native_active(Some(pattern));
     }
 
     /// Hand the answer tables of the outgoing active graph to the graph that
@@ -1127,7 +1127,7 @@ impl JsRuntime {
             let heap_exhausted = alloc::take_heap_exhausted();
             if publication.is_ok() && !interrupted && !heap_exhausted {
                 // The wrapper took the place of a native graph in play.
-                self.native_active.borrow_mut().take();
+                self.set_native_active(None);
                 return Ok(());
             }
 
@@ -1342,10 +1342,9 @@ impl JsRuntime {
                 EffectPolicy::NONE
             };
             let _policy_guard = PolicyGuard(self, self.replace_effect_policy(policy));
-            let native = self.core_settings.with(|| {
-                let _published_owner = self.core_settings.bind();
-                self.native_score(program, Some(source))
-            });
+            let native = self
+                .core_settings
+                .with(|| self.native_score(program, Some(source)));
             if let Some(score) = native {
                 if cancellation.load(std::sync::atomic::Ordering::Relaxed) {
                     return Err(QueryError::Limit(rustel_core::QueryLimit::Cancelled));

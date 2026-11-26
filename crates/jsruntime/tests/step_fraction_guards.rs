@@ -36,7 +36,7 @@ fn query_first_cycle(source: &str) -> Result<Vec<Hap>, QueryError> {
 
 fn timing(haps: Vec<Hap>) -> Vec<String> {
     haps.into_iter()
-        .map(|hap| format!("{:?} {:?} {:?}", hap.whole, hap.part, hap.value))
+        .map(|hap| format!("{:?} {:?} {:?}", hap.whole(), hap.part(), hap.value))
         .collect()
 }
 
@@ -63,7 +63,7 @@ fn morph_keeps_an_ordinary_groove() {
         .expect("morph plays");
     let begins: Vec<_> = haps
         .iter()
-        .map(|hap| hap.whole.map(|whole| whole.begin))
+        .map(|hap| hap.whole().map(|whole| whole.begin))
         .collect();
     assert_eq!(begins, [Some(Fraction::new(1, 5))]);
 }

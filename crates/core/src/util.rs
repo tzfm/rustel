@@ -113,11 +113,9 @@ pub fn accidentals_offset(accidentals: &str) -> i32 {
 }
 
 #[inline]
-pub fn note_to_midi(note: &str, default_octave: i32) -> Result<f64, String> {
+pub(crate) fn try_note_to_midi(note: &str, default_octave: i32) -> Option<f64> {
     let bytes = note.as_bytes();
-    let Some(&first) = bytes.first() else {
-        return Err(format!("not a note: \"{note}\""));
-    };
+    let &first = bytes.first()?;
     let chroma: i32 = match first | 0x20 {
         b'c' => 0,
         b'd' => 2,
@@ -126,7 +124,7 @@ pub fn note_to_midi(note: &str, default_octave: i32) -> Result<f64, String> {
         b'g' => 7,
         b'a' => 9,
         b'b' => 11,
-        _ => return Err(format!("not a note: \"{note}\"")),
+        _ => return None,
     };
     let mut i = 1;
     let mut acc: i32 = 0;
@@ -148,7 +146,7 @@ pub fn note_to_midi(note: &str, default_octave: i32) -> Result<f64, String> {
             (false, rest)
         };
         if !digits.iter().all(u8::is_ascii_digit) {
-            return Err(format!("not a note: \"{note}\""));
+            return None;
         }
         if digits.is_empty() {
             f64::NAN
@@ -156,12 +154,15 @@ pub fn note_to_midi(note: &str, default_octave: i32) -> Result<f64, String> {
             let v = f64::from(digits[0] - b'0');
             if neg { -v } else { v }
         } else {
-            note[i..]
-                .parse::<f64>()
-                .map_err(|_| format!("not a note: \"{note}\""))?
+            note[i..].parse::<f64>().ok()?
         }
     };
-    Ok((octave + 1.0) * 12.0 + f64::from(chroma + acc))
+    Some((octave + 1.0) * 12.0 + f64::from(chroma + acc))
+}
+
+#[inline]
+pub fn note_to_midi(note: &str, default_octave: i32) -> Result<f64, String> {
+    try_note_to_midi(note, default_octave).ok_or_else(|| format!("not a note: \"{note}\""))
 }
 
 /// A MIDI note number as a name, for a display a musician can read.
@@ -294,14 +295,21 @@ pub fn parse_numeral(value: &Value) -> Result<f64, String> {
         Value::Bool(value) => Ok(f64::from(*value)),
         Value::Null => Ok(0.0),
         Value::Str(value) => {
-            if let Ok(number) = value.trim().parse::<f64>() {
-                return Ok(number);
+            if let Some(&first) = value.as_bytes().first()
+                && matches!(first | 0x20, b'a'..=b'g')
+                && let Some(midi) = try_note_to_midi(value, 3)
+            {
+                return Ok(midi);
             }
-            if value.trim().is_empty() {
+            let trimmed = value.trim();
+            if trimmed.is_empty() {
                 return Ok(0.0);
             }
-            if is_note(value) {
-                return note_to_midi(value, 3);
+            if let Ok(number) = trimmed.parse::<f64>() {
+                return Ok(number);
+            }
+            if let Some(midi) = try_note_to_midi(value, 3) {
+                return Ok(midi);
             }
             Err(format!("cannot parse as numeral: \"{value}\""))
         }

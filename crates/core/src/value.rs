@@ -4147,6 +4147,74 @@ impl OrderedMap {
         };
     }
 
+    /// Merge stack-packed built-in controls `(keys, vals)` into a `Builtin`
+    /// map by borrowing `vals`. Returns `false` when `self` is not a
+    /// non-`"value"` built-in map or overflows.
+    pub(crate) fn try_merge_packed_ref(&mut self, keys: &[u16], vals: &[Value]) -> bool {
+        if keys.is_empty()
+            || keys
+                .iter()
+                .any(|&k| crate::controls::builtin_name_str_by_id(k & 0x03ff) == Some("value"))
+        {
+            return false;
+        }
+        let Entries::Builtin(entries, made) = &mut self.entries else {
+            return false;
+        };
+        let owned = std::mem::replace(
+            entries,
+            Arc::new(BuiltinMap {
+                keys: [],
+                values: [],
+            }),
+        );
+        match merge_builtin_with_packed(owned, keys, vals) {
+            Ok(merged) => {
+                *entries = merged;
+                *made = true;
+                true
+            }
+            Err(orig) => {
+                *entries = orig;
+                false
+            }
+        }
+    }
+
+    /// Merge stack-packed built-in controls `(keys, vals)` into a `Builtin`
+    /// map by moving values out of `vals`. Returns `false` (leaving `vals`
+    /// untouched) when `self` is not a non-`"value"` built-in map or overflows.
+    pub(crate) fn try_merge_packed_owned(&mut self, keys: &[u16], vals: &mut [Value]) -> bool {
+        if keys.is_empty()
+            || keys
+                .iter()
+                .any(|&k| crate::controls::builtin_name_str_by_id(k & 0x03ff) == Some("value"))
+        {
+            return false;
+        }
+        let Entries::Builtin(entries, made) = &mut self.entries else {
+            return false;
+        };
+        let owned = std::mem::replace(
+            entries,
+            Arc::new(BuiltinMap {
+                keys: [],
+                values: [],
+            }),
+        );
+        match merge_builtin_with_packed_owned(owned, keys, vals) {
+            Ok(merged) => {
+                *entries = merged;
+                *made = true;
+                true
+            }
+            Err(orig) => {
+                *entries = orig;
+                false
+            }
+        }
+    }
+
     /// [`Self::merge`] producing flat entries directly without creating a
     /// temporary [`Patched`] overlay (for build-time folds that would
     /// otherwise immediately undress the overlay).

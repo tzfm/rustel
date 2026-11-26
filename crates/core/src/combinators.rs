@@ -327,8 +327,7 @@ pub fn press<P: PatOps>(pat: &P) -> P {
 /// Samples `pat` at `rate` events per cycle: structure from the pulse
 /// pattern, values from `pat` - what turns a continuous signal discrete.
 pub fn segment<P: PatOps>(pat: &P, rate: Fraction) -> P {
-    let pulse = P::pat_pulse(rate);
-    compose(pat, &pulse, ComposeOp::KeepIf, Alignment::Out).set_steps(Some(rate))
+    pat.pat_segment(rate)
 }
 
 /// Loops the first `t` of each cycle; negative `t` loops the end. Zero is silence.
@@ -362,19 +361,7 @@ pub fn iter<P: PatOps>(pat: &P, times: Fraction, back: bool) -> P {
     if let Some(refused) = refuse_oversized_parts(if back { "iterBack" } else { "iter" }, parts) {
         return refused;
     }
-    let mut pats = Vec::new();
-    if pats.try_reserve_exact(parts as usize).is_err() {
-        return host_memory_refusal();
-    }
-    for i in 0..parts {
-        let offset = Fraction::int(i128::from(i)).div(times);
-        pats.push(if back {
-            pat.late(offset)
-        } else {
-            pat.early(offset)
-        });
-    }
-    P::pat_slowcat(pats)
+    pat.pat_iter(times, parts, back)
 }
 
 /// Speeds the pattern up AND multiplies sample playback rate. `speed` is
@@ -917,7 +904,7 @@ pub fn echo<P: PatOps>(
 
 pub fn within<P: PatOps>(pat: &P, begin: Fraction, end: Fraction, f: Option<&FunctionRef>) -> P {
     let inside = pat.filter_haps(move |hap| {
-        let Some(whole) = hap.whole else {
+        let Some(whole) = hap.whole() else {
             crate::signal_query_error(|| "within requires discrete haps".into());
             return false;
         };
@@ -925,7 +912,7 @@ pub fn within<P: PatOps>(pat: &P, begin: Fraction, end: Fraction, f: Option<&Fun
         position >= begin && position <= end
     });
     let outside = pat.filter_haps(move |hap| {
-        let Some(whole) = hap.whole else {
+        let Some(whole) = hap.whole() else {
             crate::signal_query_error(|| "within requires discrete haps".into());
             return false;
         };
@@ -2419,6 +2406,20 @@ pub fn scale<P: PatOps>(pat: &P, scale_arg: Value) -> P {
     })
 }
 
+/// Direct owned `scale` for a resolved scale name string, avoiding `Value`
+/// wrapping and registry dispatch on native score builds.
+pub fn scale_str_owned(pat: crate::Pattern, scale_name: &str) -> crate::Pattern {
+    pat.map_scale_pitch_owned(scale_name, || {
+        let steps = std::sync::Arc::new(ScaleSteps::new(scale_name.to_owned()));
+        let tag = std::sync::Arc::clone(&steps.tag);
+        let degrees = steps.degree_cache.clone();
+        let kept = std::sync::Arc::clone(&steps);
+        let of_hap = move |hap: &crate::Hap| scale_hap(hap, &kept);
+        let of_note = move |note: &Value| scale_note(&steps, note, None);
+        (of_hap, of_note, Some(tag), degrees)
+    })
+}
+
 /// Owned variant of [`scale`] that mutates uniquely-owned `Sequence` and `Pick`
 /// subtrees in place rather than cloning layers and value arrays.
 pub fn scale_owned<P: PatOps>(pat: P, scale_arg: Value) -> P {
@@ -2526,7 +2527,7 @@ struct ScaleSteps {
     resolved: Result<crate::tonaljs::ResolvedScale, String>,
     /// Precomputed note names for integer scale degrees `-8..24` when `resolved`
     /// is valid, turning common scale-degree lookups into a single array index.
-    degree_cache: Option<Box<[crate::value::SharedStr; 32]>>,
+    degree_cache: Option<std::sync::Arc<[crate::value::SharedStr; 32]>>,
 }
 
 /// The note of a degree of a scale, or why the scale gives none.
@@ -2544,7 +2545,9 @@ impl ScaleSteps {
             for deg in Self::DEGREE_MIN..Self::DEGREE_MAX {
                 entries.push(res.step_shared(deg as f64).ok()?);
             }
-            entries.into_boxed_slice().try_into().ok()
+            let boxed: Box<[crate::value::SharedStr; 32]> =
+                entries.into_boxed_slice().try_into().ok()?;
+            Some(std::sync::Arc::from(boxed))
         });
         Self {
             tagged: crate::context_keys::ContextKeys::of(crate::context_keys::Keys {
@@ -2763,7 +2766,7 @@ mod degrade_tests {
 
     fn signature(haps: Vec<Hap>) -> Vec<HapSignature> {
         haps.into_iter()
-            .map(|hap| (hap.whole, hap.part, hap.value, hap.context))
+            .map(|hap| (hap.whole(), hap.part(), hap.value, hap.context))
             .collect()
     }
 
@@ -3257,7 +3260,7 @@ mod step_scaling_overflow_tests {
                 .try_query_arc_sorted(begin, end)
                 .expect("a legal take/drop is not a refusal")
                 .into_iter()
-                .map(|hap| (hap.whole, hap.part, hap.value))
+                .map(|hap| (hap.whole(), hap.part(), hap.value))
                 .collect()
         };
         let quarter = |n: i128| Fraction::new(n, 4);
@@ -3548,7 +3551,7 @@ mod tests {
         let parts: Vec<_> = pat
             .query_arc_sorted(Fraction::ZERO, Fraction::ONE)
             .into_iter()
-            .map(|hap| (hap.part.begin, hap.part.end, hap.value))
+            .map(|hap| (hap.part().begin, hap.part().end, hap.value))
             .collect();
         assert_eq!(
             parts,

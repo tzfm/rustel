@@ -2289,7 +2289,7 @@ pub(crate) mod tests {
             .query(Fraction::ZERO, Fraction::ONE)
             .expect("query score")
             .into_iter()
-            .map(|hap| (hap.part.begin, hap.part.end))
+            .map(|hap| (hap.part().begin, hap.part().end))
             .collect()
     }
     pub(super) fn shown_note(session: &Session) -> String {

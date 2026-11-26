@@ -2,7 +2,7 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::marker::PhantomData;
 use std::rc::Rc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock, Mutex, RwLock, Weak};
 
 static NEXT_RUNTIME_IDENTITY: AtomicU64 = AtomicU64::new(1);
@@ -25,6 +25,10 @@ struct RuntimeSettingsInner {
     /// detached publication slot. Re-entering the same runtime during one
     /// operation therefore reuses the already selected state.
     identity: u64,
+    /// Lock-free mirror of whether `state` currently selects a host-owned
+    /// voicing dictionary, letting pure native queries avoid `RwLock::read`
+    /// and `bind()` on every window.
+    has_host_voicings: AtomicBool,
     /// All clones share this publication slot. A bound operation pins the
     /// selected state identity once, so replacement is atomic across the
     /// complete operation rather than field-by-field in its middle.
@@ -35,9 +39,15 @@ impl Default for RuntimeSettingsInner {
     fn default() -> Self {
         Self {
             identity: next_runtime_identity(),
+            has_host_voicings: AtomicBool::new(false),
             state: RwLock::default(),
         }
     }
+}
+
+#[inline]
+fn state_has_host_voicings(state: &SettingsState) -> bool {
+    matches!(state.default_voicings(), Some(VoicingDefault::Host { .. }))
 }
 
 #[derive(Clone, Debug, Default)]
@@ -250,7 +260,72 @@ impl RuntimeSettingsScope {
     }
 }
 
+/// Lightweight immutable handle to a point-in-time [`RuntimeSettings`] state.
+///
+/// Cloning the inner `Arc` requires no heap allocation or `RwLock` creation,
+/// letting panic-recovery checkpoints capture pre-operation settings at zero
+/// allocation cost and materialize a detached [`RuntimeSettings`] only if
+/// recovery actually runs.
+#[doc(hidden)]
+#[derive(Clone, Debug)]
+pub struct RuntimeSettingsSnapshot(Arc<SettingsState>);
+
+impl RuntimeSettingsSnapshot {
+    /// Identify the selected host dictionary for retained setup replay.
+    #[doc(hidden)]
+    pub fn host_voicing_identity(&self) -> Option<VoicingDictionaryIdentity> {
+        let Some(VoicingDefault::Host { lease, .. }) = self.0.default_voicings() else {
+            return None;
+        };
+        Some(VoicingDictionaryIdentity(Arc::downgrade(&lease._inner)))
+    }
+
+    /// Materialize a fresh-realm recovery copy of this snapshot.
+    #[doc(hidden)]
+    pub fn recovery_snapshot(&self) -> RuntimeSettings {
+        let source = &self.0;
+        let rare = source.rare.as_deref().map(|r| {
+            Box::new(SettingsRare {
+                default_voicings: r.default_voicings.as_ref().map(VoicingDefault::recovered),
+                midi_maps: r.midi_maps.clone(),
+                user_voicing_dicts: r.user_voicing_dicts.clone(),
+            })
+        });
+        let top_note = *source
+            .legacy_voicing_top_note
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let state = SettingsState {
+            max_polyphony: source.max_polyphony,
+            rng_mode: source.rng_mode,
+            default_join: source.default_join,
+            rare,
+            legacy_voicing_top_note: Arc::new(Mutex::new(top_note)),
+        };
+        RuntimeSettings {
+            inner: Arc::new(RuntimeSettingsInner {
+                identity: next_runtime_identity(),
+                has_host_voicings: AtomicBool::new(false),
+                state: RwLock::new(Arc::new(state)),
+            }),
+        }
+    }
+}
+
 impl RuntimeSettings {
+    /// Capture an allocation-free snapshot of the currently published settings
+    /// state without creating a new `RwLock` publication slot.
+    #[doc(hidden)]
+    #[inline]
+    pub fn snapshot_state(&self) -> RuntimeSettingsSnapshot {
+        let state = self
+            .inner
+            .state
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        RuntimeSettingsSnapshot(Arc::clone(&state))
+    }
+
     /// Conservatively charge immutable native storage retained by a snapshot.
     ///
     /// Includes container capacities and immutable Arc-retained dictionaries,
@@ -338,6 +413,13 @@ impl RuntimeSettings {
         Arc::as_ptr(&self.inner) as usize
     }
 
+    /// Lock-free check for whether the published settings select a host-owned
+    /// voicing dictionary.
+    #[inline]
+    pub fn has_host_owned_voicings_fast(&self) -> bool {
+        self.inner.has_host_voicings.load(Ordering::Relaxed)
+    }
+
     /// Request this handle for the dynamic extent of `f`.
     ///
     /// A nested handle from the same runtime keeps the snapshot already
@@ -422,9 +504,11 @@ impl RuntimeSettings {
     #[doc(hidden)]
     pub fn snapshot_current() -> Self {
         let selected = current_state();
+        let has_host_voicings = state_has_host_voicings(&selected);
         Self {
             inner: Arc::new(RuntimeSettingsInner {
                 identity: next_runtime_identity(),
+                has_host_voicings: AtomicBool::new(has_host_voicings),
                 state: RwLock::new(selected),
             }),
         }
@@ -453,9 +537,11 @@ impl RuntimeSettings {
             .read()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone();
+        let has_host_voicings = state_has_host_voicings(&selected);
         Self {
             inner: Arc::new(RuntimeSettingsInner {
                 identity: self.inner.identity,
+                has_host_voicings: AtomicBool::new(has_host_voicings),
                 state: RwLock::new(selected),
             }),
         }
@@ -528,6 +614,7 @@ impl RuntimeSettings {
         Self {
             inner: Arc::new(RuntimeSettingsInner {
                 identity: next_runtime_identity(),
+                has_host_voicings: AtomicBool::new(false),
                 state: RwLock::new(Arc::new(state)),
             }),
         }
@@ -539,9 +626,11 @@ impl RuntimeSettings {
     /// returned.
     pub(crate) fn pin_current() -> Self {
         let (identity, selected) = current_binding();
+        let has_host_voicings = state_has_host_voicings(&selected);
         Self {
             inner: Arc::new(RuntimeSettingsInner {
                 identity,
+                has_host_voicings: AtomicBool::new(has_host_voicings),
                 state: RwLock::new(selected),
             }),
         }
@@ -602,11 +691,15 @@ impl RuntimeSettings {
             .read()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone();
+        let has_host_voicings = state_has_host_voicings(&selected);
         *self
             .inner
             .state
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = selected;
+        self.inner
+            .has_host_voicings
+            .store(has_host_voicings, Ordering::Relaxed);
     }
 }
 
@@ -862,8 +955,12 @@ fn update_current<R>(f: impl FnOnce(&mut SettingsState) -> R) -> R {
             legacy_voicing_top_note: Arc::clone(&source.legacy_voicing_top_note),
         };
         let result = f(&mut next);
+        let has_host_voicings = state_has_host_voicings(&next);
         let next = Arc::new(next);
         *published = Arc::clone(&next);
+        owner
+            .has_host_voicings
+            .store(has_host_voicings, Ordering::Relaxed);
         (next, result)
     };
     CURRENT.with(|current| {

@@ -46,8 +46,8 @@ fn runtime(source: &str) -> JsRuntime {
 fn assert_musical_contract(expected: &[Hap], actual: &[Hap], label: &str) {
     assert_eq!(actual.len(), expected.len(), "{label}: hap count");
     for (index, (expected, actual)) in expected.iter().zip(actual).enumerate() {
-        assert_eq!(actual.whole, expected.whole, "{label}: whole {index}");
-        assert_eq!(actual.part, expected.part, "{label}: part {index}");
+        assert_eq!(actual.whole(), expected.whole(), "{label}: whole {index}");
+        assert_eq!(actual.part(), expected.part(), "{label}: part {index}");
         assert_eq!(actual.value, expected.value, "{label}: value {index}");
         assert_eq!(
             actual.scale_context(),

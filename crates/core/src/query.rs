@@ -70,26 +70,16 @@ impl ValueReading {
     }
 }
 
-/// Pack a single `(begin, end)` range into a non-zero `u32` for [`RunApply`]:
-/// `begin` in the high 20 bits and `length + 1` in the low 12 bits, leaving
-/// `0` as the empty sentinel.
+/// Pack a single `(begin, end)` range into a non-zero 31-bit `u32` matching
+/// [`Locations`] directly.
 #[inline]
-pub(crate) fn pack_run_loc((begin, end): (usize, usize)) -> Option<u32> {
-    const LEN_BITS: u32 = 12;
-    const MAX_LEN: u32 = (1 << LEN_BITS) - 2;
-    const MAX_BEGIN: u32 = (1 << (32 - LEN_BITS)) - 1;
-    let length = u32::try_from(end.checked_sub(begin)?).ok()?;
-    let begin = u32::try_from(begin).ok()?;
-    (begin <= MAX_BEGIN && length <= MAX_LEN).then_some((begin << LEN_BITS) | (length + 1))
+pub(crate) fn pack_run_loc(range: (usize, usize)) -> Option<u32> {
+    Locations::pack_range_raw(range)
 }
 
 #[inline]
 pub(crate) fn unpack_run_loc(packed: u32) -> (usize, usize) {
-    const LEN_BITS: u32 = 12;
-    const LEN_MASK: u32 = (1 << LEN_BITS) - 1;
-    let begin = (packed >> LEN_BITS) as usize;
-    let length = ((packed & LEN_MASK) - 1) as usize;
-    (begin, begin + length)
+    Locations::unpack_range_raw(packed)
 }
 
 #[derive(Clone)]
@@ -356,10 +346,12 @@ impl RunMeeting {
         out: &mut Vec<Hap>,
     ) -> bool {
         let met = hf.whole_or_part();
-        let Some(overlap) = (match hf.whole {
-            None => (hf.part.begin <= hf.part.end).then_some(hf.part),
-            Some(whole) if whole == hf.part => (hf.part.begin <= hf.part.end).then_some(hf.part),
-            Some(whole) => hf.part.intersection(&whole),
+        let Some(overlap) = (match hf.whole() {
+            None => (hf.part().begin <= hf.part().end).then_some(hf.part()),
+            Some(whole) if whole == hf.part() => {
+                (hf.part().begin <= hf.part().end).then_some(hf.part())
+            }
+            Some(whole) => hf.part().intersection(&whole),
         }) else {
             if met.begin != met.end
                 && !met
@@ -387,7 +379,7 @@ impl RunMeeting {
                 if !Meeting::in_place_run_meeting(&mut hap, self, overlap, cache) {
                     let constant = self.as_hap();
                     let apply = self.combine();
-                    hap = applied_hap(&hap, &constant, hap.whole, overlap, &apply, self.flow());
+                    hap = applied_hap(&hap, &constant, hap.whole(), overlap, &apply, self.flow());
                 }
                 return !thread.stop_requested() && thread.push_budgeted(out, 0, hap);
             }
@@ -406,7 +398,7 @@ impl RunMeeting {
                 if !Meeting::in_place_run_meeting(&mut hap, self, part, cache.as_deref_mut()) {
                     let (constant, apply) =
                         fallback.get_or_insert_with(|| (self.as_hap(), self.combine()));
-                    hap = applied_hap(&hap, constant, hap.whole, part, apply, self.flow());
+                    hap = applied_hap(&hap, constant, hap.whole(), part, apply, self.flow());
                 }
                 if thread.stop_requested() || !thread.push_budgeted(out, 0, hap) {
                     stopped = true;
@@ -419,7 +411,7 @@ impl RunMeeting {
         let mut single: Option<TimeSpan> = None;
         let mut count = 0usize;
         met.for_each_cycle(|piece| {
-            if let Some(part) = hf.part.intersection(&piece) {
+            if let Some(part) = hf.part().intersection(&piece) {
                 single = Some(part);
                 count += 1;
             }
@@ -433,7 +425,7 @@ impl RunMeeting {
             if !Meeting::in_place_run_meeting(&mut hap, self, part, cache) {
                 let constant = self.as_hap();
                 let apply = self.combine();
-                hap = applied_hap(&hap, &constant, hap.whole, part, &apply, self.flow());
+                hap = applied_hap(&hap, &constant, hap.whole(), part, &apply, self.flow());
             }
             return !thread.stop_requested() && thread.push_budgeted(out, 0, hap);
         }
@@ -441,14 +433,14 @@ impl RunMeeting {
             if stopped {
                 return;
             }
-            let Some(part) = hf.part.intersection(&piece) else {
+            let Some(part) = hf.part().intersection(&piece) else {
                 return;
             };
             let mut hap = hf.clone();
             if !Meeting::in_place_run_meeting(&mut hap, self, part, cache.as_deref_mut()) {
                 let (constant, apply) =
                     fallback.get_or_insert_with(|| (self.as_hap(), self.combine()));
-                hap = applied_hap(&hap, constant, hap.whole, part, apply, self.flow());
+                hap = applied_hap(&hap, constant, hap.whole(), part, apply, self.flow());
             }
             if thread.stop_requested() || !thread.push_budgeted(out, 0, hap) {
                 stopped = true;
@@ -1161,15 +1153,18 @@ fn slowcat_cycle_with_onto(
     let moved = shift(state.span, -offset).and_then(|inner_span| {
         query_inner(inner_span, out);
         out[from..].iter_mut().try_for_each(|hap| {
-            let part = shift(hap.part, offset)?;
+            let old_part = hap.part();
+            let part = shift(old_part, offset)?;
             // A hap that is not cut reads the times of its part one time.
-            if let Some(whole) = hap.whole.as_mut() {
-                *whole = match *whole == hap.part {
-                    true => part,
-                    false => shift(*whole, offset)?,
-                };
-            }
-            hap.part = part;
+            let whole = match hap.whole() {
+                Some(whole) => Some(if whole == old_part {
+                    part
+                } else {
+                    shift(whole, offset)?
+                }),
+                None => None,
+            };
+            hap.set_spans(whole, part);
             Some(())
         })
     });
@@ -1179,6 +1174,1614 @@ fn slowcat_cycle_with_onto(
             operation: "slowcat",
         });
     }
+}
+
+#[inline(always)]
+fn gcd_u32(mut a: u32, mut b: u32) -> u32 {
+    if a == 0 {
+        return b;
+    }
+    if b == 0 {
+        return a;
+    }
+    let shift = (a | b).trailing_zeros();
+    a >>= a.trailing_zeros();
+    loop {
+        b >>= b.trailing_zeros();
+        if a > b {
+            std::mem::swap(&mut a, &mut b);
+        }
+        b -= a;
+        if b == 0 {
+            return a << shift;
+        }
+    }
+}
+
+#[cold]
+#[inline(never)]
+fn reduce_i64_u32_slow(n: i64, d: u32) -> (i64, std::num::NonZeroU32) {
+    match d {
+        0 | 1 => return (n, std::num::NonZeroU32::MIN),
+        5 => {
+            if n % 5 == 0 {
+                return (n / 5, std::num::NonZeroU32::MIN);
+            }
+            return (n, const { std::num::NonZeroU32::new(5).unwrap() });
+        }
+        6 => {
+            return match n.unsigned_abs() % 6 {
+                0 => (n / 6, std::num::NonZeroU32::MIN),
+                2 | 4 => (n / 2, const { std::num::NonZeroU32::new(3).unwrap() }),
+                3 => (n / 3, const { std::num::NonZeroU32::new(2).unwrap() }),
+                _ => (n, const { std::num::NonZeroU32::new(6).unwrap() }),
+            };
+        }
+        _ => {}
+    }
+    let rem = (n.unsigned_abs() % u64::from(d)) as u32;
+    if rem == 0 {
+        return (n / i64::from(d), std::num::NonZeroU32::MIN);
+    }
+    if rem == 1 || rem == d - 1 {
+        return (
+            n,
+            std::num::NonZeroU32::new(d).unwrap_or(std::num::NonZeroU32::MIN),
+        );
+    }
+    let g = gcd_u32(rem, d);
+    if g == 1 {
+        (
+            n,
+            std::num::NonZeroU32::new(d).unwrap_or(std::num::NonZeroU32::MIN),
+        )
+    } else {
+        (
+            n / i64::from(g),
+            std::num::NonZeroU32::new(d / g).unwrap_or(std::num::NonZeroU32::MIN),
+        )
+    }
+}
+
+#[inline(always)]
+pub(crate) fn reduce_i64_u32(n: i64, d: u32) -> (i64, std::num::NonZeroU32) {
+    if n == 0 {
+        return (0, std::num::NonZeroU32::MIN);
+    }
+    // Triplets (`d == 3`) stay inline as a 2-cycle magic multiply; rarer
+    // non-power-of-two denominators stay cold to keep window loops compact.
+    if d == 3 {
+        if n % 3 == 0 {
+            return (n / 3, std::num::NonZeroU32::MIN);
+        }
+        return (n, const { std::num::NonZeroU32::new(3).unwrap() });
+    }
+    reduce_i64_u32_slow(n, d)
+}
+
+#[derive(Clone, Copy)]
+#[repr(C, align(4))]
+struct DyadicStep {
+    bn0: u8,
+    en0: u8,
+    bd: std::num::NonZeroU8,
+    ed: std::num::NonZeroU8,
+}
+
+const fn dyadic_u8(k: u32, shift: u32) -> (u8, std::num::NonZeroU8) {
+    if k == 0 {
+        return (0, std::num::NonZeroU8::MIN);
+    }
+    let tz = k.trailing_zeros();
+    let s = if tz < shift { tz } else { shift };
+    let n = (k >> s) as u8;
+    let d = 1u8 << (shift - s);
+    (
+        n,
+        match std::num::NonZeroU8::new(d) {
+            Some(nz) => nz,
+            None => std::num::NonZeroU8::MIN,
+        },
+    )
+}
+
+const fn make_dyadic_table<const N: usize>(shift: u32) -> [DyadicStep; N] {
+    let mut table = [DyadicStep {
+        bn0: 0,
+        en0: 1,
+        bd: std::num::NonZeroU8::MIN,
+        ed: std::num::NonZeroU8::MIN,
+    }; N];
+    let mut i = 0usize;
+    while i < N {
+        let (bn0, bd) = dyadic_u8(i as u32, shift);
+        let (en0, ed) = dyadic_u8((i + 1) as u32, shift);
+        table[i] = DyadicStep { bn0, en0, bd, ed };
+        i += 1;
+    }
+    table
+}
+
+const DYADIC_2: [DyadicStep; 2] = make_dyadic_table::<2>(1);
+const DYADIC_4: [DyadicStep; 4] = make_dyadic_table::<4>(2);
+const DYADIC_8: [DyadicStep; 8] = make_dyadic_table::<8>(3);
+const DYADIC_16: [DyadicStep; 16] = make_dyadic_table::<16>(4);
+const DYADIC_32: [DyadicStep; 32] = make_dyadic_table::<32>(5);
+const DYADIC_64: [DyadicStep; 64] = make_dyadic_table::<64>(6);
+
+#[inline(always)]
+const fn dyadic_table_for(count: u32) -> Option<&'static [DyadicStep]> {
+    match count {
+        2 => Some(&DYADIC_2),
+        4 => Some(&DYADIC_4),
+        8 => Some(&DYADIC_8),
+        16 => Some(&DYADIC_16),
+        32 => Some(&DYADIC_32),
+        64 => Some(&DYADIC_64),
+        _ => None,
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+#[inline(always)]
+fn fill_dyadic_turns<const N: usize, const SHIFT: u32>(
+    out: &mut Vec<Hap>,
+    table: &'static [DyadicStep; N],
+    total: usize,
+    first_cycle: i64,
+    base_iv: i8,
+    named_id: u16,
+    loc0: u32,
+    loc1: u32,
+    step_neg: bool,
+) {
+    let turns = total >> SHIFT;
+    if !step_neg {
+        for turn in 0..turns {
+            let c = first_cycle + turn as i64;
+            out.extend(table.iter().enumerate().map(move |(i, e)| {
+                let bn = i64::from(e.bn0) + c * i64::from(e.bd.get());
+                let en = i64::from(e.en0) + c * i64::from(e.ed.get());
+                let iv = base_iv.wrapping_add(i as i8);
+                Hap::of_whole_parts(
+                    bn,
+                    std::num::NonZeroU32::from(e.bd),
+                    en,
+                    std::num::NonZeroU32::from(e.ed),
+                    Value::Object(OrderedMap::from_static_int(named_id, iv, false)),
+                    Locations::from_packed([loc0, loc1, 0, 0]),
+                    ContextKeys::default(),
+                )
+            }));
+        }
+    } else {
+        for turn in 0..turns {
+            let c = first_cycle + turn as i64;
+            out.extend(table.iter().enumerate().map(move |(i, e)| {
+                let bn = i64::from(e.bn0) + c * i64::from(e.bd.get());
+                let en = i64::from(e.en0) + c * i64::from(e.ed.get());
+                let iv = base_iv.wrapping_sub(i as i8);
+                Hap::of_whole_parts(
+                    bn,
+                    std::num::NonZeroU32::from(e.bd),
+                    en,
+                    std::num::NonZeroU32::from(e.ed),
+                    Value::Object(OrderedMap::from_static_int(named_id, iv, false)),
+                    Locations::from_packed([loc0, loc1, 0, 0]),
+                    ContextKeys::default(),
+                )
+            }));
+        }
+    }
+}
+
+/// Zero-TLS direct emission for dyadic power-of-two exact-edge `Node::IntRange`
+/// queries producing at most 1024 haps (e.g. `1/8` playback windows and 16-cycle
+/// `n("0 .. 63")` queries).
+#[allow(clippy::too_many_arguments)]
+fn try_query_int_range_direct(
+    start: i32,
+    count: u32,
+    loc0: u32,
+    loc1: u32,
+    named_id: u16,
+    step_neg: bool,
+    state: &State,
+    hap_budget: u64,
+) -> Option<Result<Vec<Hap>, QueryLimit>> {
+    if count == 0 || !count.is_power_of_two() {
+        return None;
+    }
+    let span = state.span;
+    let (Ok(bn_i32), Ok(en_i32), Ok(bd_u16), Ok(ed_u16)) = (
+        i32::try_from(span.begin.numer()),
+        i32::try_from(span.end.numer()),
+        u16::try_from(span.begin.denom()),
+        u16::try_from(span.end.denom()),
+    ) else {
+        return None;
+    };
+    let bn = i64::from(bn_i32);
+    let en = i64::from(en_i32);
+    let bd_u32 = u32::from(bd_u16);
+    let ed_u32 = u32::from(ed_u16);
+    if bn.abs() > (1i64 << 30)
+        || en.abs() > (1i64 << 30)
+        || bn * i64::from(ed_u32) >= en * i64::from(bd_u32)
+        || bd_u32 > count
+        || ed_u32 > count
+        || !bd_u32.is_power_of_two()
+        || !ed_u32.is_power_of_two()
+    {
+        return None;
+    }
+    let shift = count.trailing_zeros();
+    if shift >= 24 {
+        return None;
+    }
+    let dir = if step_neg { -1i64 } else { 1i64 };
+    let min_v = i64::from(start).min(i64::from(start) + i64::from(count - 1) * dir);
+    let max_v = i64::from(start).max(i64::from(start) + i64::from(count - 1) * dir);
+    if named_id != 0 && (min_v < i64::from(i8::MIN) || max_v > i64::from(i8::MAX)) {
+        return None;
+    }
+    let bd_sh = bd_u32.trailing_zeros();
+    let ed_sh = ed_u32.trailing_zeros();
+    let first_i64 = bn << (shift - bd_sh);
+    let last_i64 = en << (shift - ed_sh);
+    let first_cycle = first_i64 >> shift;
+    let last_cycle = (last_i64 - 1) >> shift;
+    let cycles = last_cycle - first_cycle + 1;
+    if i128::from(cycles) > MAX_QUERY_SPAN_CYCLES {
+        return Some(Err(QueryLimit::QuerySpan {
+            cycles: MAX_QUERY_SPAN_CYCLES,
+        }));
+    }
+    let total = (last_i64 - first_i64) as usize;
+    if total == 0 || total > 1024 {
+        return None;
+    }
+    if total as u64 > hap_budget {
+        return Some(Err(QueryLimit::HapBudget { budget: hap_budget }));
+    }
+    let mask = i64::from(count - 1);
+    let base_start = i64::from(start);
+    let mut out = Vec::with_capacity(total);
+    if named_id != 0 {
+        if let Some(table) = dyadic_table_for(count) {
+            if first_cycle == last_cycle {
+                let start_idx = (first_i64 & mask) as usize;
+                let slice = &table[start_idx..start_idx + total];
+                if !step_neg {
+                    let base_iv = (base_start + start_idx as i64) as i8;
+                    out.extend(slice.iter().enumerate().map(move |(j, e)| {
+                        let bn = i64::from(e.bn0) + first_cycle * i64::from(e.bd.get());
+                        let en = i64::from(e.en0) + first_cycle * i64::from(e.ed.get());
+                        let iv = base_iv.wrapping_add(j as i8);
+                        Hap::of_whole_parts(
+                            bn,
+                            std::num::NonZeroU32::from(e.bd),
+                            en,
+                            std::num::NonZeroU32::from(e.ed),
+                            Value::Object(OrderedMap::from_static_int(named_id, iv, false)),
+                            Locations::from_packed([loc0, loc1, 0, 0]),
+                            ContextKeys::default(),
+                        )
+                    }));
+                } else {
+                    let base_iv = (base_start - start_idx as i64) as i8;
+                    out.extend(slice.iter().enumerate().map(move |(j, e)| {
+                        let bn = i64::from(e.bn0) + first_cycle * i64::from(e.bd.get());
+                        let en = i64::from(e.en0) + first_cycle * i64::from(e.ed.get());
+                        let iv = base_iv.wrapping_sub(j as i8);
+                        Hap::of_whole_parts(
+                            bn,
+                            std::num::NonZeroU32::from(e.bd),
+                            en,
+                            std::num::NonZeroU32::from(e.ed),
+                            Value::Object(OrderedMap::from_static_int(named_id, iv, false)),
+                            Locations::from_packed([loc0, loc1, 0, 0]),
+                            ContextKeys::default(),
+                        )
+                    }));
+                }
+                return Some(Ok(out));
+            }
+            if (first_i64 & mask) == 0 && (last_i64 & mask) == 0 {
+                let base_iv = base_start as i8;
+                match count {
+                    64 => fill_dyadic_turns::<64, 6>(
+                        &mut out,
+                        &DYADIC_64,
+                        total,
+                        first_cycle,
+                        base_iv,
+                        named_id,
+                        loc0,
+                        loc1,
+                        step_neg,
+                    ),
+                    32 => fill_dyadic_turns::<32, 5>(
+                        &mut out,
+                        &DYADIC_32,
+                        total,
+                        first_cycle,
+                        base_iv,
+                        named_id,
+                        loc0,
+                        loc1,
+                        step_neg,
+                    ),
+                    16 => fill_dyadic_turns::<16, 4>(
+                        &mut out,
+                        &DYADIC_16,
+                        total,
+                        first_cycle,
+                        base_iv,
+                        named_id,
+                        loc0,
+                        loc1,
+                        step_neg,
+                    ),
+                    8 => fill_dyadic_turns::<8, 3>(
+                        &mut out,
+                        &DYADIC_8,
+                        total,
+                        first_cycle,
+                        base_iv,
+                        named_id,
+                        loc0,
+                        loc1,
+                        step_neg,
+                    ),
+                    4 => fill_dyadic_turns::<4, 2>(
+                        &mut out,
+                        &DYADIC_4,
+                        total,
+                        first_cycle,
+                        base_iv,
+                        named_id,
+                        loc0,
+                        loc1,
+                        step_neg,
+                    ),
+                    2 => fill_dyadic_turns::<2, 1>(
+                        &mut out,
+                        &DYADIC_2,
+                        total,
+                        first_cycle,
+                        base_iv,
+                        named_id,
+                        loc0,
+                        loc1,
+                        step_neg,
+                    ),
+                    _ => unreachable!("dyadic_table_for matched count"),
+                }
+                return Some(Ok(out));
+            }
+        }
+        let (mut cur_bn, mut cur_bd) = Fraction::dyadic_i64_parts(first_i64, shift);
+        if !step_neg {
+            out.extend((first_i64..last_i64).map(move |k| {
+                let (bn, bd) = (cur_bn, cur_bd);
+                let (en, ed) = Fraction::dyadic_i64_parts(k + 1, shift);
+                cur_bn = en;
+                cur_bd = ed;
+                let iv = (base_start + (k & mask)) as i8;
+                Hap::of_whole_parts(
+                    bn,
+                    bd,
+                    en,
+                    ed,
+                    Value::Object(OrderedMap::from_static_int(named_id, iv, false)),
+                    Locations::from_packed([loc0, loc1, 0, 0]),
+                    ContextKeys::default(),
+                )
+            }));
+        } else {
+            out.extend((first_i64..last_i64).map(move |k| {
+                let (bn, bd) = (cur_bn, cur_bd);
+                let (en, ed) = Fraction::dyadic_i64_parts(k + 1, shift);
+                cur_bn = en;
+                cur_bd = ed;
+                let iv = (base_start - (k & mask)) as i8;
+                Hap::of_whole_parts(
+                    bn,
+                    bd,
+                    en,
+                    ed,
+                    Value::Object(OrderedMap::from_static_int(named_id, iv, false)),
+                    Locations::from_packed([loc0, loc1, 0, 0]),
+                    ContextKeys::default(),
+                )
+            }));
+        }
+    } else {
+        let (mut cur_bn, mut cur_bd) = Fraction::dyadic_i64_parts(first_i64, shift);
+        out.extend((first_i64..last_i64).map(move |k| {
+            let (bn, bd) = (cur_bn, cur_bd);
+            let (en, ed) = Fraction::dyadic_i64_parts(k + 1, shift);
+            cur_bn = en;
+            cur_bd = ed;
+            let num = base_start + (k & mask) * dir;
+            Hap::of_whole_parts(
+                bn,
+                bd,
+                en,
+                ed,
+                Value::F64(num as f64),
+                Locations::from_packed([loc0, loc1, 0, 0]),
+                ContextKeys::default(),
+            )
+        }));
+    }
+    Some(Ok(out))
+}
+
+#[inline]
+fn int_range_locations(loc0: u32, loc1: u32) -> Locations {
+    Locations::from_packed([loc0, loc1, 0, 0])
+}
+
+/// Emit `Node::IntRange { start, count, loc0, loc1, named_id, step_neg }`
+/// directly in ascending time order with zero per-step metadata tables.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn query_int_range_onto(
+    thread: &QueryThread,
+    start: i32,
+    count: u32,
+    loc0: u32,
+    loc1: u32,
+    named_id: u16,
+    step_neg: bool,
+    state: &State,
+    out: &mut Vec<Hap>,
+) {
+    if count == 0 {
+        return;
+    }
+    let span = state.span;
+    if span.begin > span.end {
+        return;
+    }
+    let n_i128 = i128::from(count);
+    let n_frac = Fraction::int(n_i128);
+    let make_loc = || int_range_locations(loc0, loc1);
+    let dir = if step_neg { -1i64 } else { 1i64 };
+    let make_value = |idx: u32| -> Value {
+        let num = i64::from(start) + i64::from(idx) * dir;
+        if named_id == 0 {
+            Value::F64(num as f64)
+        } else if let Ok(iv) = i8::try_from(num) {
+            Value::Object(OrderedMap::from_static_int(named_id, iv, false))
+        } else if let Some(spec) = controls::builtin_spec_by_id(named_id) {
+            Value::Object(OrderedMap::from_single_packed(
+                spec.packed_key,
+                Value::F64(num as f64),
+            ))
+        } else {
+            Value::F64(num as f64)
+        }
+    };
+
+    let from = out.len();
+    if span.begin == span.end {
+        let Some(scaled) = span.begin.checked_mul(n_frac) else {
+            refuse(QueryLimit::NativeFraction { operation: "range" });
+            return;
+        };
+        let k = scaled.floor_int();
+        let (Some(wb), Some(we)) = (
+            Fraction::int(k).checked_div(n_frac),
+            k.checked_add(1)
+                .and_then(|next| Fraction::int(next).checked_div(n_frac)),
+        ) else {
+            refuse(QueryLimit::NativeFraction { operation: "range" });
+            return;
+        };
+        if !thread.charge(1) {
+            return;
+        }
+        let idx = k.rem_euclid(n_i128) as u32;
+        out.push(Hap::of_sequence(
+            TimeSpan::new(wb, we),
+            span,
+            make_value(idx),
+            make_loc(),
+            ContextKeys::default(),
+        ));
+        thread.note_accumulated(1);
+        thread.note_materialised(1);
+        return;
+    }
+
+    // Zero-GCD power-of-two exact-edge StaticInt fast path (covers whole cycles
+    // and dyadic windows like `1/8` on `n("0 .. 63")`).
+    let min_v = i64::from(start).min(i64::from(start) + i64::from(count - 1) * dir);
+    let max_v = i64::from(start).max(i64::from(start) + i64::from(count - 1) * dir);
+    if count.is_power_of_two()
+        && span.begin < span.end
+        && span.begin.denom() <= n_i128
+        && span.end.denom() <= n_i128
+        && (span.begin.denom() as u32).is_power_of_two()
+        && (span.end.denom() as u32).is_power_of_two()
+        && span.begin.numer().abs() <= (1i128 << 30)
+        && span.end.numer().abs() <= (1i128 << 30)
+    {
+        let shift = count.trailing_zeros();
+        let bd_sh = (span.begin.denom() as u32).trailing_zeros();
+        let ed_sh = (span.end.denom() as u32).trailing_zeros();
+        let first_i64 = (span.begin.numer() as i64) << (shift - bd_sh);
+        let last_i64 = (span.end.numer() as i64) << (shift - ed_sh);
+        let cycles = ((last_i64 - 1) >> shift) - (first_i64 >> shift) + 1;
+        if i128::from(cycles) > MAX_QUERY_SPAN_CYCLES {
+            refuse(QueryLimit::QuerySpan {
+                cycles: MAX_QUERY_SPAN_CYCLES,
+            });
+            return;
+        }
+        let total = (last_i64 - first_i64) as usize;
+        if total == 0 || !thread.charge(total) {
+            return;
+        }
+        let base_loc = make_loc();
+        if shift < 24
+            && let Some(packed_loc) = base_loc.as_packed_copy()
+        {
+            let mask = i64::from(count - 1);
+            out.reserve_exact(total);
+            if named_id != 0 && min_v >= i64::from(i8::MIN) && max_v <= i64::from(i8::MAX) {
+                let mut cur_k = first_i64;
+                let base_start = i64::from(start);
+                if !step_neg {
+                    while cur_k < last_i64 {
+                        if cur_k != first_i64 && thread.stop_requested() {
+                            out.truncate(from);
+                            return;
+                        }
+                        let chunk_end = (cur_k + 1024).min(last_i64);
+                        let (mut cur_bn, mut cur_bd) = Fraction::dyadic_i64_parts(cur_k, shift);
+                        out.extend((cur_k..chunk_end).map(move |k| {
+                            let (bn, bd) = (cur_bn, cur_bd);
+                            let (en, ed) = Fraction::dyadic_i64_parts(k + 1, shift);
+                            cur_bn = en;
+                            cur_bd = ed;
+                            let iv = (base_start + (k & mask)) as i8;
+                            Hap::of_whole_parts(
+                                bn,
+                                bd,
+                                en,
+                                ed,
+                                Value::Object(OrderedMap::from_static_int(named_id, iv, false)),
+                                Locations::from_packed_copy(packed_loc),
+                                ContextKeys::default(),
+                            )
+                        }));
+                        cur_k = chunk_end;
+                    }
+                } else {
+                    while cur_k < last_i64 {
+                        if cur_k != first_i64 && thread.stop_requested() {
+                            out.truncate(from);
+                            return;
+                        }
+                        let chunk_end = (cur_k + 1024).min(last_i64);
+                        let (mut cur_bn, mut cur_bd) = Fraction::dyadic_i64_parts(cur_k, shift);
+                        out.extend((cur_k..chunk_end).map(move |k| {
+                            let (bn, bd) = (cur_bn, cur_bd);
+                            let (en, ed) = Fraction::dyadic_i64_parts(k + 1, shift);
+                            cur_bn = en;
+                            cur_bd = ed;
+                            let iv = (base_start - (k & mask)) as i8;
+                            Hap::of_whole_parts(
+                                bn,
+                                bd,
+                                en,
+                                ed,
+                                Value::Object(OrderedMap::from_static_int(named_id, iv, false)),
+                                Locations::from_packed_copy(packed_loc),
+                                ContextKeys::default(),
+                            )
+                        }));
+                        cur_k = chunk_end;
+                    }
+                }
+            } else if named_id == 0 {
+                let mut cur_k = first_i64;
+                let (mut cur_bn, mut cur_bd) = Fraction::dyadic_i64_parts(cur_k, shift);
+                while cur_k < last_i64 {
+                    if cur_k != first_i64 && thread.stop_requested() {
+                        out.truncate(from);
+                        return;
+                    }
+                    let chunk_end = (cur_k + 1024).min(last_i64);
+                    out.extend((cur_k..chunk_end).map(|k| {
+                        let (bn, bd) = (cur_bn, cur_bd);
+                        let (en, ed) = Fraction::dyadic_i64_parts(k + 1, shift);
+                        cur_bn = en;
+                        cur_bd = ed;
+                        let idx = k & mask;
+                        let num = i64::from(start) + idx * dir;
+                        Hap::of_whole_parts(
+                            bn,
+                            bd,
+                            en,
+                            ed,
+                            Value::F64(num as f64),
+                            Locations::from_packed_copy(packed_loc),
+                            ContextKeys::default(),
+                        )
+                    }));
+                    cur_k = chunk_end;
+                }
+            } else {
+                let mut cur_k = first_i64;
+                let (mut cur_bn, mut cur_bd) = Fraction::dyadic_i64_parts(cur_k, shift);
+                while cur_k < last_i64 {
+                    if cur_k != first_i64 && thread.stop_requested() {
+                        out.truncate(from);
+                        return;
+                    }
+                    let chunk_end = (cur_k + 1024).min(last_i64);
+                    out.extend((cur_k..chunk_end).map(|k| {
+                        let (bn, bd) = (cur_bn, cur_bd);
+                        let (en, ed) = Fraction::dyadic_i64_parts(k + 1, shift);
+                        cur_bn = en;
+                        cur_bd = ed;
+                        let idx = (k & mask) as u32;
+                        Hap::of_whole_parts(
+                            bn,
+                            bd,
+                            en,
+                            ed,
+                            make_value(idx),
+                            Locations::from_packed_copy(packed_loc),
+                            ContextKeys::default(),
+                        )
+                    }));
+                    cur_k = chunk_end;
+                }
+            }
+            thread.note_accumulated(total);
+            thread.note_materialised(total);
+            return;
+        }
+    }
+
+    if !span
+        .cycle_count()
+        .is_some_and(|cycles| cycles <= MAX_QUERY_SPAN_CYCLES)
+    {
+        refuse(QueryLimit::QuerySpan {
+            cycles: MAX_QUERY_SPAN_CYCLES,
+        });
+        return;
+    }
+
+    let (Some(scaled_b), Some(scaled_e)) =
+        (span.begin.checked_mul(n_frac), span.end.checked_mul(n_frac))
+    else {
+        refuse(QueryLimit::NativeFraction { operation: "range" });
+        return;
+    };
+    let first_k = scaled_b.floor_int();
+    let last_k = scaled_e.ceil().numer();
+    if first_k >= last_k {
+        return;
+    }
+    let Some(total) = last_k
+        .checked_sub(first_k)
+        .and_then(|v| usize::try_from(v).ok())
+    else {
+        refuse(QueryLimit::QuerySpan {
+            cycles: MAX_QUERY_SPAN_CYCLES,
+        });
+        return;
+    };
+    if !thread.charge(total) {
+        return;
+    }
+
+    // Ultra-fast power-of-two exact-edge StaticInt path (`n("0 .. 63")`).
+    if count.is_power_of_two()
+        && scaled_b.denom() == 1
+        && scaled_e.denom() == 1
+        && first_k.abs() <= (1i128 << 36)
+        && last_k.abs() <= (1i128 << 36)
+    {
+        let shift = count.trailing_zeros();
+        let base_loc = make_loc();
+        if shift < 24
+            && let Some(packed_loc) = base_loc.as_packed_copy()
+        {
+            let first_i64 = first_k as i64;
+            let last_i64 = last_k as i64;
+            let mask = i64::from(count - 1);
+            out.reserve_exact(total);
+            if named_id != 0 && min_v >= i64::from(i8::MIN) && max_v <= i64::from(i8::MAX) {
+                let mut cur_k = first_i64;
+                let (mut cur_bn, mut cur_bd) = Fraction::dyadic_i64_parts(cur_k, shift);
+                while cur_k < last_i64 {
+                    if cur_k != first_i64 && thread.stop_requested() {
+                        out.truncate(from);
+                        return;
+                    }
+                    let chunk_end = (cur_k + 1024).min(last_i64);
+                    out.extend((cur_k..chunk_end).map(|k| {
+                        let (bn, bd) = (cur_bn, cur_bd);
+                        let (en, ed) = Fraction::dyadic_i64_parts(k + 1, shift);
+                        cur_bn = en;
+                        cur_bd = ed;
+                        let idx = k & mask;
+                        let iv = (i64::from(start) + idx * dir) as i8;
+                        Hap::of_whole_parts(
+                            bn,
+                            bd,
+                            en,
+                            ed,
+                            Value::Object(OrderedMap::from_static_int(named_id, iv, false)),
+                            Locations::from_packed_copy(packed_loc),
+                            ContextKeys::default(),
+                        )
+                    }));
+                    cur_k = chunk_end;
+                }
+            } else if named_id == 0 {
+                let mut cur_k = first_i64;
+                let (mut cur_bn, mut cur_bd) = Fraction::dyadic_i64_parts(cur_k, shift);
+                while cur_k < last_i64 {
+                    if cur_k != first_i64 && thread.stop_requested() {
+                        out.truncate(from);
+                        return;
+                    }
+                    let chunk_end = (cur_k + 1024).min(last_i64);
+                    out.extend((cur_k..chunk_end).map(|k| {
+                        let (bn, bd) = (cur_bn, cur_bd);
+                        let (en, ed) = Fraction::dyadic_i64_parts(k + 1, shift);
+                        cur_bn = en;
+                        cur_bd = ed;
+                        let idx = k & mask;
+                        let num = i64::from(start) + idx * dir;
+                        Hap::of_whole_parts(
+                            bn,
+                            bd,
+                            en,
+                            ed,
+                            Value::F64(num as f64),
+                            Locations::from_packed_copy(packed_loc),
+                            ContextKeys::default(),
+                        )
+                    }));
+                    cur_k = chunk_end;
+                }
+            } else {
+                let packed_key = controls::builtin_spec_by_id(named_id).map(|s| s.packed_key);
+                let mut cur_k = first_i64;
+                let (mut cur_bn, mut cur_bd) = Fraction::dyadic_i64_parts(cur_k, shift);
+                while cur_k < last_i64 {
+                    if cur_k != first_i64 && thread.stop_requested() {
+                        out.truncate(from);
+                        return;
+                    }
+                    let chunk_end = (cur_k + 1024).min(last_i64);
+                    out.extend((cur_k..chunk_end).map(|k| {
+                        let (bn, bd) = (cur_bn, cur_bd);
+                        let (en, ed) = Fraction::dyadic_i64_parts(k + 1, shift);
+                        cur_bn = en;
+                        cur_bd = ed;
+                        let idx = k & mask;
+                        let num = i64::from(start) + idx * dir;
+                        let val = match packed_key {
+                            Some(pk) => Value::Object(OrderedMap::from_single_packed(
+                                pk,
+                                Value::F64(num as f64),
+                            )),
+                            None => Value::F64(num as f64),
+                        };
+                        Hap::of_whole_parts(
+                            bn,
+                            bd,
+                            en,
+                            ed,
+                            val,
+                            Locations::from_packed_copy(packed_loc),
+                            ContextKeys::default(),
+                        )
+                    }));
+                    cur_k = chunk_end;
+                }
+            }
+            let added = out.len() - from;
+            if added > 0 {
+                thread.note_accumulated(added);
+                thread.note_materialised(added);
+            }
+            return;
+        }
+    }
+
+    // Fast exact-edge path for non-power-of-two integer `count` (`n("0 .. 64")`).
+    if scaled_b.denom() == 1
+        && scaled_e.denom() == 1
+        && first_k.abs() <= (1i128 << 36)
+        && last_k.abs() <= (1i128 << 36)
+        && named_id != 0
+        && min_v >= i64::from(i8::MIN)
+        && max_v <= i64::from(i8::MAX)
+    {
+        let base_loc = make_loc();
+        if let Some(packed_loc) = base_loc.as_packed_copy() {
+            let first_i64 = first_k as i64;
+            let last_i64 = last_k as i64;
+            let count_i64 = i64::from(count);
+            out.reserve_exact(total);
+            let mut cur_k = first_i64;
+            let (mut cur_bn, mut cur_bd) = reduce_i64_u32(cur_k, count);
+            let mut idx = cur_k.rem_euclid(count_i64);
+            while cur_k < last_i64 {
+                if cur_k != first_i64 && thread.stop_requested() {
+                    out.truncate(from);
+                    return;
+                }
+                let chunk_end = (cur_k + 1024).min(last_i64);
+                out.extend((cur_k..chunk_end).map(|k| {
+                    let (bn, bd) = (cur_bn, cur_bd);
+                    let (en, ed) = reduce_i64_u32(k + 1, count);
+                    cur_bn = en;
+                    cur_bd = ed;
+                    let iv = (i64::from(start) + idx * dir) as i8;
+                    idx += 1;
+                    if idx == count_i64 {
+                        idx = 0;
+                    }
+                    Hap::of_whole_parts(
+                        bn,
+                        bd,
+                        en,
+                        ed,
+                        Value::Object(OrderedMap::from_static_int(named_id, iv, false)),
+                        Locations::from_packed_copy(packed_loc),
+                        ContextKeys::default(),
+                    )
+                }));
+                cur_k = chunk_end;
+            }
+            let added = out.len() - from;
+            if added > 0 {
+                thread.note_accumulated(added);
+                thread.note_materialised(added);
+            }
+            return;
+        }
+    }
+
+    // General exact path for arbitrary `count`, fractional edges, or wide spans.
+    let base_loc = make_loc();
+    out.reserve_exact(total);
+    let mut k = first_k;
+    let mut step_num = 0usize;
+    while k < last_k {
+        if step_num != 0 && (step_num & 255) == 0 && thread.stop_requested() {
+            out.truncate(from);
+            return;
+        }
+        let (Some(wb), Some(we)) = (
+            Fraction::int(k).checked_div(n_frac),
+            k.checked_add(1)
+                .and_then(|next| Fraction::int(next).checked_div(n_frac)),
+        ) else {
+            out.truncate(from);
+            refuse(QueryLimit::NativeFraction { operation: "range" });
+            return;
+        };
+        let whole = TimeSpan::new(wb, we);
+        let part = TimeSpan::new(wb.max(span.begin), we.min(span.end));
+        if part.begin < part.end {
+            let idx = k.rem_euclid(n_i128) as u32;
+            out.push(Hap::of_sequence(
+                whole,
+                part,
+                make_value(idx),
+                base_loc.clone(),
+                ContextKeys::default(),
+            ));
+        }
+        k += 1;
+        step_num += 1;
+    }
+    let added = out.len() - from;
+    if added > 0 {
+        thread.note_accumulated(added);
+        thread.note_materialised(added);
+    }
+}
+
+/// Fused L1-hot query for `iter(parts)` (optionally wrapped in `fast(2^fast_shift)`)
+/// directly over a power-of-two `Node::IntRange` (`n("0 .. 63").iter(64).fast(64)`).
+/// Returns `Some(true)` when handled in sorted order.
+fn try_query_iter_int_range_pow2_onto(
+    thread: &QueryThread,
+    node: &IterNode,
+    fast_shift: u32,
+    state: &State,
+    out: &mut Vec<Hap>,
+) -> Option<bool> {
+    if node.inner.has_runtime_settings() || (node.inner.node_flags() & FLAG_VOLATILE) != 0 {
+        return None;
+    }
+    let Node::IntRange {
+        start,
+        count,
+        loc0,
+        loc1,
+        named_id,
+        step_neg,
+    } = *node.inner.node_kind()
+    else {
+        return None;
+    };
+    if !count.is_power_of_two() || named_id == 0 {
+        return None;
+    }
+    let parts_u32 = u32::try_from(node.parts).ok()?;
+    if parts_u32 == 0
+        || count % parts_u32 != 0
+        || node.times != Fraction::int(i128::from(parts_u32))
+    {
+        return None;
+    }
+    let ticks_shift = count.trailing_zeros();
+    let total_shift = ticks_shift.checked_add(fast_shift)?;
+    if total_shift >= 24 {
+        return None;
+    }
+    let dir = if step_neg { -1i64 } else { 1i64 };
+    let min_v = i64::from(start).min(i64::from(start) + i64::from(count - 1) * dir);
+    let max_v = i64::from(start).max(i64::from(start) + i64::from(count - 1) * dir);
+    if min_v < i64::from(i8::MIN) || max_v > i64::from(i8::MAX) {
+        return None;
+    }
+    let (ab, ae) = if fast_shift == 0 {
+        (state.span.begin, state.span.end)
+    } else {
+        (
+            state.span.begin.checked_mul_pow2(fast_shift)?,
+            state.span.end.checked_mul_pow2(fast_shift)?,
+        )
+    };
+    if ab >= ae || ab.denom() != 1 || ae.denom() != 1 {
+        return None;
+    }
+    let start_cycle = ab.numer();
+    let end_cycle = ae.numer();
+    let cycle_span = end_cycle.checked_sub(start_cycle)?;
+    if cycle_span > MAX_QUERY_SPAN_CYCLES {
+        refuse(QueryLimit::QuerySpan {
+            cycles: MAX_QUERY_SPAN_CYCLES,
+        });
+        return Some(true);
+    }
+    let cycle_count = usize::try_from(cycle_span).ok()?;
+    let start_i64 = i64::try_from(start_cycle).ok()?;
+    let end_i64 = i64::try_from(end_cycle).ok()?;
+    let max_abs_cycle = start_i64.unsigned_abs().max(end_i64.unsigned_abs());
+    if max_abs_cycle
+        .checked_add(1)?
+        .checked_mul(u64::from(count))?
+        > (1u64 << 37)
+    {
+        return None;
+    }
+    let base_loc = int_range_locations(loc0, loc1);
+    let packed_loc = base_loc.as_packed_copy()?;
+    let total_haps = cycle_count.checked_mul(count as usize)?;
+    let from = out.len();
+    if !thread.charge(out.len() - from + total_haps) {
+        out.truncate(from);
+        return Some(true);
+    }
+    out.reserve_exact(total_haps);
+    let stride = count / parts_u32;
+    let mask = count - 1;
+    let parts_i64 = i64::from(parts_u32);
+    let back = node.back;
+    let base_start = i64::from(start);
+    for step_idx in 0..cycle_count {
+        if step_idx != 0 && (step_idx & 15) == 0 && thread.stop_requested() {
+            out.truncate(from);
+            return Some(true);
+        }
+        let cycle_i64 = start_i64 + step_idx as i64;
+        let k = cycle_i64.rem_euclid(parts_i64) as u32;
+        let rot = (k * stride) & mask;
+        let base_rot = if back { (count - rot) & mask } else { rot };
+        let offset = cycle_i64 << ticks_shift;
+        let (mut cur_bn, mut cur_bd) = Fraction::dyadic_i64_parts(offset, total_shift);
+        if !step_neg {
+            out.extend((0..count).map(move |i| {
+                let (bn, bd) = (cur_bn, cur_bd);
+                let (en, ed) = Fraction::dyadic_i64_parts(offset + i64::from(i) + 1, total_shift);
+                cur_bn = en;
+                cur_bd = ed;
+                let iv = (base_start + i64::from((i + base_rot) & mask)) as i8;
+                Hap::of_whole_parts(
+                    bn,
+                    bd,
+                    en,
+                    ed,
+                    Value::Object(OrderedMap::from_static_int(named_id, iv, false)),
+                    Locations::from_packed_copy(packed_loc),
+                    ContextKeys::default(),
+                )
+            }));
+        } else {
+            out.extend((0..count).map(move |i| {
+                let (bn, bd) = (cur_bn, cur_bd);
+                let (en, ed) = Fraction::dyadic_i64_parts(offset + i64::from(i) + 1, total_shift);
+                cur_bn = en;
+                cur_bd = ed;
+                let iv = (base_start - i64::from((i + base_rot) & mask)) as i8;
+                Hap::of_whole_parts(
+                    bn,
+                    bd,
+                    en,
+                    ed,
+                    Value::Object(OrderedMap::from_static_int(named_id, iv, false)),
+                    Locations::from_packed_copy(packed_loc),
+                    ContextKeys::default(),
+                )
+            }));
+        }
+    }
+    let added = out.len() - from;
+    if added > 0 {
+        thread.note_accumulated(added);
+        thread.note_materialised(added);
+    }
+    Some(true)
+}
+
+/// Fused L1-hot query for `fast(scale)` over `Node::Iter` on a `Node::IntRange`.
+fn try_query_fast_pow2_iter_onto(
+    thread: &QueryThread,
+    inner: &Node,
+    factor: Fraction,
+    state: &State,
+    out: &mut Vec<Hap>,
+) -> Option<bool> {
+    let Node::Iter(iter_node) = inner else {
+        return None;
+    };
+    if factor.denom() != 1 || factor.numer() <= 1 || factor.numer() > 65_536 {
+        return None;
+    }
+    let scale = factor.numer() as u32;
+    if scale.is_power_of_two() {
+        return try_query_iter_int_range_pow2_onto(
+            thread,
+            iter_node,
+            scale.trailing_zeros(),
+            state,
+            out,
+        );
+    }
+    try_query_iter_int_range_scaled_onto(thread, iter_node, scale, state, out)
+}
+
+/// Fused L1-hot query for `fast(scale)` over `Node::Iter` on a `Node::IntRange`
+/// when `scale` is any positive integer (e.g. `fast(65)`).
+fn try_query_iter_int_range_scaled_onto(
+    thread: &QueryThread,
+    node: &IterNode,
+    scale: u32,
+    state: &State,
+    out: &mut Vec<Hap>,
+) -> Option<bool> {
+    if node.inner.has_runtime_settings() || (node.inner.node_flags() & FLAG_VOLATILE) != 0 {
+        return None;
+    }
+    let Node::IntRange {
+        start,
+        count,
+        loc0,
+        loc1,
+        named_id,
+        step_neg,
+    } = *node.inner.node_kind()
+    else {
+        return None;
+    };
+    if count == 0 || named_id == 0 {
+        return None;
+    }
+    let parts_u32 = u32::try_from(node.parts).ok()?;
+    if parts_u32 == 0
+        || count % parts_u32 != 0
+        || node.times != Fraction::int(i128::from(parts_u32))
+    {
+        return None;
+    }
+    let total_den = count.checked_mul(scale)?;
+    let dir = if step_neg { -1i64 } else { 1i64 };
+    let min_v = i64::from(start).min(i64::from(start) + i64::from(count - 1) * dir);
+    let max_v = i64::from(start).max(i64::from(start) + i64::from(count - 1) * dir);
+    if min_v < i64::from(i8::MIN) || max_v > i64::from(i8::MAX) {
+        return None;
+    }
+    let scale_frac = Fraction::int(i128::from(scale));
+    let ab = state.span.begin.checked_mul(scale_frac)?;
+    let ae = state.span.end.checked_mul(scale_frac)?;
+    if ab >= ae || ab.denom() != 1 || ae.denom() != 1 {
+        return None;
+    }
+    let start_cycle = ab.numer();
+    let end_cycle = ae.numer();
+    let cycle_span = end_cycle.checked_sub(start_cycle)?;
+    if cycle_span > MAX_QUERY_SPAN_CYCLES {
+        refuse(QueryLimit::QuerySpan {
+            cycles: MAX_QUERY_SPAN_CYCLES,
+        });
+        return Some(true);
+    }
+    let cycle_count = usize::try_from(cycle_span).ok()?;
+    let start_i64 = i64::try_from(start_cycle).ok()?;
+    let end_i64 = i64::try_from(end_cycle).ok()?;
+    let max_abs_cycle = start_i64.unsigned_abs().max(end_i64.unsigned_abs());
+    if max_abs_cycle
+        .checked_add(1)?
+        .checked_mul(u64::from(count))?
+        > (1u64 << 37)
+    {
+        return None;
+    }
+    let base_loc = int_range_locations(loc0, loc1);
+    let packed_loc = base_loc.as_packed_copy()?;
+    let total_haps = cycle_count.checked_mul(count as usize)?;
+    let from = out.len();
+    if !thread.charge(out.len() - from + total_haps) {
+        out.truncate(from);
+        return Some(true);
+    }
+    out.reserve_exact(total_haps);
+    let stride = count / parts_u32;
+    let parts_i64 = i64::from(parts_u32);
+    let count_i64 = i64::from(count);
+    let back = node.back;
+    let den_tz = total_den.trailing_zeros();
+    let odd_den = total_den >> den_tz;
+    if odd_den <= 255 {
+        let mut gcd_tab = [1u8; 256];
+        gcd_tab[0] = odd_den as u8;
+        for r in 1..odd_den {
+            gcd_tab[r as usize] = gcd_u32(r, odd_den) as u8;
+        }
+        let odd_i64 = i64::from(odd_den);
+        let reduce_fast = |k: i64, rem: u32| -> (i64, std::num::NonZeroU32) {
+            let s = (k as u64).trailing_zeros().min(den_tz);
+            let ks = k >> s;
+            let g = gcd_tab[usize::from(rem as u8)];
+            if g == 1 {
+                (
+                    ks,
+                    std::num::NonZeroU32::new(odd_den << (den_tz - s))
+                        .unwrap_or(std::num::NonZeroU32::MIN),
+                )
+            } else {
+                let g32 = u32::from(g);
+                (
+                    ks / i64::from(g32),
+                    std::num::NonZeroU32::new((odd_den / g32) << (den_tz - s))
+                        .unwrap_or(std::num::NonZeroU32::MIN),
+                )
+            }
+        };
+        let mut rem = (start_i64 * count_i64).rem_euclid(odd_i64) as u32;
+        for step_idx in 0..cycle_count {
+            if step_idx != 0 && (step_idx & 15) == 0 && thread.stop_requested() {
+                out.truncate(from);
+                return Some(true);
+            }
+            let cycle_i64 = start_i64 + step_idx as i64;
+            let k = cycle_i64.rem_euclid(parts_i64) as u32;
+            let rot = (k * stride) % count;
+            let base_rot = if back { (count - rot) % count } else { rot };
+            let offset = cycle_i64 * count_i64;
+            let (mut cur_bn, mut cur_bd) = reduce_fast(offset, rem);
+            out.extend((0..count).map(|i| {
+                let (bn, bd) = (cur_bn, cur_bd);
+                rem += 1;
+                if rem == odd_den {
+                    rem = 0;
+                }
+                let (en, ed) = reduce_fast(offset + i64::from(i) + 1, rem);
+                cur_bn = en;
+                cur_bd = ed;
+                let src = {
+                    let s = i + base_rot;
+                    if s >= count { s - count } else { s }
+                };
+                let iv = (i64::from(start) + i64::from(src) * dir) as i8;
+                Hap::of_whole_parts(
+                    bn,
+                    bd,
+                    en,
+                    ed,
+                    Value::Object(OrderedMap::from_static_int(named_id, iv, false)),
+                    Locations::from_packed_copy(packed_loc),
+                    ContextKeys::default(),
+                )
+            }));
+        }
+    } else {
+        for step_idx in 0..cycle_count {
+            if step_idx != 0 && (step_idx & 15) == 0 && thread.stop_requested() {
+                out.truncate(from);
+                return Some(true);
+            }
+            let cycle_i64 = start_i64 + step_idx as i64;
+            let k = cycle_i64.rem_euclid(parts_i64) as u32;
+            let rot = (k * stride) % count;
+            let base_rot = if back { (count - rot) % count } else { rot };
+            let offset = cycle_i64 * count_i64;
+            let (mut cur_bn, mut cur_bd) = reduce_i64_u32(offset, total_den);
+            out.extend((0..count).map(move |i| {
+                let (bn, bd) = (cur_bn, cur_bd);
+                let (en, ed) = reduce_i64_u32(offset + i64::from(i) + 1, total_den);
+                cur_bn = en;
+                cur_bd = ed;
+                let src = {
+                    let s = i + base_rot;
+                    if s >= count { s - count } else { s }
+                };
+                let iv = (i64::from(start) + i64::from(src) * dir) as i8;
+                Hap::of_whole_parts(
+                    bn,
+                    bd,
+                    en,
+                    ed,
+                    Value::Object(OrderedMap::from_static_int(named_id, iv, false)),
+                    Locations::from_packed_copy(packed_loc),
+                    ContextKeys::default(),
+                )
+            }));
+        }
+    }
+    let added = out.len() - from;
+    if added > 0 {
+        thread.note_accumulated(added);
+        thread.note_materialised(added);
+    }
+    Some(true)
+}
+
+/// Direct sorted emission for `Node::SegmentSignal { body, steps }`
+/// (`rand.segment(128)`, `sine.segment(16)`, etc.) with zero wrapper nodes.
+pub(crate) fn query_segment_signal_onto(
+    thread: &QueryThread,
+    body: NumberSignal,
+    steps: u32,
+    state: &State,
+    out: &mut Vec<Hap>,
+) {
+    if steps == 0 {
+        return;
+    }
+    let span = state.span;
+    if span.begin > span.end {
+        return;
+    }
+    let n_i128 = i128::from(steps);
+    let n_frac = Fraction::int(n_i128);
+    let from = out.len();
+    if span.begin == span.end {
+        let Some(scaled) = span.begin.checked_mul(n_frac) else {
+            refuse(QueryLimit::NativeFraction {
+                operation: "segment",
+            });
+            return;
+        };
+        let k = scaled.floor_int();
+        let (Some(wb), Some(we)) = (
+            Fraction::int(k).checked_div(n_frac),
+            k.checked_add(1)
+                .and_then(|next| Fraction::int(next).checked_div(n_frac)),
+        ) else {
+            refuse(QueryLimit::NativeFraction {
+                operation: "segment",
+            });
+            return;
+        };
+        if !thread.charge(1) {
+            return;
+        }
+        let val = body(wb, &state.controls);
+        out.push(Hap::new(Some(TimeSpan::new(wb, we)), span, Value::F64(val)));
+        thread.note_accumulated(1);
+        thread.note_materialised(1);
+        return;
+    }
+    if !span
+        .cycle_count()
+        .is_some_and(|cycles| cycles <= MAX_QUERY_SPAN_CYCLES)
+    {
+        refuse(QueryLimit::QuerySpan {
+            cycles: MAX_QUERY_SPAN_CYCLES,
+        });
+        return;
+    }
+    let (Some(scaled_b), Some(scaled_e)) =
+        (span.begin.checked_mul(n_frac), span.end.checked_mul(n_frac))
+    else {
+        refuse(QueryLimit::NativeFraction {
+            operation: "segment",
+        });
+        return;
+    };
+    let first_k = scaled_b.floor_int();
+    let last_k = scaled_e.ceil().numer();
+    if first_k >= last_k {
+        return;
+    }
+    let Some(total) = last_k
+        .checked_sub(first_k)
+        .and_then(|v| usize::try_from(v).ok())
+    else {
+        refuse(QueryLimit::QuerySpan {
+            cycles: MAX_QUERY_SPAN_CYCLES,
+        });
+        return;
+    };
+    if !thread.charge(total) {
+        return;
+    }
+    let exact_edges = scaled_b.denom() == 1 && scaled_e.denom() == 1;
+    let is_rand = signal::is_rand_body(body);
+    if is_rand && exact_edges && first_k.abs() <= (1i128 << 36) && last_k.abs() <= (1i128 << 36) {
+        let first_i64 = first_k as i64;
+        let last_i64 = last_k as i64;
+        let seed = state
+            .controls
+            .get("randSeed")
+            .and_then(Value::as_f64)
+            .unwrap_or(0.0);
+        let mode = rng::rng_mode();
+        let seed_i32 = if matches!(mode, rng::RngMode::Precise) {
+            compose::to_int32(seed)
+        } else {
+            0
+        };
+        out.reserve_exact(total);
+        if steps.is_power_of_two() && steps.trailing_zeros() < 24 {
+            let shift = steps.trailing_zeros();
+            let inv_count = 1.0 / f64::from(steps);
+            let mut cur_k = first_i64;
+            let (mut cur_bn, mut cur_bd) = Fraction::dyadic_i64_parts(cur_k, shift);
+            while cur_k < last_i64 {
+                if cur_k != first_i64 && thread.stop_requested() {
+                    out.truncate(from);
+                    return;
+                }
+                let chunk_end = (cur_k + 256).min(last_i64);
+                out.extend((cur_k..chunk_end).map(|k| {
+                    let (bn, bd) = (cur_bn, cur_bd);
+                    let (en, ed) = Fraction::dyadic_i64_parts(k + 1, shift);
+                    cur_bn = en;
+                    cur_bd = ed;
+                    let val =
+                        rng::rand_at_time_with_mode(mode, (k as f64) * inv_count, seed, seed_i32);
+                    Hap::of_whole_parts(
+                        bn,
+                        bd,
+                        en,
+                        ed,
+                        Value::F64(val),
+                        Locations::new(),
+                        ContextKeys::default(),
+                    )
+                }));
+                cur_k = chunk_end;
+            }
+        } else {
+            let steps_f64 = f64::from(steps);
+            let mut cur_k = first_i64;
+            let (mut cur_bn, mut cur_bd) = reduce_i64_u32(cur_k, steps);
+            while cur_k < last_i64 {
+                if cur_k != first_i64 && thread.stop_requested() {
+                    out.truncate(from);
+                    return;
+                }
+                let chunk_end = (cur_k + 256).min(last_i64);
+                out.extend((cur_k..chunk_end).map(|k| {
+                    let (bn, bd) = (cur_bn, cur_bd);
+                    let (en, ed) = reduce_i64_u32(k + 1, steps);
+                    cur_bn = en;
+                    cur_bd = ed;
+                    let val =
+                        rng::rand_at_time_with_mode(mode, (k as f64) / steps_f64, seed, seed_i32);
+                    Hap::of_whole_parts(
+                        bn,
+                        bd,
+                        en,
+                        ed,
+                        Value::F64(val),
+                        Locations::new(),
+                        ContextKeys::default(),
+                    )
+                }));
+                cur_k = chunk_end;
+            }
+        }
+        let added = out.len() - from;
+        if added > 0 {
+            thread.note_accumulated(added);
+            thread.note_materialised(added);
+        }
+        return;
+    }
+
+    // General path: arbitrary signal body, fractional query edges, or wide spans.
+    out.reserve_exact(total);
+    let mut k = first_k;
+    let mut step_num = 0usize;
+    while k < last_k {
+        if step_num != 0 && (step_num & 63) == 0 && thread.stop_requested() {
+            out.truncate(from);
+            return;
+        }
+        let (Some(wb), Some(we)) = (
+            Fraction::int(k).checked_div(n_frac),
+            k.checked_add(1)
+                .and_then(|next| Fraction::int(next).checked_div(n_frac)),
+        ) else {
+            out.truncate(from);
+            refuse(QueryLimit::NativeFraction {
+                operation: "segment",
+            });
+            return;
+        };
+        let whole = TimeSpan::new(wb, we);
+        let part = TimeSpan::new(wb.max(span.begin), we.min(span.end));
+        if part.begin < part.end {
+            let val = body(wb, &state.controls);
+            out.push(Hap::new(Some(whole), part, Value::F64(val)));
+        }
+        k += 1;
+        step_num += 1;
+    }
+    let added = out.len() - from;
+    if added > 0 {
+        thread.note_accumulated(added);
+        thread.note_materialised(added);
+    }
+}
+
+/// One cycle of `Node::Iter`: applies `slowcat` cycle selection and `early`/`late`
+/// shift directly on `node.inner`.
+fn iter_cycle_onto(thread: &QueryThread, node: &IterNode, state: &State, out: &mut Vec<Hap>) {
+    if node.parts == 0 || node.inner.is_rest() {
+        return;
+    }
+    let n = i128::from(node.parts);
+    let cycle = state.span.begin.sam().numer();
+    let k = cycle.rem_euclid(n);
+    let slowcat_off = cycle - cycle.div_euclid(n);
+    let shift_op = if node.back { "late" } else { "early" };
+    let shift_int = |span: TimeSpan, by: i128| {
+        Some(TimeSpan::new(
+            span.begin.checked_add_int(by)?,
+            span.end.checked_add_int(by)?,
+        ))
+    };
+    let Some(cat_span) = shift_int(state.span, -slowcat_off) else {
+        refuse(QueryLimit::NativeFraction {
+            operation: "slowcat",
+        });
+        return;
+    };
+    let Some(iter_off) = Fraction::int(k).checked_div(node.times) else {
+        refuse(QueryLimit::NativeFraction {
+            operation: shift_op,
+        });
+        return;
+    };
+    let query_delta = if node.back { -iter_off } else { iter_off };
+    let Some(inner_span) = cat_span
+        .begin
+        .checked_add(query_delta)
+        .zip(cat_span.end.checked_add(query_delta))
+        .map(|(b, e)| TimeSpan::new(b, e))
+    else {
+        refuse(QueryLimit::NativeFraction {
+            operation: shift_op,
+        });
+        return;
+    };
+    let from = out.len();
+    node.inner
+        .answer_child_onto(thread, &state.set_span(inner_span), out);
+    let hap_delta = -query_delta;
+    let shift_back = |time: Fraction| -> Result<Fraction, &'static str> {
+        let t1 = time.checked_add(hap_delta).ok_or(shift_op)?;
+        t1.checked_add_int(slowcat_off).ok_or("slowcat")
+    };
+    let mut err_op: Option<&'static str> = None;
+    for hap in &mut out[from..] {
+        let pb = match shift_back(hap.part().begin) {
+            Ok(v) => v,
+            Err(op) => {
+                err_op = Some(op);
+                break;
+            }
+        };
+        let pe = match shift_back(hap.part().end) {
+            Ok(v) => v,
+            Err(op) => {
+                err_op = Some(op);
+                break;
+            }
+        };
+        let old_part = hap.part();
+        let part = TimeSpan::new(pb, pe);
+        let new_whole = match hap.whole() {
+            Some(whole) => {
+                if whole == old_part {
+                    Some(part)
+                } else {
+                    let wb = match shift_back(whole.begin) {
+                        Ok(v) => v,
+                        Err(op) => {
+                            err_op = Some(op);
+                            break;
+                        }
+                    };
+                    let we = match shift_back(whole.end) {
+                        Ok(v) => v,
+                        Err(op) => {
+                            err_op = Some(op);
+                            break;
+                        }
+                    };
+                    Some(TimeSpan::new(wb, we))
+                }
+            }
+            None => None,
+        };
+        hap.set_spans(new_whole, part);
+    }
+    if let Some(op) = err_op {
+        out.truncate(from);
+        refuse(QueryLimit::NativeFraction { operation: op });
+    }
+}
+
+/// Full query for `Node::Iter`, splitting multi-cycle spans per cycle.
+fn query_iter_onto(thread: &QueryThread, node: &IterNode, state: &State, out: &mut Vec<Hap>) {
+    if node.parts == 0 || node.inner.is_rest() {
+        return;
+    }
+    if try_query_iter_int_range_pow2_onto(thread, node, 0, state, out).is_some() {
+        return;
+    }
+    if state.span.within_one_cycle() {
+        iter_cycle_onto(thread, node, state, out);
+        return;
+    }
+    let from = out.len();
+    let mut stopped = false;
+    state.span.for_each_cycle(|sub| {
+        if stopped {
+            return;
+        }
+        iter_cycle_onto(thread, node, &state.set_span(sub), out);
+        let count = out.len() - from;
+        if thread.stop_requested() || !thread.charge(count) {
+            out.truncate(from);
+            stopped = true;
+            return;
+        }
+        thread.note_accumulated(count);
+    });
 }
 
 /// The value side of one `appLeft` node, as a query meets it.
@@ -1240,7 +2843,7 @@ fn meet_steps_small(
     debug_assert!((2..=8).contains(&count));
     let slot_idx = if let Some(idx) = small_cache
         .iter()
-        .position(|s| matches!(s, Some(slot) if slot.part == hf.part))
+        .position(|s| matches!(s, Some(slot) if slot.part == hf.part()))
     {
         idx
     } else {
@@ -1250,8 +2853,8 @@ fn meet_steps_small(
         let grid_start = steps_range.start;
         let grid_end = steps_range.end;
         let mut begin = grid.time(grid_start)?;
-        bounds[0] = if begin < hf.part.begin {
-            hf.part.begin
+        bounds[0] = if begin < hf.part().begin {
+            hf.part().begin
         } else {
             begin
         };
@@ -1260,8 +2863,8 @@ fn meet_steps_small(
                 return Some(false);
             }
             let end = grid.time(k + 1)?;
-            bounds[i + 1] = if k + 1 == grid_end && end > hf.part.end {
-                hf.part.end
+            bounds[i + 1] = if k + 1 == grid_end && end > hf.part().end {
+                hf.part().end
             } else {
                 end
             };
@@ -1275,7 +2878,7 @@ fn meet_steps_small(
             *small_next = small_next.wrapping_add(1);
             victim
         };
-        small_cache[idx] = Some(SmallStepSlot::new(hf.part, count, bounds, nums));
+        small_cache[idx] = Some(SmallStepSlot::new(hf.part(), count, bounds, nums));
         idx
     };
     let slot = small_cache[slot_idx].as_mut().expect("small slot present");
@@ -1335,7 +2938,7 @@ fn meet_steps_small(
                     hf.keys.trim();
                 }
             }
-            let whole = hf.whole;
+            let whole = hf.whole();
             let last = count - 1;
             for i in 0..count {
                 let piece = TimeSpan::new(slot.bounds[i], slot.bounds[i + 1]);
@@ -1347,13 +2950,13 @@ fn meet_steps_small(
                 } else {
                     (hf.context.clone(), hf.keys.clone())
                 };
-                let hap = Hap {
+                let hap = Hap::from_parts(
                     whole,
-                    part: piece,
-                    value: Value::Object(OrderedMap::from_step_patch(&sp, row, layer_idx, i)),
+                    piece,
+                    Value::Object(OrderedMap::from_step_patch(&sp, row, layer_idx, i)),
                     context,
                     keys,
-                };
+                );
                 if bulk_ok {
                     out.push(hap);
                 } else if thread.stop_requested() || !thread.push_budgeted(out, from, hap) {
@@ -1457,12 +3060,12 @@ impl<'a> ValueSide<'a> {
             && self.reading.of(self.values, state).is_none()
             && functions
                 .iter()
-                .all(|hf| hf.part.begin < hf.part.end && part_within_whole(hf));
+                .all(|hf| hf.part().begin < hf.part().end && part_within_whole(hf));
         let all = asked
             .then(|| {
                 Some(TimeSpan::new(
-                    functions.iter().map(|hf| hf.part.begin).min()?,
-                    functions.iter().map(|hf| hf.part.end).max()?,
+                    functions.iter().map(|hf| hf.part().begin).min()?,
+                    functions.iter().map(|hf| hf.part().end).max()?,
                 ))
             })
             .flatten();
@@ -1470,7 +3073,7 @@ impl<'a> ValueSide<'a> {
             return false;
         };
         // The values between the parts are made for nothing.
-        let filled: f64 = functions.iter().map(|hf| width(hf.part)).sum();
+        let filled: f64 = functions.iter().map(|hf| width(hf.part())).sum();
         if filled * 2.0 < width(all) {
             return false;
         }
@@ -1487,7 +3090,7 @@ impl<'a> ValueSide<'a> {
             let mut heap_latest_end = Vec::new();
             let mut heap_meeting = Vec::new();
             let values_sorted = n_vals <= 1
-                || (1..n_vals).all(|i| values[i - 1].part.begin <= values[i].part.begin);
+                || (1..n_vals).all(|i| values[i - 1].part().begin <= values[i].part().begin);
             let (by_begin, latest_end): (&[usize], &[Fraction]) = if n_vals <= 32 {
                 for (i, slot) in small_by_begin[..n_vals].iter_mut().enumerate() {
                     *slot = i;
@@ -1495,15 +3098,15 @@ impl<'a> ValueSide<'a> {
                 if !values_sorted {
                     small_by_begin[..n_vals].sort_unstable_by(|a, b| {
                         values[*a]
-                            .part
+                            .part()
                             .begin
-                            .cmp(&values[*b].part.begin)
+                            .cmp(&values[*b].part().begin)
                             .then_with(|| a.cmp(b))
                     });
                 }
                 let mut latest = Fraction::ZERO;
                 for (i, &index) in small_by_begin[..n_vals].iter().enumerate() {
-                    let end = values[index].part.end;
+                    let end = values[index].part().end;
                     latest = if i == 0 { end } else { end.max(latest) };
                     small_latest_end[i] = latest;
                 }
@@ -1513,16 +3116,16 @@ impl<'a> ValueSide<'a> {
                 if !values_sorted {
                     indices.sort_unstable_by(|a, b| {
                         values[*a]
-                            .part
+                            .part()
                             .begin
-                            .cmp(&values[*b].part.begin)
+                            .cmp(&values[*b].part().begin)
                             .then_with(|| a.cmp(b))
                     });
                 }
                 heap_by_begin = indices;
                 heap_latest_end.reserve(n_vals);
                 for &index in &heap_by_begin {
-                    let end = values[index].part.end;
+                    let end = values[index].part().end;
                     heap_latest_end.push(
                         heap_latest_end
                             .last()
@@ -1546,14 +3149,15 @@ impl<'a> ValueSide<'a> {
                 ((h ^ (h >> 32)).wrapping_mul(0x9e37_79b9_7f4a_7c15) >> 59) as usize
             };
             for mut hf in functions.drain(..) {
-                let span = hf.part;
+                let span = hf.part();
                 let first = latest_end.partition_point(|end| *end <= span.begin);
-                let after = by_begin.partition_point(|index| values[*index].part.begin < span.end);
+                let after =
+                    by_begin.partition_point(|index| values[*index].part().begin < span.end);
                 let slice = by_begin.get(first..after).unwrap_or_default();
                 let meeting: &[usize] = if n_vals <= 32 {
                     let mut m_len = 0usize;
                     for &index in slice {
-                        if values[index].part.end > span.begin {
+                        if values[index].part().end > span.begin {
                             small_meeting[m_len] = index;
                             m_len += 1;
                         }
@@ -1566,7 +3170,7 @@ impl<'a> ValueSide<'a> {
                         slice
                             .iter()
                             .copied()
-                            .filter(|index| values[*index].part.end > span.begin),
+                            .filter(|index| values[*index].part().end > span.begin),
                     );
                     heap_meeting.sort_unstable();
                     &heap_meeting
@@ -1575,7 +3179,7 @@ impl<'a> ValueSide<'a> {
                 // then where the two haps meet.
                 let met = |hv: &Hap| {
                     let cut =
-                        TimeSpan::new(hv.part.begin.max(span.begin), hv.part.end.min(span.end));
+                        TimeSpan::new(hv.part().begin.max(span.begin), hv.part().end.min(span.end));
                     span.intersection(&cut)
                 };
                 // One meeting is the hap's own, as in [`Self::meet`].
@@ -1607,17 +3211,11 @@ impl<'a> ValueSide<'a> {
                         if let Some(val) = hit {
                             let mut context = hv.context.clone();
                             context.append(&hf.context);
-                            hf = Hap {
-                                whole: hf.whole,
-                                part,
-                                value: val,
-                                context,
-                                keys: ContextKeys::NONE,
-                            };
+                            hf = Hap::from_parts(hf.whole(), part, val, context, ContextKeys::NONE);
                             true
                         } else {
                             if !Meeting::in_place(&mut hf, hv, part, self.apply, self.flow) {
-                                hf = applied_hap(&hf, hv, hf.whole, part, self.apply, self.flow);
+                                hf = applied_hap(&hf, hv, hf.whole(), part, self.apply, self.flow);
                             }
                             if !thread.error_pending() && hf.keys.is_none() {
                                 let dst = if pair_cache[slot].is_none() {
@@ -1635,7 +3233,7 @@ impl<'a> ValueSide<'a> {
                         false
                     };
                     if !cached_hit && !Meeting::in_place(&mut hf, hv, part, self.apply, self.flow) {
-                        hf = applied_hap(&hf, hv, hf.whole, part, self.apply, self.flow);
+                        hf = applied_hap(&hf, hv, hf.whole(), part, self.apply, self.flow);
                     }
                     if thread.stop_requested() || !thread.push_budgeted(out, from, hf) {
                         out.truncate(from);
@@ -1671,15 +3269,9 @@ impl<'a> ValueSide<'a> {
                         if let Some(val) = hit {
                             let mut context = hv.context.clone();
                             context.append(&hf.context);
-                            Hap {
-                                whole: hf.whole,
-                                part,
-                                value: val,
-                                context,
-                                keys: ContextKeys::NONE,
-                            }
+                            Hap::from_parts(hf.whole(), part, val, context, ContextKeys::NONE)
                         } else {
-                            let hap = applied_hap(&hf, hv, hf.whole, part, self.apply, self.flow);
+                            let hap = applied_hap(&hf, hv, hf.whole(), part, self.apply, self.flow);
                             if !thread.error_pending() && hap.keys.is_none() {
                                 let dst = if pair_cache[slot].is_none() {
                                     slot
@@ -1693,7 +3285,7 @@ impl<'a> ValueSide<'a> {
                             hap
                         }
                     } else {
-                        applied_hap(&hf, hv, hf.whole, part, self.apply, self.flow)
+                        applied_hap(&hf, hv, hf.whole(), part, self.apply, self.flow)
                     };
                     if thread.stop_requested() || !thread.push_budgeted(out, from, hap) {
                         out.truncate(from);
@@ -1728,10 +3320,10 @@ impl<'a> ValueSide<'a> {
         let Value::Object(base_map) = &hf.value else {
             return None;
         };
-        let cached = if step_cache.find(hf.part).is_some() {
-            step_cache.find(hf.part).expect("checked present")
+        let cached = if step_cache.find(hf.part()).is_some() {
+            step_cache.find(hf.part()).expect("checked present")
         } else {
-            let grid = steps.grid_over(hf.part)?;
+            let grid = steps.grid_over(hf.part())?;
             let count = grid.len();
             if count == 0 {
                 return Some(true);
@@ -1744,7 +3336,7 @@ impl<'a> ValueSide<'a> {
                 let k = grid.steps().start;
                 let begin = grid.time(k)?;
                 let end = grid.time(k + 1)?;
-                let piece = grid.cut(k, TimeSpan::new(begin, end), hf.part);
+                let piece = grid.cut(k, TimeSpan::new(begin, end), hf.part());
                 let number = steps.value_at(begin, &state.controls)?;
                 let mut hap = hf.clone();
                 if !Meeting::set_number_in_place(
@@ -1767,7 +3359,7 @@ impl<'a> ValueSide<'a> {
                         return Some(false);
                     }
                     let end = grid.time(k + 1)?;
-                    pieces[i] = grid.cut(k, TimeSpan::new(begin, end), hf.part);
+                    pieces[i] = grid.cut(k, TimeSpan::new(begin, end), hf.part());
                     nums[i] = steps.value_at(begin, &state.controls)?;
                     begin = end;
                 }
@@ -1801,7 +3393,7 @@ impl<'a> ValueSide<'a> {
                         return Some(false);
                     }
                     let end = grid.time(k + 1)?;
-                    pieces.push(grid.cut(k, TimeSpan::new(begin, end), hf.part));
+                    pieces.push(grid.cut(k, TimeSpan::new(begin, end), hf.part()));
                     *slot = steps.value_at(begin, &state.controls)?;
                     begin = end;
                 }
@@ -1813,14 +3405,14 @@ impl<'a> ValueSide<'a> {
                         return Some(false);
                     }
                     let end = grid.time(k + 1)?;
-                    pieces.push(grid.cut(k, TimeSpan::new(begin, end), hf.part));
+                    pieces.push(grid.cut(k, TimeSpan::new(begin, end), hf.part()));
                     vals.push(Value::F64(steps.value_at(begin, &state.controls)?));
                     begin = end;
                 }
                 Arc::from(vals)
             };
             step_cache.insert(StepWaveCache {
-                part: hf.part,
+                part: hf.part(),
                 values,
                 pieces,
                 table: None,
@@ -1884,7 +3476,7 @@ impl<'a> ValueSide<'a> {
             };
             let mut hap = template.clone();
             hap.value = Value::Object(map);
-            hap.part = piece;
+            hap.set_part(piece);
             if bulk_ok {
                 out.push(hap);
             } else if thread.stop_requested() || !thread.push_budgeted(out, from, hap) {
@@ -1914,7 +3506,7 @@ impl<'a> ValueSide<'a> {
         // The control of a segment of a wave takes the number of each step
         // that the part meets. A hap that it cannot set is met as any other.
         if let Some(steps) = meetings.steps.as_ref() {
-            let part = hf.part;
+            let part = hf.part();
             match steps.number(part, &state.controls) {
                 Some(number) => {
                     if Meeting::set_number_in_place(
@@ -1944,17 +3536,17 @@ impl<'a> ValueSide<'a> {
         // itself, which the meeting reads.
         if hf.pick_lookup().is_none()
             && let Some(gate) = meetings.gate(self, state)
-            && hf.part.within_one_cycle()
-            && let Some(part) = hf.part.intersection(&met)
+            && hf.part().within_one_cycle()
+            && let Some(part) = hf.part().intersection(&met)
             && let Some(passes) = gate.passes(met, part, &state.controls)
         {
-            hf.part = part;
+            hf.set_part(part);
             return !passes || (!thread.stop_requested() && thread.push_budgeted(out, from, hf));
         }
         // A wave gives its number with no hap of its own.
         if let Some((key, wave)) = meetings.wave(self, state)
-            && hf.part.within_one_cycle()
-            && let Some(part) = hf.part.intersection(&met)
+            && hf.part().within_one_cycle()
+            && let Some(part) = hf.part().intersection(&met)
             && let Some(number) = wave.number(&met, &part, &state.controls)
             && Meeting::set_number_in_place_cached(
                 &mut hf,
@@ -1968,13 +3560,13 @@ impl<'a> ValueSide<'a> {
         {
             return !thread.stop_requested() && thread.push_budgeted(out, from, hf);
         }
-        let (inner, named) = meetings.values(thread, self, met, hf.part, state);
+        let (inner, named) = meetings.values(thread, self, met, hf.part(), state);
         let Some(named) = named else {
             return meet_each(thread, hf, inner, self.apply, self.flow, from, out);
         };
         // The one value of a signal is set under the name of its control.
         if let [hv] = inner
-            && let Some(part) = hf.part.intersection(&hv.part)
+            && let Some(part) = hf.part().intersection(&hv.part())
             && Meeting::set_in_place(&mut hf, &named.key, hv, part, self.apply, self.flow)
         {
             return !thread.stop_requested() && thread.push_budgeted(out, from, hf);
@@ -2006,19 +3598,19 @@ fn meet_each(
     // meeting is. Several meetings share the function hap as their
     // base, so each keeps a copy of it.
     if let [hv] = inner
-        && let Some(part) = hf.part.intersection(&hv.part)
+        && let Some(part) = hf.part().intersection(&hv.part())
     {
         // A refused in-place meeting leaves the hap unchanged.
         if !Meeting::in_place(&mut hf, hv, part, apply, flow) {
-            hf = applied_hap(&hf, hv, hf.whole, part, apply, flow);
+            hf = applied_hap(&hf, hv, hf.whole(), part, apply, flow);
         }
         return !thread.stop_requested() && thread.push_budgeted(out, from, hf);
     }
     for hv in inner {
-        let Some(part) = hf.part.intersection(&hv.part) else {
+        let Some(part) = hf.part().intersection(&hv.part()) else {
             continue;
         };
-        let hap = applied_hap(&hf, hv, hf.whole, part, apply, flow);
+        let hap = applied_hap(&hf, hv, hf.whole(), part, apply, flow);
         if thread.stop_requested() || !thread.push_budgeted(out, from, hap) {
             return false;
         }
@@ -2050,7 +3642,7 @@ fn query_run(
     if out.len() - from == 1 {
         let hf = &mut out[from];
         let met = hf.whole_or_part();
-        match hf.part.intersection(&met) {
+        match hf.part().intersection(&met) {
             None => {
                 out.truncate(from);
                 return;
@@ -2062,7 +3654,7 @@ fn query_run(
                     }
                     let constant = meeting.as_hap();
                     let apply = meeting.combine();
-                    *hf = applied_hap(hf, &constant, hf.whole, part, &apply, meeting.flow());
+                    *hf = applied_hap(hf, &constant, hf.whole(), part, &apply, meeting.flow());
                     if thread.stop_requested() {
                         out.truncate(from);
                         return;
@@ -2079,10 +3671,10 @@ fn query_run(
     // Fast in-place path when every hap's active intersection lies within a
     // single cycle (true for all sub-cycle windows even when `whole` spans
     // multiple cycles): zero scratch buffer, zero Hap moves.
-    let single_cycle = out[from..].iter().all(|hf| hf.part.within_one_cycle())
+    let single_cycle = out[from..].iter().all(|hf| hf.part().within_one_cycle())
         || out[from..].iter().all(|hf| {
             let met = hf.whole_or_part();
-            match hf.part.intersection(&met) {
+            match hf.part().intersection(&met) {
                 Some(part) => part.within_one_cycle(),
                 None => true,
             }
@@ -2095,19 +3687,19 @@ fn query_run(
                 if stopped {
                     return false;
                 }
-                let Some(part) = (match hf.whole {
-                    None => (hf.part.begin <= hf.part.end).then_some(hf.part),
-                    Some(whole) if whole == hf.part => {
-                        (hf.part.begin <= hf.part.end).then_some(hf.part)
+                let Some(part) = (match hf.whole() {
+                    None => (hf.part().begin <= hf.part().end).then_some(hf.part()),
+                    Some(whole) if whole == hf.part() => {
+                        (hf.part().begin <= hf.part().end).then_some(hf.part())
                     }
-                    Some(whole) => hf.part.intersection(&whole),
+                    Some(whole) => hf.part().intersection(&whole),
                 }) else {
                     return false;
                 };
                 if !Meeting::in_place_run_meeting(hf, meeting, part, Some(&mut cache)) {
                     let constant = meeting.as_hap();
                     let apply = meeting.combine();
-                    *hf = applied_hap(hf, &constant, hf.whole, part, &apply, meeting.flow());
+                    *hf = applied_hap(hf, &constant, hf.whole(), part, &apply, meeting.flow());
                     if thread.stop_requested() {
                         stopped = true;
                         return false;
@@ -2130,12 +3722,12 @@ fn query_run(
                 if stopped {
                     return false;
                 }
-                let Some(part) = (match hf.whole {
-                    None => (hf.part.begin <= hf.part.end).then_some(hf.part),
-                    Some(whole) if whole == hf.part => {
-                        (hf.part.begin <= hf.part.end).then_some(hf.part)
+                let Some(part) = (match hf.whole() {
+                    None => (hf.part().begin <= hf.part().end).then_some(hf.part()),
+                    Some(whole) if whole == hf.part() => {
+                        (hf.part().begin <= hf.part().end).then_some(hf.part())
                     }
-                    Some(whole) => hf.part.intersection(&whole),
+                    Some(whole) => hf.part().intersection(&whole),
                 }) else {
                     return false;
                 };
@@ -2145,7 +3737,7 @@ fn query_run(
                     }
                     let constant = meeting.as_hap();
                     let apply = meeting.combine();
-                    *hf = applied_hap(hf, &constant, hf.whole, part, &apply, meeting.flow());
+                    *hf = applied_hap(hf, &constant, hf.whole(), part, &apply, meeting.flow());
                     if thread.stop_requested() {
                         stopped = true;
                         return false;
@@ -2167,12 +3759,12 @@ fn query_run(
             if stopped {
                 return false;
             }
-            let Some(part) = (match hf.whole {
-                None => (hf.part.begin <= hf.part.end).then_some(hf.part),
-                Some(whole) if whole == hf.part => {
-                    (hf.part.begin <= hf.part.end).then_some(hf.part)
+            let Some(part) = (match hf.whole() {
+                None => (hf.part().begin <= hf.part().end).then_some(hf.part()),
+                Some(whole) if whole == hf.part() => {
+                    (hf.part().begin <= hf.part().end).then_some(hf.part())
                 }
-                Some(whole) => hf.part.intersection(&whole),
+                Some(whole) => hf.part().intersection(&whole),
             }) else {
                 return false;
             };
@@ -2182,7 +3774,7 @@ fn query_run(
                 }
                 let constant = meeting.as_hap();
                 let apply = meeting.combine();
-                *hf = applied_hap(hf, &constant, hf.whole, part, &apply, meeting.flow());
+                *hf = applied_hap(hf, &constant, hf.whole(), part, &apply, meeting.flow());
                 if thread.stop_requested() {
                     stopped = true;
                     return false;
@@ -2222,13 +3814,13 @@ fn query_run(
                     }
                     continue;
                 }
-                let Some(part) = hf.part.intersection(&met) else {
+                let Some(part) = hf.part().intersection(&met) else {
                     continue;
                 };
                 if !Meeting::in_place_run_meeting(&mut hf, meeting, part, Some(&mut cache)) {
                     let constant = meeting.as_hap();
                     let apply = meeting.combine();
-                    hf = applied_hap(&hf, &constant, hf.whole, part, &apply, meeting.flow());
+                    hf = applied_hap(&hf, &constant, hf.whole(), part, &apply, meeting.flow());
                     if thread.stop_requested() {
                         return None;
                     }
@@ -2261,7 +3853,7 @@ fn query_run(
             }
             let constant = meeting.as_hap();
             let apply = meeting.combine();
-            hf = applied_hap(&hf, &constant, hf.whole, part, &apply, meeting.flow());
+            hf = applied_hap(&hf, &constant, hf.whole(), part, &apply, meeting.flow());
             if thread.stop_requested() {
                 return false;
             }
@@ -2285,12 +3877,12 @@ fn query_run(
         };
         for hf in haps.drain(..) {
             let met = hf.whole_or_part();
-            let Some(overlap) = (match hf.whole {
-                None => (hf.part.begin <= hf.part.end).then_some(hf.part),
-                Some(whole) if whole == hf.part => {
-                    (hf.part.begin <= hf.part.end).then_some(hf.part)
+            let Some(overlap) = (match hf.whole() {
+                None => (hf.part().begin <= hf.part().end).then_some(hf.part()),
+                Some(whole) if whole == hf.part() => {
+                    (hf.part().begin <= hf.part().end).then_some(hf.part())
                 }
-                Some(whole) => hf.part.intersection(&whole),
+                Some(whole) => hf.part().intersection(&whole),
             }) else {
                 if met.begin != met.end
                     && !met
@@ -2742,13 +4334,13 @@ impl Pattern {
         if emitted == 1 {
             let hap = &mut out[from];
             let met = hap.whole_or_part();
-            let part = hap.part.intersection(&met);
+            let part = hap.part().intersection(&met);
             let ok = hap.pick_lookup().is_none()
-                && hap.part.within_one_cycle()
+                && hap.part().within_one_cycle()
                 && hap.value.is_data(0)
                 && matches!(hap.value, Value::Object(_))
                 && if has_step {
-                    hap.part.begin < hap.part.end && part == Some(hap.part)
+                    hap.part().begin < hap.part().end && part == Some(hap.part())
                 } else {
                     part.is_some()
                 };
@@ -2777,31 +4369,31 @@ impl Pattern {
                     controls.set_data_many_cached(&patches[..count], &mut dummy);
                 }
             }
-            hap.part = part;
+            hap.set_part(part);
             return true;
         }
         let can_apply_all = out[from..].iter_mut().all(|hap| {
             if hap.pick_lookup().is_some()
-                || !hap.part.within_one_cycle()
+                || !hap.part().within_one_cycle()
                 || !hap.value.is_data(0)
                 || !matches!(hap.value, Value::Object(_))
             {
                 return false;
             }
-            let part = match hap.whole {
-                None => (hap.part.begin <= hap.part.end).then_some(hap.part),
-                Some(whole) if whole == hap.part => {
-                    (hap.part.begin <= hap.part.end).then_some(hap.part)
+            let part = match hap.whole() {
+                None => (hap.part().begin <= hap.part().end).then_some(hap.part()),
+                Some(whole) if whole == hap.part() => {
+                    (hap.part().begin <= hap.part().end).then_some(hap.part())
                 }
-                Some(whole) => hap.part.intersection(&whole),
+                Some(whole) => hap.part().intersection(&whole),
             };
             let Some(part) = part else {
                 return false;
             };
-            if has_step && (hap.part.begin >= hap.part.end || part != hap.part) {
+            if has_step && (hap.part().begin >= hap.part().end || part != hap.part()) {
                 return false;
             }
-            hap.part = part;
+            hap.set_part(part);
             true
         });
         if !can_apply_all {
@@ -2827,7 +4419,7 @@ impl Pattern {
             let mut patches: [(&Key, f64); MAX_WAVES] = [(first.key(), 0.0); MAX_WAVES];
             let mut apply_one = |hap: &mut Hap| -> bool {
                 let met = hap.whole_or_part();
-                let part = hap.part;
+                let part = hap.part();
                 let slot_idx = if let Some(idx) = samples
                     .iter()
                     .position(|s| matches!(s, Some(slot) if slot.met == met && slot.part == part))
@@ -2967,18 +4559,18 @@ impl Pattern {
                                 (r, l)
                             };
                             let met = hap.whole_or_part();
-                            let part = hap.part;
+                            let part = hap.part();
                             let s_idx = if let Some(existing) =
                                 slot_hap[..n_slots].iter().position(|&rep| {
                                     let rh = &out[from + chunk_base + usize::from(rep)];
-                                    rh.whole_or_part() == met && rh.part == part
+                                    rh.whole_or_part() == met && rh.part() == part
                                 }) {
                                 existing
                             } else if n_slots < max_slots {
                                 let vals = if let Some(cached) =
                                     shared_hap[..n_shared].iter().position(|&rep| {
                                         let rh = &out[from + chunk_base + usize::from(rep)];
-                                        rh.whole_or_part() == met && rh.part == part
+                                        rh.whole_or_part() == met && rh.part() == part
                                     }) {
                                     shared_nums[cached]
                                 } else {
@@ -3251,7 +4843,7 @@ impl Pattern {
                 if let Value::Object(controls) = &mut hap.value {
                     controls.set_data_many_cached(&patches[..n_waves], &mut caches[s_idx]);
                 }
-                hap.part = TimeSpan::new(slot.bounds[s_idx], slot.bounds[s_idx + 1]);
+                hap.set_part(TimeSpan::new(slot.bounds[s_idx], slot.bounds[s_idx + 1]));
                 if bulk_ok {
                     out.push(hap);
                 } else if thread.stop_requested() || !thread.push_budgeted(out, from, hap) {
@@ -3269,21 +4861,22 @@ impl Pattern {
             let met = if has_continuous {
                 hf.whole_or_part()
             } else {
-                hf.part
+                hf.part()
             };
             let slot_idx = if let Some(idx) = slots
                 .iter()
-                .position(|s| s.active && s.part == hf.part && (!has_continuous || s.met == met))
+                .position(|s| s.active && s.part == hf.part() && (!has_continuous || s.met == met))
             {
                 idx
             } else {
-                let grid = fused::StepWave::step_grid_over(shared_steps, &hf.part)?;
+                let grid = fused::StepWave::step_grid_over(shared_steps, &hf.part())?;
                 let count = grid.len();
                 let mut hoisted_vals = [0.0f64; 4];
                 if hoisted_mask != 0 {
                     for (w, item) in items.iter().enumerate() {
                         if hoisted_mask & (1u8 << w) != 0 {
-                            hoisted_vals[w] = item.wave.number(&met, &hf.part, &state.controls)?;
+                            hoisted_vals[w] =
+                                item.wave.number(&met, &hf.part(), &state.controls)?;
                         }
                     }
                 }
@@ -3307,16 +4900,16 @@ impl Pattern {
                     out.truncate(from);
                     return Some(true);
                 }
-                let mut piece_begin = if begin < hf.part.begin {
-                    hf.part.begin
+                let mut piece_begin = if begin < hf.part().begin {
+                    hf.part().begin
                 } else {
                     begin
                 };
                 slot.bounds[0] = piece_begin;
                 for (s_idx, k) in grid_steps.enumerate() {
                     let end = grid.time(k + 1)?;
-                    let piece_end = if k + 1 == grid_end && end > hf.part.end {
-                        hf.part.end
+                    let piece_end = if k + 1 == grid_end && end > hf.part().end {
+                        hf.part().end
                     } else {
                         end
                     };
@@ -3342,7 +4935,7 @@ impl Pattern {
                     piece_begin = end;
                 }
                 slot.met = met;
-                slot.part = hf.part;
+                slot.part = hf.part();
                 slot.count = count as u8;
                 if was_active {
                     slot.step_patches = [None, None, None, None];
@@ -3435,7 +5028,7 @@ impl Pattern {
                     None
                 };
                 if let Some((sp, row, layer_idx)) = resolved {
-                    let whole = template.whole;
+                    let whole = template.whole();
                     let last = count - 1;
                     for s_idx in 0..count {
                         let piece = TimeSpan::new(slot.bounds[s_idx], slot.bounds[s_idx + 1]);
@@ -3447,15 +5040,13 @@ impl Pattern {
                         } else {
                             (template.context.clone(), template.keys.clone())
                         };
-                        let hap = Hap {
+                        let hap = Hap::from_parts(
                             whole,
-                            part: piece,
-                            value: Value::Object(OrderedMap::from_step_patch(
-                                &sp, row, layer_idx, s_idx,
-                            )),
+                            piece,
+                            Value::Object(OrderedMap::from_step_patch(&sp, row, layer_idx, s_idx)),
                             context,
                             keys,
-                        };
+                        );
                         if bulk_ok {
                             out.push(hap);
                         } else if thread.stop_requested() || !thread.push_budgeted(out, from, hap) {
@@ -3529,8 +5120,8 @@ impl Pattern {
             && !items.is_empty()
             && out[from..].iter().all(|hf| {
                 fused::StepWave::takes(hf)
-                    && (!has_continuous || (hf.whole.is_some() && hf.part.within_one_cycle()))
-                    && fused::StepWave::step_grid_over(shared_steps, &hf.part)
+                    && (!has_continuous || (hf.whole().is_some() && hf.part().within_one_cycle()))
+                    && fused::StepWave::step_grid_over(shared_steps, &hf.part())
                         .is_some_and(|g| (min_uniform_steps..=8).contains(&g.len()))
             });
         if inner_len <= 4 {
@@ -3562,7 +5153,7 @@ impl Pattern {
                 && let Some(key) = controls::builtin_key_ref_by_id(item.key_id)
                 && out[from..].iter().all(|hf| {
                     fused::StepWave::takes(hf)
-                        && fused::StepWave::step_grid_over(item.steps, &hf.part)
+                        && fused::StepWave::step_grid_over(item.steps, &hf.part())
                             .is_some_and(|g| g.len() <= 8)
                 })
             {
@@ -3577,20 +5168,20 @@ impl Pattern {
                 let mut ok = true;
                 for mut hf in stack_haps[..inner_len].iter_mut().filter_map(Option::take) {
                     let cached_one = match one_last {
-                        Some((lp, ln)) if lp == hf.part => Some(ln),
+                        Some((lp, ln)) if lp == hf.part() => Some(ln),
                         _ => fused::StepWave::step_number(
                             &item.wave,
                             item.steps,
-                            &hf.part,
+                            &hf.part(),
                             &state.controls,
                         )
                         .inspect(|&n| {
-                            one_last = Some((hf.part, n));
+                            one_last = Some((hf.part(), n));
                             one_cache = value::SharedWaveCache::default();
                         }),
                     };
                     if let Some(num) = cached_one {
-                        let part = hf.part;
+                        let part = hf.part();
                         if !Meeting::set_number_in_place_cached(
                             &mut hf,
                             key,
@@ -3610,7 +5201,7 @@ impl Pattern {
                         fused::note(fused::Hit::StepOne);
                         continue;
                     }
-                    let Some(grid) = fused::StepWave::step_grid_over(item.steps, &hf.part) else {
+                    let Some(grid) = fused::StepWave::step_grid_over(item.steps, &hf.part()) else {
                         ok = false;
                         break;
                     };
@@ -3624,13 +5215,13 @@ impl Pattern {
                             ok = false;
                             break;
                         };
-                        let piece = grid.cut(k, TimeSpan::new(begin, end), hf.part);
+                        let piece = grid.cut(k, TimeSpan::new(begin, end), hf.part());
                         let Some(num) = item.wave.step_value_at(&begin, &state.controls) else {
                             ok = false;
                             break;
                         };
-                        if one_last.is_none_or(|(lp, _)| lp != hf.part) {
-                            one_last = Some((hf.part, num));
+                        if one_last.is_none_or(|(lp, _)| lp != hf.part()) {
+                            one_last = Some((hf.part(), num));
                             one_cache = value::SharedWaveCache::default();
                         }
                         if !Meeting::set_number_in_place_cached(
@@ -3706,14 +5297,14 @@ impl Pattern {
                     let mut last_span: Option<(TimeSpan, TimeSpan, f64)> = None;
                     for hap in buf.iter_mut() {
                         if hap.pick_lookup().is_some()
-                            || !hap.part.within_one_cycle()
+                            || !hap.part().within_one_cycle()
                             || !hap.value.is_data(0)
                             || !matches!(hap.value, Value::Object(_))
                         {
                             return None;
                         }
                         let met = hap.whole_or_part();
-                        let part = hap.part.intersection(&met)?;
+                        let part = hap.part().intersection(&met)?;
                         let num = match last_span {
                             Some((lm, lp, ln)) if lm == met && lp == part => ln,
                             _ => {
@@ -3756,20 +5347,20 @@ impl Pattern {
                     let mut large_cache = StepWaveCacheSet::default();
                     for mut hf in src.drain(..) {
                         let cached_one = match one_last {
-                            Some((lp, ln)) if lp == hf.part => Some(ln),
+                            Some((lp, ln)) if lp == hf.part() => Some(ln),
                             _ => fused::StepWave::step_number(
                                 &item.wave,
                                 item.steps,
-                                &hf.part,
+                                &hf.part(),
                                 &state.controls,
                             )
                             .inspect(|&n| {
-                                one_last = Some((hf.part, n));
+                                one_last = Some((hf.part(), n));
                                 one_cache = value::SharedWaveCache::default();
                             }),
                         };
                         if let Some(num) = cached_one {
-                            let part = hf.part;
+                            let part = hf.part();
                             if !Meeting::set_number_in_place_cached(
                                 &mut hf,
                                 key,
@@ -3787,7 +5378,7 @@ impl Pattern {
                             fused::note(fused::Hit::StepOne);
                             continue;
                         }
-                        let grid = fused::StepWave::step_grid_over(item.steps, &hf.part)?;
+                        let grid = fused::StepWave::step_grid_over(item.steps, &hf.part())?;
                         let count = grid.len();
                         if count == 0 {
                             continue;
@@ -3796,10 +5387,10 @@ impl Pattern {
                             let k = grid.steps().start;
                             let begin = grid.time(k)?;
                             let end = grid.time(k + 1)?;
-                            let piece = grid.cut(k, TimeSpan::new(begin, end), hf.part);
+                            let piece = grid.cut(k, TimeSpan::new(begin, end), hf.part());
                             let num = item.wave.step_value_at(&begin, &state.controls)?;
-                            if one_last.is_none_or(|(lp, _)| lp != hf.part) {
-                                one_last = Some((hf.part, num));
+                            if one_last.is_none_or(|(lp, _)| lp != hf.part()) {
+                                one_last = Some((hf.part(), num));
                                 one_cache = value::SharedWaveCache::default();
                             }
                             if !Meeting::set_number_in_place_cached(
@@ -3840,8 +5431,8 @@ impl Pattern {
                         let Value::Object(base_map) = &hf.value else {
                             return None;
                         };
-                        let cached = if large_cache.find(hf.part).is_some() {
-                            large_cache.find(hf.part).expect("checked present")
+                        let cached = if large_cache.find(hf.part()).is_some() {
+                            large_cache.find(hf.part()).expect("checked present")
                         } else {
                             let mut pieces = large_cache.take_victim_pieces(count);
                             let mut begin = grid.time(grid.steps().start)?;
@@ -3851,14 +5442,14 @@ impl Pattern {
                                     return Some(false);
                                 }
                                 let end = grid.time(k + 1)?;
-                                pieces.push(grid.cut(k, TimeSpan::new(begin, end), hf.part));
+                                pieces.push(grid.cut(k, TimeSpan::new(begin, end), hf.part()));
                                 vals.push(Value::F64(
                                     item.wave.step_value_at(&begin, &state.controls)?,
                                 ));
                                 begin = end;
                             }
                             large_cache.insert(StepWaveCache {
-                                part: hf.part,
+                                part: hf.part(),
                                 values: Arc::from(vals),
                                 pieces,
                                 table: None,
@@ -3922,7 +5513,7 @@ impl Pattern {
                             };
                             let mut hap = template.clone();
                             hap.value = Value::Object(map);
-                            hap.part = piece;
+                            hap.set_part(piece);
                             if bulk_ok {
                                 dst.push(hap);
                             } else if thread.stop_requested()
@@ -3998,7 +5589,7 @@ impl Pattern {
         }
         if !out[from..]
             .iter()
-            .all(|hap| hap.pick_lookup().is_none() && hap.part.within_one_cycle())
+            .all(|hap| hap.pick_lookup().is_none() && hap.part().within_one_cycle())
         {
             out.truncate(from);
             return false;
@@ -4009,12 +5600,12 @@ impl Pattern {
                 return false;
             }
             let met = hap.whole_or_part();
-            let Some(part) = hap.part.intersection(&met) else {
+            let Some(part) = hap.part().intersection(&met) else {
                 return false;
             };
             match gate.passes(met, part, &state.controls) {
                 Some(true) => {
-                    hap.part = part;
+                    hap.set_part(part);
                     true
                 }
                 Some(false) => false,
@@ -4084,7 +5675,7 @@ impl Pattern {
         with_list(|haps| {
             let asked = state.set_span(all);
             self.answer_child_onto(thread, &asked, haps);
-            if haps.iter().any(|hap| hap.part.begin >= hap.part.end) {
+            if haps.iter().any(|hap| hap.part().begin >= hap.part().end) {
                 return false;
             }
             // Count the split pieces first and charge any active hap budget
@@ -4094,8 +5685,8 @@ impl Pattern {
                 if (index & 63) == 0 && thread.stop_requested() {
                     return true;
                 }
-                let first = parts.partition_point(|part| part.end <= hap.part.begin);
-                let after = parts.partition_point(|part| part.begin < hap.part.end);
+                let first = parts.partition_point(|part| part.end <= hap.part().begin);
+                let after = parts.partition_point(|part| part.begin < hap.part().end);
                 let Some(next_total) = total_met.checked_add(after.saturating_sub(first)) else {
                     let _ = thread.charge(usize::MAX);
                     return thread.stop_requested();
@@ -4120,8 +5711,8 @@ impl Pattern {
                     }
                     return true;
                 }
-                let first = parts.partition_point(|part| part.end <= hap.part.begin);
-                let after = parts.partition_point(|part| part.begin < hap.part.end);
+                let first = parts.partition_point(|part| part.end <= hap.part().begin);
+                let after = parts.partition_point(|part| part.begin < hap.part().end);
                 met.extend((first..after).map(|part| (part, index, part + 1 == after)));
             }
             // Haps in the order of the parts, each in one part: the answer.
@@ -4163,8 +5754,10 @@ impl Pattern {
                     break;
                 };
                 let part = parts[part_idx];
-                hap.part =
-                    TimeSpan::new(hap.part.begin.max(part.begin), hap.part.end.min(part.end));
+                hap.set_part(TimeSpan::new(
+                    hap.part().begin.max(part.begin),
+                    hap.part().end.min(part.end),
+                ));
                 out.push(hap);
             }
             if !ok {
@@ -4206,7 +5799,7 @@ impl Pattern {
             return false;
         }
         // This graph answers for the part of a hap as for its whole, cut.
-        let asked = |hv: &Hap| hv.part;
+        let asked = |hv: &Hap| hv.part();
         if values
             .iter()
             .any(|hv| asked(hv).begin >= asked(hv).end || !part_within_whole(hv))
@@ -4242,21 +5835,21 @@ impl Pattern {
                     *slot = i;
                 }
                 small_by_begin[..n_funcs]
-                    .sort_by(|a, b| functions[*a].part.begin.cmp(&functions[*b].part.begin));
+                    .sort_by(|a, b| functions[*a].part().begin.cmp(&functions[*b].part().begin));
                 let mut latest = Fraction::ZERO;
                 for (i, &index) in small_by_begin[..n_funcs].iter().enumerate() {
-                    let end = functions[index].part.end;
+                    let end = functions[index].part().end;
                     latest = if i == 0 { end } else { end.max(latest) };
                     small_latest_end[i] = latest;
                 }
                 (&small_by_begin[..n_funcs], &small_latest_end[..n_funcs])
             } else {
                 let mut indices: Vec<usize> = (0..n_funcs).collect();
-                indices.sort_by(|a, b| functions[*a].part.begin.cmp(&functions[*b].part.begin));
+                indices.sort_by(|a, b| functions[*a].part().begin.cmp(&functions[*b].part().begin));
                 heap_by_begin = indices;
                 heap_latest_end.reserve(n_funcs);
                 for &index in &heap_by_begin {
-                    let end = functions[index].part.end;
+                    let end = functions[index].part().end;
                     heap_latest_end.push(
                         heap_latest_end
                             .last()
@@ -4271,12 +5864,12 @@ impl Pattern {
                 let span = asked(hv);
                 let first = latest_end.partition_point(|end| *end <= span.begin);
                 let after =
-                    by_begin.partition_point(|index| functions[*index].part.begin < span.end);
+                    by_begin.partition_point(|index| functions[*index].part().begin < span.end);
                 let range = by_begin.get(first..after).unwrap_or_default();
                 let met_indices: &[usize] = if range.len() <= 32 {
                     let mut m_len = 0usize;
                     for &index in range {
-                        if functions[index].part.end > span.begin {
+                        if functions[index].part().end > span.begin {
                             small_meeting[m_len] = index;
                             m_len += 1;
                         }
@@ -4289,7 +5882,7 @@ impl Pattern {
                         range
                             .iter()
                             .copied()
-                            .filter(|index| functions[*index].part.end > span.begin),
+                            .filter(|index| functions[*index].part().end > span.begin),
                     );
                     heap_meeting.sort_unstable();
                     &heap_meeting
@@ -4299,11 +5892,11 @@ impl Pattern {
                     // The part of the function hap, as the query of the whole
                     // cuts it, then where the two haps meet.
                     let cut =
-                        TimeSpan::new(hf.part.begin.max(span.begin), hf.part.end.min(span.end));
-                    let Some(part) = cut.intersection(&hv.part) else {
+                        TimeSpan::new(hf.part().begin.max(span.begin), hf.part().end.min(span.end));
+                    let Some(part) = cut.intersection(&hv.part()) else {
                         continue;
                     };
-                    let hap = applied_hap(hf, hv, hv.whole, part, apply, flow);
+                    let hap = applied_hap(hf, hv, hv.whole(), part, apply, flow);
                     if thread.stop_requested() || !thread.push_budgeted(out, from, hap) {
                         out.truncate(from);
                         return;
@@ -4360,19 +5953,24 @@ impl Pattern {
         impl Drop for MergeCacheGuard {
             fn drop(&mut self) {
                 if self.0 {
-                    context_keys::end_query_merge_cache();
+                    QUERY_THREAD.with(|thread| {
+                        thread.merge_cache_active.set(false);
+                        if thread.merge_cache_dirty.replace(false) {
+                            context_keys::clear_query_merge_cache();
+                        }
+                    });
                 }
             }
         }
         let outermost = thread.depth.get() == 0;
         if outermost {
-            context_keys::begin_query_merge_cache();
+            thread.merge_cache_active.set(true);
         }
-        let _merge_guard = MergeCacheGuard(outermost);
+        let merge_guard = MergeCacheGuard(outermost);
         if self.is_volatile() {
             note_uncacheable();
         }
-        match self.runtime_settings() {
+        let data_only = match self.runtime_settings() {
             Some(settings) => {
                 if thread.current_runtime.get() == settings.ptr_id() {
                     let owner = outermost.then_some(settings);
@@ -4389,7 +5987,15 @@ impl Pattern {
                 let attach_current = outermost && thread.current_runtime.get() != 0;
                 self.query_with_bound_runtime(thread, state, None, attach_current, order, out)
             }
+        };
+        if outermost {
+            thread.merge_cache_active.set(false);
+            if thread.merge_cache_dirty.replace(false) {
+                context_keys::clear_query_merge_cache();
+            }
         }
+        std::mem::forget(merge_guard);
+        data_only
     }
 
     /// Recursive child query (always `Order::Graph`, never outermost).
@@ -4524,18 +6130,47 @@ impl Pattern {
                 Node::Sequence(layers) if !layers.is_empty() => {
                     sequence::query_sequence_sorted_onto(thread, layers, state, out)
                 }
+                Node::IntRange {
+                    start,
+                    count,
+                    loc0,
+                    loc1,
+                    named_id,
+                    step_neg,
+                } => {
+                    query_int_range_onto(
+                        thread, *start, *count, *loc0, *loc1, *named_id, *step_neg, state, out,
+                    );
+                    true
+                }
+                Node::SegmentSignal { body, steps } => {
+                    query_segment_signal_onto(thread, *body, *steps, state, out);
+                    true
+                }
+                Node::Iter(node) => {
+                    try_query_iter_int_range_pow2_onto(thread, node, 0, state, out).is_some()
+                }
                 Node::Fast(node)
                     if !node.0.has_runtime_settings()
                         && (node.0.node_flags() & FLAG_VOLATILE) == 0 =>
                 {
-                    if let Some(sorted) = try_query_fast_pow2_slowcat_onto(
+                    if let Some(sorted) = try_query_fast_pow2_iter_onto(
                         thread,
                         node.0.node_kind(),
                         node.1,
-                        node.2,
                         state,
                         out,
-                    ) {
+                    )
+                    .or_else(|| {
+                        try_query_fast_pow2_slowcat_onto(
+                            thread,
+                            node.0.node_kind(),
+                            node.1,
+                            node.2,
+                            state,
+                            out,
+                        )
+                    }) {
                         if !sorted {
                             crate::hap::sort_haps_for_query_in_place(&mut out[from..]);
                         }
@@ -4550,7 +6185,12 @@ impl Pattern {
                     let factor = Fraction::new(i128::from(*numer), i128::from(*denom));
                     let op = if *is_slow { "slow" } else { "fast" };
                     if let Some(sorted) =
-                        try_query_fast_pow2_slowcat_onto(thread, &cell.kind, factor, op, state, out)
+                        try_query_fast_pow2_iter_onto(thread, &cell.kind, factor, state, out)
+                            .or_else(|| {
+                                try_query_fast_pow2_slowcat_onto(
+                                    thread, &cell.kind, factor, op, state, out,
+                                )
+                            })
                     {
                         if !sorted {
                             crate::hap::sort_haps_for_query_in_place(&mut out[from..]);
@@ -4571,10 +6211,22 @@ impl Pattern {
                 crate::hap::sort_haps_for_query_in_place(&mut out[from..]);
             }
         }
-        let mut data_only = matches!(
-            self.node_kind(),
-            Node::Sequence(layers) if sequence::holds_data(layers)
-        );
+        let mut data_only = match self.node_kind() {
+            Node::IntRange { .. } | Node::SegmentSignal { .. } => true,
+            Node::Sequence(layers) => sequence::holds_data(layers),
+            Node::Iter(node) => sequence::is_data(&node.inner),
+            Node::Fast(node) => {
+                sequence::is_data(&node.0)
+                    || matches!(node.0.node_kind(), Node::Iter(it) if sequence::is_data(&it.inner))
+            }
+            Node::FastSmall(cell, ..) => match &cell.kind {
+                Node::IntRange { .. } | Node::SegmentSignal { .. } => true,
+                Node::Sequence(layers) => sequence::holds_data(layers),
+                Node::Iter(it) => sequence::is_data(&it.inner),
+                _ => false,
+            },
+            _ => false,
+        };
         if !data_only && (metadata_owner.is_some() || attach_current_if_needed) {
             let mut all_known_data = true;
             let mut lazy_current: Option<Option<settings::RuntimeSettings>> = None;
@@ -4817,18 +6469,39 @@ impl Pattern {
 
             Node::Sequence(layers) => sequence::query_sequence_onto(thread, layers, state, out),
 
+            Node::IntRange {
+                start,
+                count,
+                loc0,
+                loc1,
+                named_id,
+                step_neg,
+            } => query_int_range_onto(
+                thread, *start, *count, *loc0, *loc1, *named_id, *step_neg, state, out,
+            ),
+
+            Node::Iter(node) => query_iter_onto(thread, node, state, out),
+
             Node::Fast(node) => {
                 if !node.0.has_runtime_settings()
                     && (node.0.node_flags() & FLAG_VOLATILE) == 0
-                    && try_query_fast_pow2_slowcat_onto(
+                    && (try_query_fast_pow2_iter_onto(
                         thread,
                         node.0.node_kind(),
                         node.1,
-                        node.2,
                         state,
                         out,
                     )
                     .is_some()
+                        || try_query_fast_pow2_slowcat_onto(
+                            thread,
+                            node.0.node_kind(),
+                            node.1,
+                            node.2,
+                            state,
+                            out,
+                        )
+                        .is_some())
                 {
                     return;
                 }
@@ -4840,8 +6513,12 @@ impl Pattern {
                 let factor = Fraction::new(i128::from(*numer), i128::from(*denom));
                 let op = if *is_slow { "slow" } else { "fast" };
                 if (*flags & FLAG_VOLATILE) == 0
-                    && try_query_fast_pow2_slowcat_onto(thread, &cell.kind, factor, op, state, out)
+                    && (try_query_fast_pow2_iter_onto(thread, &cell.kind, factor, state, out)
                         .is_some()
+                        || try_query_fast_pow2_slowcat_onto(
+                            thread, &cell.kind, factor, op, state, out,
+                        )
+                        .is_some())
                 {
                     return;
                 }
@@ -4944,17 +6621,17 @@ impl Pattern {
                             if coin.partial_cmp(&amount) != Some(std::cmp::Ordering::Greater) {
                                 return false;
                             }
-                            let part = match hap.whole {
-                                None => (hap.part.begin <= hap.part.end).then_some(hap.part),
-                                Some(whole) if whole == hap.part => {
-                                    (hap.part.begin <= hap.part.end).then_some(hap.part)
+                            let part = match hap.whole() {
+                                None => (hap.part().begin <= hap.part().end).then_some(hap.part()),
+                                Some(whole) if whole == hap.part() => {
+                                    (hap.part().begin <= hap.part().end).then_some(hap.part())
                                 }
-                                Some(whole) => hap.part.intersection(&whole),
+                                Some(whole) => hap.part().intersection(&whole),
                             };
                             let Some(part) = part else {
                                 return false;
                             };
-                            hap.part = part;
+                            hap.set_part(part);
                             true
                         });
                     }
@@ -4977,8 +6654,9 @@ impl Pattern {
                         pat.answer_child_onto(thread, state, out);
                     }
                 }
+                let mut loc_cache = locations::LocMergeCache::new();
                 for hap in &mut out[from..] {
-                    hap.context.extend_from_slice(locs);
+                    loc_cache.extend_into(&mut hap.context, locs);
                 }
             }
 
@@ -5080,17 +6758,17 @@ impl Pattern {
                     out.reserve(values.len());
                     with_list(|funcs| {
                         for hv in values.drain(..) {
-                            let asked = pat_func.asked_for(hv.whole_or_part(), hv.part);
+                            let asked = pat_func.asked_for(hv.whole_or_part(), hv.part());
                             let sampled = sampler.as_mut().is_some_and(|(signal, probe)| {
-                                signal.answer(asked, hv.part, probe, funcs).is_some()
+                                signal.answer(asked, hv.part(), probe, funcs).is_some()
                             });
                             if !sampled {
                                 funcs.clear();
                                 pat_func.answer_child_onto(thread, &state.set_span(asked), funcs);
                             }
                             for hf in funcs.iter() {
-                                if let Some(part) = hf.part.intersection(&hv.part) {
-                                    let hap = applied_hap(hf, &hv, hv.whole, part, apply, *flow);
+                                if let Some(part) = hf.part().intersection(&hv.part()) {
+                                    let hap = applied_hap(hf, &hv, hv.whole(), part, apply, *flow);
                                     if thread.stop_requested()
                                         || !thread.push_budgeted(out, from, hap)
                                     {
@@ -5215,6 +6893,18 @@ impl Pattern {
 
             Node::Signal(signal) => {
                 out.push(Hap::new(None, state.span, signal(state)));
+            }
+
+            Node::NumberSignal(body) => {
+                out.push(Hap::new(
+                    None,
+                    state.span,
+                    Value::F64(body(state.span.begin, &state.controls)),
+                ));
+            }
+
+            Node::SegmentSignal { body, steps } => {
+                query_segment_signal_onto(thread, *body, *steps, state, out);
             }
 
             Node::ControlMap(cell, flags, id, unnamed_only) => {
@@ -5499,6 +7189,8 @@ impl Pattern {
             | Node::Pure(_)
             | Node::PureAt(_)
             | Node::PurePickLookup(..)
+            | Node::IntRange { .. }
+            | Node::Iter(_)
             | Node::Sequence(_)
             | Node::Fast(..)
             | Node::FastSmall(..)
@@ -5528,6 +7220,8 @@ impl Pattern {
             | Node::FmapNative(..)
             | Node::ExpandHapsNative(..)
             | Node::Signal(..)
+            | Node::NumberSignal(..)
+            | Node::SegmentSignal { .. }
             | Node::ControlMap(..)
             | Node::ControlMapBoxed(..)
             | Node::MapHapsNative(..)
@@ -5603,7 +7297,7 @@ impl Pattern {
                 let (pat, id) = (&boxed.0, boxed.1);
                 let mut output = Vec::new();
                 for hap in pat.query(state) {
-                    let Some(whole) = hap.whole else {
+                    let Some(whole) = hap.whole() else {
                         signal_query_error(|| {
                             "Cannot read properties of undefined (reading 'begin')".into()
                         });
@@ -5646,8 +7340,8 @@ impl Pattern {
                     context.dedup();
                     Some(
                         Hap::new(
-                            carrier.whole,
-                            carrier.part,
+                            carrier.whole(),
+                            carrier.part(),
                             Value::Haps(value::HapList::new(group)),
                         )
                         .with_ui_visuals_context(ui_visuals)
@@ -5840,24 +7534,19 @@ impl Pattern {
                             timelines.remove(&pick_property_key(&negative));
                         }
                     }
-                    for hap in pattern.late(offset).query(&state.set_span(time_hap.part)) {
+                    for hap in pattern.late(offset).query(&state.set_span(time_hap.part())) {
                         let mut context = hap.context.clone();
                         context.append(&time_hap.context);
+                        let keys = ContextKeys::merge_with(
+                            &time_hap.keys,
+                            &hap.keys,
+                            hap.live_controls(),
+                            hap.slider_binding(),
+                            hap.pick_lookup_arc(),
+                        );
                         if !push_budgeted(
                             &mut result,
-                            Hap {
-                                whole: hap.whole,
-                                part: hap.part,
-                                keys: ContextKeys::merge_with(
-                                    &time_hap.keys,
-                                    &hap.keys,
-                                    hap.live_controls(),
-                                    hap.slider_binding(),
-                                    hap.pick_lookup_arc(),
-                                ),
-                                value: hap.value,
-                                context,
-                            },
+                            Hap::from_parts(hap.whole(), hap.part(), hap.value, context, keys),
                         ) {
                             return Vec::new();
                         }
@@ -5926,18 +7615,18 @@ impl Pattern {
                 let mut out = Vec::new();
                 for (outer, inner) in resolved {
                     let extended = poly_extend(&inner, outer_steps);
-                    for b in extended.query(&state.set_span(outer.part)) {
+                    for b in extended.query(&state.set_span(outer.part())) {
                         let mut ctx = outer.context.clone();
                         ctx.append(&b.context);
                         if !push_budgeted(
                             &mut out,
-                            Hap {
-                                whole: outer.whole,
-                                part: b.part,
-                                keys: ContextKeys::merge(&b.keys, &outer.keys),
-                                value: b.value.clone(),
-                                context: ctx,
-                            },
+                            Hap::from_parts(
+                                outer.whole(),
+                                b.part(),
+                                b.value.clone(),
+                                ctx,
+                                ContextKeys::merge(&b.keys, &outer.keys),
+                            ),
                         ) {
                             return Vec::new();
                         }
@@ -5956,7 +7645,7 @@ impl Pattern {
                     // The carrier hap has no context of its own, so
                     // `innerJoin` contributes only the index hap's context.
                     let carrier = &group[0];
-                    for index_hap in indices.query(&state.set_span(carrier.part)) {
+                    for index_hap in indices.query(&state.set_span(carrier.part())) {
                         // Negative integers wrap; a fractional index misses
                         // and the following dereference throws.
                         let Some(picked) = js_index(&index_hap.value, group.len()) else {
@@ -5972,14 +7661,14 @@ impl Pattern {
                         context.append(&picked.context);
                         if !push_budgeted(
                             &mut out,
-                            Hap {
+                            Hap::from_parts(
                                 // `innerJoin`: the INNER (index) hap's whole.
-                                whole: index_hap.whole,
-                                part: index_hap.part,
-                                keys: ContextKeys::merge(&picked.keys, &index_hap.keys),
-                                value: picked.value.clone(),
+                                index_hap.whole(),
+                                index_hap.part(),
+                                picked.value.clone(),
                                 context,
-                            },
+                                ContextKeys::merge(&picked.keys, &index_hap.keys),
+                            ),
                         ) {
                             return Vec::new();
                         }
@@ -6002,7 +7691,7 @@ impl Pattern {
                         signal_query_error(|| "Maximum call stack size exceeded".into());
                         return Vec::new();
                     };
-                    for inner in selected.query(&state.set_span(carrier.part)) {
+                    for inner in selected.query(&state.set_span(carrier.part())) {
                         let materialized = materialize_js_value(&inner.value);
                         let Some(object) = materialized.as_object() else {
                             // `null.value` / `undefined.value` throw at the
@@ -6077,17 +7766,17 @@ impl Pattern {
                         }
                         if !push_budgeted(
                             &mut out,
-                            Hap {
-                                whole: inner.whole,
-                                part: inner.part,
+                            Hap::from_parts(
+                                inner.whole(),
+                                inner.part(),
                                 value,
-                                context: locations,
+                                locations,
                                 // `combineContext(h.value)`: each key on the
                                 // value-side context wins, and the receiving
                                 // hap keeps each key that side lacks. `.log()`
                                 // writes its formatted text under `logLine`,
                                 // which the runtime prints on the onset.
-                                keys: ContextKeys::merge_with(
+                                ContextKeys::merge_with(
                                     &ContextKeys::of(context_keys::Keys {
                                         scale: context
                                             .and_then(|context| context.get("scale"))
@@ -6118,7 +7807,7 @@ impl Pattern {
                                     0,
                                     None,
                                 ),
-                            },
+                            ),
                         ) {
                             return Vec::new();
                         }
@@ -6143,7 +7832,7 @@ impl Pattern {
                         return Vec::new();
                     };
                     let selected =
-                        arp_with(pat.clone(), id).query(&state.set_span(callback_hap.part));
+                        arp_with(pat.clone(), id).query(&state.set_span(callback_hap.part()));
                     if query_error_pending() {
                         return Vec::new();
                     }
@@ -6443,6 +8132,98 @@ impl Pattern {
                         })
                         .collect()
                 }),
+            Node::Iter(node) => {
+                if node.parts == 0 || node.inner.is_rest() {
+                    return Some(Vec::new());
+                }
+                let n = i128::from(node.parts);
+                let shift_op = if node.back { "late" } else { "early" };
+                let mut resolved_haps = Vec::new();
+                for subspan in state.span.span_cycles() {
+                    let cycle = subspan.begin.sam().numer();
+                    let k = cycle.rem_euclid(n);
+                    let slowcat_off = cycle - cycle.div_euclid(n);
+                    let Some(cat_span) = subspan
+                        .begin
+                        .checked_add_int(-slowcat_off)
+                        .zip(subspan.end.checked_add_int(-slowcat_off))
+                        .map(|(b, e)| TimeSpan::new(b, e))
+                    else {
+                        refuse(QueryLimit::NativeFraction {
+                            operation: "slowcat",
+                        });
+                        return Some(Vec::new());
+                    };
+                    let Some(iter_off) = Fraction::int(k).checked_div(node.times) else {
+                        refuse(QueryLimit::NativeFraction {
+                            operation: shift_op,
+                        });
+                        return Some(Vec::new());
+                    };
+                    let query_delta = if node.back { -iter_off } else { iter_off };
+                    let Some(inner_span) = cat_span
+                        .begin
+                        .checked_add(query_delta)
+                        .zip(cat_span.end.checked_add(query_delta))
+                        .map(|(b, e)| TimeSpan::new(b, e))
+                    else {
+                        refuse(QueryLimit::NativeFraction {
+                            operation: shift_op,
+                        });
+                        return Some(Vec::new());
+                    };
+                    let inner_resolved =
+                        node.inner.resolve_pattern_of(&state.set_span(inner_span))?;
+                    let hap_delta = -query_delta;
+                    let mut mapped = Vec::with_capacity(inner_resolved.len());
+                    for mut r in inner_resolved {
+                        let shift_back = |t: Fraction| -> Result<Fraction, &'static str> {
+                            t.checked_add(hap_delta)
+                                .ok_or(shift_op)?
+                                .checked_add_int(slowcat_off)
+                                .ok_or("slowcat")
+                        };
+                        let (pb, pe) =
+                            match (shift_back(r.hap.part().begin), shift_back(r.hap.part().end)) {
+                                (Ok(b), Ok(e)) => (b, e),
+                                (Err(op), _) | (_, Err(op)) => {
+                                    refuse(QueryLimit::NativeFraction { operation: op });
+                                    return Some(Vec::new());
+                                }
+                            };
+                        let old_part = r.hap.part();
+                        let part = TimeSpan::new(pb, pe);
+                        let new_whole = match r.hap.whole() {
+                            Some(whole) => {
+                                if whole == old_part {
+                                    Some(part)
+                                } else {
+                                    let (wb, we) =
+                                        match (shift_back(whole.begin), shift_back(whole.end)) {
+                                            (Ok(b), Ok(e)) => (b, e),
+                                            (Err(op), _) | (_, Err(op)) => {
+                                                refuse(QueryLimit::NativeFraction {
+                                                    operation: op,
+                                                });
+                                                return Some(Vec::new());
+                                            }
+                                        };
+                                    Some(TimeSpan::new(wb, we))
+                                }
+                            }
+                            None => None,
+                        };
+                        r.hap.set_spans(new_whole, part);
+                        mapped.push(r);
+                    }
+                    if !charge_haps(resolved_haps.len() + mapped.len()) {
+                        return Some(Vec::new());
+                    }
+                    resolved_haps.extend(mapped);
+                    note_accumulated(resolved_haps.len());
+                }
+                Some(resolved_haps)
+            }
             Node::FastSmall(cell, flags, numer, denom, is_slow) => {
                 let factor = Fraction::new(i128::from(*numer), i128::from(*denom));
                 let op = if *is_slow { "slow" } else { "fast" };
@@ -6636,14 +8417,14 @@ impl Pattern {
     /// Shared by the query path and the pattern-of-patterns resolution so a
     /// join consumes exactly the same compressed windows the query produces.
     pub(crate) fn fast_gap_unmap_hap(hap: &Hap, factor: Fraction) -> Option<Hap> {
-        let begin = hap.part.begin;
-        let end = hap.part.end;
+        let begin = hap.part().begin;
+        let end = hap.part().end;
         let cyc = begin.sam();
         let one = Fraction::ONE;
         let begin_pos = begin.checked_sub(cyc)?.checked_div(factor)?.min(one);
         let end_pos = end.checked_sub(cyc)?.checked_div(factor)?.min(one);
         let new_part = TimeSpan::new(cyc.checked_add(begin_pos)?, cyc.checked_add(end_pos)?);
-        let new_whole = match hap.whole {
+        let new_whole = match hap.whole() {
             Some(w) => Some(TimeSpan::new(
                 new_part
                     .begin
@@ -6654,13 +8435,13 @@ impl Pattern {
             )),
             None => None,
         };
-        Some(Hap {
-            whole: new_whole,
-            part: new_part,
-            value: hap.value.clone(),
-            context: hap.context.clone(),
-            keys: hap.keys.clone(),
-        })
+        Some(Hap::from_parts(
+            new_whole,
+            new_part,
+            hap.value.clone(),
+            hap.context.clone(),
+            hap.keys.clone(),
+        ))
     }
 
     /// `queryArc(begin, end)` - the public pattern-query boundary.
@@ -6737,6 +8518,459 @@ impl Pattern {
         self.query_arc_outcome_in(state, budget, table::Order::Graph)
     }
 
+    /// Single-TLS-scope top-level sorted query for native patterns under a
+    /// cancellation flag, wall-clock budget, and hap budget.
+    pub fn query_native_sorted_bounded(
+        &self,
+        state: &State,
+        hap_budget: u64,
+        time_budget: std::time::Duration,
+        cancellation: &std::sync::atomic::AtomicBool,
+    ) -> Result<QueryArcOutcome, QueryLimit> {
+        let error_free = self.is_query_settings_independent();
+        self.query_native_sorted_bounded_inner(
+            state,
+            hap_budget,
+            time_budget,
+            cancellation,
+            error_free,
+        )
+    }
+
+    /// Variant of [`Self::query_native_sorted_bounded`] when the caller already
+    /// verified [`Self::is_query_settings_independent`], avoiding a second pass
+    /// over multi-layer sequences.
+    pub fn query_native_independent_sorted_bounded(
+        &self,
+        state: &State,
+        hap_budget: u64,
+        time_budget: std::time::Duration,
+        cancellation: &std::sync::atomic::AtomicBool,
+    ) -> Result<QueryArcOutcome, QueryLimit> {
+        debug_assert!(self.is_query_settings_independent());
+        self.query_native_sorted_bounded_inner(state, hap_budget, time_budget, cancellation, true)
+    }
+
+    fn query_native_sorted_bounded_inner(
+        &self,
+        state: &State,
+        hap_budget: u64,
+        time_budget: std::time::Duration,
+        cancellation: &std::sync::atomic::AtomicBool,
+        error_free: bool,
+    ) -> Result<QueryArcOutcome, QueryLimit> {
+        // Zero-guard direct top-level path for pure, settings-independent leaf
+        // queries (dyadic `IntRange` <= 1024 haps and single-cycle fractional
+        // `Sequence` windows), bypassing `FastGuard`'s 19 TLS mutations and
+        // unwind drop glue while preserving exact metrics and budget refusals.
+        if error_free
+            && !time_budget.is_zero()
+            && !cancellation.load(std::sync::atomic::Ordering::Relaxed)
+        {
+            let direct = QUERY_THREAD.with(|thread| {
+                if !thread.can_skip_fast_guard() {
+                    return None;
+                }
+                match self.node_kind() {
+                    Node::IntRange {
+                        start,
+                        count,
+                        loc0,
+                        loc1,
+                        named_id,
+                        step_neg,
+                    } => {
+                        let res = try_query_int_range_direct(
+                            *start, *count, *loc0, *loc1, *named_id, *step_neg, state, hap_budget,
+                        )?;
+                        if let Ok(haps) = &res {
+                            let n = haps.len();
+                            if n > 0 {
+                                thread.note_accumulated(n);
+                                thread.note_materialised(n);
+                            }
+                        }
+                        Some(res.map(QueryArcOutcome::Haps))
+                    }
+                    Node::Sequence(layers)
+                        if (1..=16).contains(&layers.len())
+                            && (state.span.begin.denom() != 1 || state.span.end.denom() != 1) =>
+                    {
+                        let single = layers.len() == 1;
+                        if single
+                            && let Some(res) =
+                                sequence::try_query_single_uniform_window(layers, state, hap_budget)
+                        {
+                            if let Ok(haps) = &res {
+                                let len = haps.len();
+                                if len > 0 {
+                                    thread.note_accumulated(len);
+                                    thread.note_materialised(len);
+                                }
+                            }
+                            return Some(res.map(QueryArcOutcome::Haps));
+                        }
+                        let root_ptr = Arc::as_ptr(&self.node) as usize;
+                        let (ptr, cap) = if single {
+                            (0usize, 0u16)
+                        } else {
+                            thread.short_query_hint.get()
+                        };
+                        let room = if single {
+                            0
+                        } else if ptr == root_ptr {
+                            usize::from(cap)
+                        } else {
+                            layers.len().min(8)
+                        };
+                        let mut haps = Vec::with_capacity(room);
+                        match sequence::query_multi_window_sorted_budgeted(
+                            layers,
+                            state,
+                            Some(hap_budget),
+                            &mut haps,
+                        ) {
+                            Ok(true) => {
+                                let len = haps.len();
+                                if !single && (ptr != root_ptr || len > room) {
+                                    let needed = len.max(layers.len().min(8)).min(64) as u16;
+                                    let next = if ptr == root_ptr {
+                                        cap.max(needed)
+                                    } else {
+                                        needed
+                                    };
+                                    thread.short_query_hint.set((root_ptr, next));
+                                }
+                                if len > 0 {
+                                    thread.note_accumulated(len);
+                                    thread.note_materialised(len);
+                                }
+                                Some(Ok(QueryArcOutcome::Haps(haps)))
+                            }
+                            Ok(false) => None,
+                            Err(limit) => Some(Err(limit)),
+                        }
+                    }
+                    _ => None,
+                }
+            });
+            if let Some(outcome) = direct {
+                return outcome;
+            }
+        }
+        self.query_native_sorted_bounded_slow(
+            state,
+            hap_budget,
+            time_budget,
+            cancellation,
+            error_free,
+        )
+    }
+
+    #[inline(never)]
+    fn query_native_sorted_bounded_slow(
+        &self,
+        state: &State,
+        hap_budget: u64,
+        time_budget: std::time::Duration,
+        cancellation: &std::sync::atomic::AtomicBool,
+        error_free: bool,
+    ) -> Result<QueryArcOutcome, QueryLimit> {
+        let error_boundary = (!error_free).then(QueryErrorBoundary::enter_top_level);
+        let bound_settings = if error_free {
+            None
+        } else {
+            self.runtime_settings()
+        };
+        let run = || {
+            host::run_native_bounded(cancellation, time_budget, hap_budget, |thread| {
+                if error_free {
+                    if thread.error_published.get() {
+                        host::clear_published_errors_slow();
+                    }
+                    // Direct top-level sorted emission for pure, settings-independent
+                    // leaf graphs: bypasses `MergeCacheGuard`, `DepthGuard`,
+                    // `answer_onto`, and `i128` window-width checks.
+                    if thread.depth.get() == 0 {
+                        if thread.stop_requested() {
+                            return Vec::new();
+                        }
+                        match self.node_kind() {
+                            Node::IntRange {
+                                start,
+                                count,
+                                loc0,
+                                loc1,
+                                named_id,
+                                step_neg,
+                            } => {
+                                let mut haps = Vec::new();
+                                query_int_range_onto(
+                                    thread, *start, *count, *loc0, *loc1, *named_id, *step_neg,
+                                    state, &mut haps,
+                                );
+                                return haps;
+                            }
+                            Node::SegmentSignal { body, steps } => {
+                                let mut haps = Vec::new();
+                                query_segment_signal_onto(thread, *body, *steps, state, &mut haps);
+                                return haps;
+                            }
+                            Node::Iter(node) => {
+                                let mut haps = Vec::new();
+                                if try_query_iter_int_range_pow2_onto(
+                                    thread, node, 0, state, &mut haps,
+                                )
+                                .is_some()
+                                {
+                                    return haps;
+                                }
+                            }
+                            Node::Fast(node)
+                                if !node.0.has_runtime_settings()
+                                    && (node.0.node_flags() & FLAG_VOLATILE) == 0
+                                    && matches!(node.0.node_kind(), Node::Iter(_)) =>
+                            {
+                                let mut haps = Vec::new();
+                                if let Some(sorted) = try_query_fast_pow2_iter_onto(
+                                    thread,
+                                    node.0.node_kind(),
+                                    node.1,
+                                    state,
+                                    &mut haps,
+                                ) {
+                                    if !sorted {
+                                        crate::hap::sort_haps_for_query_in_place(&mut haps);
+                                    }
+                                    return haps;
+                                }
+                            }
+                            Node::FastSmall(cell, flags, numer, denom, _)
+                                if (*flags & FLAG_VOLATILE) == 0
+                                    && matches!(cell.kind, Node::Iter(_)) =>
+                            {
+                                let factor = Fraction::new(i128::from(*numer), i128::from(*denom));
+                                let mut haps = Vec::new();
+                                if let Some(sorted) = try_query_fast_pow2_iter_onto(
+                                    thread, &cell.kind, factor, state, &mut haps,
+                                ) {
+                                    if !sorted {
+                                        crate::hap::sort_haps_for_query_in_place(&mut haps);
+                                    }
+                                    return haps;
+                                }
+                            }
+                            Node::Sequence(layers) if !layers.is_empty() => {
+                                if state.span.begin > state.span.end {
+                                    return Vec::new();
+                                }
+                                if state.span.begin < state.span.end
+                                    && (state.span.begin.denom() != 1
+                                        || state.span.end.denom() != 1)
+                                {
+                                    if layers.len() == 1 {
+                                        let mut haps = Vec::new();
+                                        if sequence::query_multi_window_sorted_onto(
+                                            thread, layers, state, &mut haps,
+                                        ) {
+                                            return haps;
+                                        }
+                                    } else if layers.len() <= 16 {
+                                        let root_ptr = Arc::as_ptr(&self.node) as usize;
+                                        let (ptr, cap) = thread.short_query_hint.get();
+                                        let room = if ptr == root_ptr {
+                                            usize::from(cap)
+                                        } else {
+                                            layers.len().min(8)
+                                        };
+                                        let mut haps = Vec::with_capacity(room);
+                                        if sequence::query_multi_window_sorted_onto(
+                                            thread, layers, state, &mut haps,
+                                        ) {
+                                            let len = haps.len();
+                                            if ptr != root_ptr || len > room {
+                                                let needed =
+                                                    len.max(layers.len().min(8)).min(64) as u16;
+                                                let next = if ptr == root_ptr {
+                                                    cap.max(needed)
+                                                } else {
+                                                    needed
+                                                };
+                                                thread.short_query_hint.set((root_ptr, next));
+                                            }
+                                            return haps;
+                                        }
+                                    }
+                                } else if state.span.begin.denom() == 1
+                                    && state.span.end.denom() == 1
+                                {
+                                    let mut haps = Vec::new();
+                                    if sequence::query_sequence_sorted_onto(
+                                        thread, layers, state, &mut haps,
+                                    ) {
+                                        return haps;
+                                    }
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+                let self_sizes_exact_always = match self.node_kind() {
+                    Node::IntRange { .. } | Node::SegmentSignal { .. } | Node::Iter(_) => true,
+                    Node::Fast(node) => matches!(node.0.node_kind(), Node::Iter(_)),
+                    Node::FastSmall(cell, ..) => matches!(cell.kind, Node::Iter(_)),
+                    _ => false,
+                };
+                let raw_query_attaches_metadata = thread.depth.get() == 0;
+                let root_ptr = Arc::as_ptr(&self.node) as usize;
+                let (is_short, default_cap, room) = if self_sizes_exact_always {
+                    (false, 0usize, 0usize)
+                } else {
+                    let (is_short, is_narrow) = if state.span.end <= state.span.begin {
+                        (true, true)
+                    } else {
+                        let b_cycle = state.span.begin.floor_int();
+                        let e_cycle = state.span.end.floor_int();
+                        let check_narrow = || {
+                            let bn = state.span.begin.numer();
+                            let bd = state.span.begin.denom();
+                            let en = state.span.end.numer();
+                            let ed = state.span.end.denom();
+                            en.checked_mul(bd)
+                                .zip(bn.checked_mul(ed))
+                                .zip(bd.checked_mul(ed))
+                                .and_then(|((lhs, rhs), den)| {
+                                    lhs.checked_sub(rhs)?
+                                        .checked_mul(4)
+                                        .map(|diff4| diff4 <= den)
+                                })
+                                .unwrap_or(false)
+                        };
+                        match e_cycle.checked_sub(b_cycle) {
+                            Some(0) => (true, check_narrow()),
+                            Some(1) => {
+                                let short =
+                                    state.span.end.cycle_pos() <= state.span.begin.cycle_pos();
+                                (short, short && check_narrow())
+                            }
+                            _ => (false, false),
+                        }
+                    };
+                    let default_cap = match self.node_kind() {
+                        Node::Sequence(layers) => {
+                            if is_narrow && layers.len() <= 8 {
+                                let mut bound = 0usize;
+                                for layer in layers.iter() {
+                                    bound = bound.saturating_add(layer.narrow_hap_bound());
+                                    if bound > 8 {
+                                        break;
+                                    }
+                                }
+                                if bound <= 8 {
+                                    bound.clamp(1, 8)
+                                } else {
+                                    16usize
+                                }
+                            } else {
+                                16usize
+                            }
+                        }
+                        _ => 32usize,
+                    };
+                    let room = if is_short {
+                        let (ptr, cap) = thread.short_query_hint.get();
+                        if ptr == root_ptr {
+                            usize::from(cap)
+                        } else {
+                            default_cap
+                        }
+                    } else if match self.node_kind() {
+                        Node::Sequence(_) => true,
+                        Node::Fast(node) => split_slowcat_slice(node.0.node_kind()).is_some(),
+                        Node::FastSmall(cell, ..) => split_slowcat_slice(&cell.kind).is_some(),
+                        Node::FilterValues(boxed) => {
+                            Pattern::is_keep_defined(&boxed.1)
+                                && matches!(boxed.0.node_kind(), Node::AppRight(_))
+                        }
+                        _ => false,
+                    } {
+                        0
+                    } else {
+                        64
+                    };
+                    (is_short, default_cap, room)
+                };
+                let mut haps = Vec::with_capacity(room);
+                let data_only = self.answer_onto(thread, state, table::Order::Sorted, &mut haps);
+                if is_short && !self_sizes_exact_always {
+                    let len = haps.len();
+                    let base = default_cap as u16;
+                    let needed = if len <= usize::from(base) {
+                        base
+                    } else if len <= 8 {
+                        8u16
+                    } else if len <= 16 {
+                        16u16
+                    } else if len <= 24 {
+                        24u16
+                    } else if len <= 32 {
+                        32u16
+                    } else if len <= 48 {
+                        48u16
+                    } else {
+                        64u16
+                    };
+                    let (ptr, cap) = thread.short_query_hint.get();
+                    let next = if ptr == root_ptr {
+                        cap.max(needed)
+                    } else {
+                        needed
+                    };
+                    thread.short_query_hint.set((root_ptr, next));
+                }
+                if data_only {
+                    return haps;
+                }
+                let metadata_owner = bound_settings
+                    .cloned()
+                    .or_else(settings::RuntimeSettings::current_requested);
+                if self.is_pure() && metadata_owner.is_none() {
+                    return haps;
+                }
+                for hap in &mut haps {
+                    let materialized = hap.value.contains_js_value();
+                    if materialized {
+                        hap.value = materialize_js_value(&hap.value);
+                        hap.clear_live_bindings();
+                    }
+                    if let Some(settings) = &metadata_owner
+                        && (materialized || !raw_query_attaches_metadata)
+                        && !hap.value.attach_runtime_settings(settings, 0)
+                    {
+                        return Vec::new();
+                    }
+                }
+                haps
+            })
+        };
+        let (haps, refusal, cancelled) = match bound_settings {
+            Some(settings) if !settings.is_current_requested() => settings.with(run),
+            _ => run(),
+        };
+        let thrown = error_boundary.and_then(QueryErrorBoundary::finish);
+        if cancelled {
+            return Err(QueryLimit::Cancelled);
+        }
+        if let Some(limit) = refusal {
+            return Err(limit);
+        }
+        Ok(match thrown {
+            Some(message) => QueryArcOutcome::Thrown(message),
+            None => QueryArcOutcome::Haps(haps),
+        })
+    }
+
     /// [`Self::query_arc_outcome_with_budget`] with the haps sorted as
     /// [`sort_haps_for_query`] sorts them. A precomputed answer comes sorted
     /// already, so this is cheaper than sorting the outcome afterwards.
@@ -6811,9 +9045,17 @@ impl Pattern {
                     }
                     _ => 32usize,
                 };
+                let self_sizes_exact_always = match self.node_kind() {
+                    Node::IntRange { .. } | Node::SegmentSignal { .. } | Node::Iter(_) => true,
+                    Node::Fast(node) => matches!(node.0.node_kind(), Node::Iter(_)),
+                    Node::FastSmall(cell, ..) => matches!(cell.kind, Node::Iter(_)),
+                    _ => false,
+                };
                 let (raw_query_attaches_metadata, room) = QUERY_THREAD.with(|thread| {
                     let top = thread.depth.get() == 0;
-                    let room = if is_short {
+                    let room = if self_sizes_exact_always {
+                        0
+                    } else if is_short {
                         let (ptr, cap) = thread.short_query_hint.get();
                         if ptr == root_ptr {
                             usize::from(cap)
@@ -7189,7 +9431,7 @@ fn query_join_resolved_onto(
                     break;
                 }
                 let inner_from = out.len();
-                let asked = state.set_span(a.part);
+                let asked = state.set_span(a.part());
                 inner_pat.answer_child_onto(thread, &asked, out);
                 if thread.stop_requested() {
                     ok = false;
@@ -7199,25 +9441,25 @@ fn query_join_resolved_onto(
                     JoinMode::Inner => {
                         if !a.context.is_empty() || !a.keys.is_none() {
                             for b in &mut out[inner_from..] {
-                                hap::join_hap_in_place(&a, b, b.whole);
+                                hap::join_hap_in_place(&a, b, b.whole());
                             }
                         }
                     }
                     JoinMode::Outer => {
                         if a.context.is_empty() && a.keys.is_none() {
                             for b in &mut out[inner_from..] {
-                                b.whole = a.whole;
+                                b.set_whole(a.whole());
                             }
                         } else {
                             for b in &mut out[inner_from..] {
-                                hap::join_hap_in_place(&a, b, a.whole);
+                                hap::join_hap_in_place(&a, b, a.whole());
                             }
                         }
                     }
                     JoinMode::Mix => {
                         let mut kept = inner_from;
                         for at in inner_from..out.len() {
-                            let whole = match (a.whole, out[at].whole) {
+                            let whole = match (a.whole(), out[at].whole()) {
                                 (Some(x), Some(y)) => match x.intersection(&y) {
                                     Some(i) => Some(i),
                                     None => {
@@ -7256,7 +9498,7 @@ fn query_join_resolved_onto(
             } in resolved.drain(..)
             {
                 let inner_pat = inner_pat.expect("checked all patterns");
-                let Some(outer_whole) = outer.whole else {
+                let Some(outer_whole) = outer.whole() else {
                     continue;
                 };
                 if part_asked && refuses_part(&inner_pat) {
@@ -7264,27 +9506,27 @@ fn query_join_resolved_onto(
                     break;
                 }
                 let inner_from = out.len();
-                let asked = state.set_span(outer.part);
+                let asked = state.set_span(outer.part());
                 inner_pat.query_focused_onto(thread, outer.whole_or_part(), &asked, out);
                 if thread.stop_requested() {
                     ok = false;
                     break;
                 }
                 let mut kept = inner_from;
+                let mut loc_cache = locations::LocMergeCache::new();
                 for at in inner_from..out.len() {
-                    let whole = match out[at].whole {
+                    let whole = match out[at].whole() {
                         Some(iw) => match iw.intersection(&outer_whole) {
                             Some(w) => Some(w),
                             None => continue,
                         },
                         None => None,
                     };
-                    let Some(part) = out[at].part.intersection(&outer.part) else {
+                    let Some(part) = out[at].part().intersection(&outer.part()) else {
                         continue;
                     };
                     let inner = &mut out[at];
-                    inner.whole = whole;
-                    inner.part = part;
+                    inner.set_spans(whole, part);
                     if !outer.keys.is_none() {
                         let pick_lookup = joined_pick_lookup(&outer, inner);
                         inner.keys = ContextKeys::merge_with(
@@ -7296,7 +9538,7 @@ fn query_join_resolved_onto(
                         );
                     }
                     if !outer.context.is_empty() {
-                        inner.context.append(&outer.context);
+                        loc_cache.append_into(&mut inner.context, &outer.context);
                     }
                     if kept != at {
                         out.swap(kept, at);
@@ -7322,7 +9564,7 @@ fn query_join_resolved_onto(
             } in resolved.drain(..)
             {
                 let inner_pat = inner_pat.expect("checked all patterns");
-                let Some(outer_whole) = outer.whole else {
+                let Some(outer_whole) = outer.whole() else {
                     continue;
                 };
                 let shift = if *mode == JoinMode::Restart {
@@ -7331,20 +9573,21 @@ fn query_join_resolved_onto(
                     outer_whole.begin.cycle_pos()
                 };
                 let inner_from = out.len();
-                inner_pat.query_restarted_onto(thread, shift, state, outer.part, out);
+                inner_pat.query_restarted_onto(thread, shift, state, outer.part(), out);
                 if thread.stop_requested() {
                     ok = false;
                     break;
                 }
                 let mut kept = inner_from;
+                let mut loc_cache = locations::LocMergeCache::new();
                 for at in inner_from..out.len() {
-                    let Some(part) = out[at].part.intersection(&outer.part) else {
+                    let Some(part) = out[at].part().intersection(&outer.part()) else {
                         continue;
                     };
-                    let whole = out[at].whole.and_then(|iw| iw.intersection(&outer_whole));
+                    let whole = out[at].whole().and_then(|iw| iw.intersection(&outer_whole));
                     let inner = &mut out[at];
-                    inner.part = part;
-                    hap::join_hap_in_place(&outer, inner, whole);
+                    inner.set_part(part);
+                    hap::join_hap_in_place_cached(&outer, inner, whole, &mut loc_cache);
                     if kept != at {
                         out.swap(kept, at);
                     }
@@ -7381,14 +9624,15 @@ fn query_inner_join_onto(
         for outer in outer_haps.drain(..) {
             let inner_pat = f(&outer.value);
             let inner_from = out.len();
-            let asked = state.set_span(outer.part);
+            let asked = state.set_span(outer.part());
             inner_pat.answer_child_onto(thread, &asked, out);
             if thread.stop_requested() {
                 return false;
             }
             if !outer.context.is_empty() || !outer.keys.is_none() {
+                let mut loc_cache = locations::LocMergeCache::new();
                 for inner in &mut out[inner_from..] {
-                    hap::join_hap_in_place(&outer, inner, inner.whole);
+                    hap::join_hap_in_place_cached(&outer, inner, inner.whole(), &mut loc_cache);
                 }
             }
             let made = out.len() - from;
@@ -7427,10 +9671,10 @@ fn query_app_both_onto(
             }
             for hf in funcs.iter() {
                 for hv in vals.iter() {
-                    let Some(part) = hf.part.intersection(&hv.part) else {
+                    let Some(part) = hf.part().intersection(&hv.part()) else {
                         continue;
                     };
-                    let whole = match (hf.whole, hv.whole) {
+                    let whole = match (hf.whole(), hv.whole()) {
                         (Some(a), Some(b)) => match a.intersection(&b) {
                             Some(w) => Some(w),
                             None => {
@@ -7460,6 +9704,6 @@ fn query_app_both_onto(
 /// Whether `hap`'s part lies inside its whole, so that a discrete side asked
 /// over the part answers as it does asked over the whole, cut to the part.
 fn part_within_whole(hap: &Hap) -> bool {
-    hap.whole
-        .is_none_or(|whole| whole.begin <= hap.part.begin && hap.part.end <= whole.end)
+    hap.whole()
+        .is_none_or(|whole| whole.begin <= hap.part().begin && hap.part().end <= whole.end)
 }

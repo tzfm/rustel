@@ -333,14 +333,14 @@ fn stepalt_checked_compression_handles_large_denominators_and_total_overflow() {
         "representable large-denominator compression changed"
     );
     let half = Fraction::new(1, 2);
-    assert_eq!(haps[0].part.begin, Fraction::ZERO);
-    assert_eq!(haps[0].part.end, half);
-    assert_eq!(haps[0].whole.expect("first whole").begin, Fraction::ZERO);
-    assert_eq!(haps[0].whole.expect("first whole").end, half);
-    assert_eq!(haps[1].part.begin, half);
-    assert_eq!(haps[1].part.end, Fraction::ONE);
-    assert_eq!(haps[1].whole.expect("second whole").begin, half);
-    assert_eq!(haps[1].whole.expect("second whole").end, Fraction::ONE);
+    assert_eq!(haps[0].part().begin, Fraction::ZERO);
+    assert_eq!(haps[0].part().end, half);
+    assert_eq!(haps[0].whole().expect("first whole").begin, Fraction::ZERO);
+    assert_eq!(haps[0].whole().expect("first whole").end, half);
+    assert_eq!(haps[1].part().begin, half);
+    assert_eq!(haps[1].part().end, Fraction::ONE);
+    assert_eq!(haps[1].whole().expect("second whole").begin, half);
+    assert_eq!(haps[1].whole().expect("second whole").end, Fraction::ONE);
     assert_clean(&representable, "representable stepalt compression");
     representable.clear_active();
 

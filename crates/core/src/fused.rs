@@ -472,10 +472,10 @@ impl Segment {
                 return None;
             }
             for function in funcs.iter() {
-                let Some(met) = function.part.intersection(&part) else {
+                let Some(met) = function.part().intersection(&part) else {
                     continue;
                 };
-                let hap = applied_hap(function, &value, value.whole, met, &self.apply, self.flow);
+                let hap = applied_hap(function, &value, value.whole(), met, &self.apply, self.flow);
                 if crate::query_stop_requested() || !crate::push_budgeted_from(out, from, hap) {
                     out.truncate(from);
                     return Some(());
@@ -535,11 +535,11 @@ impl StepWave {
         hf.pick_lookup().is_none()
             && matches!(hf.value, Value::Object(_))
             && hf.value.is_data(0)
-            && hf.part.begin < hf.part.end
+            && hf.part().begin < hf.part().end
             && hf
-                .whole
+                .whole()
                 .as_ref()
-                .is_none_or(|w| w.begin <= hf.part.begin && hf.part.end <= w.end)
+                .is_none_or(|w| w.begin <= hf.part().begin && hf.part().end <= w.end)
     }
 
     /// Whether `span` lies entirely inside a single step of `steps`, so every
@@ -1162,6 +1162,17 @@ impl Wave {
                         .then(|| crate::number_signal(signal))
                         .flatten();
                 }
+                Node::NumberSignal(body) => {
+                    return (times <= Self::MOST_TIMES).then_some(*body);
+                }
+                Node::SegmentSignal { body, steps: count }
+                    if let Some(steps) = steps.as_deref_mut()
+                        && steps.is_none()
+                        && times == 0 =>
+                {
+                    *steps = Some(i128::from(*count));
+                    return Some(*body);
+                }
                 // A segment with no change of time outside it: the inner wave
                 // may still apply time transforms (e.g. `sine.slow(8).seg(16)`)
                 // as long as no inner constant is cut across a cycle boundary.
@@ -1258,7 +1269,11 @@ impl Wave {
                 _ => break,
             };
         }
-        matches!(pattern.kind(), Node::FilterValues(boxed) if matches!(boxed.0.node_kind(), Node::AppRight(..)))
+        match pattern.kind() {
+            Node::SegmentSignal { .. } => true,
+            Node::FilterValues(boxed) => matches!(boxed.0.node_kind(), Node::AppRight(..)),
+            _ => false,
+        }
     }
 
     /// The count of steps and the pattern of the signal, when `pattern` is a

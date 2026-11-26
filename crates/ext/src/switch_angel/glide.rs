@@ -156,12 +156,12 @@ fn glide_frequency(value: &Value) -> Result<f64, String> {
 /// Returns the whole of `note`. A note without a whole signals the error
 /// that the authored glide throws.
 fn note_whole(note: &Hap) -> Option<TimeSpan> {
-    if note.whole.is_none() {
+    if note.whole().is_none() {
         rustel_core::signal_query_error(|| {
             "Cannot read properties of undefined (reading 'begin')".into()
         });
     }
-    note.whole
+    note.whole()
 }
 
 /// Returns the frequency of `note`, or signals why it has none.
@@ -181,7 +181,7 @@ fn note_frequency(note: &Hap) -> Option<f64> {
 fn in_onset_order(notes: &[Hap]) -> bool {
     notes
         .windows(2)
-        .all(|pair| match (pair[0].whole, pair[1].whole) {
+        .all(|pair| match (pair[0].whole(), pair[1].whole()) {
             (Some(earlier), Some(later)) => earlier.begin <= later.begin,
             _ => true,
         })
@@ -201,7 +201,7 @@ fn glide_note(
     output: &mut Vec<Hap>,
 ) -> bool {
     for glide_hap in glide_times {
-        let Some(part) = note.part.intersection(&glide_hap.part) else {
+        let Some(part) = note.part().intersection(&glide_hap.part()) else {
             continue;
         };
         let glide_time = number(&glide_hap.value);
@@ -430,7 +430,7 @@ mod tests {
         let haps = node.query(&state);
         let answer: Vec<_> = haps
             .iter()
-            .map(|hap| (hap.value.get("note"), hap.whole.map(|whole| whole.begin)))
+            .map(|hap| (hap.value.get("note"), hap.whole().map(|whole| whole.begin)))
             .collect();
         let c3 = Value::Str("c3".into());
         let g3 = Value::Str("g3".into());

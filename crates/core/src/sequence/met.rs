@@ -3,12 +3,18 @@
 
 use super::*;
 
-/// Stack-resident builder that packs multi-location runs into `SmallCopyBuf<u32, 32>`
-/// with O(1) deduplication via a 256-slot open-addressed table and previous-run cache.
+/// Stack-resident builder that packs multi-location runs into `SmallCopyBuf<u32, 32>`.
+/// Small grids (`<= 12` distinct runs) scan inline with zero table init; larger
+/// grids lazily initialize a 256-slot open-addressed table for O(1) deduplication.
 pub(super) struct PackedRunsBuilder {
     runs: SmallCopyBuf<u32, 32>,
-    ht: [u16; 256],
-    ht_count: usize,
+    ht: Option<Box<[u16; 256]>>,
+    distinct: usize,
+    /// Inline cache of up to 8 distinct 2-word runs `(w0, w1, start_pos)` for
+    /// small multi-step meets so repeated note/control location pairs match
+    /// without scanning `runs` or allocating `ht`.
+    pair_cache: [(u32, u32, u16); 8],
+    pair_len: u8,
     prev: ([u32; 4], usize, usize),
 }
 
@@ -17,8 +23,10 @@ impl PackedRunsBuilder {
     pub(super) fn new() -> Self {
         Self {
             runs: SmallCopyBuf::new(0),
-            ht: [u16::MAX; 256],
-            ht_count: 0,
+            ht: None,
+            distinct: 0,
+            pair_cache: [(0, 0, 0); 8],
+            pair_len: 0,
             prev: ([0; 4], 0, 0),
         }
     }
@@ -38,22 +46,76 @@ impl PackedRunsBuilder {
         self.runs.into_boxed_slice()
     }
 
+    fn init_ht(&mut self) {
+        let mut ht = [u16::MAX; 256];
+        let existing = self.runs.as_slice();
+        let mut pos = 0usize;
+        while pos < existing.len() {
+            let start = pos;
+            while pos < existing.len() && (existing[pos] & PackedLoc::SPARE) == 0 {
+                pos += 1;
+            }
+            if pos >= existing.len() {
+                break;
+            }
+            if start < usize::from(u16::MAX) {
+                let h = (u64::from(existing[start]).wrapping_mul(0x9e37_79b9)
+                    ^ u64::from(existing[pos]).wrapping_mul(0x517c_c1b7))
+                    >> 8;
+                let mut slot = (h as usize) & 255;
+                while ht[slot] != u16::MAX {
+                    slot = (slot + 1) & 255;
+                }
+                ht[slot] = start as u16;
+            }
+            pos += 1;
+        }
+        self.ht = Some(Box::new(ht));
+    }
+
     #[inline]
     pub(super) fn intern_run(&mut self, needle: &[u32]) -> Option<usize> {
         let n = needle.len();
         debug_assert!(n >= 2);
-        if n <= 4 && self.prev.1 == n && self.prev.0[..n] == *needle {
+        if n == 2 {
+            let (w0, w1) = (needle[0], needle[1]);
+            let plen = usize::from(self.pair_len);
+            for &(c0, c1, pos) in &self.pair_cache[..plen] {
+                if c0 == w0 && c1 == w1 {
+                    return Some(usize::from(pos));
+                }
+            }
+            if plen < self.pair_cache.len() && self.ht.is_none() {
+                let start = self.runs.len();
+                if start > PackedLoc::INDEX_MASK as usize {
+                    return None;
+                }
+                self.runs.push(w0);
+                self.runs.push(w1);
+                if start < usize::from(u16::MAX) {
+                    self.pair_cache[plen] = (w0, w1, start as u16);
+                    self.pair_len += 1;
+                }
+                self.distinct += 1;
+                return Some(start);
+            }
+        } else if n <= 4 && self.prev.1 == n && self.prev.0[..n] == *needle {
             return Some(self.prev.2);
         }
         let first_word = needle[0];
-        let start = if self.ht_count < 128 {
+        if self.ht.is_none() && self.distinct >= 12 {
+            self.init_ht();
+        }
+        let start = if let Some(ht) = self.ht.as_mut()
+            && self.distinct < 128
+        {
             let existing = self.runs.as_slice();
             let h = (u64::from(first_word).wrapping_mul(0x9e37_79b9)
                 ^ u64::from(needle[n - 1]).wrapping_mul(0x517c_c1b7))
                 >> 8;
             let mut slot = (h as usize) & 255;
             let found = loop {
-                let entry = self.ht[slot];
+                let entry = ht[slot];
                 if entry == u16::MAX {
                     break None;
                 }
@@ -77,9 +139,9 @@ impl PackedRunsBuilder {
                         self.runs.push(word);
                     }
                     if start < usize::from(u16::MAX) {
-                        self.ht[slot] = start as u16;
-                        self.ht_count += 1;
+                        ht[slot] = start as u16;
                     }
+                    self.distinct += 1;
                     start
                 }
             }
@@ -107,6 +169,7 @@ impl PackedRunsBuilder {
                     for &word in needle {
                         self.runs.push(word);
                     }
+                    self.distinct += 1;
                     start
                 }
             }
@@ -444,17 +507,6 @@ impl Layer {
     ) -> Option<(Layer, SmallCopyBuf<(u32, u32), 16>)> {
         let own_period = self.period();
         let values_period = values.period();
-        let period = own_period.checked_lcm(values_period)?;
-        let small = |term: i128| (1..=MAX_PERIOD_TERM).contains(&term);
-        if !(small(period.numer()) && small(period.denom())) {
-            return None;
-        }
-        let p_num = u32::try_from(period.numer()).ok()?;
-        let p_den = u32::try_from(period.denom()).ok()?;
-        let n1 = u32::try_from(own_period.numer()).ok()?;
-        let d1 = u32::try_from(own_period.denom()).ok()?;
-        let n2 = u32::try_from(values_period.numer()).ok()?;
-        let d2 = u32::try_from(values_period.denom()).ok()?;
         let gcd = |mut a: u32, mut b: u32| -> u32 {
             while b != 0 {
                 let r = a % b;
@@ -464,7 +516,43 @@ impl Layer {
             a
         };
         let lcm = |a: u32, b: u32| -> Option<u32> { (a / gcd(a, b)).checked_mul(b) };
-        let turns = u32::try_from(period.checked_div(own_period)?.numer()).ok()?;
+        let (period, p_num, p_den, n1, d1, n2, d2, turns) =
+            if own_period.denom() == 1 && values_period.denom() == 1 {
+                let n1 = u32::try_from(own_period.numer()).ok()?;
+                let n2 = u32::try_from(values_period.numer()).ok()?;
+                if n1 == 0 || n2 == 0 {
+                    return None;
+                }
+                let p_num = lcm(n1, n2)?;
+                if i128::from(p_num) > MAX_PERIOD_TERM {
+                    return None;
+                }
+                let turns = p_num / n1;
+                (
+                    Fraction::int(i128::from(p_num)),
+                    p_num,
+                    1u32,
+                    n1,
+                    1u32,
+                    n2,
+                    1u32,
+                    turns,
+                )
+            } else {
+                let period = own_period.checked_lcm(values_period)?;
+                let small = |term: i128| (1..=MAX_PERIOD_TERM).contains(&term);
+                if !(small(period.numer()) && small(period.denom())) {
+                    return None;
+                }
+                let p_num = u32::try_from(period.numer()).ok()?;
+                let p_den = u32::try_from(period.denom()).ok()?;
+                let n1 = u32::try_from(own_period.numer()).ok()?;
+                let d1 = u32::try_from(own_period.denom()).ok()?;
+                let n2 = u32::try_from(values_period.numer()).ok()?;
+                let d2 = u32::try_from(values_period.denom()).ok()?;
+                let turns = u32::try_from(period.checked_div(own_period)?.numer()).ok()?;
+                (period, p_num, p_den, n1, d1, n2, d2, turns)
+            };
         if turns == 0 || turns > MAX_FOLDED_STEPS as u32 {
             return None;
         }
@@ -527,23 +615,32 @@ impl Layer {
                     let p1_ticks = n1.checked_mul(ticks / d1)?;
                     let p2_ticks = n2.checked_mul(ticks / d2)?;
                     let other_len = other.steps.len();
-                    #[derive(Clone, Copy)]
-                    struct MetStep {
-                        part_begin: u32,
-                        part_end: u32,
-                        value: u16,
-                        loc_start: u16,
-                        loc_len: u8,
+                    let own_base = own.base & !Grid::SMALL;
+                    let other_base = other.base & !Grid::SMALL;
+                    // Precompute the packed-location base in O(1) so steps and
+                    // packed location runs build in a single pass with zero
+                    // intermediate `MetStep` / `loc_buf` buffers.
+                    let mut base = dress_base;
+                    if own_base != 0 || !own.steps.has_no_locations() {
+                        base = base.min(own_base);
                     }
-                    let mut met_steps = SmallCopyBuf::<MetStep, 32>::new(MetStep {
-                        part_begin: 0,
-                        part_end: 0,
-                        value: 0,
-                        loc_start: 0,
-                        loc_len: 0,
-                    });
-                    let mut loc_buf = SmallCopyBuf::<(u32, u16), 128>::new((0, 0));
-                    let mut own_step_locs = SmallCopyBuf::<(u32, u16), 8>::new((0, 0));
+                    if other_base != 0 || !other.steps.has_no_locations() {
+                        base = base.min(other_base);
+                    }
+                    let base = if base == u32::MAX { 0 } else { base };
+                    if base & Grid::SMALL != 0 {
+                        return None;
+                    }
+                    let mut small_steps =
+                        SmallCopyBuf::<SmallGridStep, 64>::new(GridSteps::ZERO_SMALL);
+                    let mut wide_steps: Vec<GridStep> = Vec::new();
+                    let mut packed_runs = PackedRunsBuilder::new();
+                    let mut wide_locs_inline: [Option<Locations>; 4] = [None, None, None, None];
+                    let mut wide_locs_len = 0usize;
+                    let mut wide_locs_spill: Vec<Locations> = Vec::new();
+                    let mut loc_pair_cache = [(0u32, 0u32, 0u32); 8];
+                    let mut loc_cache_len = 0usize;
+                    let mut step_locs = SmallCopyBuf::<(u32, u16), 16>::new((0, 0));
                     let mut tick_cuts = SmallCopyBuf::<Cut, 16>::new(Cut {
                         index: 0,
                         begin: 0,
@@ -552,7 +649,8 @@ impl Layer {
                     let mut pairs = SmallCopyBuf::<(u32, u32), 16>::new((0, 0));
                     let own_vlen = self.values.len();
                     let other_vlen = values.values.len().max(1);
-                    let use_pair_map = own_vlen > 0 && own_vlen.saturating_mul(other_vlen) <= 256;
+                    let pair_prod = own_vlen.saturating_mul(other_vlen);
+                    let use_pair_map = pair_prod > 12 && pair_prod <= 256;
                     let mut pair_map_storage;
                     let pair_map: &mut [u16] = if use_pair_map {
                         pair_map_storage = [u16::MAX; 256];
@@ -561,17 +659,20 @@ impl Layer {
                         &mut []
                     };
                     let mut in_cycles = true;
+                    let check_in_cycles = !(self.in_cycles() && p_den == 1);
+                    let single_other_turn = p2_ticks == period_ticks_u32;
+                    let p2_pow2 = p2_ticks
+                        .is_power_of_two()
+                        .then(|| p2_ticks.trailing_zeros());
                     let turns_den = u64::from(p_den);
                     let ticks64 = u64::from(ticks);
-                    let mut base = dress_base;
-                    let own_base = own.base & !Grid::SMALL;
-                    let other_base = other.base & !Grid::SMALL;
                     let own_has_cuts = own.rare.is_some();
                     let mut prev_at = u32::MAX;
                     let mut prev_own_b = 0u32;
                     let mut prev_j = 0usize;
                     let mut prev_piece_b = 0u32;
                     let mut prev_piece_e = 0u32;
+                    let mut step_count = 0usize;
                     for turn in 0..turns {
                         let start1 = turn * p1_ticks;
                         let mut own_cuts = if own_has_cuts {
@@ -594,32 +695,13 @@ impl Layer {
                             } else {
                                 (own_b, own_e)
                             };
-                            let mut single_own_loc = [(0u32, 0u16); 1];
-                            let around_sl: &[(u32, u16)] =
-                                if !has_self_dress && (own_step.loc.0 & PackedLoc::SPARE) == 0 {
-                                    let packed = own_step.loc.0;
-                                    if packed == 0 {
-                                        &[]
-                                    } else {
-                                        let b = own_base + (packed >> PackedLoc::LENGTH_BITS);
-                                        let l = ((packed & PackedLoc::LENGTH_MASK) - 1) as u16;
-                                        base = base.min(b);
-                                        single_own_loc[0] = (b, l);
-                                        &single_own_loc
-                                    }
-                                } else {
-                                    own_step_locs.clear();
-                                    for &loc in self_before_sl {
-                                        own_step_locs.push(loc);
-                                    }
-                                    own.push_inline_locs_raw(i, &mut own_step_locs, &mut base)?;
-                                    for &loc in self_after_sl {
-                                        own_step_locs.push(loc);
-                                    }
-                                    own_step_locs.as_slice()
-                                };
-                            let first_at = own_b / p2_ticks;
-                            let last_at = (own_e - 1) / p2_ticks;
+                            let (first_at, last_at) = if single_other_turn {
+                                (0u32, 0u32)
+                            } else if let Some(sh) = p2_pow2 {
+                                (own_b >> sh, (own_e - 1) >> sh)
+                            } else {
+                                (own_b / p2_ticks, (own_e - 1) / p2_ticks)
+                            };
                             for at in first_at..=last_at {
                                 let start2 = at * p2_ticks;
                                 let rel_b = own_b.saturating_sub(start2);
@@ -659,7 +741,7 @@ impl Layer {
                                     }
                                     prev_piece_b = piece_b;
                                     prev_piece_e = piece_e;
-                                    if met_steps.len() >= MAX_FOLDED_STEPS {
+                                    if step_count >= MAX_FOLDED_STEPS {
                                         return None;
                                     }
                                     let pair = (own_step.value, other_step.value);
@@ -693,59 +775,108 @@ impl Layer {
                                             }
                                         }
                                     };
-                                    let value = u16::try_from(pair_idx).ok()?;
-                                    let loc_start = u16::try_from(loc_buf.len()).ok()?;
-                                    let push_other_loc =
-                                        |loc_buf: &mut SmallCopyBuf<(u32, u16), 128>,
-                                         base: &mut u32|
-                                         -> Option<()> {
-                                            if !has_other_dress
-                                                && (other_step.loc.0 & PackedLoc::SPARE) == 0
-                                            {
-                                                let packed = other_step.loc.0;
-                                                if packed != 0 {
-                                                    let b = other_base
-                                                        + (packed >> PackedLoc::LENGTH_BITS);
-                                                    let l = ((packed & PackedLoc::LENGTH_MASK) - 1)
-                                                        as u16;
-                                                    *base = (*base).min(b);
-                                                    loc_buf.push((b, l));
+                                    let value = u32::try_from(pair_idx).ok()?;
+                                    let key_a = own_step.loc.0;
+                                    let key_b = other_step.loc.0;
+                                    let loc = if let Some(&(_, _, cached)) = loc_pair_cache
+                                        [..loc_cache_len]
+                                        .iter()
+                                        .find(|&&(a, b, _)| a == key_a && b == key_b)
+                                    {
+                                        PackedLoc(cached)
+                                    } else {
+                                        step_locs.clear();
+                                        let mut dummy_base = base;
+                                        let push_own =
+                                            |dst: &mut SmallCopyBuf<(u32, u16), 16>,
+                                             b_ref: &mut u32|
+                                             -> Option<()> {
+                                                if !has_self_dress
+                                                    && (key_a & PackedLoc::SPARE) == 0
+                                                {
+                                                    if key_a != 0 {
+                                                        let b = own_base
+                                                            + (key_a >> PackedLoc::LENGTH_BITS);
+                                                        let l = ((key_a & PackedLoc::LENGTH_MASK)
+                                                            - 1)
+                                                            as u16;
+                                                        dst.push((b, l));
+                                                    }
+                                                    return Some(());
                                                 }
-                                                return Some(());
+                                                for &l in self_before_sl {
+                                                    dst.push(l);
+                                                }
+                                                own.push_inline_locs_raw(i, dst, b_ref)?;
+                                                for &l in self_after_sl {
+                                                    dst.push(l);
+                                                }
+                                                Some(())
+                                            };
+                                        let push_other =
+                                            |dst: &mut SmallCopyBuf<(u32, u16), 16>,
+                                             b_ref: &mut u32|
+                                             -> Option<()> {
+                                                if !has_other_dress
+                                                    && (key_b & PackedLoc::SPARE) == 0
+                                                {
+                                                    if key_b != 0 {
+                                                        let b = other_base
+                                                            + (key_b >> PackedLoc::LENGTH_BITS);
+                                                        let l = ((key_b & PackedLoc::LENGTH_MASK)
+                                                            - 1)
+                                                            as u16;
+                                                        dst.push((b, l));
+                                                    }
+                                                    return Some(());
+                                                }
+                                                for &l in other_before_sl {
+                                                    dst.push(l);
+                                                }
+                                                other.push_inline_locs_raw(j, dst, b_ref)?;
+                                                for &l in other_after_sl {
+                                                    dst.push(l);
+                                                }
+                                                Some(())
+                                            };
+                                        match side {
+                                            Side::Functions => {
+                                                push_other(&mut step_locs, &mut dummy_base)?;
+                                                push_own(&mut step_locs, &mut dummy_base)?;
                                             }
-                                            for &loc in other_before_sl {
-                                                loc_buf.push(loc);
-                                            }
-                                            other.push_inline_locs_raw(j, loc_buf, base)?;
-                                            for &loc in other_after_sl {
-                                                loc_buf.push(loc);
-                                            }
-                                            Some(())
-                                        };
-                                    match side {
-                                        Side::Functions => {
-                                            push_other_loc(&mut loc_buf, &mut base)?;
-                                            for &loc in around_sl {
-                                                loc_buf.push(loc);
+                                            Side::Values => {
+                                                push_own(&mut step_locs, &mut dummy_base)?;
+                                                push_other(&mut step_locs, &mut dummy_base)?;
                                             }
                                         }
-                                        Side::Values => {
-                                            for &loc in around_sl {
-                                                loc_buf.push(loc);
-                                            }
-                                            push_other_loc(&mut loc_buf, &mut base)?;
+                                        let sl = step_locs.as_slice();
+                                        let n = sl.len();
+                                        if n > 16 {
+                                            return None;
+                                        }
+                                        let built_loc = pack_met_step_loc(
+                                            base,
+                                            sl,
+                                            &mut packed_runs,
+                                            &mut wide_locs_inline,
+                                            &mut wide_locs_len,
+                                            &mut wide_locs_spill,
+                                        )?;
+                                        if loc_cache_len < loc_pair_cache.len() {
+                                            loc_pair_cache[loc_cache_len] =
+                                                (key_a, key_b, built_loc.0);
+                                            loc_cache_len += 1;
+                                        }
+                                        built_loc
+                                    };
+                                    if check_in_cycles && in_cycles {
+                                        let begins = u64::from(piece_b) * turns_den;
+                                        let ends = u64::from(piece_e) * turns_den;
+                                        if ends > (begins / ticks64 + 1) * ticks64 {
+                                            in_cycles = false;
                                         }
                                     }
-                                    let n_locs = loc_buf.len() - usize::from(loc_start);
-                                    if n_locs > 16 {
-                                        return None;
-                                    }
-                                    let begins = u64::from(piece_b) * turns_den;
-                                    let ends = u64::from(piece_e) * turns_den;
-                                    if ends > (begins / ticks64 + 1) * ticks64 {
-                                        in_cycles = false;
-                                    }
-                                    let step_idx = met_steps.len() as u32;
+                                    let step_idx = step_count as u32;
                                     if piece_b != own_whole_b || piece_e != own_whole_e {
                                         tick_cuts.push(Cut {
                                             index: step_idx,
@@ -753,66 +884,48 @@ impl Layer {
                                             end: own_whole_e,
                                         });
                                     }
-                                    met_steps.push(MetStep {
+                                    let grid_step = GridStep {
                                         part_begin: piece_b,
                                         part_end: piece_e,
                                         value,
-                                        loc_start,
-                                        loc_len: n_locs as u8,
-                                    });
+                                        loc,
+                                    };
+                                    if wide_steps.is_empty() {
+                                        if let Some(small) = SmallGridStep::from_wide(grid_step) {
+                                            small_steps.push(small);
+                                        } else {
+                                            wide_steps.reserve(small_steps.len() + 1);
+                                            wide_steps.extend(
+                                                small_steps.as_slice().iter().map(|s| s.to_wide()),
+                                            );
+                                            wide_steps.push(grid_step);
+                                        }
+                                    } else {
+                                        wide_steps.push(grid_step);
+                                    }
+                                    step_count += 1;
                                     j += 1;
                                 }
                             }
                         }
                     }
-                    let base = if base == u32::MAX { 0 } else { base };
-                    if base & Grid::SMALL != 0 {
-                        return None;
-                    }
-                    let slice = met_steps.as_slice();
-                    let locs_all = loc_buf.as_slice();
-                    let mut packed_runs = PackedRunsBuilder::new();
-                    let steps = GridSteps::build(slice.len(), |index| {
-                        let step = slice[index];
-                        let n = usize::from(step.loc_len);
-                        let loc = match n {
-                            0 => PackedLoc(0),
-                            1 => {
-                                let (b, l) = locs_all[usize::from(step.loc_start)];
-                                PackedLoc::range_raw(base, b, u32::from(l))?
-                            }
-                            _ => {
-                                let start = usize::from(step.loc_start);
-                                let mut run = [0u32; 16];
-                                for (k, &(b, l)) in locs_all[start..start + n].iter().enumerate() {
-                                    run[k] = PackedLoc::range_raw(base, b, u32::from(l))?.0;
-                                }
-                                run[n - 1] |= PackedLoc::SPARE;
-                                let run_start = packed_runs.intern_run(&run[..n])?;
-                                PackedLoc(PackedLoc::SPARE | run_start as u32)
-                            }
-                        };
-                        Some(GridStep {
-                            part_begin: step.part_begin,
-                            part_end: step.part_end,
-                            value: u32::from(step.value),
-                            loc,
-                        })
-                    })?;
+                    let steps = finish_met_grid_steps(small_steps, wide_steps);
+                    let wide_box =
+                        finish_wide_locs(&mut wide_locs_inline, wide_locs_len, wide_locs_spill);
                     let (steps, rare) = match steps {
                         GridSteps::Wide(wide_steps) => (
                             GridSteps::Small(Box::from([])),
                             Some(Box::new(SpareRare::from_parts(
                                 tick_cuts.as_slice(),
-                                Box::from([]),
+                                wide_box,
                                 wide_steps,
                             ))),
                         ),
-                        other if !tick_cuts.is_empty() => (
+                        other if !tick_cuts.is_empty() || !wide_box.is_empty() => (
                             other,
                             Some(Box::new(SpareRare::from_parts(
                                 tick_cuts.as_slice(),
-                                Box::from([]),
+                                wide_box,
                                 Box::from([]),
                             ))),
                         ),
@@ -837,13 +950,15 @@ impl Layer {
                     let mut met = self.clone();
                     met.set_in_cycles(in_cycles);
                     met.set_period_and_steps(period, Steps::Listed(listing));
-                    met.change_dress(|dress| {
-                        dress.clear_before();
-                        if side == Side::Values {
-                            dress.clear_after();
-                        }
-                        dress.set_keys(keys.clone());
-                    });
+                    if met.dress.is_some() || !keys.is_empty() {
+                        met.change_dress(|dress| {
+                            dress.clear_before();
+                            if side == Side::Values {
+                                dress.clear_after();
+                            }
+                            dress.set_keys(keys.clone());
+                        });
+                    }
                     debug_assert!(met.is_in_order());
                     Some((met, pairs))
                 })
@@ -851,6 +966,470 @@ impl Layer {
             .flatten()
             .flatten()
     }
+
+    /// Direct single-pass meet of `self` (on the `Side::Functions` side of `appLeft`)
+    /// against `rhs_locs.len()` (`2..=8`) equal-width numeric steps (`slowcat == false`:
+    /// period `1`, ticks `k`; `slowcat == true`: period `k`, ticks `1`) with zero
+    /// temporary RHS `Layer`, `Grid`, or `Pattern` allocation.
+    pub(super) fn met_flat_numbers(
+        &self,
+        rhs_locs: &[(u32, u16)],
+        slowcat: bool,
+    ) -> Option<(Layer, SmallCopyBuf<(u32, u32), 16>)> {
+        let k = rhs_locs.len();
+        if !(2..=8).contains(&k) {
+            return None;
+        }
+        let own_period = self.period();
+        let n1 = u32::try_from(own_period.numer()).ok()?;
+        let d1 = u32::try_from(own_period.denom()).ok()?;
+        if n1 == 0 || d1 == 0 {
+            return None;
+        }
+        let n2 = if slowcat { k as u32 } else { 1u32 };
+        let gcd = |mut a: u32, mut b: u32| -> u32 {
+            while b != 0 {
+                let r = a % b;
+                a = b;
+                b = r;
+            }
+            a
+        };
+        let lcm = |a: u32, b: u32| -> Option<u32> { (a / gcd(a, b)).checked_mul(b) };
+        // `rhs_period = n2 / 1` is always an integer, so `lcm(n1/d1, n2)` is
+        // the integer `lcm(n1, n2)` and `turns = (p_num / n1) * d1`.
+        let p_num = lcm(n1, n2)?;
+        if i128::from(p_num) > MAX_PERIOD_TERM {
+            return None;
+        }
+        let turns = (p_num / n1).checked_mul(d1)?;
+        if turns == 0 || turns > MAX_FOLDED_STEPS as u32 {
+            return None;
+        }
+        let period = Fraction::int(i128::from(p_num));
+        let has_self_before = self.dress().before_len() != 0;
+        let mut dress_base = u32::MAX;
+        let mut self_before_buf;
+        let self_before_sl: &[(u32, u16)] = if has_self_before {
+            self_before_buf = SmallCopyBuf::<(u32, u16), 8>::new((0, 0));
+            collect_before_raw(self.dress(), &mut self_before_buf, &mut dress_base)?;
+            self_before_buf.as_slice()
+        } else {
+            &[]
+        };
+        let mut rhs_base = u32::MAX;
+        for &(b, l) in rhs_locs {
+            if u32::from(l) >= PackedLoc::LENGTH_MASK {
+                return None;
+            }
+            rhs_base = rhs_base.min(b);
+        }
+        self.listing()
+            .with_grid_view(|own| {
+                let t1 = own.ticks.get();
+                let t2 = if slowcat { 1u32 } else { k as u32 };
+                let ticks = lcm(lcm(t1, t2)?, d1)?;
+                let period_ticks = u64::from(p_num) * u64::from(ticks);
+                if period_ticks > u64::from(u32::MAX) {
+                    return None;
+                }
+                let period_ticks_u32 = period_ticks as u32;
+                let scale1 = ticks / t1;
+                let scale2 = ticks / t2;
+                let p1_ticks = n1.checked_mul(ticks / d1)?;
+                let p2_ticks = n2.checked_mul(ticks)?;
+                let own_base = own.base & !Grid::SMALL;
+                let mut base = dress_base.min(rhs_base);
+                if own_base != 0 || !own.steps.has_no_locations() {
+                    base = base.min(own_base);
+                }
+                let base = if base == u32::MAX { 0 } else { base };
+                if base & Grid::SMALL != 0 {
+                    return None;
+                }
+                let mut small_steps = SmallCopyBuf::<SmallGridStep, 64>::new(GridSteps::ZERO_SMALL);
+                let mut wide_steps: Vec<GridStep> = Vec::new();
+                let mut packed_runs = PackedRunsBuilder::new();
+                let mut wide_locs_inline: [Option<Locations>; 4] = [None, None, None, None];
+                let mut wide_locs_len = 0usize;
+                let mut wide_locs_spill: Vec<Locations> = Vec::new();
+                let mut loc_pair_cache = [(0u32, 0u8, 0u32); 8];
+                let mut loc_cache_len = 0usize;
+                let mut step_locs = SmallCopyBuf::<(u32, u16), 16>::new((0, 0));
+                let mut tick_cuts = SmallCopyBuf::<Cut, 16>::new(Cut {
+                    index: 0,
+                    begin: 0,
+                    end: 0,
+                });
+                let mut pairs = SmallCopyBuf::<(u32, u32), 16>::new((0, 0));
+                let own_vlen = self.values.len();
+                let pair_prod = own_vlen.saturating_mul(k);
+                let mut pair_map_tiny = [u8::MAX; 16];
+                let use_tiny_map = pair_prod > 0 && pair_prod <= 16;
+                // O(1) location cache indexed by `pair_idx` (`0..16`). Sentinel
+                // `u32::MAX` cannot be a valid `PackedLoc` bit pattern.
+                let mut loc_by_pair_key = [u32::MAX; 16];
+                let mut loc_by_pair_val = [0u32; 16];
+                let mut in_cycles = true;
+                let check_in_cycles = !self.in_cycles();
+                let single_other_turn = p2_ticks == period_ticks_u32;
+                let p2_pow2 = p2_ticks
+                    .is_power_of_two()
+                    .then(|| p2_ticks.trailing_zeros());
+                let scale2_pow2 = scale2.is_power_of_two().then(|| scale2.trailing_zeros());
+                let ticks64 = u64::from(ticks);
+                let own_has_cuts = own.rare.is_some();
+                let mut prev_piece_b = 0u32;
+                let mut prev_piece_e = 0u32;
+                let mut step_count = 0usize;
+                for turn in 0..turns {
+                    let start1 = turn * p1_ticks;
+                    let mut own_cuts = if own_has_cuts {
+                        own.cuts()
+                    } else {
+                        CutsSlice::EMPTY
+                    };
+                    for i in 0..own.steps.len() {
+                        let own_step = own.steps.get(i);
+                        let own_b = start1 + own_step.part_begin * scale1;
+                        let own_e = start1 + own_step.part_end * scale1;
+                        let (own_whole_b, own_whole_e) = if own_has_cuts {
+                            match own_cuts.split_first_at(i) {
+                                Some(cut) => (
+                                    start1.checked_add(cut.begin.checked_mul(scale1)?)?,
+                                    start1.checked_add(cut.end.checked_mul(scale1)?)?,
+                                ),
+                                None => (own_b, own_e),
+                            }
+                        } else {
+                            (own_b, own_e)
+                        };
+                        let (first_at, last_at) = if single_other_turn {
+                            (0u32, 0u32)
+                        } else if let Some(sh) = p2_pow2 {
+                            (own_b >> sh, (own_e - 1) >> sh)
+                        } else {
+                            (own_b / p2_ticks, (own_e - 1) / p2_ticks)
+                        };
+                        for at in first_at..=last_at {
+                            let start2 = at * p2_ticks;
+                            let rel_b = own_b.saturating_sub(start2);
+                            let rel_e = (own_e - start2).min(p2_ticks);
+                            let (j_first, j_last) = if let Some(sh) = scale2_pow2 {
+                                ((rel_b >> sh) as usize, ((rel_e - 1) >> sh) as usize)
+                            } else {
+                                ((rel_b / scale2) as usize, ((rel_e - 1) / scale2) as usize)
+                            };
+                            for (offset, &rhs_loc) in
+                                rhs_locs[j_first..=j_last.min(k - 1)].iter().enumerate()
+                            {
+                                let j = j_first + offset;
+                                let jb = (j as u32) * scale2;
+                                let je = jb + scale2;
+                                let piece_b = own_b.max(start2 + jb);
+                                let piece_e = own_e.min(start2 + je);
+                                if !(own_whole_b <= piece_b
+                                    && piece_b < piece_e
+                                    && piece_e <= own_whole_e
+                                    && own_whole_e <= period_ticks_u32)
+                                    || prev_piece_b > piece_b
+                                    || prev_piece_e > piece_e
+                                {
+                                    return None;
+                                }
+                                prev_piece_b = piece_b;
+                                prev_piece_e = piece_e;
+                                if step_count >= MAX_FOLDED_STEPS {
+                                    return None;
+                                }
+                                let pair = (own_step.value, j as u32);
+                                let pair_idx = if use_tiny_map
+                                    && (own_step.value as usize) < own_vlen
+                                {
+                                    let flat = ((own_step.value as usize) * k + j) & 15;
+                                    let cached = pair_map_tiny[flat];
+                                    if cached != u8::MAX {
+                                        usize::from(cached)
+                                    } else {
+                                        let idx = pairs.len();
+                                        pairs.push(pair);
+                                        pair_map_tiny[flat] = idx as u8;
+                                        idx
+                                    }
+                                } else {
+                                    match pairs.as_slice().iter().position(|known| *known == pair) {
+                                        Some(idx) => idx,
+                                        None => {
+                                            pairs.push(pair);
+                                            pairs.len() - 1
+                                        }
+                                    }
+                                };
+                                let value = u32::try_from(pair_idx).ok()?;
+                                let key_a = own_step.loc.0;
+                                let key_b = j as u8;
+                                let loc = if pair_idx < 16 && loc_by_pair_key[pair_idx] == key_a {
+                                    PackedLoc(loc_by_pair_val[pair_idx])
+                                } else if let Some(&(_, _, cached)) = loc_pair_cache
+                                    [..loc_cache_len]
+                                    .iter()
+                                    .find(|&&(a, b, _)| a == key_a && b == key_b)
+                                {
+                                    PackedLoc(cached)
+                                } else {
+                                    step_locs.clear();
+                                    step_locs.push(rhs_loc);
+                                    if !has_self_before && (key_a & PackedLoc::SPARE) == 0 {
+                                        if key_a != 0 {
+                                            let b = own_base + (key_a >> PackedLoc::LENGTH_BITS);
+                                            let l = ((key_a & PackedLoc::LENGTH_MASK) - 1) as u16;
+                                            step_locs.push((b, l));
+                                        }
+                                    } else {
+                                        for &l in self_before_sl {
+                                            step_locs.push(l);
+                                        }
+                                        let mut dummy_base = base;
+                                        own.push_inline_locs_raw(
+                                            i,
+                                            &mut step_locs,
+                                            &mut dummy_base,
+                                        )?;
+                                    }
+                                    let sl = step_locs.as_slice();
+                                    if sl.len() > 16 {
+                                        return None;
+                                    }
+                                    let built_loc = pack_met_step_loc(
+                                        base,
+                                        sl,
+                                        &mut packed_runs,
+                                        &mut wide_locs_inline,
+                                        &mut wide_locs_len,
+                                        &mut wide_locs_spill,
+                                    )?;
+                                    if pair_idx < 16 && loc_by_pair_key[pair_idx] == u32::MAX {
+                                        loc_by_pair_key[pair_idx] = key_a;
+                                        loc_by_pair_val[pair_idx] = built_loc.0;
+                                    } else if loc_cache_len < loc_pair_cache.len() {
+                                        loc_pair_cache[loc_cache_len] = (key_a, key_b, built_loc.0);
+                                        loc_cache_len += 1;
+                                    }
+                                    built_loc
+                                };
+                                if check_in_cycles && in_cycles {
+                                    let begins = u64::from(piece_b);
+                                    let ends = u64::from(piece_e);
+                                    if ends > (begins / ticks64 + 1) * ticks64 {
+                                        in_cycles = false;
+                                    }
+                                }
+                                let step_idx = step_count as u32;
+                                if piece_b != own_whole_b || piece_e != own_whole_e {
+                                    tick_cuts.push(Cut {
+                                        index: step_idx,
+                                        begin: own_whole_b,
+                                        end: own_whole_e,
+                                    });
+                                }
+                                let grid_step = GridStep {
+                                    part_begin: piece_b,
+                                    part_end: piece_e,
+                                    value,
+                                    loc,
+                                };
+                                if wide_steps.is_empty() {
+                                    if let Some(small) = SmallGridStep::from_wide(grid_step) {
+                                        small_steps.push(small);
+                                    } else {
+                                        wide_steps.reserve(small_steps.len() + 1);
+                                        wide_steps.extend(
+                                            small_steps.as_slice().iter().map(|s| s.to_wide()),
+                                        );
+                                        wide_steps.push(grid_step);
+                                    }
+                                } else {
+                                    wide_steps.push(grid_step);
+                                }
+                                step_count += 1;
+                            }
+                        }
+                    }
+                }
+                let steps = finish_met_grid_steps(small_steps, wide_steps);
+                let wide_box =
+                    finish_wide_locs(&mut wide_locs_inline, wide_locs_len, wide_locs_spill);
+                let (steps, rare) = match steps {
+                    GridSteps::Wide(wide_steps) => (
+                        GridSteps::Small(Box::from([])),
+                        Some(Box::new(SpareRare::from_parts(
+                            tick_cuts.as_slice(),
+                            wide_box,
+                            wide_steps,
+                        ))),
+                    ),
+                    other if !tick_cuts.is_empty() || !wide_box.is_empty() => (
+                        other,
+                        Some(Box::new(SpareRare::from_parts(
+                            tick_cuts.as_slice(),
+                            wide_box,
+                            Box::from([]),
+                        ))),
+                    ),
+                    other => (other, None),
+                };
+                let packed = if packed_runs.is_empty() {
+                    PackedRunsInput::None
+                } else if rare.is_none()
+                    && let Some(small) = try_pack_runs_u16(packed_runs.as_slice())
+                {
+                    PackedRunsInput::Small(small)
+                } else {
+                    PackedRunsInput::Wide(packed_runs.into_boxed_slice())
+                };
+                let listing = Listing::from_parts(
+                    NonZeroU32::new(ticks)?,
+                    base | Grid::SMALL,
+                    steps,
+                    packed,
+                    rare,
+                );
+                let mut met = self.clone();
+                met.set_in_cycles(in_cycles);
+                met.set_period_and_steps(period, Steps::Listed(listing));
+                if met.dress.is_some() {
+                    met.change_dress(|dress| {
+                        dress.clear_before();
+                    });
+                }
+                debug_assert!(met.is_in_order());
+                Some((met, pairs))
+            })
+            .flatten()
+    }
+}
+
+/// Pack a single met step's `(begin, length)` ranges relative to `base` into a
+/// [`PackedLoc`], deduplicating 2..=4-range runs into `packed_runs` and 5+
+/// ranges into stack-backed `wide_locs_inline` / `wide_locs_spill`.
+#[inline]
+fn pack_met_step_loc(
+    base: u32,
+    sl: &[(u32, u16)],
+    packed_runs: &mut PackedRunsBuilder,
+    wide_locs_inline: &mut [Option<Locations>; 4],
+    wide_locs_len: &mut usize,
+    wide_locs_spill: &mut Vec<Locations>,
+) -> Option<PackedLoc> {
+    match sl.len() {
+        0 => Some(PackedLoc(0)),
+        1 => {
+            let (b, l) = sl[0];
+            PackedLoc::range_raw(base, b, u32::from(l))
+        }
+        2..=4 => {
+            let n = sl.len();
+            let mut run = [0u32; 4];
+            for (k, &(b, l)) in sl.iter().enumerate() {
+                run[k] = PackedLoc::range_raw(base, b, u32::from(l))?.0;
+            }
+            run[n - 1] |= PackedLoc::SPARE;
+            let run_start = packed_runs.intern_run(&run[..n])?;
+            Some(PackedLoc(PackedLoc::SPARE | run_start as u32))
+        }
+        n => {
+            let mut ranges = [(0usize, 0usize); 16];
+            for (k, &(b, l)) in sl.iter().enumerate() {
+                ranges[k] = (b as usize, b as usize + usize::from(l));
+            }
+            let wanted = &ranges[..n];
+            let at = if wide_locs_spill.is_empty() {
+                match wide_locs_inline[..*wide_locs_len].iter().position(|slot| {
+                    slot.as_ref()
+                        .is_some_and(|known| known.with_slice(|s| s == wanted))
+                }) {
+                    Some(existing) => existing as u32,
+                    None => {
+                        let idx = *wide_locs_len as u32;
+                        if idx > PackedLoc::INDEX_MASK {
+                            return None;
+                        }
+                        let mut locs = Locations::new();
+                        locs.extend_from_slice(wanted);
+                        if *wide_locs_len < wide_locs_inline.len() {
+                            wide_locs_inline[*wide_locs_len] = Some(locs);
+                            *wide_locs_len += 1;
+                        } else {
+                            wide_locs_spill.reserve(8);
+                            for slot in wide_locs_inline.iter_mut() {
+                                if let Some(prev) = slot.take() {
+                                    wide_locs_spill.push(prev);
+                                }
+                            }
+                            wide_locs_spill.push(locs);
+                            *wide_locs_len = wide_locs_spill.len();
+                        }
+                        idx
+                    }
+                }
+            } else {
+                match wide_locs_spill
+                    .iter()
+                    .position(|known| known.with_slice(|s| s == wanted))
+                {
+                    Some(existing) => existing as u32,
+                    None => {
+                        let idx = wide_locs_spill.len() as u32;
+                        if idx > PackedLoc::INDEX_MASK {
+                            return None;
+                        }
+                        let mut locs = Locations::new();
+                        locs.extend_from_slice(wanted);
+                        wide_locs_spill.push(locs);
+                        *wide_locs_len = wide_locs_spill.len();
+                        idx
+                    }
+                }
+            };
+            Some(PackedLoc(PackedLoc::WIDE_MASK | at))
+        }
+    }
+}
+
+#[inline]
+fn finish_met_grid_steps(
+    small_steps: SmallCopyBuf<SmallGridStep, 64>,
+    wide_steps: Vec<GridStep>,
+) -> GridSteps {
+    if !wide_steps.is_empty() {
+        return GridSteps::Wide(wide_steps.into_boxed_slice());
+    }
+    let len = small_steps.len();
+    if len <= MAX_INLINE_GRID_LEN {
+        let mut inline = [GridSteps::ZERO_SMALL; MAX_INLINE_GRID_LEN];
+        inline[..len].copy_from_slice(small_steps.as_slice());
+        GridSteps::Inline(len as u8, inline)
+    } else {
+        GridSteps::Small(small_steps.into_boxed_slice())
+    }
+}
+
+#[inline]
+fn finish_wide_locs(
+    inline: &mut [Option<Locations>; 4],
+    len: usize,
+    spill: Vec<Locations>,
+) -> Box<[Locations]> {
+    if !spill.is_empty() {
+        return spill.into_boxed_slice();
+    }
+    if len == 0 {
+        return Box::from([]);
+    }
+    inline[..len]
+        .iter_mut()
+        .map(|slot| slot.take().expect("wide location populated"))
+        .collect()
 }
 
 /// Whether the part of each of `places` lies in one cycle, in every turn of

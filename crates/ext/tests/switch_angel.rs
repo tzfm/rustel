@@ -250,7 +250,7 @@ fn min_and_max_take_the_bound_where_the_comparison_fails_as_hers_do() {
 fn spans(source: &str) -> Vec<String> {
     haps(source)
         .iter()
-        .map(|hap| format!("{} → {}", hap.part.begin, hap.part.end))
+        .map(|hap| format!("{} → {}", hap.part().begin, hap.part().end))
         .collect()
 }
 
@@ -265,7 +265,7 @@ fn voices(source: &str) -> Vec<String> {
                 .and_then(|o| o.get("n"))
                 .and_then(rustel_core::Value::as_f64)
                 .unwrap_or(f64::NAN);
-            format!("n{n}@{}", hap.part.begin)
+            format!("n{n}@{}", hap.part().begin)
         })
         .collect()
 }
@@ -698,7 +698,7 @@ mod sealing {
             rt.query(Slot::Active, 0, Fraction::ZERO, Fraction::ONE)
                 .expect("query")
                 .iter()
-                .filter_map(|hap| hap.whole.map(|whole| whole.end))
+                .filter_map(|hap| hap.whole().map(|whole| whole.end))
                 .collect::<Vec<_>>()
         };
         let engine = vec![Fraction::new(1, 2), Fraction::ONE];

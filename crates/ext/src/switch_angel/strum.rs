@@ -35,7 +35,7 @@ impl StrumNode {
             let mut placed = false;
             for group in &mut groups {
                 let other = &group[0];
-                let congruent = match (hap.whole, other.whole) {
+                let congruent = match (hap.whole(), other.whole()) {
                     (None, None) => true,
                     (None, Some(_)) => {
                         rustel_core::signal_query_error(|| {

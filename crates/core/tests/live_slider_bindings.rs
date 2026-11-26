@@ -171,8 +171,8 @@ fn native_outer_control_bind_preserves_timing_and_tracks_both_dependencies() {
     assert_eq!(haps.len(), 2);
     for hap in haps {
         assert_eq!(hap.live_controls(), [41, 0, 0, 0]);
-        assert_eq!(hap.whole.unwrap().end, Fraction::from(2));
-        assert_eq!(hap.part.duration(), Fraction::new(1, 2));
+        assert_eq!(hap.whole().unwrap().end, Fraction::from(2));
+        assert_eq!(hap.part().duration(), Fraction::new(1, 2));
     }
     let callbacks = receiver
         .fmap_js(7)

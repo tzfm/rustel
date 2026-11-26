@@ -162,6 +162,13 @@ impl Session {
     ) -> Result<(), RuntimeError> {
         use crate::score_import::ImportRefusal;
 
+        if !source.contains("import") {
+            if self.js.has_loaded_imports() {
+                self.js.show_imports(&[]);
+            }
+            return Ok(());
+        }
+
         // Approve every import first, so a refusal leaves the others unrun.
         let imports = rustel_transpiler::script_imports(source)
             .into_iter()
@@ -700,7 +707,9 @@ impl Session {
         // no JavaScript parser. Any other text is the transpiler's.
         // A number the host made live becomes a cell in the transpiler's
         // output, so a text with live numbers takes the transpiler.
-        let live_numbers = self.live_numbers(source);
+        let live_numbers = (!self.live_numbers.is_empty()).then(|| self.live_numbers(source));
+        let live_numbers_slice: &[crate::ui_events::LiveNumber] =
+            live_numbers.as_deref().unwrap_or(&[]);
         // Identical pure native re-evaluation: when the source text matches
         // the installed native score and no plugin, live-number, or recovery
         // state differs, reuse the active native graph and its tempo directly.
@@ -710,15 +719,20 @@ impl Session {
             && self.lanes.same_document();
         #[cfg(not(feature = "vst"))]
         let same_vst_state = true;
+        #[cfg(feature = "vst")]
+        let unlabeled_clean =
+            self.lanes.is_unlabeled_clean() || self.lanes.is_single_unlabeled_clean();
+        #[cfg(not(feature = "vst"))]
+        let unlabeled_clean = true;
         if self.score_engine == Some(ScoreEngine::Native)
-            && self.last_source.as_deref() == Some(source)
-            && live_numbers.is_empty()
+            && live_numbers_slice.is_empty()
             && seed.is_none()
             && same_vst_state
             && !self.csound_made()
             && !budget.is_zero()
             && !cancellation.load(std::sync::atomic::Ordering::Relaxed)
-            && let Some((pattern, cps, settings)) = self.js.try_reuse_identical_native_score(source)
+            && (self.last_source.as_deref() == Some(source) || unlabeled_clean)
+            && let Some((pattern, cps, settings)) = self.js.try_reuse_native_score(source)
         {
             #[cfg(feature = "hydra")]
             {
@@ -737,7 +751,7 @@ impl Session {
             });
         }
         #[cfg_attr(not(feature = "vst"), allow(unused_mut))]
-        let mut read = if live_numbers.is_empty() {
+        let mut read = if live_numbers_slice.is_empty() {
             rustel_score::read(source, rustel_transpiler::call_form)
         } else {
             None
@@ -746,6 +760,13 @@ impl Session {
         // plugin note names the same lane after an edit.
         #[cfg(feature = "vst")]
         let lane_numbers = match &mut read {
+            Some(read)
+                if (read.lanes.is_empty() && self.lanes.is_unlabeled_clean())
+                    || (self.lanes.is_single_unlabeled_clean()
+                        && self.lanes.can_reuse_single_unlabeled(source, &read.lanes)) =>
+            {
+                Vec::new()
+            }
             Some(read) => {
                 let lanes = std::mem::take(&mut read.lanes);
                 let shared = self.js.share_source_text(source);
@@ -759,18 +780,31 @@ impl Session {
         let read_by_place = read
             .as_mut()
             .is_some_and(|read| !read.number_lanes(&lane_numbers));
-        let options = TranspileOptions {
+        static DEFAULT_SCORE_TRANSPILE_OPTIONS: std::sync::LazyLock<TranspileOptions> =
+            std::sync::LazyLock::new(|| TranspileOptions {
+                list_mini_leaves: false,
+                default_widget_methods: true,
+                ..TranspileOptions::default()
+            });
+        #[cfg(feature = "vst")]
+        let use_default_options = lane_numbers.is_empty() && live_numbers_slice.is_empty();
+        #[cfg(not(feature = "vst"))]
+        let use_default_options = live_numbers_slice.is_empty();
+        let custom_options = (!use_default_options).then(|| TranspileOptions {
             // The editor lists the leaves with its own layout pass.
             list_mini_leaves: false,
             default_widget_methods: true,
             #[cfg(feature = "vst")]
             lane_numbers,
-            live_numbers: live_numbers
+            live_numbers: live_numbers_slice
                 .iter()
                 .map(|number| number.literal.clone())
                 .collect(),
             ..TranspileOptions::default()
-        };
+        });
+        let options: &TranspileOptions = custom_options
+            .as_ref()
+            .unwrap_or(&DEFAULT_SCORE_TRANSPILE_OPTIONS);
         let program = read.as_ref().map(|read| &read.program);
         let evaluated = match seed {
             Some((settings, _, _)) => self
@@ -778,7 +812,7 @@ impl Session {
                 .evaluate_score_candidate_with_effects_cancellable_seeded(
                     source,
                     program,
-                    &options,
+                    options,
                     budget,
                     cancellation,
                     settings,
@@ -786,7 +820,7 @@ impl Session {
             None => self.js.evaluate_score_candidate_with_effects_cancellable(
                 source,
                 program,
-                &options,
+                options,
                 budget,
                 cancellation,
             ),
@@ -826,7 +860,7 @@ impl Session {
                 // A live number its host moved away from the literal starts
                 // where the host left it, before anything queries it: the
                 // cell plays on through the install, with no jump back.
-                for number in live_numbers.iter() {
+                for number in live_numbers_slice.iter() {
                     if let Some(value) = number.value {
                         let id = rustel_transpiler::live_number_id(number.literal.clone());
                         // A number the evaluation did not make live has no
@@ -4207,7 +4241,7 @@ endin`";
             .query(Fraction::ZERO, Fraction::ONE)
             .expect("query configured-parser score")
             .into_iter()
-            .map(|hap| (hap.value.show(), hap.part.begin, hap.part.end))
+            .map(|hap| (hap.value.show(), hap.part().begin, hap.part().end))
             .collect();
         assert_eq!(
             queried,
@@ -4353,7 +4387,7 @@ endin`";
             .query(Fraction::ZERO, Fraction::new(200, 1))
             .expect("query")
             .into_iter()
-            .filter_map(|hap| hap.whole.map(|whole| whole.begin.to_f64()))
+            .filter_map(|hap| hap.whole().map(|whole| whole.begin.to_f64()))
             .collect()
     }
 

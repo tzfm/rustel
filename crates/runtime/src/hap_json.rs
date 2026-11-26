@@ -73,8 +73,8 @@ pub struct HapJson {
 impl HapJson {
     pub fn from_hap(hap: &Hap) -> Self {
         Self {
-            whole: hap.whole.map(SpanJson::from_span),
-            part: SpanJson::from_span(hap.part),
+            whole: hap.whole().map(SpanJson::from_span),
+            part: SpanJson::from_span(hap.part()),
             value: ValueJson::from_value(&hap.value),
             context: hap.context.to_vec(),
             has_onset: hap.has_onset(),

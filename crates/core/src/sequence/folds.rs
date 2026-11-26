@@ -30,6 +30,7 @@ pub(crate) fn holds_data(layers: &[Layer]) -> bool {
 pub(crate) fn is_data(pattern: &Pattern) -> bool {
     match pattern.node_kind() {
         Node::Sequence(layers) => holds_data(layers),
+        Node::IntRange { .. } | Node::SegmentSignal { .. } => true,
         Node::Pure(value) => value.is_data(0),
         Node::PureAt(boxed) => boxed.0.is_data(0),
         Node::AddContext(boxed) => is_data(&boxed.0),
@@ -110,7 +111,9 @@ pub(crate) fn builds_each_node() -> bool {
 /// Whether an application on `pattern` may fold into its steps: it is a
 /// sequence or a constant.
 pub(crate) fn holds_steps(pattern: &Pattern) -> bool {
-    folded(pattern).is_some() || constant(pattern).is_some()
+    folded(pattern).is_some()
+        || constant(pattern).is_some()
+        || matches!(pattern.node_kind(), Node::IntRange { count, .. } if *count <= 1024 && folds(pattern))
 }
 
 /// Whether a constructor may fold `pattern`: its handle is not marked
@@ -225,13 +228,89 @@ impl Layers<'_> {
     }
 }
 
+fn int_range_layer(
+    start: i32,
+    count: u32,
+    loc0: u32,
+    loc1: u32,
+    named_id: u16,
+    step_neg: bool,
+) -> Option<Layer> {
+    let count_usize = usize::try_from(count).ok()?;
+    if count_usize == 0 || count_usize > 1024 {
+        return None;
+    }
+    let ticks = NonZeroU32::new(count)?;
+    let dir = if step_neg { -1i64 } else { 1i64 };
+    let values: Arc<[Value]> = (0..count_usize)
+        .map(|i| Value::F64((i64::from(start) + (i as i64) * dir) as f64))
+        .collect();
+    let steps = GridSteps::build(count_usize, |index| {
+        Some(GridStep {
+            part_begin: index as u32,
+            part_end: (index + 1) as u32,
+            value: index as u32,
+            loc: PackedLoc(0),
+        })
+    })?;
+    let (steps, rare) = match steps {
+        GridSteps::Wide(wide_steps) => (
+            GridSteps::Small(Box::from([])),
+            Some(Box::new(SpareRare::WideSteps(wide_steps))),
+        ),
+        other => (other, None),
+    };
+    let listing = Listing::from_parts(ticks, Grid::SMALL, steps, PackedRunsInput::None, rare);
+    let mut layer = Layer::holding_classified(
+        Fraction::ONE,
+        Steps::Listed(listing),
+        true,
+        values,
+        true,
+        false,
+        true,
+    );
+    if loc0 != 0 {
+        let mut ranges = [(0usize, 0usize); 2];
+        let mut n = 1;
+        ranges[0] = crate::unpack_run_loc(loc0);
+        if loc1 != 0 {
+            ranges[1] = crate::unpack_run_loc(loc1);
+            n = 2;
+        }
+        layer.change_dress(|dress| dress.extend_after(&ranges[..n]));
+    }
+    if named_id != 0 {
+        let spec = crate::controls::builtin_spec_by_id(named_id)?;
+        Layer::named_in_place(std::slice::from_mut(&mut layer), spec);
+    } else {
+        layer.refresh_direct();
+    }
+    Some(layer)
+}
+
 pub(super) fn layers(pattern: &Pattern) -> Option<Layers<'_>> {
     if let Some(layers) = folded(pattern) {
         return Some(Layers::Borrowed(layers));
     }
+    if folds(pattern)
+        && let Node::IntRange {
+            start,
+            count,
+            loc0,
+            loc1,
+            named_id,
+            step_neg,
+        } = pattern.node_kind()
+        && *count <= 1024
+    {
+        return Some(Layers::Single([int_range_layer(
+            *start, *count, *loc0, *loc1, *named_id, *step_neg,
+        )?]));
+    }
     let hap = constant(pattern)?;
     let raw = Raw {
-        whole: hap.whole?,
+        whole: hap.whole()?,
         part: None,
         value: 0,
         locations: hap.context,
@@ -599,8 +678,10 @@ pub(crate) fn mapped(pattern: &Pattern, map: &OwnedHapMapFn) -> Option<Pattern> 
         let hap = map(cycle_hap(value.clone()))?;
         // A map that reads no span moves no hap.
         let cycle = TimeSpan::new(Fraction::ZERO, Fraction::ONE);
-        ((hap.whole, hap.part) == (Some(cycle), cycle) && is_plain(&hap) && hap.context.is_empty())
-            .then_some(hap.value)
+        ((hap.whole(), hap.part()) == (Some(cycle), cycle)
+            && is_plain(&hap)
+            && hap.context.is_empty())
+        .then_some(hap.value)
     })
 }
 
@@ -891,6 +972,177 @@ pub(crate) fn renote_in_place(
     .is_some()
 }
 
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn renoted_int_range_layer(
+    start: i32,
+    count: u32,
+    loc0: u32,
+    loc1: u32,
+    named_id: u16,
+    step_neg: bool,
+    map: &HapMapFn,
+    note: &NoteFn,
+    degree_notes: Option<&[crate::value::SharedStr; 32]>,
+    known_keys: Option<&ContextKeys>,
+    dress_cache: &mut RenoteDressCache,
+) -> Option<Layer> {
+    if count == 0
+        || count > 1024
+        || !matches!(
+            crate::controls::builtin_name_str_by_id(named_id),
+            Some("note" | "n")
+        )
+    {
+        return None;
+    }
+    let count_usize = count as usize;
+    let ticks = NonZeroU32::new(count)?;
+    let dir = if step_neg { -1i64 } else { 1i64 };
+    let first_deg = i64::from(start);
+    let last_deg = first_deg + ((count - 1) as i64) * dir;
+    let min_deg = first_deg.min(last_deg);
+    let max_deg = first_deg.max(last_deg);
+    if let Some(notes) = degree_notes
+        && let Some(keys) = known_keys
+        && count_usize <= 16
+        && min_deg >= -8
+        && max_deg < 24
+    {
+        let values: Arc<[Value]> = (0..count_usize)
+            .map(|i| {
+                let deg = first_deg + (i as i64) * dir;
+                Value::Str(notes[(deg + 8) as usize].clone())
+            })
+            .collect();
+        let listing = Listing::CompactGrid(CompactGrid::Uniform(count as u8));
+        let mut layer = Layer::holding_classified(
+            Fraction::ONE,
+            Steps::Listed(listing),
+            true,
+            values,
+            true,
+            true,
+            true,
+        );
+        layer.named_id = crate::controls::note_control_id();
+        if loc0 != 0 {
+            layer.change_dress(|dress| {
+                dress.set_before_packed(loc0, loc1);
+                dress.set_keys(keys.clone());
+            });
+        } else if !keys.is_empty() {
+            if let Some(bare) = dress_cache.get(std::ptr::null()).flatten() {
+                layer.dress = Some(bare);
+            } else {
+                layer.change_dress(|dress| dress.set_keys(keys.clone()));
+            }
+        }
+        layer.refresh_direct_inner(true);
+        return Some(layer);
+    }
+    without_query_signals(|| {
+        let mut data = true;
+        let mut no_objects = true;
+        let values: Arc<[Value]> = if count_usize <= 16 {
+            let mut stack_vals = [const { Value::Undefined }; 16];
+            for (i, slot) in stack_vals[..count_usize].iter_mut().enumerate() {
+                let raw = Value::F64((i64::from(start) + (i as i64) * dir) as f64);
+                let mapped = note(&raw)?;
+                if data && !mapped.is_data(0) {
+                    data = false;
+                }
+                if matches!(mapped, Value::Object(_)) {
+                    no_objects = false;
+                }
+                *slot = mapped;
+            }
+            stack_vals[..count_usize]
+                .iter_mut()
+                .map(|v| std::mem::replace(v, Value::Undefined))
+                .collect()
+        } else {
+            let mut vals = Vec::with_capacity(count_usize);
+            for i in 0..count_usize {
+                let raw = Value::F64((i64::from(start) + (i as i64) * dir) as f64);
+                let mapped = note(&raw)?;
+                if data && !mapped.is_data(0) {
+                    data = false;
+                }
+                if matches!(mapped, Value::Object(_)) {
+                    no_objects = false;
+                }
+                vals.push(mapped);
+            }
+            vals.into()
+        };
+        let listing = if count_usize <= MAX_UNIFORM_GRID_LEN {
+            Listing::CompactGrid(CompactGrid::Uniform(count as u8))
+        } else {
+            let steps = GridSteps::build(count_usize, |index| {
+                Some(GridStep {
+                    part_begin: index as u32,
+                    part_end: (index + 1) as u32,
+                    value: index as u32,
+                    loc: PackedLoc(0),
+                })
+            })?;
+            let (steps, rare) = match steps {
+                GridSteps::Wide(wide_steps) => (
+                    GridSteps::Small(Box::from([])),
+                    Some(Box::new(SpareRare::WideSteps(wide_steps))),
+                ),
+                other => (other, None),
+            };
+            Listing::from_parts(ticks, Grid::SMALL, steps, PackedRunsInput::None, rare)
+        };
+        let mut layer = Layer::holding_classified(
+            Fraction::ONE,
+            Steps::Listed(listing),
+            true,
+            values,
+            data,
+            true,
+            no_objects,
+        );
+        layer.named_id = crate::controls::note_control_id();
+        let dress_keys = if let Some(keys) = known_keys {
+            keys.clone()
+        } else {
+            let mut read = cycle_hap(Value::Object(crate::OrderedMap::from_single_packed(
+                crate::controls::builtin_spec_by_id(named_id)?.packed_key,
+                Value::F64(f64::from(start)),
+            )));
+            let hap = map(&read)?;
+            let cycle = TimeSpan::new(Fraction::ZERO, Fraction::ONE);
+            if (hap.whole(), hap.part()) != (Some(cycle), cycle)
+                || !holds_a_value_and_keys(&hap)
+                || !hap.context.is_empty()
+            {
+                return None;
+            }
+            read.keys = hap.keys;
+            read.keys
+        };
+        if loc0 != 0 {
+            // Every step in `IntRange` has empty per-step locations (`loc = 0`),
+            // so storing `[loc0, loc1]` in `dress.before_packed` yields identical
+            // final location order without allocating `Box<DressTail>`.
+            layer.change_dress(|dress| {
+                dress.set_before_packed(loc0, loc1);
+                dress.set_keys(dress_keys);
+            });
+        } else if !dress_keys.is_empty() {
+            if let Some(bare) = dress_cache.get(std::ptr::null()).flatten() {
+                layer.dress = Some(bare);
+            } else {
+                layer.change_dress(|dress| dress.set_keys(dress_keys));
+            }
+        }
+        layer.refresh_direct_inner(no_objects);
+        Some(layer)
+    })
+}
+
 pub(crate) fn renoted_cached(
     pattern: &Pattern,
     map: &HapMapFn,
@@ -898,6 +1150,31 @@ pub(crate) fn renoted_cached(
     known_keys: Option<&ContextKeys>,
     dress_cache: &mut RenoteDressCache,
 ) -> Option<Pattern> {
+    if folds(pattern)
+        && let Node::IntRange {
+            start,
+            count,
+            loc0,
+            loc1,
+            named_id,
+            step_neg,
+        } = *pattern.node_kind()
+    {
+        let layer = renoted_int_range_layer(
+            start,
+            count,
+            loc0,
+            loc1,
+            named_id,
+            step_neg,
+            map,
+            note,
+            None,
+            known_keys,
+            dress_cache,
+        )?;
+        return node_of_one(layer);
+    }
     let layers = folded(pattern)?;
     without_query_signals(|| {
         if let [layer] = layers {
@@ -954,7 +1231,7 @@ pub(crate) fn mapped_haps(pattern: &Pattern, map: &HapMapFn) -> Option<Pattern> 
                         read.value = value;
                         let hap = map(&read)?;
                         let keys = keys.get_or_insert_with(|| hap.keys.clone());
-                        ((hap.whole, hap.part) == (Some(cycle), cycle)
+                        ((hap.whole(), hap.part()) == (Some(cycle), cycle)
                             && holds_a_value_and_keys(&hap)
                             && hap.context.is_empty()
                             && keys.same(&hap.keys))
@@ -1004,10 +1281,10 @@ pub(super) fn made(
     }
     let mut hap = cycle_hap(function.clone());
     let meets = cycle_hap(value.clone());
-    let part = hap.part;
+    let part = hap.part();
     // A meeting that is not made in place is made as its node makes it.
     if !Meeting::in_place(&mut hap, &meets, part, apply, flow) {
-        hap = applied_hap(&hap, &meets, hap.whole, part, apply, flow);
+        hap = applied_hap(&hap, &meets, hap.whole(), part, apply, flow);
     }
     is_plain(&hap).then(|| {
         let mut value = hap.value;
@@ -1276,16 +1553,94 @@ pub(crate) fn applied(
     })
 }
 
+/// Compute the per-cycle reverse-emission mask of `met` produced by combining
+/// `layer` (left) with `values` (right), or `None` when the combined emission
+/// order cannot be represented in `Layer`'s 6-bit mask.
+fn tile_rev_mask(layer: &Layer, values: &Layer, met: &Layer) -> Option<u8> {
+    if values.has_rev_order() {
+        return None;
+    }
+    let l_mask = layer.rev_mask();
+    if l_mask == 0 {
+        return Some(0);
+    }
+    if values.source().is_some() || !values.in_cycles() {
+        return None;
+    }
+    let vp = values.period();
+    if vp.denom() != 1 || vp.numer() <= 0 {
+        return None;
+    }
+    let at_most_one_per_cycle = values
+        .listing()
+        .with_grid_view(|grid| {
+            let ticks = grid.ticks.get();
+            let GridStepsRef::Small(steps) = grid.steps else {
+                return false;
+            };
+            let mut prev_cycle: Option<u32> = None;
+            for &s in steps {
+                if s.part_end <= s.part_begin {
+                    return false;
+                }
+                let c_begin = u32::from(s.part_begin) / ticks;
+                let c_end = u32::from(s.part_end - 1) / ticks;
+                if c_begin != c_end || prev_cycle.is_some_and(|p| c_begin <= p) {
+                    return false;
+                }
+                prev_cycle = Some(c_begin);
+            }
+            true
+        })
+        .unwrap_or(false);
+    if !at_most_one_per_cycle {
+        return None;
+    }
+    let lp = layer.period();
+    let mp = met.period();
+    if lp.numer() == 1 && lp.denom() > 1 {
+        let all = (l_mask & 1) != 0;
+        if mp.numer() == 1 && mp.denom() > 1 {
+            return Some(u8::from(all));
+        }
+        if mp.denom() == 1 && (1..=6).contains(&mp.numer()) {
+            return Some(if all { (1u8 << mp.numer()) - 1 } else { 0 });
+        }
+        return None;
+    }
+    if lp.denom() == 1
+        && (1..=6).contains(&lp.numer())
+        && mp.denom() == 1
+        && (1..=6).contains(&mp.numer())
+    {
+        let l_len = lp.numer();
+        let m_len = mp.numer();
+        let mut out = 0u8;
+        for c in 0..m_len {
+            if (l_mask >> (c % l_len)) & 1 != 0 {
+                out |= 1u8 << c;
+            }
+        }
+        return Some(out);
+    }
+    None
+}
+
 pub(super) fn apply_layer_with(
     layer: &Layer,
     values: &Layer,
     apply: &Combine,
     flow: LookupFlow,
 ) -> Option<Layer> {
+    if values.has_rev_order() {
+        return None;
+    }
     if let Some(set) = layer.set(values, apply, flow) {
         return Some(set);
     }
     let (mut met, pairs) = layer.met(values, Side::Functions)?;
+    let rev_mask = tile_rev_mask(layer, values, &met)?;
+    met.set_rev_mask(rev_mask);
     // Fast path: single-value constant built-in control applied by Set
     // folds into `met.dress` directly without materializing per-step
     // `BuiltinMap` objects or copying `layer.values` when 1-to-1.
@@ -1374,15 +1729,63 @@ pub(super) fn apply_layer_with(
                         ))
                     })
                     .collect();
-                return Some(met.valued(met_values));
+                return Some(met.valued_data_maps(met_values));
             }
             Some(dress)
                 if !dress.set_packed_keys().contains(&k1)
                     && dress.set_len() + 2 <= crate::value::MAX_BUILTIN_MAP_LEN =>
             {
                 let tail_slice = dress.set_slice();
-                let met_values: Arc<[Value]> = pairs
-                    .as_slice()
+                let pairs_slice = pairs.as_slice();
+                let tail_len = tail_slice.len();
+                let total_keys = tail_len + 2;
+                let pool_len = layer.values.len() + tail_len + values.values.len();
+                // For 3+ key maps repeated across 4+ pairs (e.g. synth chain +
+                // patterned control), pool the unique values once into a single
+                // `Arc<[Value]>` and emit 48 B `PooledBuiltinMap`s instead of
+                // 96+ B `BuiltinMap`s.
+                if pairs_slice.len() >= 4 && tail_len >= 1 && pool_len <= usize::from(u16::MAX) {
+                    let mut pool_vec = Vec::with_capacity(pool_len);
+                    // Clone each unique source/tail/rhs value once into the shared pool.
+                    pool_vec.extend(layer.values.iter().cloned());
+                    let tail_base = pool_vec.len() as u16;
+                    for idx in 0..tail_len {
+                        pool_vec.push(tail_slice.value_at(idx).clone());
+                    }
+                    let rhs_base = pool_vec.len() as u16;
+                    pool_vec.extend(values.values.iter().cloned());
+                    let pool: Arc<[Value]> = Arc::from(pool_vec);
+                    let mut out_keys = [0u16; crate::value::MAX_BUILTIN_MAP_LEN];
+                    out_keys[0] = k0;
+                    for (slot, &tk) in out_keys[1..1 + tail_len]
+                        .iter_mut()
+                        .zip(dress.set_packed_keys().iter())
+                    {
+                        *slot = tk;
+                    }
+                    out_keys[1 + tail_len] = k1;
+                    let mut out_vals = [0u16; crate::value::MAX_BUILTIN_MAP_LEN];
+                    for idx in 0..tail_len {
+                        out_vals[1 + idx] = tail_base + idx as u16;
+                    }
+                    let met_values: Arc<[Value]> = pairs_slice
+                        .iter()
+                        .map(|&(f, v)| {
+                            out_vals[0] = f as u16;
+                            out_vals[1 + tail_len] = rhs_base + v as u16;
+                            Value::Object(crate::OrderedMap::from_made_builtin(
+                                crate::value::make_pooled_builtin_arc(
+                                    // Share one value pool handle across each pooled pair map.
+                                    Arc::clone(&pool),
+                                    &out_keys[..total_keys],
+                                    &out_vals[..total_keys],
+                                ),
+                            ))
+                        })
+                        .collect();
+                    return Some(met.valued_data_maps(met_values));
+                }
+                let met_values: Arc<[Value]> = pairs_slice
                     .iter()
                     .map(|&(f, v)| {
                         Value::Object(crate::OrderedMap::from_keyed_tail_and_packed(
@@ -1394,7 +1797,7 @@ pub(super) fn apply_layer_with(
                         ))
                     })
                     .collect();
-                return Some(met.valued(met_values));
+                return Some(met.valued_data_maps(met_values));
             }
             Some(_) => {}
         }
@@ -1437,7 +1840,7 @@ pub(super) fn apply_layer_with(
             let (f, v) = pairs_slice[0];
             if let Some(res) = map_pair(f, v) {
                 met.values = crate::value::arc_single_value(res);
-                met.refresh_direct();
+                met.refresh_direct_inner(true);
                 return Some(met);
             }
         } else if pairs_slice.len() <= 16 {
@@ -1455,7 +1858,7 @@ pub(super) fn apply_layer_with(
                     .iter_mut()
                     .map(|v| std::mem::replace(v, Value::Undefined))
                     .collect();
-                met.refresh_direct();
+                met.refresh_direct_inner(true);
                 return Some(met);
             }
         } else {
@@ -1470,7 +1873,7 @@ pub(super) fn apply_layer_with(
             }
             if ok {
                 met.values = vec_vals.into();
-                met.refresh_direct();
+                met.refresh_direct_inner(true);
                 return Some(met);
             }
         }
@@ -1754,6 +2157,444 @@ pub(crate) fn applied_constant(
     Ok(out.with_steps(steps))
 }
 
+/// Build a plain numeric sequence pattern from 2..=8 flat numeric steps when
+/// [`applied_flat_numbers`] falls back to general composition.
+pub(crate) fn pattern_of_flat_numbers(
+    values: &[f64],
+    locs: &[(u32, u16)],
+    slowcat: bool,
+) -> Option<Pattern> {
+    let k = values.len();
+    if !(2..=8).contains(&k) || locs.len() != k {
+        return None;
+    }
+    let layer_values: Arc<[Value]> = values.iter().map(|&v| Value::F64(v)).collect();
+    let mut raw_steps = [(0u16, 0u16, 0u16, 0u32, 0u16); 8];
+    for (idx, &(b, l)) in locs.iter().enumerate() {
+        raw_steps[idx] = (idx as u16, (idx + 1) as u16, idx as u16, b, l);
+    }
+    let (period, ticks, steps_meta) = if slowcat {
+        (
+            Fraction::int(i128::from(k as u32)),
+            NonZeroU32::new(1)?,
+            Some(Fraction::ONE),
+        )
+    } else {
+        (
+            Fraction::ONE,
+            NonZeroU32::new(k as u32)?,
+            Some(Fraction::int(i128::from(k as u32))),
+        )
+    };
+    let pat = super::sequence_of_ticks_plain(period, ticks, layer_values, true, &raw_steps[..k])?;
+    Some(pat.with_steps(steps_meta))
+}
+
+/// Apply a flat numeric control sequence (`"0.8 0.6"`, `"<0.15 0.3 0.2 0.25>"`)
+/// directly onto a folded direct-keyed `Node::Sequence` in a single pass with
+/// zero temporary RHS `Pattern`, `Layer`, or `Grid` allocations.
+pub(crate) fn applied_flat_numbers(
+    mut functions: Pattern,
+    spec: &crate::controls::ControlSpec,
+    values: &[f64],
+    locs: &[(u32, u16)],
+    slowcat: bool,
+) -> Result<Pattern, Pattern> {
+    let k = values.len();
+    if !(2..=8).contains(&k)
+        || locs.len() != k
+        || crate::compose::default_alignment() != crate::compose::Alignment::In
+        || builds_each_node()
+        || spec.id == 0
+        || spec.packed_key == 0
+        || spec.name() == "value"
+    {
+        return Err(functions);
+    }
+    let Some(layers) = folded(&functions) else {
+        return Err(functions);
+    };
+    if layers.is_empty() || !holds_data(layers) {
+        return Err(functions);
+    }
+    let k1 = spec.packed_key;
+    if !layers.iter().all(|layer| {
+        layer.is_direct_keyed()
+            && layer.named_id != spec.id
+            && layer.dress.as_deref().is_none_or(|d| {
+                !d.has_set_map()
+                    || (!d.set_packed_keys().contains(&k1)
+                        && d.set_len() + 2 <= crate::value::MAX_BUILTIN_MAP_LEN)
+            })
+    }) {
+        return Err(functions);
+    }
+    let steps = functions.steps();
+    let apply_one = |layer: &Layer| -> Option<Layer> {
+        let (met, pairs) = layer.met_flat_numbers(locs, slowcat)?;
+        let pairs_slice = pairs.as_slice();
+        let k0 = layer.seq_packed_key();
+        let tail_dress = layer.dress.as_deref().filter(|d| d.has_set_map());
+        let met_values: Arc<[Value]> = match tail_dress {
+            None => pairs_slice
+                .iter()
+                .map(|&(f, v)| {
+                    Value::Object(crate::OrderedMap::from_two_packed(
+                        k0,
+                        layer.values[f as usize].clone(),
+                        k1,
+                        Value::F64(values[v as usize]),
+                    ))
+                })
+                .collect(),
+            Some(dress) => {
+                let tail_slice = dress.set_slice();
+                let tail_len = tail_slice.len();
+                let total_keys = tail_len + 2;
+                let pool_len = layer.values.len() + tail_len + k;
+                if pairs_slice.len() >= 4 && tail_len >= 1 && pool_len <= usize::from(u16::MAX) {
+                    let mut pool_vec = Vec::with_capacity(pool_len);
+                    // Clone each unique source/tail value once into the shared pool.
+                    pool_vec.extend(layer.values.iter().cloned());
+                    let tail_base = pool_vec.len() as u16;
+                    for idx in 0..tail_len {
+                        pool_vec.push(tail_slice.value_at(idx).clone());
+                    }
+                    let rhs_base = pool_vec.len() as u16;
+                    for &num in values {
+                        pool_vec.push(Value::F64(num));
+                    }
+                    let pool: Arc<[Value]> = Arc::from(pool_vec);
+                    let mut out_keys = [0u16; crate::value::MAX_BUILTIN_MAP_LEN];
+                    out_keys[0] = k0;
+                    for (slot, &tk) in out_keys[1..1 + tail_len]
+                        .iter_mut()
+                        .zip(dress.set_packed_keys().iter())
+                    {
+                        *slot = tk;
+                    }
+                    out_keys[1 + tail_len] = k1;
+                    let mut out_vals = [0u16; crate::value::MAX_BUILTIN_MAP_LEN];
+                    for idx in 0..tail_len {
+                        out_vals[1 + idx] = tail_base + idx as u16;
+                    }
+                    pairs_slice
+                        .iter()
+                        .map(|&(f, v)| {
+                            out_vals[0] = f as u16;
+                            out_vals[1 + tail_len] = rhs_base + v as u16;
+                            Value::Object(crate::OrderedMap::from_made_builtin(
+                                crate::value::make_pooled_builtin_arc(
+                                    // Share one value pool handle across each pooled pair map.
+                                    Arc::clone(&pool),
+                                    &out_keys[..total_keys],
+                                    &out_vals[..total_keys],
+                                ),
+                            ))
+                        })
+                        .collect()
+                } else {
+                    pairs_slice
+                        .iter()
+                        .map(|&(f, v)| {
+                            Value::Object(crate::OrderedMap::from_keyed_tail_and_packed(
+                                k0,
+                                layer.values[f as usize].clone(),
+                                tail_slice,
+                                k1,
+                                Value::F64(values[v as usize]),
+                            ))
+                        })
+                        .collect()
+                }
+            }
+        };
+        Some(met.valued_data_maps(met_values))
+    };
+    if layers.len() == 1 {
+        let Some(one) = without_query_signals(|| apply_one(&layers[0])) else {
+            return Err(functions);
+        };
+        if let Some(cell) = functions.own_node()
+            && let Node::Sequence(target) = &mut cell.kind
+            && let Some(dst) = Arc::get_mut(target)
+            && dst.len() == 1
+        {
+            dst[0] = one;
+            return Ok(functions.with_steps(steps));
+        }
+        let Some(out) = node_of_one(one) else {
+            return Err(functions);
+        };
+        return Ok(out.with_steps(steps));
+    }
+    let built = without_query_signals(|| {
+        if layers.len() <= 8 {
+            let mut buf: [Option<Layer>; 8] = Default::default();
+            for (slot, layer) in buf.iter_mut().zip(layers.iter()) {
+                *slot = Some(apply_one(layer)?);
+            }
+            return Some((Some(buf), None, layers.len()));
+        }
+        let met = layers.iter().map(apply_one).collect::<Option<Vec<_>>>()?;
+        let len = met.len();
+        Some((None, Some(met), len))
+    });
+    let Some((mut stack_buf, vec_buf, len)) = built else {
+        return Err(functions);
+    };
+    if let Some(cell) = functions.own_node()
+        && let Node::Sequence(target) = &mut cell.kind
+        && let Some(dst) = Arc::get_mut(target)
+        && dst.len() == len
+    {
+        if let Some(buf) = &mut stack_buf {
+            for (d, s) in dst.iter_mut().zip(buf[..len].iter_mut()) {
+                *d = s.take().expect("met layer present");
+            }
+        } else if let Some(met) = vec_buf {
+            for (d, s) in dst.iter_mut().zip(met) {
+                *d = s;
+            }
+        }
+        return Ok(functions.with_steps(steps));
+    }
+    let out = match (stack_buf.as_mut(), vec_buf) {
+        (Some(buf), _) => node_of_sound_stack(buf, len),
+        (None, Some(met)) => node_of_sound(met),
+        (None, None) => unreachable!("either stack or vec buffer present"),
+    };
+    Ok(out.with_steps(steps))
+}
+
+/// Compose a direct-keyed `Node::Sequence` with a same-key flat numeric control
+/// sequence (e.g. `.add(note("<0 12>"))`, `.sub(n("0 7"))`) in one pass without
+/// allocating an intermediate RHS `Pattern`, `Layer`, or `Grid`.
+pub(crate) fn composed_control_flat_numbers(
+    mut functions: Pattern,
+    spec_id: u16,
+    values: &[f64],
+    locs: &[(u32, u16)],
+    slowcat: bool,
+    op: crate::compose::ComposeOp,
+    flow: LookupFlow,
+) -> Result<Pattern, Pattern> {
+    let k = values.len();
+    if !(2..=8).contains(&k)
+        || locs.len() != k
+        || op == crate::compose::ComposeOp::KeepIf
+        || (flow == LookupFlow::Set && op != crate::compose::ComposeOp::Set)
+        || crate::compose::default_alignment() != crate::compose::Alignment::In
+        || builds_each_node()
+        || spec_id == 0
+        || crate::controls::builtin_name_str_by_id(spec_id) == Some("value")
+    {
+        return Err(functions);
+    }
+    let Some(layers) = folded(&functions) else {
+        return Err(functions);
+    };
+    if layers.is_empty() || !holds_data(layers) {
+        return Err(functions);
+    }
+    if !layers.iter().all(|layer| {
+        layer.is_direct_keyed()
+            && layer.dress().tail.is_none()
+            && layer.named_id == spec_id
+            && (!layer.has_rev_order() || slowcat)
+    }) {
+        return Err(functions);
+    }
+    let steps = functions.steps();
+    let apply_one = |layer: &Layer| -> Option<Layer> {
+        let (mut met, pairs) = layer.met_flat_numbers(locs, slowcat)?;
+        let l_mask = layer.rev_mask();
+        let rev_mask = if l_mask == 0 {
+            0u8
+        } else {
+            let lp = layer.period();
+            let mp = met.period();
+            if lp.numer() == 1 && lp.denom() > 1 {
+                let all = (l_mask & 1) != 0;
+                if mp.numer() == 1 && mp.denom() > 1 {
+                    u8::from(all)
+                } else if mp.denom() == 1 && (1..=6).contains(&mp.numer()) {
+                    if all { (1u8 << mp.numer()) - 1 } else { 0 }
+                } else {
+                    return None;
+                }
+            } else if lp.denom() == 1
+                && (1..=6).contains(&lp.numer())
+                && mp.denom() == 1
+                && (1..=6).contains(&mp.numer())
+            {
+                let l_len = lp.numer();
+                let m_len = mp.numer();
+                let mut out = 0u8;
+                for c in 0..m_len {
+                    if (l_mask >> (c % l_len)) & 1 != 0 {
+                        out |= 1u8 << c;
+                    }
+                }
+                out
+            } else {
+                return None;
+            }
+        };
+        met.set_rev_mask(rev_mask);
+        let pairs_slice = pairs.as_slice();
+        let is_arith = matches!(
+            op,
+            crate::compose::ComposeOp::Add
+                | crate::compose::ComposeOp::Sub
+                | crate::compose::ComposeOp::Mul
+                | crate::compose::ComposeOp::Div
+                | crate::compose::ComposeOp::Mod
+                | crate::compose::ComposeOp::Pow
+                | crate::compose::ComposeOp::Band
+                | crate::compose::ComposeOp::Bor
+                | crate::compose::ComposeOp::Bxor
+                | crate::compose::ComposeOp::Blshift
+                | crate::compose::ComposeOp::Brshift
+        );
+        if is_arith && layer.values.len() <= 16 && pairs_slice.len() <= 16 {
+            let mut lhs_nums = [0.0f64; 16];
+            let mut parsed_all = true;
+            for (dst, a) in lhs_nums[..layer.values.len()]
+                .iter_mut()
+                .zip(layer.values.iter())
+            {
+                if matches!(a, Value::Object(_) | Value::Undefined) {
+                    parsed_all = false;
+                    break;
+                }
+                match crate::util::parse_numeral(a) {
+                    Ok(x) => *dst = x,
+                    Err(_) => {
+                        parsed_all = false;
+                        break;
+                    }
+                }
+            }
+            if parsed_all {
+                met.values = if pairs_slice.len() == 1 {
+                    let (f, v) = pairs_slice[0];
+                    crate::value::arc_single_value(Value::F64(
+                        op.of_numbers(lhs_nums[f as usize], values[v as usize])?,
+                    ))
+                } else {
+                    let mut ok = true;
+                    let built: Arc<[Value]> = pairs_slice
+                        .iter()
+                        .map(|&(f, v)| {
+                            match op.of_numbers(lhs_nums[f as usize], values[v as usize]) {
+                                Some(n) => Value::F64(n),
+                                None => {
+                                    ok = false;
+                                    Value::Undefined
+                                }
+                            }
+                        })
+                        .collect();
+                    if !ok {
+                        return None;
+                    }
+                    built
+                };
+                met.refresh_direct_inner(true);
+                return Some(met);
+            }
+        }
+        let map_pair = |f: u32, v: u32| -> Option<Value> {
+            let a = &layer.values[f as usize];
+            if matches!(a, Value::Object(_) | Value::Undefined) {
+                return None;
+            }
+            let b = Value::F64(values[v as usize]);
+            let res = op.apply_scalar(a, &b);
+            if matches!(res, Value::Object(_) | Value::Undefined) || !res.is_data(0) {
+                return None;
+            }
+            Some(res)
+        };
+        if pairs_slice.len() == 1 {
+            let (f, v) = pairs_slice[0];
+            met.values = crate::value::arc_single_value(map_pair(f, v)?);
+        } else if pairs_slice.len() <= 16 {
+            let mut stack_vals: [Value; 16] = std::array::from_fn(|_| Value::Undefined);
+            for (slot, &(f, v)) in stack_vals.iter_mut().zip(pairs_slice) {
+                *slot = map_pair(f, v)?;
+            }
+            met.values = stack_vals[..pairs_slice.len()]
+                .iter_mut()
+                .map(|v| std::mem::replace(v, Value::Undefined))
+                .collect();
+        } else {
+            let mut vec_vals = Vec::with_capacity(pairs_slice.len());
+            for &(f, v) in pairs_slice {
+                vec_vals.push(map_pair(f, v)?);
+            }
+            met.values = vec_vals.into();
+        }
+        met.refresh_direct_inner(true);
+        Some(met)
+    };
+    if layers.len() == 1 {
+        let Some(one) = without_query_signals(|| apply_one(&layers[0])) else {
+            return Err(functions);
+        };
+        if let Some(cell) = functions.own_node()
+            && let Node::Sequence(target) = &mut cell.kind
+            && let Some(dst) = Arc::get_mut(target)
+            && dst.len() == 1
+        {
+            dst[0] = one;
+            return Ok(functions.with_steps(steps));
+        }
+        let Some(out) = node_of_one(one) else {
+            return Err(functions);
+        };
+        return Ok(out.with_steps(steps));
+    }
+    let built = without_query_signals(|| {
+        if layers.len() <= 8 {
+            let mut buf: [Option<Layer>; 8] = Default::default();
+            for (slot, layer) in buf.iter_mut().zip(layers.iter()) {
+                *slot = Some(apply_one(layer)?);
+            }
+            return Some((Some(buf), None, layers.len()));
+        }
+        let met = layers.iter().map(apply_one).collect::<Option<Vec<_>>>()?;
+        let len = met.len();
+        Some((None, Some(met), len))
+    });
+    let Some((mut stack_buf, vec_buf, len)) = built else {
+        return Err(functions);
+    };
+    if let Some(cell) = functions.own_node()
+        && let Node::Sequence(target) = &mut cell.kind
+        && let Some(dst) = Arc::get_mut(target)
+        && dst.len() == len
+    {
+        if let Some(buf) = &mut stack_buf {
+            for (d, s) in dst.iter_mut().zip(buf[..len].iter_mut()) {
+                *d = s.take().expect("met layer present");
+            }
+        } else if let Some(met) = vec_buf {
+            for (d, s) in dst.iter_mut().zip(met) {
+                *d = s;
+            }
+        }
+        return Ok(functions.with_steps(steps));
+    }
+    let out = match (stack_buf.as_mut(), vec_buf) {
+        (Some(buf), _) => node_of_sound_stack(buf, len),
+        (None, Some(met)) => node_of_sound(met),
+        (None, None) => unreachable!("either stack or vec buffer present"),
+    };
+    Ok(out.with_steps(steps))
+}
+
 /// Whether each step of the sequence `functions` takes the data value
 /// `control` in place by a `set` of a constant of it, as [`applied`] folds
 /// that `set`. See [`Layer::takes_set`].
@@ -1861,13 +2702,111 @@ pub(crate) fn set_packed_layers_owned(
     );
 }
 
+fn finish_single_map_context(layer: &mut Layer, context: Locations) {
+    if !context.is_empty() {
+        if let Some(dress) = layer.dress.as_mut().and_then(Arc::get_mut) {
+            dress.prepend_before(context);
+        } else {
+            let mut dress = layer.dress().clone();
+            dress.prepend_before(context);
+            layer.dress = Some(dress.into_arc());
+        }
+        layer.refresh_direct();
+    }
+}
+
+/// Merge packed built-in controls directly into a single-value compound control
+/// map layer (such as `s("[~ oh:2]*2")`) when no `Dress::set` is present, so
+/// both native and scripted tiers construct the same direct layer without
+/// allocating a `Dress::set` or lazy `Table` cache.
+fn try_merge_single_map_owned(
+    layer: &mut Layer,
+    keys: &[u16],
+    vals: &mut [Value],
+    context: &mut Locations,
+) -> bool {
+    if layer.named_id != 0
+        || layer
+            .dress
+            .as_deref()
+            .is_some_and(|d| d.has_set() || d.has_custom_name())
+        || layer.values.len() != 1
+        || !matches!(layer.values[0], Value::Object(_))
+        || !vals
+            .iter()
+            .all(|v| matches!(v, Value::F64(_) | Value::Str(_) | Value::Bool(_)))
+    {
+        return false;
+    }
+    if let Some(vals_mut) = Arc::get_mut(&mut layer.values) {
+        let Value::Object(map) = &mut vals_mut[0] else {
+            return false;
+        };
+        if !map.try_merge_packed_owned(keys, vals) {
+            return false;
+        }
+    } else {
+        let Value::Object(existing) = &layer.values[0] else {
+            return false;
+        };
+        let mut cloned = existing.clone();
+        if !cloned.try_merge_packed_owned(keys, vals) {
+            return false;
+        }
+        layer.values = crate::value::arc_single_value(Value::Object(cloned));
+    }
+    finish_single_map_context(layer, std::mem::take(context));
+    true
+}
+
+/// Borrowing counterpart of [`try_merge_single_map_owned`].
+fn try_merge_single_map_ref(
+    layer: &mut Layer,
+    keys: &[u16],
+    vals: &[Value],
+    context: &mut Locations,
+) -> bool {
+    if layer.named_id != 0
+        || layer
+            .dress
+            .as_deref()
+            .is_some_and(|d| d.has_set() || d.has_custom_name())
+        || layer.values.len() != 1
+        || !matches!(layer.values[0], Value::Object(_))
+        || !vals
+            .iter()
+            .all(|v| matches!(v, Value::F64(_) | Value::Str(_) | Value::Bool(_)))
+    {
+        return false;
+    }
+    if let Some(vals_mut) = Arc::get_mut(&mut layer.values) {
+        let Value::Object(map) = &mut vals_mut[0] else {
+            return false;
+        };
+        if !map.try_merge_packed_ref(keys, vals) {
+            return false;
+        }
+    } else {
+        let Value::Object(existing) = &layer.values[0] else {
+            return false;
+        };
+        let mut cloned = existing.clone();
+        if !cloned.try_merge_packed_ref(keys, vals) {
+            return false;
+        }
+        layer.values = crate::value::arc_single_value(Value::Object(cloned));
+    }
+    finish_single_map_context(layer, std::mem::take(context));
+    true
+}
+
 /// Single-layer owned fast path of [`set_packed_here`], moving values out of
 /// `vals` straight into the layer's built-in control map with zero clones.
 pub(crate) fn set_packed_single_layer_owned(
     layers: &mut Arc<[Layer]>,
     keys: &[u16],
     vals: &mut [Value],
-    context: Locations,
+    mut context: Locations,
 ) {
     if Arc::get_mut(layers).is_none() {
         *layers = layers.iter().map(|layer| layer.with(|_| {})).collect();
@@ -1876,6 +2815,9 @@ pub(crate) fn set_packed_single_layer_owned(
     let [layer] = layers else {
         unreachable!("caller verified single layer");
     };
+    if try_merge_single_map_owned(layer, keys, vals, &mut context) {
+        return;
+    }
     if let Some(dress) = layer.dress.as_mut().and_then(Arc::get_mut) {
         dress.set_packed_here_owned(keys, vals, context);
         layer.refresh_direct_after_set();
@@ -1898,7 +2840,7 @@ pub(crate) fn set_packed_here(
     layers: &mut Arc<[Layer]>,
     keys: &[u16],
     vals: &[Value],
-    context: Locations,
+    mut context: Locations,
     shared_entries: &mut Option<Arc<dyn crate::value::BuiltinEntries>>,
     shared_bare_dress: &mut Option<Arc<Dress>>,
     shared_last_dress: &mut Option<(Arc<Dress>, Arc<Dress>)>,
@@ -1908,6 +2850,9 @@ pub(crate) fn set_packed_here(
     }
     let layers = Arc::get_mut(layers).expect("layers that no other sequence holds");
     if let [layer] = layers {
+        if try_merge_single_map_ref(layer, keys, vals, &mut context) {
+            return;
+        }
         if let Some(dress) = layer.dress.as_mut().and_then(Arc::get_mut) {
             dress.set_packed_here(keys, vals, context, shared_entries);
             layer.refresh_direct_after_set();
@@ -1982,7 +2927,7 @@ pub(crate) fn set_here(layers: &mut Arc<[Layer]>, control: &Value, context: Loca
 pub(crate) fn set_here_cached(
     layers: &mut Arc<[Layer]>,
     control: &Value,
-    context: Locations,
+    mut context: Locations,
     cache: &mut RenoteDressCache,
 ) {
     if Arc::get_mut(layers).is_none() {
@@ -1990,6 +2935,18 @@ pub(crate) fn set_here_cached(
     }
     let layers = Arc::get_mut(layers).expect("layers that no other sequence holds");
     if let [layer] = layers {
+        if let Value::Object(map) = control {
+            if let Some((pk, val)) = map.single_packed_entry()
+                && try_merge_single_map_ref(layer, &[pk], std::slice::from_ref(val), &mut context)
+            {
+                return;
+            } else if let Some(entries) = map.as_builtin()
+                && let crate::value::Slice::Builtin(keys, vals) = entries.as_slice()
+                && try_merge_single_map_ref(layer, keys, vals, &mut context)
+            {
+                return;
+            }
+        }
         let from = layer.dress.as_ref().map_or(std::ptr::null(), Arc::as_ptr);
         if let Some(cached) = cache.get(from) {
             layer.dress = cached;
@@ -2054,7 +3011,10 @@ pub(crate) fn applied_out(
     };
     let values = layers(values)?;
     // A value of the script is read through its host, at each query.
-    if !(functions.is_data() && holds_data(&values)) {
+    if !(functions.is_data() && holds_data(&values))
+        || functions.has_rev_order()
+        || values.iter().any(Layer::has_rev_order)
+    {
         return None;
     }
     without_query_signals(|| {
@@ -2070,7 +3030,7 @@ pub(crate) fn applied_out(
                     .map(|&(value, function)| {
                         let hf = cycle_hap(functions.value(function as usize)?);
                         let hv = cycle_hap(layer.value(value as usize)?);
-                        let hap = applied_hap(&hf, &hv, hv.whole, hv.part, apply, flow);
+                        let hap = applied_hap(&hf, &hv, hv.whole(), hv.part(), apply, flow);
                         is_plain(&hap).then(|| {
                             let mut value = hap.value;
                             if let Value::Object(map) = &mut value {
@@ -2178,7 +3138,7 @@ pub(crate) fn faster_in_place(layers: &mut Arc<[Layer]>, factor: Fraction) -> bo
     };
     // Validate every layer's new period fits before mutating any layer.
     for layer in slice.iter() {
-        if layer.period().checked_div(factor).filter(small).is_none() {
+        if layer.has_rev_order() || layer.period().checked_div(factor).filter(small).is_none() {
             return false;
         }
     }
@@ -2329,6 +3289,9 @@ pub(crate) fn faster(pattern: &Pattern, factor: Fraction) -> Option<Pattern> {
         ))
     };
     let rescale_layer = |layer: &Layer| -> Option<Layer> {
+        if layer.has_rev_order() {
+            return None;
+        }
         let period = layer.period().checked_div(factor).filter(small)?;
         // The times of the steps are in cycles, so they change with
         // the speed.
@@ -2388,6 +3351,9 @@ pub(crate) fn plied(pattern: &Pattern, count: usize) -> Option<Pattern> {
     let layers = layers
         .iter()
         .map(|layer| {
+            if layer.has_rev_order() {
+                return None;
+            }
             let steps = layer.listing();
             let listed = steps.len().checked_mul(count)?;
             if !layer.is_data() || listed > MAX_FOLDED_STEPS {
@@ -2467,7 +3433,7 @@ pub(crate) fn reversed(pattern: &Pattern) -> Option<Pattern> {
             return None;
         }
         let listing = layer.listing();
-        let new_listing = listing.with_grid_view(|grid| {
+        let (new_listing, multi_step) = listing.with_grid_view(|grid| {
             if grid.rare.is_some() || grid.ticks.get() % k != 0 {
                 return None;
             }
@@ -2475,14 +3441,13 @@ pub(crate) fn reversed(pattern: &Pattern) -> Option<Pattern> {
             let GridStepsRef::Small(steps) = grid.steps else {
                 return None;
             };
-            // Multi-step cycles emit haps in reversed order on the graph path
-            // (which downstream index-seeded effects such as `humanize` observe),
-            // whereas a grid keeps steps sorted by `part_begin`. Only fold
-            // single-step or empty layers where emission order is identical.
-            if steps.len() > 1 {
+            // Multi-step cycles require disjoint, in-order steps so reversing
+            // keeps the grid sorted; `Layer::rev_mask` preserves the exact
+            // descending emission order for `Order::Graph` queries.
+            if !steps.windows(2).all(|w| w[0].part_end <= w[1].part_begin) {
                 return None;
             }
-            if !steps.is_empty() && steps[0].part_end > period_ticks {
+            if steps.last().is_some_and(|s| s.part_end > period_ticks) {
                 return None;
             }
             let grid_steps = if steps.len() <= MAX_INLINE_GRID_LEN {
@@ -2508,16 +3473,25 @@ pub(crate) fn reversed(pattern: &Pattern) -> Option<Pattern> {
                 }
                 GridSteps::Small(rev_steps.into_boxed_slice())
             };
-            Some(Listing::from_parts(
-                grid.ticks,
-                grid.base | Grid::SMALL,
-                grid_steps,
-                clone_packed_runs(grid.packed),
-                None,
+            Some((
+                Listing::from_parts(
+                    grid.ticks,
+                    grid.base | Grid::SMALL,
+                    grid_steps,
+                    clone_packed_runs(grid.packed),
+                    None,
+                ),
+                steps.len() > 1,
             ))
         })??;
+        let next_rev = if multi_step {
+            if (layer.rev_mask() & 1) != 0 { 0 } else { 1 }
+        } else {
+            0
+        };
         Some(layer.with(|l| {
             l.set_period_and_steps(period, Steps::Listed(new_listing));
+            l.set_rev_mask(next_rev);
         }))
     };
     if layers.len() <= 8 {
@@ -2534,7 +3508,11 @@ pub(crate) fn reversed(pattern: &Pattern) -> Option<Pattern> {
 /// Shift one uncut `period == 1` small-grid layer by `by` when `by * ticks` is
 /// an integer and no step straddles the wrap boundary.
 pub(super) fn shift_one_layer(layer: &Layer, by: Fraction) -> Option<Layer> {
-    if layer.source().is_some() || !layer.in_cycles() || layer.period() != Fraction::ONE {
+    if layer.has_rev_order()
+        || layer.source().is_some()
+        || !layer.in_cycles()
+        || layer.period() != Fraction::ONE
+    {
         return None;
     }
     let listing = layer.listing();
@@ -2756,6 +3734,150 @@ pub(crate) fn off_shifted(
     Some(node_of_sound_stack(&mut buf, n * 2).with_steps(pattern.steps()))
 }
 
+/// Fold `every(n, rev)` / `firstOf(n, rev)` directly on a single-layer
+/// `Node::Sequence` (`2 <= n <= 6`, `period = 1/k`, disjoint uncut steps) in
+/// one pass, mutating uniquely-owned patterns in place without allocating a new
+/// `NodeCell`, `Arc<[Layer]>`, or intermediate `rev()` node.
+pub(crate) fn every_rev_owned(mut pattern: Pattern, n: usize) -> Result<Pattern, Pattern> {
+    if !(2..=6).contains(&n) {
+        return Err(pattern);
+    }
+    let Some(ls) = layers(&pattern) else {
+        return Err(pattern);
+    };
+    if ls.len() != 1 {
+        return Err(pattern);
+    }
+    let first = &ls[0];
+    if first.source().is_some() || !first.in_cycles() || first.has_rev_order() {
+        return Err(pattern);
+    }
+    let period = first.period();
+    if period.numer() != 1 {
+        return Err(pattern);
+    }
+    let Ok(k) = u32::try_from(period.denom()) else {
+        return Err(pattern);
+    };
+    if k == 0 {
+        return Err(pattern);
+    }
+    let listing = first.listing();
+    let Some((new_listing, multi_step)) = listing
+        .with_grid_view(|grid| {
+            if grid.rare.is_some() {
+                return None;
+            }
+            let ticks_u32 = grid.ticks.get();
+            if ticks_u32 % k != 0 || n.checked_mul(ticks_u32 as usize)? > usize::from(u16::MAX) {
+                return None;
+            }
+            let sub_ticks = ticks_u32 / k;
+            let sub_ticks_u16 = u16::try_from(sub_ticks).ok()?;
+            let GridStepsRef::Small(steps) = grid.steps else {
+                return None;
+            };
+            if !steps.windows(2).all(|w| w[0].part_end <= w[1].part_begin) {
+                return None;
+            }
+            if steps.last().is_some_and(|s| s.part_end > sub_ticks_u16) {
+                return None;
+            }
+            let per_cycle = steps.len().checked_mul(k as usize)?;
+            let total_steps = per_cycle.checked_mul(n)?;
+            if total_steps > 256 {
+                return None;
+            }
+            let mut stack_steps = [GridSteps::ZERO_SMALL; 64];
+            let mut heap_steps = (total_steps > 64).then(|| Vec::with_capacity(total_steps));
+            let mut cursor = 0usize;
+            let mut push_step = |step: SmallGridStep| {
+                if let Some(vec) = &mut heap_steps {
+                    vec.push(step);
+                } else {
+                    stack_steps[cursor] = step;
+                    cursor += 1;
+                }
+            };
+            // Cycle 0: reversed within each `1/k` sub-cycle.
+            for copy in 0..k {
+                let offset = (copy * sub_ticks) as u16;
+                for &s in steps.iter().rev() {
+                    push_step(SmallGridStep {
+                        part_begin: offset + (sub_ticks_u16 - s.part_end),
+                        part_end: offset + (sub_ticks_u16 - s.part_begin),
+                        value: s.value,
+                        loc: s.loc,
+                    });
+                }
+            }
+            // Cycles 1..n: original order.
+            for cycle_idx in 1..n {
+                let cycle_off = (cycle_idx as u32) * ticks_u32;
+                for copy in 0..k {
+                    let offset = (cycle_off + copy * sub_ticks) as u16;
+                    for &s in steps {
+                        push_step(SmallGridStep {
+                            part_begin: offset + s.part_begin,
+                            part_end: offset + s.part_end,
+                            value: s.value,
+                            loc: s.loc,
+                        });
+                    }
+                }
+            }
+            let grid_steps = if let Some(vec) = heap_steps {
+                pack_small_steps(vec)
+            } else if total_steps <= MAX_INLINE_GRID_LEN {
+                let mut arr = [GridSteps::ZERO_SMALL; MAX_INLINE_GRID_LEN];
+                arr[..total_steps].copy_from_slice(&stack_steps[..total_steps]);
+                GridSteps::Inline(total_steps as u8, arr)
+            } else {
+                GridSteps::Small(Box::from(&stack_steps[..total_steps]))
+            };
+            Some((
+                Listing::from_parts(
+                    grid.ticks,
+                    grid.base | Grid::SMALL,
+                    grid_steps,
+                    clone_packed_runs(grid.packed),
+                    None,
+                ),
+                steps.len() > 1,
+            ))
+        })
+        .flatten()
+    else {
+        return Err(pattern);
+    };
+    let rev_mask = if multi_step { 1u8 } else { 0u8 };
+    let new_period = Fraction::int(n as i128);
+    if let Some(cell) = pattern.own_node()
+        && let Node::Sequence(target) = &mut cell.kind
+        && let Some(dst) = Arc::get_mut(target)
+        && dst.len() == 1
+    {
+        let l = &mut dst[0];
+        l.set_in_cycles(true);
+        l.set_period_and_steps(new_period, Steps::Listed(new_listing));
+        l.set_rev_mask(rev_mask);
+        return Ok(pattern);
+    }
+    let steps = pattern.steps();
+    let cloned = layers(&pattern).expect("single sequence layer verified above")[0].with(|l| {
+        l.set_in_cycles(true);
+        l.set_period_and_steps(new_period, Steps::Listed(new_listing));
+        l.set_rev_mask(rev_mask);
+    });
+    let Some(mut out) = node_of_one(cloned) else {
+        return Err(pattern);
+    };
+    if let Some(s) = steps {
+        out = out.with_steps(Some(s));
+    }
+    Ok(out)
+}
+
 /// Fold `slowcat_prime` (`every` / `firstOf` / `lastOf`) of `2..=16`
 /// single-layer sequences sharing values/dress/ticks and integer-divisor
 /// periods (`period = 1/k`) into one multi-cycle `Node::Sequence`.
@@ -2783,6 +3905,7 @@ pub(crate) fn slowcat_primed(pats: &[Pattern]) -> Option<Pattern> {
         return None;
     }
     let mut total_steps = 0usize;
+    let mut rev_mask = 0u8;
     let mut inline_steps = [GridSteps::ZERO_SMALL; MAX_INLINE_GRID_LEN];
     let mut all_steps: Option<Vec<SmallGridStep>> = None;
     for (cycle_idx, pat) in pats.iter().enumerate() {
@@ -2791,6 +3914,14 @@ pub(crate) fn slowcat_primed(pats: &[Pattern]) -> Option<Pattern> {
             return None;
         }
         let layer = &ls[0];
+        if layer.has_rev_order() {
+            if n > 6 {
+                return None;
+            }
+            if (layer.rev_mask() & 1) != 0 {
+                rev_mask |= 1u8 << cycle_idx;
+            }
+        }
         if layer.source().is_some()
             || !layer.in_cycles()
             || layer.named_id != first.named_id
@@ -2883,5 +4014,6 @@ pub(crate) fn slowcat_primed(pats: &[Pattern]) -> Option<Pattern> {
     node_of_one(first.with(|l| {
         l.set_in_cycles(true);
         l.set_period_and_steps(Fraction::int(n as i128), Steps::Listed(listing));
+        l.set_rev_mask(rev_mask);
     }))
 }

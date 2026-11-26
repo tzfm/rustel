@@ -28,7 +28,7 @@ fn cycles(begin: i128, end: i128) -> (Fraction, Fraction) {
 /// The observable shape of a hap, for comparing two answers.
 fn shape(haps: &[Hap]) -> Vec<(Option<TimeSpan>, TimeSpan, String)> {
     haps.iter()
-        .map(|hap| (hap.whole, hap.part, hap.value.show()))
+        .map(|hap| (hap.whole(), hap.part(), hap.value.show()))
         .collect()
 }
 

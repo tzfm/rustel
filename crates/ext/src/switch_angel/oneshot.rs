@@ -28,7 +28,7 @@ fn once(receiver: &Pattern, cycle: f64, grid: &Value) -> Pattern {
     let grid = number(grid);
     let start = (cycle / grid).ceil() * grid;
     receiver.filter_haps(move |hap| {
-        hap.whole.is_some_and(|whole| {
+        hap.whole().is_some_and(|whole| {
             let onset = whole.begin.to_f64();
             onset >= start && onset < start + 1.0
         })

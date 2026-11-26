@@ -61,7 +61,7 @@ fn public_swing_preserves_scalar_steps_and_keeps_zero_no_step_and_patterned_boun
         if label == "patterned swing boundary" {
             assert_eq!(
                 haps.iter()
-                    .map(|hap| (hap.part.begin, hap.part.end))
+                    .map(|hap| (hap.part().begin, hap.part().end))
                     .collect::<Vec<_>>(),
                 [
                     (Fraction::ZERO, Fraction::new(1, 4)),

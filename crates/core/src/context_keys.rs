@@ -22,7 +22,6 @@ use std::sync::{Arc, OnceLock};
 type MergeSlot = (Arc<Keys>, Arc<Keys>, Arc<Keys>);
 
 struct MergeCache {
-    active: bool,
     next: usize,
     slots: [Option<MergeSlot>; 4],
 }
@@ -30,7 +29,6 @@ struct MergeCache {
 impl MergeCache {
     const fn new() -> Self {
         Self {
-            active: false,
             next: 0,
             slots: [None, None, None, None],
         }
@@ -43,18 +41,11 @@ thread_local! {
     static MERGE_CACHE: RefCell<MergeCache> = const { RefCell::new(MergeCache::new()) };
 }
 
-#[inline]
-pub(crate) fn begin_query_merge_cache() {
-    let _ = MERGE_CACHE.try_with(|cache| {
-        cache.borrow_mut().active = true;
-    });
-}
-
-#[inline]
-pub(crate) fn end_query_merge_cache() {
+#[cold]
+#[inline(never)]
+pub(crate) fn clear_query_merge_cache() {
     let _ = MERGE_CACHE.try_with(|cache| {
         let mut cache = cache.borrow_mut();
-        cache.active = false;
         cache.next = 0;
         cache.slots = [None, None, None, None];
     });
@@ -486,20 +477,20 @@ impl ContextKeys {
                 {
                     return second.clone();
                 }
-                let cached = MERGE_CACHE
-                    .try_with(|cache| {
-                        let cache = cache.borrow();
-                        if !cache.active {
-                            return None;
-                        }
-                        cache.slots.iter().flatten().find_map(|(ca, cb, cout)| {
-                            (Arc::ptr_eq(ca, a) && Arc::ptr_eq(cb, b)).then(|| Arc::clone(cout))
+                let cache_active = crate::host::merge_cache_active();
+                if cache_active {
+                    let cached = MERGE_CACHE
+                        .try_with(|cache| {
+                            let cache = cache.borrow();
+                            cache.slots.iter().flatten().find_map(|(ca, cb, cout)| {
+                                (Arc::ptr_eq(ca, a) && Arc::ptr_eq(cb, b)).then(|| Arc::clone(cout))
+                            })
                         })
-                    })
-                    .ok()
-                    .flatten();
-                if let Some(hit) = cached {
-                    return Self(Some(hit));
+                        .ok()
+                        .flatten();
+                    if let Some(hit) = cached {
+                        return Self(Some(hit));
+                    }
                 }
                 let out = Arc::new(Keys {
                     scale: a.scale.clone().or_else(|| b.scale.clone()),
@@ -516,14 +507,15 @@ impl ContextKeys {
                     lane: a.lane.or(b.lane),
                     pick_lookup: a.pick_lookup.clone(),
                 });
-                let _ = MERGE_CACHE.try_with(|cache| {
-                    let mut cache = cache.borrow_mut();
-                    if cache.active {
+                if cache_active {
+                    let _ = MERGE_CACHE.try_with(|cache| {
+                        let mut cache = cache.borrow_mut();
                         let slot = cache.next;
                         cache.slots[slot] = Some((Arc::clone(a), Arc::clone(b), Arc::clone(&out)));
                         cache.next = (slot + 1) & 3;
-                    }
-                });
+                    });
+                    crate::host::mark_merge_cache_dirty();
+                }
                 Self(Some(out))
             }
         }

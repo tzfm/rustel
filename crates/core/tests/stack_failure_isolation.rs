@@ -36,7 +36,7 @@ fn values(haps: &[Hap]) -> Vec<Value> {
 
 fn shape(haps: &[Hap]) -> Vec<(Option<TimeSpan>, TimeSpan, Value)> {
     haps.iter()
-        .map(|hap| (hap.whole, hap.part, hap.value.clone()))
+        .map(|hap| (hap.whole(), hap.part(), hap.value.clone()))
         .collect()
 }
 

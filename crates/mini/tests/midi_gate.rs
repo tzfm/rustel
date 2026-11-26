@@ -26,7 +26,7 @@ fn a_patterned_length_is_read_where_the_key_was_struck() {
     state.controls.insert("_cps".into(), Value::F64(cps));
     let haps = pattern.query(&state);
     assert_eq!(haps.len(), 1, "one press, one note: {haps:?}");
-    let whole = haps[0].whole.expect("a struck note has a whole");
+    let whole = haps[0].whole().expect("a struck note has a whole");
     let length = whole.end.sub(whole.begin).to_f64();
     assert!(
         length < 0.5,
@@ -69,7 +69,7 @@ fn a_re_query_keeps_the_length_the_finger_chose() {
     state.controls.insert("_cps".into(), Value::F64(cps));
     let first = pattern.query(&state);
     assert_eq!(first.len(), 1, "one press, one note: {first:?}");
-    let first_whole = first[0].whole.expect("a struck note has a whole");
+    let first_whole = first[0].whole().expect("a struck note has a whole");
     let first_length = first_whole.end.sub(first_whole.begin).to_f64();
     assert!(
         first_length > 0.5,
@@ -82,7 +82,7 @@ fn a_re_query_keeps_the_length_the_finger_chose() {
     std::thread::sleep(Duration::from_millis(200));
     let second = pattern.query(&state);
     assert_eq!(second.len(), 1, "the press is still there: {second:?}");
-    let second_whole = second[0].whole.expect("a struck note has a whole");
+    let second_whole = second[0].whole().expect("a struck note has a whole");
     let second_length = second_whole.end.sub(second_whole.begin).to_f64();
     assert!(
         second_length > 0.5,

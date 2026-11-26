@@ -124,7 +124,7 @@ impl Step {
                     return true;
                 };
                 let owned =
-                    std::mem::replace(hap, Hap::new(None, hap.part, crate::Value::Undefined));
+                    std::mem::replace(hap, Hap::new(None, hap.part(), crate::Value::Undefined));
                 Self::replaced(
                     hap,
                     crate::controls::apply_control_hap(spec, *unnamed_only, owned),
@@ -149,7 +149,7 @@ impl Step {
 
     #[inline(never)]
     fn run_owned(f: &OwnedHapMapFn, hap: &mut Hap) -> bool {
-        let owned = std::mem::replace(hap, Hap::new(None, hap.part, crate::Value::Undefined));
+        let owned = std::mem::replace(hap, Hap::new(None, hap.part(), crate::Value::Undefined));
         Self::replaced(hap, f(owned))
     }
 }
@@ -168,11 +168,17 @@ enum SignalOp {
     },
 }
 
+#[derive(Clone)]
+enum SignalSource {
+    Fn(SignalFn),
+    Number(crate::NumberSignal),
+}
+
 /// A signal and the nodes above it, innermost first, evaluated directly without
 /// recursing through the pattern graph.
 #[derive(Clone)]
 pub(super) struct Signal {
-    source: SignalFn,
+    source: SignalSource,
     ops: Vec<SignalOp>,
 }
 
@@ -209,7 +215,12 @@ impl Signal {
         }
         out.clear();
         probe.span = asked;
-        let value = (self.source)(probe);
+        let value = match &self.source {
+            SignalSource::Fn(f) => f(probe),
+            SignalSource::Number(body) => {
+                crate::Value::F64(body(probe.span.begin, &probe.controls))
+            }
+        };
         out.push(Hap::new(None, asked, value));
 
         for op in &self.ops {
@@ -231,18 +242,18 @@ impl Signal {
                     apply,
                     flow,
                 } => {
-                    if out.iter().all(|hap| in_one_cycle(hap.part)) {
+                    if out.iter().all(|hap| in_one_cycle(hap.part())) {
                         for hap in out.iter_mut() {
-                            let part = hap.part;
+                            let part = hap.part();
                             if !(matches!(side, Side::Value)
                                 && Meeting::in_place(hap, constant, part, apply, *flow))
                             {
                                 *hap = match side {
                                     Side::Value => {
-                                        applied_hap(hap, constant, hap.whole, part, apply, *flow)
+                                        applied_hap(hap, constant, hap.whole(), part, apply, *flow)
                                     }
                                     Side::Function => {
-                                        applied_hap(constant, hap, hap.whole, part, apply, *flow)
+                                        applied_hap(constant, hap, hap.whole(), part, apply, *flow)
                                     }
                                 };
                             }
@@ -251,7 +262,7 @@ impl Signal {
                     }
                     let mut met = Vec::with_capacity(out.len());
                     for hap in out.iter() {
-                        let count = hap.part.cycle_count()?;
+                        let count = hap.part().cycle_count()?;
                         if count > crate::MAX_QUERY_SPAN_CYCLES
                             || crate::hap_budget().is_some_and(|budget| {
                                 met.len() as i128 + count > i128::from(budget)
@@ -259,20 +270,20 @@ impl Signal {
                         {
                             return None;
                         }
-                        let first = hap.part.begin.floor().numer();
-                        let last = hap.part.end.ceil().numer().checked_sub(1)?;
+                        let first = hap.part().begin.floor().numer();
+                        let last = hap.part().end.ceil().numer().checked_sub(1)?;
                         for cycle in first..=last {
                             let mut other = shifted(constant, cycle)?;
-                            let Some(part) = other.part.intersection(&hap.part) else {
+                            let Some(part) = other.part().intersection(&hap.part()) else {
                                 continue;
                             };
-                            other.part = part;
+                            other.set_part(part);
                             met.push(match side {
                                 Side::Value => {
-                                    applied_hap(hap, &other, hap.whole, part, apply, *flow)
+                                    applied_hap(hap, &other, hap.whole(), part, apply, *flow)
                                 }
                                 Side::Function => {
-                                    applied_hap(&other, hap, hap.whole, part, apply, *flow)
+                                    applied_hap(&other, hap, hap.whole(), part, apply, *flow)
                                 }
                             });
                         }
@@ -302,7 +313,13 @@ fn signal_of_depth(pattern: crate::NodeRef<'_>, depth: u32) -> Option<Signal> {
     let (inner, op) = match pattern.kind() {
         Node::Signal(signal) => {
             return Some(Signal {
-                source: signal.clone(),
+                source: SignalSource::Fn(signal.clone()),
+                ops: Vec::new(),
+            });
+        }
+        Node::NumberSignal(body) => {
+            return Some(Signal {
+                source: SignalSource::Number(*body),
                 ops: Vec::new(),
             });
         }
@@ -590,11 +607,12 @@ pub(super) fn in_one_cycle(span: TimeSpan) -> bool {
 
 fn shifted(hap: &Hap, cycles: i128) -> Option<Hap> {
     let mut hap = hap.clone();
-    hap.part = shifted_span(hap.part, cycles)?;
-    hap.whole = match hap.whole {
+    let part = shifted_span(hap.part(), cycles)?;
+    let whole = match hap.whole() {
         Some(whole) => Some(shifted_span(whole, cycles)?),
         None => None,
     };
+    hap.set_spans(whole, part);
     Some(hap)
 }
 
@@ -607,10 +625,11 @@ fn shifted_span(span: TimeSpan, cycles: i128) -> Option<TimeSpan> {
 
 fn retime(hap: &mut Hap, map: impl Fn(Fraction) -> Option<Fraction>) -> Option<()> {
     let span = |span: TimeSpan| Some(TimeSpan::new(map(span.begin)?, map(span.end)?));
-    hap.part = span(hap.part)?;
-    hap.whole = match hap.whole {
+    let part = span(hap.part())?;
+    let whole = match hap.whole() {
         Some(whole) => Some(span(whole)?),
         None => None,
     };
+    hap.set_spans(whole, part);
     Some(())
 }

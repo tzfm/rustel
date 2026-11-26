@@ -2,7 +2,9 @@
 
 ## Unreleased
 
-- `rustel bench` now reports engine tier, CPU time, allocation counts, peak query memory, and held session memory for both score files and `-e` patterns (in human output and `--json`).
+- Fixed: scores and MIDI imports with more than 4,096 mini-notation tokens now keep visuals, sliders, and lane controls active instead of dropping the UI layout.
+- Faster score evaluation, live edits, and pattern querying with lower memory use.
+- `rustel bench` now reports engine tier, CPU time, allocations, peak query memory, and held session memory for score files and `-e` patterns (human output and `--json`).
 
 ## v0.1.9
 

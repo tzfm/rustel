@@ -82,7 +82,7 @@ impl Session {
             .into_iter()
             .filter(|hap| hap.has_onset())
             .filter_map(|hap| {
-                let whole = hap.whole?;
+                let whole = hap.whole()?;
                 (whole.begin >= begin).then(|| (whole.begin, hap.value.show(), hap))
             })
             .collect::<Vec<_>>();
@@ -153,23 +153,17 @@ impl Session {
         let query = || {
             #[cfg(any(test, feature = "test-support"))]
             self.panic_if_injected(SessionPanicPoint::Query);
-            let result = rustel_core::with_cancellation(cancellation, || {
-                run(cancellation).map_err(RuntimeError::from)
-            });
+            let result = run(cancellation).map_err(RuntimeError::from);
             self.js.raise_caught_native_panic();
             result
         };
         // Inside a recovery boundary a panic rebuilds the Session; a query
         // made outside one, such as `rustel query`, reports it as an error.
-        if recovery::panic_is_contained() {
-            query()
-        } else {
-            recovery::catch_score_panic(query).unwrap_or_else(|message| {
-                Err(RuntimeError::Panic(format!(
-                    "native score work panicked ({message})"
-                )))
-            })
-        }
+        recovery::catch_score_panic_if_needed(query).unwrap_or_else(|message| {
+            Err(RuntimeError::Panic(format!(
+                "native score work panicked ({message})"
+            )))
+        })
     }
 
     pub fn query_report(

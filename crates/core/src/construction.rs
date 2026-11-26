@@ -245,6 +245,33 @@ fn same_node<'g>(
         Node::Silence => matches!(right, Node::Silence),
         Node::Pure(a) => matches!(right, Node::Pure(b) if same_value(a, b)),
         Node::PureAt(a) => matches!(right, Node::PureAt(b) if a.1 == b.1 && same_value(&a.0, &b.0)),
+        Node::IntRange {
+            start: as_,
+            count: ac,
+            loc0: al0,
+            loc1: al1,
+            named_id: an,
+            step_neg: ag,
+        } => matches!(
+            right,
+            Node::IntRange {
+                start: bs,
+                count: bc,
+                loc0: bl0,
+                loc1: bl1,
+                named_id: bn,
+                step_neg: bg,
+            } if as_ == bs && ac == bc && al0 == bl0 && al1 == bl1 && an == bn && ag == bg
+        ),
+        Node::Iter(a) => match right {
+            Node::Iter(b) => {
+                a.parts == b.parts
+                    && a.times == b.times
+                    && a.back == b.back
+                    && child!(&a.inner, &b.inner)
+            }
+            _ => false,
+        },
         Node::Sequence(a) => match right {
             Node::Sequence(b) => {
                 a.len() == b.len() && a.iter().zip(b.iter()).all(|(a, b)| a.same(b, same_value))
@@ -427,6 +454,14 @@ fn same_node<'g>(
             _ => false,
         },
         Node::Signal(_) => matches!(right, Node::Signal(_)),
+        Node::NumberSignal(a) => {
+            matches!(right, Node::NumberSignal(b) if std::ptr::fn_addr_eq(*a, *b))
+        }
+        Node::SegmentSignal { body, steps } => matches!(
+            right,
+            Node::SegmentSignal { body: b, steps: s }
+                if *steps == *s && std::ptr::fn_addr_eq(*body, *b)
+        ),
         Node::ChooseCycles(a) => match right {
             Node::ChooseCycles(b) => a.1 == b.1 && same_children(&a.0, &b.0, pending),
             _ => false,

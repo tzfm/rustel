@@ -28,7 +28,7 @@ fn query(runtime: &JsRuntime) -> Vec<Hap> {
 
 fn shape(haps: Vec<Hap>) -> Vec<(Option<TimeSpan>, TimeSpan, Value)> {
     haps.into_iter()
-        .map(|hap| (hap.whole, hap.part, hap.value))
+        .map(|hap| (hap.whole(), hap.part(), hap.value))
         .collect()
 }
 

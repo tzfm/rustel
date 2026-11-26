@@ -8,7 +8,7 @@ fn continuous_arithmetic_query_keeps_wholeless_haps_across_cycles() {
             let haps = query_active(&runtime, Fraction::ZERO, Fraction::int(cycles))
                 .expect("query continuous signal");
             assert_eq!(haps.len(), cycles as usize, "{source} over {cycles} cycles");
-            assert!(haps.iter().all(|hap| hap.whole.is_none()));
+            assert!(haps.iter().all(|hap| hap.whole().is_none()));
         }
     }
 
@@ -23,7 +23,7 @@ fn continuous_arithmetic_query_keeps_wholeless_haps_across_cycles() {
         )
         .expect("scheduler query continuous signal");
     assert_eq!(haps.len(), 2);
-    assert!(haps.iter().all(|hap| hap.whole.is_none()));
+    assert!(haps.iter().all(|hap| hap.whole().is_none()));
 
     let explicitly_sorted = semantic_runtime("s(rand.mul(3)).sortHapsByPart()");
     assert!(

@@ -1399,6 +1399,7 @@ pub fn take_query_callback_failure() -> Option<String> {
         let taken = errors.published_callback_failure.borrow_mut().take();
         if taken.is_some() && errors.published_contained_throw.borrow().is_none() {
             errors.has_published.set(false);
+            let _ = QUERY_THREAD.try_with(|t| t.error_published.set(false));
         }
         taken
     })
@@ -1415,6 +1416,7 @@ pub fn take_query_contained_throw() -> Option<String> {
         let taken = errors.published_contained_throw.borrow_mut().take();
         if taken.is_some() && errors.published_callback_failure.borrow().is_none() {
             errors.has_published.set(false);
+            let _ = QUERY_THREAD.try_with(|t| t.error_published.set(false));
         }
         taken
     })
@@ -1477,6 +1479,7 @@ impl QueryErrors {
             *self.published_callback_failure.borrow_mut() = None;
             *self.published_contained_throw.borrow_mut() = None;
             self.has_published.set(false);
+            let _ = QUERY_THREAD.try_with(|t| t.error_published.set(false));
         }
     }
 
@@ -1577,13 +1580,19 @@ impl QueryErrorBoundary {
                 // playing" warning would be false for a silent window.
                 errors.clear_published();
             } else {
+                let mut published = false;
                 if let Some(failure) = inner_callback_failure {
                     *errors.published_callback_failure.borrow_mut() = Some(failure);
                     errors.has_published.set(true);
+                    published = true;
                 }
                 if let Some(thrown) = inner_contained_throw {
                     *errors.published_contained_throw.borrow_mut() = Some(thrown);
                     errors.has_published.set(true);
+                    published = true;
+                }
+                if published {
+                    let _ = QUERY_THREAD.try_with(|t| t.error_published.set(true));
                 }
             }
             inner
@@ -2128,6 +2137,13 @@ pub(crate) struct QueryThread {
     stepwise_remaining: std::cell::Cell<Option<u64>>,
     /// Per-root capacity hint for short window queries (`(root_ptr, cap)`).
     pub(crate) short_query_hint: std::cell::Cell<(usize, u16)>,
+    /// Whether the outermost query enabled the `ContextKeys::merge` cache.
+    pub(crate) merge_cache_active: std::cell::Cell<bool>,
+    /// Whether `ContextKeys::merge` actually inserted into `MERGE_CACHE`.
+    pub(crate) merge_cache_dirty: std::cell::Cell<bool>,
+    /// Mirror of `QUERY_ERRORS.has_published` so pure native queries avoid
+    /// touching `QUERY_ERRORS` when no contained failure was published.
+    pub(crate) error_published: std::cell::Cell<bool>,
 }
 
 impl QueryThread {
@@ -2254,6 +2270,23 @@ impl QueryThread {
         ticks >= 2 && self.deadline_check_clock()
     }
 
+    /// Whether no outer query frame, error, refusal, budget, or deadline state
+    /// prevents a zero-guard direct leaf query from bypassing [`run_native_bounded`].
+    #[inline(always)]
+    pub(crate) fn can_skip_fast_guard(&self) -> bool {
+        self.depth.get() == 0
+            && !self.error_published.get()
+            && self.stop.get() == 0
+            && self.hap_budget.get().is_none()
+            && self.deadline.get().is_none()
+            && self.budget.get().is_none()
+    }
+
+    #[inline(always)]
+    pub(crate) fn hap_budget(&self) -> Option<u64> {
+        self.hap_budget.get()
+    }
+
     /// See [`charge_haps`].
     #[inline(always)]
     pub(crate) fn charge(&self, n: usize) -> bool {
@@ -2331,8 +2364,138 @@ thread_local! {
             current_runtime: std::cell::Cell::new(0),
             stepwise_remaining: std::cell::Cell::new(None),
             short_query_hint: std::cell::Cell::new((0, 20)),
+            merge_cache_active: std::cell::Cell::new(false),
+            merge_cache_dirty: std::cell::Cell::new(false),
+            error_published: std::cell::Cell::new(false),
         }
     };
+}
+
+#[cold]
+#[inline(never)]
+pub(crate) fn clear_published_errors_slow() {
+    QUERY_ERRORS.with(QueryErrors::clear_published);
+}
+
+#[inline(always)]
+pub(crate) fn merge_cache_active() -> bool {
+    QUERY_THREAD.with(|thread| thread.merge_cache_active.get())
+}
+
+#[inline(always)]
+pub(crate) fn mark_merge_cache_dirty() {
+    QUERY_THREAD.with(|thread| thread.merge_cache_dirty.set(true));
+}
+
+/// Run a top-level native query installing cancellation, deadline budget, and
+/// hap budget in a single `QUERY_THREAD.with` access when unnested.
+/// Returns `(result, refusal, cancel_requested)`.
+pub(crate) fn run_native_bounded<R>(
+    flag: &std::sync::atomic::AtomicBool,
+    time_budget: std::time::Duration,
+    hap_budget: u64,
+    f: impl FnOnce(&QueryThread) -> R,
+) -> (R, Option<QueryLimit>, bool) {
+    struct FastGuard {
+        prev_cancel: Option<*const std::sync::atomic::AtomicBool>,
+        prev_cancel_observed: bool,
+        prev_millis: u64,
+        prev_expired: bool,
+        prev_stepwise: Option<u64>,
+    }
+    impl Drop for FastGuard {
+        fn drop(&mut self) {
+            let mut clear_refusal = false;
+            QUERY_THREAD.with(|thread| {
+                thread.set_stop_bit(STOP_CANCEL_ARMED, self.prev_cancel.is_some());
+                thread.cancel.set(self.prev_cancel);
+                thread.cancel_observed.set(self.prev_cancel_observed);
+                thread.set_stop_bit(STOP_DEADLINE_ARMED, false);
+                thread.deadline.set(None);
+                thread.budget.set(None);
+                thread.deadline_millis.set(self.prev_millis);
+                thread.set_stop_bit(STOP_DEADLINE_PASSED, self.prev_expired);
+                thread.deadline_expired.set(self.prev_expired);
+                thread.hap_budget.set(None);
+                thread.stepwise_remaining.set(self.prev_stepwise);
+                if thread.stop.get() & STOP_REFUSED != 0 {
+                    thread.set_stop_bit(STOP_REFUSED, false);
+                    clear_refusal = true;
+                }
+            });
+            if clear_refusal {
+                REFUSAL.with(|slot| *slot.borrow_mut() = None);
+            }
+        }
+    }
+
+    let fast_out = QUERY_THREAD.with(|thread| {
+        if thread.hap_budget.get().is_some()
+            || thread.deadline.get().is_some()
+            || thread.budget.get().is_some()
+            || (thread.stop.get() & STOP_REFUSED) != 0
+        {
+            return Err(f);
+        }
+        let prev_cancel = thread.cancel.replace(Some(flag as *const _));
+        let prev_cancel_observed = thread.cancel_observed.replace(false);
+        thread.budget.set(Some(time_budget));
+        let allowed = time_budget.as_millis().min(u128::from(u64::MAX)) as u64;
+        let prev_millis = thread.deadline_millis.replace(allowed);
+        let prev_expired = thread.deadline_expired.replace(false);
+        thread.deadline_tick.set(0);
+        let prev_stepwise = thread
+            .stepwise_remaining
+            .replace(Some(MAX_STEPWISE_ENTRIES));
+        thread.hap_budget.set(Some(hap_budget));
+        // Set CANCEL_ARMED + DEADLINE_ARMED and clear DEADLINE_PASSED in one byte write.
+        let word =
+            (thread.stop.get() & !STOP_DEADLINE_PASSED) | STOP_CANCEL_ARMED | STOP_DEADLINE_ARMED;
+        thread.stop.set(word);
+        let guard = FastGuard {
+            prev_cancel,
+            prev_cancel_observed,
+            prev_millis,
+            prev_expired,
+            prev_stepwise,
+        };
+        let out = f(thread);
+        let cancelled = thread.cancellation_requested();
+        let had_inner = thread.stop.get() & STOP_REFUSED != 0;
+        thread.cancel.set(guard.prev_cancel);
+        thread.cancel_observed.set(guard.prev_cancel_observed);
+        thread.deadline.set(None);
+        thread.budget.set(None);
+        thread.deadline_millis.set(guard.prev_millis);
+        thread.deadline_expired.set(guard.prev_expired);
+        thread.hap_budget.set(None);
+        thread.stepwise_remaining.set(guard.prev_stepwise);
+        let mut word = thread.stop.get()
+            & !(STOP_CANCEL_ARMED | STOP_DEADLINE_ARMED | STOP_DEADLINE_PASSED | STOP_REFUSED);
+        if guard.prev_cancel.is_some() {
+            word |= STOP_CANCEL_ARMED;
+        }
+        if guard.prev_expired {
+            word |= STOP_DEADLINE_PASSED;
+        }
+        thread.stop.set(word);
+        std::mem::forget(guard);
+        let refusal = if had_inner {
+            REFUSAL.with(|slot| slot.borrow_mut().take())
+        } else {
+            None
+        };
+        Ok((out, refusal, cancelled))
+    });
+
+    match fast_out {
+        Ok(res) => res,
+        Err(f) => with_cancellation_and_query_budget(flag, time_budget, || {
+            let (out, refusal) = with_hap_budget(hap_budget, || QUERY_THREAD.with(f));
+            let cancelled = cancellation_requested();
+            (out, refusal, cancelled)
+        }),
+    }
 }
 
 /// A view of one field of this thread's [`QueryThread`].

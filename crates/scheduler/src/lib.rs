@@ -239,15 +239,15 @@ impl ScheduleTraceEvent {
         onset_id: u64,
         target_time: f64,
     ) -> Option<Self> {
-        let whole = hap.whole?;
+        let whole = hap.whole()?;
         let value_show = hap.value.show();
         Some(Self {
             onset_id,
             generation,
             whole_begin: whole.begin,
             whole_end: whole.end,
-            part_begin: hap.part.begin,
-            part_end: hap.part.end,
+            part_begin: hap.part().begin,
+            part_end: hap.part().end,
             duration: hap.duration(),
             target_time,
             value_show: (value_show.len() <= MAX_TRACE_TEXT_BYTES).then_some(value_show),
@@ -850,7 +850,7 @@ fn hap_tempo(value: &Value) -> Option<f64> {
 /// one cycle, so each onset is timed at the tempo in force at it. The sort
 /// is stable.
 fn sort_for_tempo(haps: &mut [Hap]) {
-    let begin = |hap: &Hap| hap.whole.map_or(hap.part.begin, |whole| whole.begin);
+    let begin = |hap: &Hap| hap.whole().map_or(hap.part().begin, |whole| whole.begin);
     haps.sort_by(|a, b| {
         begin(a).cmp(&begin(b)).then_with(|| {
             let changes = |hap: &Hap| hap_tempo(&hap.value).is_some();
@@ -1736,7 +1736,7 @@ impl Scheduler {
             if !hap.has_onset() {
                 continue;
             }
-            let Some(whole) = hap.whole else { continue };
+            let Some(whole) = hap.whole() else { continue };
             // From the takeover on the replacement plays alone. The
             // exception is a hap on the begin of a copy the device keeps
             // past it.
@@ -2293,7 +2293,7 @@ impl Scheduler {
             self.sync_covering_tempo = false;
             if self.pattern_tempo {
                 for hap in &haps {
-                    if let Some(whole) = hap.whole
+                    if let Some(whole) = hap.whole()
                         && whole.begin < self.queried_to
                         && whole.end > self.queried_to
                         && let Some(cps) = hap_tempo(&hap.value)
@@ -2330,14 +2330,14 @@ impl Scheduler {
                 unprocessed_begin = std::iter::once(&hap)
                     .chain(pending.as_slice())
                     .filter(|hap| hap.has_onset())
-                    .map(|hap| hap.part.begin)
+                    .map(|hap| hap.part().begin)
                     .min();
                 break;
             }
             if !hap.has_onset() {
                 continue;
             }
-            let Some(whole) = hap.whole else { continue };
+            let Some(whole) = hap.whole() else { continue };
             let target_time = self.tempo.time_at_cycle(whole.begin);
             // After a slower tempo, an onset past the horizon waits for a
             // later fill. The cursor stops at it.

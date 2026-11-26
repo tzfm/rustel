@@ -280,6 +280,71 @@ pub(crate) struct LaneTable {
 }
 
 impl LaneTable {
+    /// True when the table carries no playing, away, candidate, audible, or
+    /// resting lanes on the active document, so an unlabeled score needs no
+    /// lane pairing or source-text sharing.
+    #[inline]
+    pub(crate) fn is_unlabeled_clean(&self) -> bool {
+        self.playing.lanes.is_empty()
+            && self.away.is_empty()
+            && self.candidate.is_none()
+            && self.rest.is_empty()
+            && self.document == self.reading
+            && !self.adopted
+            && match &self.audible {
+                Audible::InPlay => true,
+                Audible::Earlier { document, lanes } => {
+                    *document == self.document && lanes.is_empty()
+                }
+            }
+    }
+
+    /// True when the active document holds exactly one unlabeled plugin-free
+    /// lane and no pending candidate, away, or resting lanes, so an in-place
+    /// single-expression edit preserves the lane identity unchanged.
+    #[inline]
+    pub(crate) fn is_single_unlabeled_clean(&self) -> bool {
+        matches!(
+            &self.playing.lanes,
+            LaneList::One(lane) if lane.label.is_empty() && lane.plugins.is_empty()
+        ) && self.away.is_empty()
+            && self.candidate.is_none()
+            && self.rest.is_empty()
+            && self.document == self.reading
+            && !self.adopted
+    }
+
+    /// True when `lanes` is a single unlabeled plugin-free statement whose body
+    /// is the trimmed score text on the same line and pairs with the single
+    /// playing lane, so [`Self::read_read_lanes_shared`] can be skipped and
+    /// [`Self::install_shared`] refreshes `lane.body` in place.
+    #[inline(never)]
+    pub(crate) fn can_reuse_single_unlabeled(
+        &self,
+        source: &str,
+        lanes: &rustel_score::ReadLanes,
+    ) -> bool {
+        let rustel_score::ReadLanes::One(stmt) = lanes else {
+            return false;
+        };
+        let LaneList::One(lane) = &self.playing.lanes else {
+            return false;
+        };
+        if !self.is_single_unlabeled_clean()
+            || !stmt.label_str(source).is_empty()
+            || u32::try_from(stmt.line).unwrap_or(u32::MAX) != lane.line
+        {
+            return false;
+        }
+        let body = stmt.body_str(source);
+        if body != source.trim() || body.contains("vst") {
+            return false;
+        }
+        let prev = lane.body.as_str();
+        let shorter = body.len().min(prev.len());
+        shorter > 0 && 2 * equal_ends(body, prev) >= shorter
+    }
+
     /// Reads the lanes of a score text of the reading document before its
     /// evaluation: see [`Self::set_reading`]. Gives the lane number of each
     /// labeled statement, in text order, for
@@ -567,6 +632,23 @@ impl LaneTable {
                 lane.body.share_with(source, lane.line);
             }
             self.put_in_play(document, read);
+        } else if let LaneList::One(lane) = &mut self.playing.lanes
+            && lane.label.is_empty()
+            && lane.plugins.is_empty()
+            && matches!(&lane.body, LaneBody::Slice(kept, ..) if !std::sync::Arc::ptr_eq(kept, source))
+        {
+            let trimmed = source.trim();
+            let start = trimmed.as_ptr() as usize - source.as_ptr() as usize;
+            let end = start + trimmed.len();
+            if let (Ok(s), Ok(e)) = (u32::try_from(start), u32::try_from(end)) {
+                if matches!(self.audible, Audible::InPlay) {
+                    self.audible = Audible::Earlier {
+                        document: self.document,
+                        lanes: vec![lane.clone()],
+                    };
+                }
+                lane.body = LaneBody::Slice(std::sync::Arc::clone(source), s, e);
+            }
         }
     }
 

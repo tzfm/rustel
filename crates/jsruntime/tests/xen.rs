@@ -60,7 +60,7 @@ fn selected_ratio_voices_keep_source_spans_across_query_slices() {
     let haps = query(&steady, Fraction::ZERO, Fraction::ONE);
     assert_eq!(frequencies(&haps), [220.0, 330.0]);
     for hap in &haps {
-        let whole = hap.whole.unwrap();
+        let whole = hap.whole().unwrap();
         assert_eq!((whole.begin, whole.end), (Fraction::ZERO, Fraction::ONE));
         assert_eq!(hap.value.get("gain").and_then(Value::as_f64), Some(0.25));
     }
@@ -68,17 +68,20 @@ fn selected_ratio_voices_keep_source_spans_across_query_slices() {
     let three_quarters = Fraction::new(3, 4);
     for hap in &haps {
         assert_eq!(
-            (hap.part.begin, hap.part.end),
+            (hap.part().begin, hap.part().end),
             (Fraction::ZERO, Fraction::ONE)
         );
     }
     let slice = query(&steady, quarter, three_quarters);
     assert_eq!(frequencies(&slice), [220.0, 330.0]);
     for hap in &slice {
-        assert_eq!((hap.part.begin, hap.part.end), (quarter, three_quarters));
+        assert_eq!(
+            (hap.part().begin, hap.part().end),
+            (quarter, three_quarters)
+        );
     }
-    assert_eq!(slice[0].whole, haps[0].whole);
-    assert_eq!(slice[1].whole, haps[1].whole);
+    assert_eq!(slice[0].whole(), haps[0].whole());
+    assert_eq!(slice[1].whole(), haps[1].whole());
 
     let split = runtime("i(1).gain(\"0.25 0.5\").xen([\"1:1\", \"[1:1 3:2]\"])");
     let half = Fraction::new(1, 2);
@@ -86,14 +89,14 @@ fn selected_ratio_voices_keep_source_spans_across_query_slices() {
         let haps = query(&split, begin, end);
         assert_eq!(frequencies(&haps), [220.0, 330.0, 220.0, 330.0]);
         for (index, hap) in haps.iter().enumerate() {
-            assert_eq!(hap.whole, slice[0].whole);
+            assert_eq!(hap.whole(), slice[0].whole());
             let (expected_begin, expected_end, gain) = if index < 2 {
                 (begin, half, 0.25)
             } else {
                 (half, end, 0.5)
             };
             assert_eq!(
-                (hap.part.begin, hap.part.end),
+                (hap.part().begin, hap.part().end),
                 (expected_begin, expected_end)
             );
             assert_eq!(hap.value.get("gain").and_then(Value::as_f64), Some(gain));
@@ -101,7 +104,7 @@ fn selected_ratio_voices_keep_source_spans_across_query_slices() {
     }
     let first_quarter = query(&split, Fraction::ZERO, quarter);
     assert_eq!(frequencies(&first_quarter), [220.0]);
-    assert_eq!(first_quarter[0].part.end, quarter);
+    assert_eq!(first_quarter[0].part().end, quarter);
 
     for (degree, expected) in [
         (0, vec![220.0, 220.0]),
@@ -113,9 +116,9 @@ fn selected_ratio_voices_keep_source_spans_across_query_slices() {
         let haps = query(&runtime, Fraction::ZERO, Fraction::ONE);
         assert_eq!(frequencies(&haps), expected);
         for hap in haps {
-            assert_eq!(hap.whole, slice[0].whole);
+            assert_eq!(hap.whole(), slice[0].whole());
             assert_eq!(
-                (hap.part.begin, hap.part.end),
+                (hap.part().begin, hap.part().end),
                 (Fraction::ZERO, Fraction::ONE)
             );
         }
@@ -229,7 +232,7 @@ fn numeric_scale_keeps_one_voice_for_notes_longer_than_a_cycle() {
         let runtime = runtime(source);
         let haps = query(&runtime, Fraction::ZERO, Fraction::from(2));
         assert_eq!(frequencies(&haps), [220.0], "{source}");
-        assert_eq!(haps[0].part.end, Fraction::from(2));
-        assert_eq!(haps[0].whole.unwrap().end, Fraction::from(2));
+        assert_eq!(haps[0].part().end, Fraction::from(2));
+        assert_eq!(haps[0].whole().unwrap().end, Fraction::from(2));
     }
 }

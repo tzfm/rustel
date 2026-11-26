@@ -133,7 +133,7 @@ impl JsRuntime {
     /// Clear the active slot, making the current graph unreachable.
     pub fn clear_active(&self) {
         let _settings = self.core_settings.bind();
-        self.native_active.borrow_mut().take();
+        self.set_native_active(None);
         if self.realm.get().is_none() {
             return;
         }
@@ -148,7 +148,6 @@ impl JsRuntime {
     /// The active wrapper may be absent before the first successful install;
     /// its baseline slider and voicing state still needs to be restorable.
     pub fn snapshot_active_as_last_good(&self) {
-        let _settings = self.core_settings.bind();
         self.keep_last_good_imports();
         // The timeline offsets of this score are the offsets in play now.
         *self.last_good_timeline.borrow_mut() = None;
@@ -161,6 +160,7 @@ impl JsRuntime {
         if self.realm.get().is_none() {
             return;
         }
+        let _settings = self.core_settings.bind();
         let replaces = self.last_good_active.borrow().is_some();
         // The snapshot reads and writes private roots: it runs no score code.
         with_ctx_running_no_script(self, |ctx| {
@@ -201,7 +201,7 @@ impl JsRuntime {
         self.show_last_good_imports();
         self.restore_last_good_timeline();
         let native = self.native_last_good.borrow().clone();
-        *self.native_active.borrow_mut() = native;
+        self.set_native_active(native);
         // A runtime with no realm has no wrapper and no slider or voicing
         // state to restore.
         if self.realm.get().is_none() {
@@ -281,7 +281,7 @@ impl JsRuntime {
     /// runtime's module settings on the exported handle.
     pub fn active_pattern(&self) -> Option<Pattern> {
         self.active_pattern_unwrapped()
-            .map(|pattern| pattern.with_runtime_settings(self.core_settings.clone()))
+            .map(|pattern| pattern.with_shared_runtime_settings(self.plain_settings_extras()))
     }
 
     /// The active graph as its score built it, before the export takes this
@@ -294,13 +294,13 @@ impl JsRuntime {
     /// Whether the active slot contains a pattern wrapper, without cloning its
     /// graph.
     pub fn has_active_pattern(&self) -> bool {
-        let _settings = self.core_settings.bind();
         if self.native_active.borrow().is_some() {
             return true;
         }
         if self.realm.get().is_none() {
             return false;
         }
+        let _settings = self.core_settings.bind();
         with_ctx(self, |ctx| {
             let Ok(active) = host_active(&ctx) else {
                 return false;
@@ -317,13 +317,13 @@ impl JsRuntime {
     }
 
     pub(super) fn active_pattern_unwrapped(&self) -> Option<Pattern> {
-        let _settings = self.core_settings.bind();
         if let Some(pattern) = &*self.native_active.borrow() {
             // The handle of the graph in play, for the caller to hold.
             return Some(pattern.clone());
         }
         // A runtime with no realm holds no wrapper.
         self.realm.get()?;
+        let _settings = self.core_settings.bind();
         with_ctx(self, |ctx| -> Option<Pattern> {
             let value: rquickjs::Value = host_active(&ctx).ok()?.get(0).ok()?;
             if value.is_null() || value.is_undefined() {

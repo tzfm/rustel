@@ -100,6 +100,96 @@ pub fn bjorklund(pulses: i32, steps: usize) -> Result<Vec<u8>, String> {
     Ok(pattern)
 }
 
+fn emit_group_slice(
+    level: usize,
+    is_x: bool,
+    ops: &[Op],
+    invert_bit: u8,
+    out: &mut [u8],
+    len: &mut usize,
+) {
+    if level == 0 {
+        out[*len] = u8::from(is_x) ^ invert_bit;
+        *len += 1;
+        return;
+    }
+    let prev = level - 1;
+    let op = ops[prev];
+    if is_x {
+        emit_group_slice(prev, true, ops, invert_bit, out, len);
+        for _ in 0..op.repeat {
+            emit_group_slice(prev, false, ops, invert_bit, out, len);
+        }
+    } else {
+        emit_group_slice(prev, op.more_ons, ops, invert_bit, out, len);
+    }
+}
+
+/// Write `euclid_rot(pulses, steps, rotation)` directly into `out[..steps]`
+/// without heap allocation when `steps <= out.len()`.
+pub fn euclid_rot_into(
+    pulses: i32,
+    steps: usize,
+    rotation: isize,
+    out: &mut [u8],
+) -> Result<usize, String> {
+    if steps > MAX_EUCLID_STEPS || steps > out.len() {
+        return Err(format!(
+            "bjorklund: steps ({steps}) exceeds buffer limit ({})",
+            MAX_EUCLID_STEPS.min(out.len())
+        ));
+    }
+    let invert_bit = u8::from(pulses < 0);
+    let mut ons = pulses.unsigned_abs() as usize;
+    if ons > steps {
+        return Err(format!(
+            "bjorklund: abs(pulses) ({ons}) exceeds steps ({steps})"
+        ));
+    }
+    let mut offs = steps - ons;
+    let mut ops = [Op {
+        more_ons: false,
+        repeat: 0,
+    }; 64];
+    let mut depth = 0usize;
+    while ons.min(offs) > 1 {
+        if ons > offs {
+            ops[depth] = Op {
+                more_ons: true,
+                repeat: 1,
+            };
+            (ons, offs) = (offs, ons - offs);
+        } else {
+            let k = offs / ons;
+            ops[depth] = Op {
+                more_ons: false,
+                repeat: k as u16,
+            };
+            offs %= ons;
+        }
+        depth += 1;
+    }
+    let mut len = 0usize;
+    for _ in 0..ons {
+        emit_group_slice(depth, true, &ops[..depth], invert_bit, out, &mut len);
+    }
+    for _ in 0..offs {
+        emit_group_slice(depth, false, &ops[..depth], invert_bit, out, &mut len);
+    }
+    let slice = &mut out[..len];
+    if rotation != 0 && !slice.is_empty() {
+        let n = rotation.saturating_neg();
+        let len_isize = isize::try_from(slice.len()).unwrap_or(isize::MAX);
+        let at = if n < 0 {
+            len_isize.saturating_add(n).max(0)
+        } else {
+            n.min(len_isize)
+        } as usize;
+        slice.rotate_left(at);
+    }
+    Ok(len)
+}
+
 pub fn euclid_rot(pulses: i32, steps: usize, rotation: isize) -> Result<Vec<u8>, String> {
     let mut pattern = bjorklund(pulses, steps)?;
     if rotation != 0 && !pattern.is_empty() {

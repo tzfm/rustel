@@ -55,10 +55,10 @@ fn raw_expand_contract_keep_timing_purity_ownership_and_pool_neutrality() {
             haps.iter()
                 .map(|hap| (
                     hap.value.show(),
-                    hap.part.begin,
-                    hap.part.end,
-                    hap.whole.expect("sequence hap whole").begin,
-                    hap.whole.expect("sequence hap whole").end,
+                    hap.part().begin,
+                    hap.part().end,
+                    hap.whole().expect("sequence hap whole").begin,
+                    hap.whole().expect("sequence hap whole").end,
                 ))
                 .collect::<Vec<_>>(),
             [

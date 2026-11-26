@@ -233,11 +233,11 @@ fn user_authored_query_function_reads_oversized_bigint_limbs_exactly() {
     assert_eq!(haps.len(), 2, "both oversized haps must survive the read");
     // Sorted by part, so the 2^63 hap precedes the 2^64+1 hap.
     assert_eq!(haps[0].value.show(), "u64");
-    assert_eq!(haps[0].part.begin, Fraction::new(2_i128.pow(63), 1));
-    assert_eq!(haps[0].part.end, Fraction::new(2_i128.pow(63) + 1, 1));
+    assert_eq!(haps[0].part().begin, Fraction::new(2_i128.pow(63), 1));
+    assert_eq!(haps[0].part().end, Fraction::new(2_i128.pow(63) + 1, 1));
     assert_eq!(haps[1].value.show(), "text");
-    assert_eq!(haps[1].part.begin, Fraction::new(2_i128.pow(64) + 1, 1));
-    assert_eq!(haps[1].part.end, Fraction::new(2_i128.pow(64) + 2, 1));
+    assert_eq!(haps[1].part().begin, Fraction::new(2_i128.pow(64) + 1, 1));
+    assert_eq!(haps[1].part().end, Fraction::new(2_i128.pow(64) + 2, 1));
 }
 
 /// A query callback time whose limbs do not fit an `i128` fraction fails the

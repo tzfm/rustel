@@ -213,7 +213,7 @@ fn within_transforms_only_the_inside_and_includes_its_end() {
                 .and_then(|map| map.get("note"))
                 .map(rustel_core::Value::show)
                 .unwrap_or_default();
-            format!("{}@{}", note, hap.whole.expect("whole").begin)
+            format!("{}@{}", note, hap.whole().expect("whole").begin)
         })
         .collect();
     // Upstream, run directly: the transform sees ONLY the inside haps, so
@@ -438,7 +438,7 @@ fn variadic_arity_two_methods_use_recursive_sequence_semantics() {
     let haps = session.query(Fraction::ZERO, Fraction::ONE).expect("query");
     let spans: Vec<_> = haps
         .iter()
-        .map(|hap| (hap.part.begin, hap.part.end))
+        .map(|hap| (hap.part().begin, hap.part().end))
         .collect();
     assert_eq!(
         spans,
@@ -1008,7 +1008,7 @@ fn chop_keeps_squeezed_timing_and_context() {
     assert_eq!(haps.len(), 4);
     assert_eq!(
         haps.iter()
-            .map(|hap| hap.whole.expect("whole"))
+            .map(|hap| hap.whole().expect("whole"))
             .collect::<Vec<_>>(),
         [
             rustel_core::TimeSpan::new(Fraction::ZERO, Fraction::new(1, 4)),
@@ -1338,8 +1338,8 @@ fn isobite_plays_the_next_cycle_on_each_structure_event() {
             .expect("query")
             .into_iter()
             .map(|hap| {
-                let whole = hap.whole.map(|whole| (whole.begin, whole.end));
-                (hap.part.begin, hap.part.end, whole, hap.value.show())
+                let whole = hap.whole().map(|whole| (whole.begin, whole.end));
+                (hap.part().begin, hap.part().end, whole, hap.value.show())
             })
             .collect();
         events.sort();

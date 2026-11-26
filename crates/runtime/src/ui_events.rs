@@ -69,7 +69,8 @@ pub const UI_CONTROL_ACK_PROTOCOL_VERSION: u16 = 1;
 pub const MAX_UI_LAYOUT_OPTIONS_BYTES: usize = 4 * 1024;
 
 /// Maximum mini-notation leaf ranges in one installed score layout.
-pub const MAX_UI_LAYOUT_MINI_LOCATIONS: usize = 4 * 1024;
+/// Covers large multi-bar MIDI imports while keeping wire payloads bounded.
+pub const MAX_UI_LAYOUT_MINI_LOCATIONS: usize = 64 * 1024;
 
 /// Generated IDs and canonical kinds are small; explicit caps also keep a
 /// deserialized untrusted record bounded before an editor uses either as a key.
@@ -734,12 +735,14 @@ pub fn visual_layout_with_live_numbers(
         })
         .collect::<Vec<_>>();
     let sliders = within_the_slider_cap(sliders);
+    let mut mini_locations = output.mini_locations;
+    mini_locations.truncate(MAX_UI_LAYOUT_MINI_LOCATIONS);
     let layout = UiLayout::new(
         generation,
         source_revision(source),
         visuals,
         sliders,
-        output.mini_locations,
+        mini_locations,
     )?
     .with_lanes(lanes_in_source(source))?;
     for (index, visual) in layout.visuals.iter().enumerate() {
@@ -2820,6 +2823,16 @@ all(pianoroll)"
                 bytes: MAX_UI_LAYOUT_OPTIONS_BYTES + 1,
             })
         );
+
+        let large_mini = format!(
+            "note(\"{}\").scope()",
+            std::iter::repeat_n("c4", 5_000)
+                .collect::<Vec<_>>()
+                .join(" ")
+        );
+        let large_layout = visual_layout(&large_mini, 1).expect("5000 mini tokens must install");
+        assert_eq!(large_layout.ui_layout.mini_locations.len(), 5_000);
+        assert_eq!(large_layout.ui_layout.visuals.len(), 1);
     }
 
     #[test]

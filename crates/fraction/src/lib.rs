@@ -549,14 +549,34 @@ impl Fraction {
         Self::dyadic(i128::from(n), shift)
     }
 
+    /// Construct a reduced fraction from `(i64, NonZeroU32)` without running GCD.
+    /// Caller guarantees `d > 0`, `gcd(|n|, d) == 1`, and `n == 0 => d == 1`.
+    #[inline(always)]
+    pub fn from_reduced_parts_i64(n: i64, d: NonZeroU32) -> Self {
+        debug_assert!(
+            (n == 0 && d.get() == 1)
+                || (n != 0 && gcd_u64(n.unsigned_abs(), u64::from(d.get())) == 1)
+        );
+        Self {
+            n: i128::from(n),
+            d: NonZeroI128::new(i128::from(d.get())).unwrap_or(ONE_I128),
+        }
+    }
+
+    /// Reduce `n / 2^shift` directly into `(i64, NonZeroU32)` when `shift < 31`.
+    #[inline(always)]
+    pub fn dyadic_i64_parts(n: i64, shift: u32) -> (i64, NonZeroU32) {
+        debug_assert!(shift < 31);
+        let tz = (n | (1i64 << shift)).trailing_zeros();
+        let d = 1u32 << (shift - tz);
+        (n >> tz, NonZeroU32::new(d).unwrap_or(NonZeroU32::MIN))
+    }
+
     /// The reduced cycle time of a 64-bit signed tick for a validated `shift < 63`.
     #[inline(always)]
     pub fn dyadic_i64_small(n: i64, shift: u32) -> Self {
         debug_assert!(shift < 63);
-        if n == 0 {
-            return Self::ZERO;
-        }
-        let tz = n.trailing_zeros().min(shift);
+        let tz = (n | (1i64 << shift)).trailing_zeros();
         from_reduced_i64(n >> tz, 1i64 << (shift - tz))
     }
 
@@ -565,10 +585,7 @@ impl Fraction {
     #[inline(always)]
     pub fn dyadic_i64_in_bounds(n: i64, shift: u32) -> Self {
         debug_assert!(shift < 63);
-        if n == 0 {
-            return Self::ZERO;
-        }
-        let tz = n.trailing_zeros().min(shift);
+        let tz = (n | (1i64 << shift)).trailing_zeros();
         from_reduced_i64(n >> tz, 1i64 << (shift - tz))
     }
 

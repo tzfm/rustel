@@ -98,8 +98,8 @@ fn describe(hap: &Hap) -> String {
     });
     format!(
         "{:?} {:?} {} {:?} scale={:?} edo={:?} definition={:?} tags={:?} log={:?} live={:?} visuals={} lookup={lookup:?}",
-        hap.whole,
-        hap.part,
+        hap.whole(),
+        hap.part(),
         value_without_identities(&hap.value),
         hap.context,
         hap.scale_context(),
@@ -368,7 +368,7 @@ fn a_nested_transform_arrow_plays_what_its_javascript_plays() {
         first.len(),
         4,
         "{:?}",
-        first.iter().map(|hap| hap.whole).collect::<Vec<_>>()
+        first.iter().map(|hap| hap.whole()).collect::<Vec<_>>()
     );
     let second = of_cycle(1);
     assert_eq!(second.len(), 5);
@@ -376,7 +376,7 @@ fn a_nested_transform_arrow_plays_what_its_javascript_plays() {
     assert_eq!(
         second
             .iter()
-            .filter(|hap| hap.part.end - hap.part.begin == Fraction::new(1, 8))
+            .filter(|hap| hap.part().end - hap.part().begin == Fraction::new(1, 8))
             .count(),
         2
     );

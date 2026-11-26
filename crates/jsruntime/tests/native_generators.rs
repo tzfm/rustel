@@ -40,7 +40,7 @@ fn euclid_extends_extra_pulses_and_holds_negative_steps() {
         let actual = haps
             .iter()
             .map(|hap| {
-                let whole = hap.whole.expect("rhythm event");
+                let whole = hap.whole().expect("rhythm event");
                 (whole.begin, whole.end, hap.value.clone())
             })
             .collect::<Vec<_>>();
@@ -77,7 +77,7 @@ fn euclid_extends_extra_pulses_and_holds_negative_steps() {
         let spans = haps
             .iter()
             .map(|hap| {
-                let whole = hap.whole.expect("rhythm event");
+                let whole = hap.whole().expect("rhythm event");
                 (whole.begin, whole.end)
             })
             .collect::<Vec<_>>();
@@ -96,8 +96,11 @@ fn euclid_extends_extra_pulses_and_holds_negative_steps() {
     ] {
         let haps = evaluate(&runtime, source);
         assert_eq!(haps.len(), 4, "{source}");
-        assert_eq!(haps[0].whole.expect("held gap").begin, Fraction::new(-1, 4));
-        assert_eq!(haps[0].whole.expect("held gap").end, Fraction::new(1, 4));
+        assert_eq!(
+            haps[0].whole().expect("held gap").begin,
+            Fraction::new(-1, 4)
+        );
+        assert_eq!(haps[0].whole().expect("held gap").end, Fraction::new(1, 4));
     }
 }
 
@@ -114,7 +117,7 @@ fn euclid_legato_rotation_keeps_source_notes_in_their_cycles() {
     let onsets = haps
         .iter()
         .filter(|hap| hap.has_onset())
-        .map(|hap| (hap.part.begin, hap.value.clone()))
+        .map(|hap| (hap.part().begin, hap.value.clone()))
         .collect::<Vec<_>>();
     let expected = ["eb4", "f4", "g4", "d4"]
         .into_iter()
@@ -132,11 +135,11 @@ fn euclid_legato_rotation_keeps_source_notes_in_their_cycles() {
     let boundary = haps
         .iter()
         .filter(|hap| {
-            hap.whole.is_some_and(|whole| {
+            hap.whole().is_some_and(|whole| {
                 whole.begin == Fraction::new(7, 8) && whole.end == Fraction::new(19, 16)
             })
         })
-        .map(|hap| (hap.part.begin, hap.part.end, hap.value.clone()))
+        .map(|hap| (hap.part().begin, hap.part().end, hap.value.clone()))
         .collect::<Vec<_>>();
     assert_eq!(
         boundary,
@@ -176,7 +179,7 @@ fn aligned_stacks_reify_strings_and_keep_short_lane_placement() {
                     |hap| matches!(&hap.value, Value::Str(value) if &**value == "x" || &**value == "y"),
                 )
                 .map(|hap| {
-                    let whole = hap.whole.expect("stack event");
+                    let whole = hap.whole().expect("stack event");
                     (whole.begin, whole.end)
                 })
                 .collect::<Vec<_>>();
@@ -205,7 +208,7 @@ fn repeat_stack_keeps_each_lanes_step_rate_across_cycles() {
     let short = haps
         .into_iter()
         .filter(|hap| matches!(&hap.value, Value::Str(value) if &**value == "x" || &**value == "y"))
-        .map(|hap| (hap.whole.expect("stack event").begin, hap.value))
+        .map(|hap| (hap.whole().expect("stack event").begin, hap.value))
         .collect::<Vec<_>>();
     assert_eq!(
         short,
@@ -242,7 +245,7 @@ fn degrade_by_with_uses_chooser_values_and_a_strict_threshold() {
     assert_eq!(sampled.len(), 1);
     assert_eq!(sampled[0].value, Value::Str("d".into()));
     assert_eq!(
-        sampled[0].whole.expect("source event").begin,
+        sampled[0].whole().expect("source event").begin,
         Fraction::new(3, 4)
     );
     assert_eq!(
@@ -296,7 +299,7 @@ fn numeric_generators_keep_their_values_and_timing() {
     );
     assert_eq!(
         base.iter()
-            .map(|hap| hap.whole.expect("whole").duration())
+            .map(|hap| hap.whole().expect("whole").duration())
             .collect::<Vec<_>>(),
         [Fraction::new(1, 2), Fraction::new(1, 2)]
     );

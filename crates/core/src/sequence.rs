@@ -396,7 +396,33 @@ pub(crate) enum CompactGrid {
     /// Inline 1-step uncut grid carrying a non-zero `u16` value index and
     /// 0..=2 locations with zero heap allocation.
     OneStepVal([u8; 12]),
+    /// Allocation-free uniform `count`-step (`1..=64`) zero-location grid
+    /// (`ticks = count`, `steps[i] = (i, i + 1, i, 0)`), backed by a `const`
+    /// slice in `.rodata`.
+    Uniform(u8),
 }
+
+const MAX_UNIFORM_GRID_LEN: usize = 64;
+
+const UNIFORM_GRID_STEPS: [SmallGridStep; MAX_UNIFORM_GRID_LEN] = {
+    let mut arr = [SmallGridStep {
+        part_begin: 0,
+        part_end: 0,
+        value: 0,
+        loc: 0,
+    }; MAX_UNIFORM_GRID_LEN];
+    let mut i = 0usize;
+    while i < MAX_UNIFORM_GRID_LEN {
+        arr[i] = SmallGridStep {
+            part_begin: i as u16,
+            part_end: (i + 1) as u16,
+            value: i as u16,
+            loc: 0,
+        };
+        i += 1;
+    }
+    arr
+};
 
 const MAX_INLINE_GRID_LEN: usize = 16;
 
@@ -493,6 +519,12 @@ impl CompactGrid {
                     $(Self::$n(g) => (g.ticks, g.base, &g.steps[..], None),)+
                     $(Self::$p(g) => (g.ticks, g.base, &g.steps[..], Some(&g.packed[..])),)+
                     Self::PMany(g) => (g.ticks, g.base, &g.steps[..], Some(&g.packed[..])),
+                    Self::Uniform(n) => (
+                        NonZeroU32::new(u32::from(*n)).expect("non-zero uniform grid"),
+                        Grid::SMALL,
+                        &UNIFORM_GRID_STEPS[..usize::from(*n)],
+                        None,
+                    ),
                     Self::OneStep(_) | Self::OneStepVal(_) => {
                         unreachable!("inline one-step grid handled before parts()")
                     }
@@ -503,6 +535,14 @@ impl CompactGrid {
             plain: [N1, N2, N3, N4, N5, N6, N7, N8, N9, N10, N11, N12, N13, N14, N15, N16],
             packed: [P1, P2, P3, P4, P5, P6, P7, P8, P9, P10, P11, P12, P13, P14, P15, P16]
         )
+    }
+
+    /// Out-of-line unpack of `(ticks, base, steps)` for heap-backed compact
+    /// grids so hot window loops avoid inlining a 33-arm jump table.
+    #[inline(never)]
+    fn small_parts(&self) -> (u32, u32, &[SmallGridStep]) {
+        let (ticks, base, steps, _) = self.parts();
+        (ticks.get(), base, steps)
     }
 
     #[inline(always)]
@@ -520,6 +560,10 @@ impl CompactGrid {
                         0xfeu8.hash(state);
                         buf.hash(state);
                     }
+                    Self::Uniform(n) => {
+                        0xfdu8.hash(state);
+                        n.hash(state);
+                    }
                 }
             };
         }
@@ -535,7 +579,7 @@ impl CompactGrid {
             ($($var:ident),+) => {
                 match self {
                     $(Self::$var(a) => Arc::as_ptr(a) as usize,)+
-                    Self::OneStep(_) | Self::OneStepVal(_) => 0,
+                    Self::OneStep(_) | Self::OneStepVal(_) | Self::Uniform(_) => 0,
                 }
             };
         }
@@ -553,6 +597,7 @@ impl CompactGrid {
                     $((Self::$var(a), Self::$var(b)) => Arc::ptr_eq(a, b),)+
                     (Self::OneStep(a), Self::OneStep(b)) => a == b,
                     (Self::OneStepVal(a), Self::OneStepVal(b)) => a == b,
+                    (Self::Uniform(a), Self::Uniform(b)) => a == b,
                     _ => false,
                 }
             };
@@ -579,7 +624,7 @@ impl CompactGrid {
                         let g = Arc::get_mut(g)?;
                         Some((&mut g.ticks, &mut g.base, &mut g.steps[..]))
                     }
-                    Self::OneStep(_) | Self::OneStepVal(_) => None,
+                    Self::OneStep(_) | Self::OneStepVal(_) | Self::Uniform(_) => None,
                 }
             };
         }
@@ -1035,6 +1080,13 @@ impl Listing {
                     rare: None,
                 }
             }
+            Self::CompactGrid(CompactGrid::Uniform(n)) => GridView {
+                ticks: NonZeroU32::new(u32::from(*n)).expect("non-zero uniform grid"),
+                base: Grid::SMALL,
+                steps: GridStepsRef::Small(&UNIFORM_GRID_STEPS[..usize::from(*n)]),
+                packed: PackedRunsRef::None,
+                rare: None,
+            },
             Self::CompactGrid(grid) => {
                 let (ticks, base, steps, packed) = grid.parts();
                 GridView {
@@ -1053,10 +1105,104 @@ impl Listing {
         Some(f(view))
     }
 
+    /// Direct register-friendly unpack for uncut small grids, bypassing
+    /// [`GridView`] stack copies and the 33-arm `CompactGrid::parts` jump table
+    /// on the hot window query path.
+    #[inline(always)]
+    fn fast_uncut_small_grid(&self) -> Option<FastSmallGrid<'_>> {
+        match self {
+            Self::CompactGrid(CompactGrid::OneStep(buf)) => {
+                let extra = u32::from_ne_bytes([buf[8], buf[9], buf[10], buf[11]]);
+                if extra != 0 {
+                    return None;
+                }
+                let base_ticks = u32::from_ne_bytes([buf[0], buf[1], buf[2], buf[3]]);
+                let span_loc = u32::from_ne_bytes([buf[4], buf[5], buf[6], buf[7]]);
+                Some(FastSmallGrid::OneStep {
+                    ticks: base_ticks >> 25,
+                    base: base_ticks & 0x00ff_ffff,
+                    part_begin: (span_loc & 0xff) as u16,
+                    part_end: ((span_loc >> 8) & 0xff) as u16,
+                    value: 0,
+                    loc: (span_loc >> 16) as u16,
+                })
+            }
+            Self::CompactGrid(CompactGrid::OneStepVal(buf)) => {
+                let loc1 = u16::from_ne_bytes([buf[10], buf[11]]);
+                if loc1 != 0 {
+                    return None;
+                }
+                let base_ticks = u32::from_ne_bytes([buf[0], buf[1], buf[2], buf[3]]);
+                let span_loc = u32::from_ne_bytes([buf[4], buf[5], buf[6], buf[7]]);
+                Some(FastSmallGrid::OneStep {
+                    ticks: base_ticks >> 25,
+                    base: base_ticks & 0x00ff_ffff,
+                    part_begin: (span_loc & 0xff) as u16,
+                    part_end: ((span_loc >> 8) & 0xff) as u16,
+                    value: u16::from_ne_bytes([buf[8], buf[9]]),
+                    loc: (span_loc >> 16) as u16,
+                })
+            }
+            Self::CompactGrid(CompactGrid::Uniform(n)) => {
+                Some(FastSmallGrid::Uniform { count: *n })
+            }
+            Self::CompactGrid(CompactGrid::N2(g)) => Some(FastSmallGrid::Slice {
+                ticks: g.ticks.get(),
+                base: g.base & !Grid::SMALL,
+                steps: &g.steps,
+            }),
+            Self::CompactGrid(CompactGrid::N3(g)) => Some(FastSmallGrid::Slice {
+                ticks: g.ticks.get(),
+                base: g.base & !Grid::SMALL,
+                steps: &g.steps,
+            }),
+            Self::CompactGrid(CompactGrid::N4(g)) => Some(FastSmallGrid::Slice {
+                ticks: g.ticks.get(),
+                base: g.base & !Grid::SMALL,
+                steps: &g.steps,
+            }),
+            Self::CompactGrid(CompactGrid::N6(g)) => Some(FastSmallGrid::Slice {
+                ticks: g.ticks.get(),
+                base: g.base & !Grid::SMALL,
+                steps: &g.steps,
+            }),
+            Self::CompactGrid(CompactGrid::N8(g)) => Some(FastSmallGrid::Slice {
+                ticks: g.ticks.get(),
+                base: g.base & !Grid::SMALL,
+                steps: &g.steps,
+            }),
+            Self::CompactGrid(grid) => {
+                let (ticks, base, steps) = grid.small_parts();
+                Some(FastSmallGrid::Slice {
+                    ticks,
+                    base: base & !Grid::SMALL,
+                    steps,
+                })
+            }
+            Self::Grid(grid) => {
+                let has_rare = grid
+                    .side
+                    .as_deref()
+                    .and_then(|s| s.rare.as_deref())
+                    .is_some();
+                if has_rare {
+                    return None;
+                }
+                Some(FastSmallGrid::Slice {
+                    ticks: grid.ticks.get(),
+                    base: grid.base & !Grid::SMALL,
+                    steps: &grid.small_steps,
+                })
+            }
+            Self::Places(_) => None,
+        }
+    }
+
     fn len(&self) -> usize {
         match self {
             Self::Places(listed) => listed.places.len(),
             Self::CompactGrid(CompactGrid::OneStep(_) | CompactGrid::OneStepVal(_)) => 1,
+            Self::CompactGrid(CompactGrid::Uniform(n)) => usize::from(*n),
             Self::CompactGrid(grid) => grid.parts().2.len(),
             Self::Grid(grid) => grid.steps_ref().len(),
         }
@@ -1110,6 +1256,7 @@ impl Listing {
             Self::CompactGrid(CompactGrid::OneStepVal(buf)) => {
                 u32::from(u16::from_ne_bytes([buf[8], buf[9]]))
             }
+            Self::CompactGrid(CompactGrid::Uniform(_)) => index as u32,
             Self::CompactGrid(grid) => u32::from(grid.parts().2[index].value),
             Self::Grid(grid) => grid.steps_ref().get(index).value,
         }
@@ -1142,10 +1289,31 @@ impl Listing {
             Self::CompactGrid(CompactGrid::OneStep(buf) | CompactGrid::OneStepVal(buf)) => {
                 u32::from_ne_bytes([buf[0], buf[1], buf[2], buf[3]]) & (1 << 24) != 0
             }
+            Self::CompactGrid(CompactGrid::Uniform(_)) => true,
             Self::CompactGrid(grid) => grid.parts().1 & Grid::SMALL != 0,
             Self::Grid(grid) => grid.small_denominators(),
         }
     }
+}
+
+/// Fast unpacked representation of an uncut small grid for hot window queries.
+pub(super) enum FastSmallGrid<'a> {
+    Uniform {
+        count: u8,
+    },
+    OneStep {
+        ticks: u32,
+        base: u32,
+        part_begin: u16,
+        part_end: u16,
+        value: u16,
+        loc: u16,
+    },
+    Slice {
+        ticks: u32,
+        base: u32,
+        steps: &'a [SmallGridStep],
+    },
 }
 
 /// The places of one layer and whether their times fit a restart at a small offset.
@@ -1720,6 +1888,11 @@ impl SpareRare {
     }
 
     #[inline]
+    fn has_cuts(&self) -> bool {
+        self.cuts().len() != 0
+    }
+
+    #[inline]
     fn wide(&self) -> &[Locations] {
         match self {
             Self::SmallCuts(_) | Self::WideCuts(_) | Self::WideSteps(_) => &[],
@@ -1794,7 +1967,7 @@ impl Grid {
                 wide.push(index);
                 PackedLoc(PackedLoc::WIDE_MASK | at)
             }
-            len => {
+            len if len <= 4 => {
                 let mut run = SmallCopyBuf::<u32, 8>::new(0);
                 let mut all_fit = true;
                 for i in 0..len {
@@ -1815,6 +1988,14 @@ impl Grid {
                         return PackedLoc(PackedLoc::SPARE | start as u32);
                     }
                 }
+                let at = wide.len() as u32;
+                wide.push(index);
+                PackedLoc(PackedLoc::WIDE_MASK | at)
+            }
+            _ => {
+                // 5+ locations would spill out of `Locations`'s 4 inline slots on
+                // every query; pre-store one shared `Locations` in `wide` so queries
+                // only bump an `Arc` refcount with zero allocations.
                 let at = wide.len() as u32;
                 wide.push(index);
                 PackedLoc(PackedLoc::WIDE_MASK | at)
@@ -2590,6 +2771,13 @@ const LAYER_MARK_BIT_MASK: u16 = 0x3f;
 /// Set when `self.values` is known to contain zero `Value::Object(_)` entries,
 /// letting post-eval deduplication skip scanning/branching over step values.
 const LAYER_VALUES_NO_OBJECTS: u16 = 1 << 9;
+/// Low 10 bits of `direct_flags` hold direct-read and bloom metadata.
+const LAYER_DIRECT_BITS: u16 = 0x03ff;
+/// Bits 10..16 store a per-cycle reverse-emission mask for `Order::Graph`
+/// (unsorted `query_arc`) when multi-step `rev()` / `every(n, rev)` folds
+/// into a sorted `Grid`. Ignored by `Order::Sorted`.
+const LAYER_REV_SHIFT: u32 = 10;
+const LAYER_REV_MASK: u16 = 0xfc00;
 
 /// One layer of a sequence node: the places of its steps, and each value
 /// of them once. Each hap holds a plain value and its locations: a fold
@@ -2680,6 +2868,54 @@ impl Maker<'_> {
         }
     }
 
+    #[inline(always)]
+    pub(super) fn make_grid_small_context(
+        &self,
+        grid: GridView<'_>,
+        index: usize,
+        loc: u16,
+    ) -> Locations {
+        if let Some(contexts) = self.contexts {
+            contexts[index].clone()
+        } else if (loc & SmallGridStep::SPARE) == 0
+            && self.loc_dress.is_none_or(|d| d.tail.is_none())
+        {
+            if loc == 0 {
+                match self.loc_dress {
+                    Some(d) if d.before_packed[0] != 0 => {
+                        Locations::from_packed([d.before_packed[0], d.before_packed[1], 0, 0])
+                    }
+                    _ => Locations::new(),
+                }
+            } else {
+                let begin =
+                    (grid.base & !Grid::SMALL) + u32::from(loc >> SmallGridStep::LENGTH_BITS);
+                let length = u32::from((loc & SmallGridStep::LENGTH_MASK) - 1);
+                if let Some(step_packed) = Locations::pack_small(begin, length) {
+                    match self.loc_dress {
+                        Some(d) if d.before_packed[0] != 0 => {
+                            if d.before_packed[1] != 0 {
+                                Locations::from_packed([
+                                    d.before_packed[0],
+                                    d.before_packed[1],
+                                    step_packed,
+                                    0,
+                                ])
+                            } else {
+                                Locations::from_packed([d.before_packed[0], step_packed, 0, 0])
+                            }
+                        }
+                        _ => Locations::from_packed([step_packed, 0, 0, 0]),
+                    }
+                } else {
+                    self.make_grid_context_slow(grid, index)
+                }
+            }
+        } else {
+            self.make_grid_context_slow(grid, index)
+        }
+    }
+
     /// Like [`Self::make_grid`], reading a pre-fetched `SmallGridStep::loc`
     /// directly without re-matching `GridStepsRef::Small`.
     #[inline(always)]
@@ -2696,59 +2932,7 @@ impl Maker<'_> {
             .values
             .get(value as usize)
             .expect("a step holds a value of its layer");
-        let context = if let Some(contexts) = self.contexts {
-            contexts[index].clone()
-        } else if (loc & SmallGridStep::SPARE) == 0
-            && self.loc_dress.is_none_or(|d| d.tail.is_none())
-        {
-            if loc == 0 {
-                match self.loc_dress {
-                    Some(d) if d.before_packed[0] != 0 => {
-                        let p0 = d.before_packed[0] - 1;
-                        if d.before_packed[1] != 0 {
-                            Locations::from_packed_parts(
-                                2,
-                                p0,
-                                u64::from(d.before_packed[1] - 1),
-                                0,
-                                0,
-                            )
-                        } else {
-                            Locations::from_packed_parts(1, p0, 0, 0, 0)
-                        }
-                    }
-                    _ => Locations::new(),
-                }
-            } else {
-                let begin =
-                    (grid.base & !Grid::SMALL) + u32::from(loc >> SmallGridStep::LENGTH_BITS);
-                let length = u32::from((loc & SmallGridStep::LENGTH_MASK) - 1);
-                if let Some(step_packed) = Locations::pack_small(begin, length) {
-                    match self.loc_dress {
-                        Some(d) if d.before_packed[0] != 0 => {
-                            let p0 = d.before_packed[0] - 1;
-                            if d.before_packed[1] != 0 {
-                                Locations::from_packed_parts(
-                                    3,
-                                    p0,
-                                    u64::from(d.before_packed[1] - 1)
-                                        | (u64::from(step_packed) << 32),
-                                    0,
-                                    0,
-                                )
-                            } else {
-                                Locations::from_packed_parts(2, p0, u64::from(step_packed), 0, 0)
-                            }
-                        }
-                        _ => Locations::from_packed_parts(1, step_packed, 0, 0, 0),
-                    }
-                } else {
-                    self.make_grid_context_slow(grid, index)
-                }
-            }
-        } else {
-            self.make_grid_context_slow(grid, index)
-        };
+        let context = self.make_grid_small_context(grid, index, loc);
         Hap::of_sequence(whole, part, value, context, self.keys.clone())
     }
 
@@ -3164,7 +3348,7 @@ impl Layer {
         }
         match &mut self.steps {
             Steps::Listed(Listing::CompactGrid(
-                CompactGrid::OneStep(_) | CompactGrid::OneStepVal(_),
+                CompactGrid::OneStep(_) | CompactGrid::OneStepVal(_) | CompactGrid::Uniform(_),
             )) => {}
             Steps::Listed(Listing::CompactGrid(g)) => {
                 deduper.dedup_compact_grid_mut(g);
@@ -3194,7 +3378,7 @@ impl Layer {
         };
         let new_steps = match &self.steps {
             Steps::Listed(Listing::CompactGrid(
-                CompactGrid::OneStep(_) | CompactGrid::OneStepVal(_),
+                CompactGrid::OneStep(_) | CompactGrid::OneStepVal(_) | CompactGrid::Uniform(_),
             )) => None,
             Steps::Listed(Listing::CompactGrid(g)) => {
                 let c = deduper.dedup_compact_grid(g);
@@ -3437,6 +3621,22 @@ impl Layer {
         self.refresh_direct();
     }
 
+    #[inline(always)]
+    pub(super) fn rev_mask(&self) -> u8 {
+        ((self.direct_flags & LAYER_REV_MASK) >> LAYER_REV_SHIFT) as u8
+    }
+
+    #[inline(always)]
+    pub(super) fn has_rev_order(&self) -> bool {
+        self.direct_flags & LAYER_REV_MASK != 0
+    }
+
+    #[inline(always)]
+    pub(super) fn set_rev_mask(&mut self, mask: u8) {
+        self.direct_flags =
+            (self.direct_flags & LAYER_DIRECT_BITS) | (u16::from(mask & 0x3f) << LAYER_REV_SHIFT);
+    }
+
     /// Recompute direct-read flags and attach or strip the rare lazy
     /// `Steps::Cached` cell whenever `steps`, `values`, `named_id`, or `dress`
     /// changes.
@@ -3454,15 +3654,17 @@ impl Layer {
     }
 
     fn refresh_direct_inner(&mut self, known_no_objects: bool) {
+        let rev = self.direct_flags & LAYER_REV_MASK;
         if self.dress.is_none() {
             if self.named_id == 0 {
                 let no_objects = known_no_objects
                     || (!self.maps() && self.values.iter().all(|v| !matches!(v, Value::Object(_))));
-                self.direct_flags = if no_objects {
-                    LAYER_VALUES_NO_OBJECTS
-                } else {
-                    0
-                };
+                self.direct_flags = rev
+                    | if no_objects {
+                        LAYER_VALUES_NO_OBJECTS
+                    } else {
+                        0
+                    };
                 self.steps.strip_cache();
                 return;
             }
@@ -3489,7 +3691,8 @@ impl Layer {
                 };
                 if all_one {
                     let mark_bit = crate::controls::builtin_mark_bit_by_id(self.named_id);
-                    self.direct_flags = LAYER_DIRECT_KEYED
+                    self.direct_flags = rev
+                        | LAYER_DIRECT_KEYED
                         | if no_objects {
                             LAYER_VALUES_NO_OBJECTS
                         } else {
@@ -3500,7 +3703,7 @@ impl Layer {
                     return;
                 }
             }
-            self.direct_flags = 0;
+            self.direct_flags = rev;
             self.steps.ensure_fresh_cache();
             return;
         }
@@ -3510,11 +3713,12 @@ impl Layer {
         if !needs_values && !spills {
             let no_objects = known_no_objects
                 || (!self.maps() && self.values.iter().all(|v| !matches!(v, Value::Object(_))));
-            self.direct_flags = if no_objects {
-                LAYER_VALUES_NO_OBJECTS
-            } else {
-                0
-            };
+            self.direct_flags = rev
+                | if no_objects {
+                    LAYER_VALUES_NO_OBJECTS
+                } else {
+                    0
+                };
             self.steps.strip_cache();
             return;
         }
@@ -3562,7 +3766,8 @@ impl Layer {
                             !drops && disjoint && tail.all_values_data()
                         };
                         if tail_ok {
-                            self.direct_flags = LAYER_DIRECT_KEYED
+                            self.direct_flags = rev
+                                | LAYER_DIRECT_KEYED
                                 | if dress.has_set_map() {
                                     LAYER_DIRECT_MADE
                                 } else {
@@ -3607,13 +3812,13 @@ impl Layer {
                         })
                     })
                 {
-                    self.direct_flags = LAYER_DIRECT_SPLIT | LAYER_DIRECT_MADE;
+                    self.direct_flags = rev | LAYER_DIRECT_SPLIT | LAYER_DIRECT_MADE;
                     self.steps.strip_cache();
                     return;
                 }
             }
         }
-        self.direct_flags = 0;
+        self.direct_flags = rev;
         self.steps.ensure_fresh_cache();
     }
 
@@ -3882,13 +4087,32 @@ impl Layer {
         self.refresh_direct();
     }
 
+    /// Small reduced `(numer, denom)` period when stored inline (`denom != 0`).
+    #[inline(always)]
+    fn small_period_parts(&self) -> Option<(i64, i64)> {
+        let denom = self.period_denom_flags & LAYER_DENOM_MASK;
+        (denom != 0).then(|| (i64::from(self.period_numer), i64::from(denom)))
+    }
+
+    /// Direct register-friendly view of an uncached, uncut small grid when
+    /// `self.steps` is directly `Steps::Listed(_)`.
+    #[inline(always)]
+    fn listing_fast_uncut(&self) -> Option<FastSmallGrid<'_>> {
+        match &self.steps {
+            Steps::Listed(listing) => listing.fast_uncut_small_grid(),
+            _ => None,
+        }
+    }
+
     #[inline]
     fn period(&self) -> Fraction {
         let denom = self.period_denom_flags & LAYER_DENOM_MASK;
         if denom == 1 {
             Fraction::int(i128::from(self.period_numer))
-        } else if denom != 0 {
-            Fraction::new(i128::from(self.period_numer), i128::from(denom))
+        } else if let Some(nz) = NonZeroU32::new(u32::from(denom)) {
+            // `pack_period` stores the already-reduced numerator and denominator
+            // of a `Fraction`, so reconstructing it requires no `i128` GCD.
+            Fraction::from_reduced_parts_i64(i64::from(self.period_numer), nz)
         } else {
             let mut cur = &self.steps;
             loop {
@@ -3918,12 +4142,19 @@ impl Layer {
 
     /// Change the dress of this layer, which then shares it with no other.
     fn change_dress(&mut self, change: impl FnOnce(&mut Dress)) {
-        let mut dress = match self.dress.take() {
-            Some(dress) => Arc::unwrap_or_clone(dress),
-            None => Dress::default(),
-        };
-        change(&mut dress);
-        self.dress = (!dress.is_bare()).then(|| dress.into_arc());
+        if let Some(arc) = &mut self.dress {
+            let dress = Arc::make_mut(arc);
+            change(dress);
+            if dress.is_bare() {
+                self.dress = None;
+            }
+        } else {
+            let mut dress = Dress::default();
+            change(&mut dress);
+            if !dress.is_bare() {
+                self.dress = Some(dress.into_arc());
+            }
+        }
         self.refresh_direct();
     }
 
@@ -4009,6 +4240,89 @@ impl Layer {
         self
     }
 
+    /// Fast variant of [`Self::valued`] when the caller already built `values`
+    /// purely from data-only control maps (`Value::Object`).
+    fn valued_data_maps(mut self, values: Arc<[Value]>) -> Self {
+        self.set_data(true);
+        self.set_maps(true);
+        self.values = values;
+        self.named_id = 0;
+        if self.dress.is_some() {
+            self.change_dress(|dress| {
+                dress.clear_custom_named();
+                dress.clear_set();
+            });
+        } else {
+            self.direct_flags &= LAYER_REV_MASK;
+            self.steps.strip_cache();
+        }
+        self
+    }
+
+    /// Eagerly materialize compound multi-name control values (`s` on `"oh:2"`)
+    /// into compact `BuiltinMap` entries when the layer has few distinct data
+    /// values, eliminating lazy first-query `Table` caches and duplicate lists.
+    fn try_materialize_compound_named(&mut self, spec: &crate::controls::ControlSpec) -> bool {
+        if spec.names.len() <= 1
+            || spec.names.len() > 8
+            || self.values.is_empty()
+            || self.values.len() > 4
+            || !self.is_data()
+            || self.dress.as_deref().is_some_and(Dress::has_set)
+            || !self.values.iter().any(|v| matches!(v, Value::List(_)))
+            || self.values.iter().any(|v| matches!(v, Value::Object(_)))
+        {
+            return false;
+        }
+        let mut packed_names = [0u16; 8];
+        for (slot, name) in packed_names[..spec.names.len()]
+            .iter_mut()
+            .zip(spec.names.iter())
+        {
+            let p = crate::controls::pack_builtin_key_str(name);
+            if p == 0 {
+                return false;
+            }
+            *slot = p;
+        }
+        let built: Arc<[Value]> = self
+            .values
+            .iter()
+            .map(|value| {
+                let mut out_keys = [0u16; 8];
+                let mut out_vals = [const { Value::Undefined }; 8];
+                let mut len = 0usize;
+                if let Value::List(list) = value {
+                    for (&pk, elem) in packed_names[..spec.names.len()].iter().zip(list.iter()) {
+                        if let Some(pos) = out_keys[..len].iter().position(|&k| k == pk) {
+                            out_vals[pos] = elem.clone();
+                        } else {
+                            out_keys[len] = pk;
+                            out_vals[len] = elem.clone();
+                            len += 1;
+                        }
+                    }
+                } else {
+                    out_keys[0] = packed_names[0];
+                    out_vals[0] = value.clone();
+                    len = 1;
+                }
+                Value::Object(crate::value::OrderedMap::from_made_builtin(
+                    crate::value::make_builtin_arc_owned(&out_keys[..len], &mut out_vals[..len]),
+                ))
+            })
+            .collect();
+        self.values = built;
+        self.named_id = 0;
+        self.set_maps(true);
+        if self.dress.as_deref().is_some_and(Dress::has_custom_name) {
+            self.change_dress(Dress::clear_custom_named);
+        } else {
+            self.refresh_direct();
+        }
+        true
+    }
+
     /// Name each value of these layers by `spec`, as the
     /// map of the control over its haps gives them. No value is made now:
     /// a chain of controls after the name makes each value one time, at
@@ -4027,6 +4341,9 @@ impl Layer {
                 .iter()
                 .map(|layer| {
                     let mut next = layer.clone();
+                    if next.try_materialize_compound_named(spec) {
+                        return next;
+                    }
                     next.named_id = id;
                     next.set_maps(true);
                     if next.dress.as_deref().is_some_and(Dress::has_custom_name) {
@@ -4073,6 +4390,9 @@ impl Layer {
         };
         if id != 0 {
             for layer in layers {
+                if layer.try_materialize_compound_named(spec) {
+                    continue;
+                }
                 layer.named_id = id;
                 layer.set_maps(true);
                 if layer.dress.as_deref().is_some_and(Dress::has_custom_name) {
@@ -4668,7 +4988,7 @@ impl Layer {
             (None, None) => true,
             _ => self.dress().same(other.dress(), &same_value),
         };
-        if !same_dress || !self.same_period(other) {
+        if !same_dress || !self.same_period(other) || self.rev_mask() != other.rev_mask() {
             return false;
         }
         let (own, others) = match (self.steps.inner(), other.steps.inner()) {
@@ -5811,6 +6131,134 @@ pub fn sequence_of_ticks(
     )?))
 }
 
+/// Build a single plain non-object layer directly from integer grid ticks and a
+/// compact deduplicated location table (up to 16 entries, each 0..=4 spans),
+/// avoiding `Fraction` GCDs and per-step `Locations` construction.
+fn layer_of_indexed_ticks_plain(
+    period: Fraction,
+    ticks: NonZeroU32,
+    values: Arc<[Value]>,
+    in_cycles: bool,
+    raw_steps: &[(u16, u16, u16, u8)],
+    loc_table: &[&[(usize, usize)]],
+) -> Option<Layer> {
+    if raw_steps.is_empty() || loc_table.len() > 16 {
+        return None;
+    }
+    let max_tick = u16::try_from(grid_max_tick(period, ticks)?).unwrap_or(u16::MAX);
+    let vlen = values.len();
+    let mut base = u32::MAX;
+    for &locs in loc_table {
+        if locs.len() > 4 {
+            return None;
+        }
+        for &(b, e) in locs {
+            let b32 = u32::try_from(b).ok()?;
+            let _ = e.checked_sub(b)?;
+            base = base.min(b32);
+        }
+    }
+    let base = if base == u32::MAX { 0 } else { base };
+    if base & Grid::SMALL != 0 {
+        return None;
+    }
+    let mut packed_runs = PackedRunsBuilder::new();
+    let mut packed_locs = [PackedLoc(0); 16];
+    for (idx, &locs) in loc_table.iter().enumerate() {
+        packed_locs[idx] = match locs.len() {
+            0 => PackedLoc(0),
+            1 => {
+                let (b, e) = locs[0];
+                let len = u32::try_from(e - b).ok()?;
+                PackedLoc::range_raw(base, b as u32, len)?
+            }
+            n => {
+                let mut run = [0u32; 4];
+                for (k, &(b, e)) in locs.iter().enumerate() {
+                    let len = u32::try_from(e - b).ok()?;
+                    run[k] = PackedLoc::range_raw(base, b as u32, len)?.0;
+                }
+                run[n - 1] |= PackedLoc::SPARE;
+                let start = packed_runs.intern_run(&run[..n])?;
+                PackedLoc(PackedLoc::SPARE | start as u32)
+            }
+        };
+    }
+    let mut prev_begin = 0u16;
+    let mut prev_end = 0u16;
+    for &(pb, pe, val, loc_idx) in raw_steps {
+        if pb >= pe
+            || pe > max_tick
+            || prev_begin > pb
+            || prev_end > pe
+            || usize::from(val) >= vlen
+            || usize::from(loc_idx) >= loc_table.len()
+        {
+            return None;
+        }
+        prev_begin = pb;
+        prev_end = pe;
+    }
+    let steps = GridSteps::build(raw_steps.len(), |index| {
+        let (pb, pe, val, loc_idx) = raw_steps[index];
+        Some(GridStep {
+            part_begin: u32::from(pb),
+            part_end: u32::from(pe),
+            value: u32::from(val),
+            loc: packed_locs[usize::from(loc_idx)],
+        })
+    })?;
+    let (steps, rare) = match steps {
+        GridSteps::Wide(wide_steps) => (
+            GridSteps::Small(Box::from([])),
+            Some(Box::new(SpareRare::WideSteps(wide_steps))),
+        ),
+        other => (other, None),
+    };
+    let packed = if packed_runs.is_empty() {
+        PackedRunsInput::None
+    } else if rare.is_none()
+        && let Some(small) = try_pack_runs_u16(packed_runs.as_slice())
+    {
+        PackedRunsInput::Small(small)
+    } else {
+        PackedRunsInput::Wide(packed_runs.into_boxed_slice())
+    };
+    let listing = Listing::from_parts(ticks, base | Grid::SMALL, steps, packed, rare);
+    debug_assert!(
+        values
+            .iter()
+            .all(|v| v.is_data(0) && !matches!(v, Value::Object(_)))
+    );
+    Some(Layer::holding_classified(
+        period,
+        Steps::Listed(listing),
+        in_cycles,
+        values,
+        true,
+        false,
+        true,
+    ))
+}
+
+/// Fast plain-data sequence constructor from integer grid ticks and a small
+/// deduplicated location table (up to 16 entries, each 0..=4 spans).
+pub fn sequence_of_indexed_ticks_plain(
+    period: Fraction,
+    ticks: NonZeroU32,
+    values: Arc<[Value]>,
+    in_cycles: bool,
+    raw_steps: &[(u16, u16, u16, u8)],
+    loc_table: &[&[(usize, usize)]],
+) -> Option<Pattern> {
+    if raw_steps.is_empty() {
+        return Some(silence());
+    }
+    Some(node_of_one_sound(layer_of_indexed_ticks_plain(
+        period, ticks, values, in_cycles, raw_steps, loc_table,
+    )?))
+}
+
 /// Fast variant of [`sequence_of_ticks`] when the caller guarantees every
 /// value is plain non-object data (e.g. mini-notation `Value::Str`/`Value::F64`).
 pub fn sequence_of_ticks_plain(
@@ -6095,6 +6543,27 @@ impl SequenceBuilder {
         let Some(layer) = layer_of_ticks_classified(
             period, ticks, values, in_cycles, raw_steps, true, false, true,
         ) else {
+            return false;
+        };
+        self.push_layer(layer);
+        true
+    }
+
+    pub fn push_indexed_ticks_plain(
+        &mut self,
+        period: Fraction,
+        ticks: NonZeroU32,
+        values: Arc<[Value]>,
+        in_cycles: bool,
+        raw_steps: &[(u16, u16, u16, u8)],
+        loc_table: &[&[(usize, usize)]],
+    ) -> bool {
+        if raw_steps.is_empty() {
+            return true;
+        }
+        let Some(layer) =
+            layer_of_indexed_ticks_plain(period, ticks, values, in_cycles, raw_steps, loc_table)
+        else {
             return false;
         };
         self.push_layer(layer);
@@ -6486,6 +6955,38 @@ fn sub_start_cycles_fallback(
     ))
 }
 
+/// Restore per-cycle reverse emission order for `Order::Graph` queries on a
+/// layer folded from multi-step `rev()` / `every(n, rev)`.
+#[cold]
+#[inline(never)]
+fn apply_rev_order(layer: &Layer, haps: &mut [Hap]) {
+    let mask = layer.rev_mask();
+    if mask == 0 || haps.len() <= 1 {
+        return;
+    }
+    let period = layer.period();
+    let all_cycles = period.numer() == 1 && period.denom() > 1;
+    let period_len = period.numer();
+    let mut i = 0;
+    while i < haps.len() {
+        let cycle = haps[i].part().begin.floor_int();
+        let mut j = i + 1;
+        while j < haps.len() && haps[j].part().begin.floor_int() == cycle {
+            j += 1;
+        }
+        let reversed = if all_cycles {
+            mask & 1 != 0
+        } else {
+            let idx = cycle.rem_euclid(period_len) as u32;
+            idx < 6 && ((mask >> idx) & 1 != 0)
+        };
+        if reversed {
+            haps[i..j].reverse();
+        }
+        i = j;
+    }
+}
+
 #[inline(never)]
 fn query_layers_multi(
     thread: &QueryThread,
@@ -6501,8 +7002,12 @@ fn query_layers_multi(
     if turns.indices.end.checked_sub(turns.indices.start) == Some(1) {
         let turn = turns.turn(turns.indices.start)?;
         for (i, layer) in layers.iter().enumerate() {
+            let layer_from = out.len();
             let layer_ref = u16::try_from(offset + i).ok().map(|idx| (owner, idx));
             layer.push(thread, layer_ref, turn, span, from, out)?;
+            if layer.has_rev_order() {
+                apply_rev_order(layer, &mut out[layer_from..]);
+            }
         }
         return Ok(());
     }
@@ -6529,6 +7034,7 @@ fn query_layers_multi(
         ))
     });
     for (i, layer) in layers.iter().enumerate() {
+        let layer_from = out.len();
         let layer_ref = u16::try_from(offset + i).ok().map(|idx| (owner, idx));
         if let Some((period_cycles, whole_start, whole_end)) = whole_range {
             if whole_start > turns.indices.start {
@@ -6575,6 +7081,9 @@ fn query_layers_multi(
                 }
                 layer.push(thread, layer_ref, turns.turn(index)?, span, from, out)?;
             }
+        }
+        if layer.has_rev_order() {
+            apply_rev_order(layer, &mut out[layer_from..]);
         }
     }
     Ok(())
@@ -6660,6 +7169,7 @@ fn query_layers(
         return query_layers_multi(thread, owner, offset, layers, span, from, out);
     };
     for (i, layer) in layers.iter().enumerate() {
+        let layer_from = out.len();
         let layer_ref = u16::try_from(offset + i).ok().map(|idx| (owner, idx));
         if layer.source().is_none()
             && let Some(done) = layer
@@ -6801,9 +7311,15 @@ fn query_layers(
                 .flatten()
         {
             done?;
+            if layer.has_rev_order() {
+                apply_rev_order(layer, &mut out[layer_from..]);
+            }
             continue;
         }
         layer.push(thread, layer_ref, &turn, span, from, out)?;
+        if layer.has_rev_order() {
+            apply_rev_order(layer, &mut out[layer_from..]);
+        }
     }
     Ok(())
 }
@@ -6895,8 +7411,9 @@ use met::{PackedRunsBuilder, lie_in_spans};
 
 mod sorted;
 pub(crate) use sorted::{
-    push_whole_cycle_scaled_pow2, query_sequence_sorted_onto, single_cycle_step_count,
-    try_query_fast_pow2_slowcat_static_int,
+    push_whole_cycle_scaled_pow2, query_multi_window_sorted_budgeted,
+    query_multi_window_sorted_onto, query_sequence_sorted_onto, single_cycle_step_count,
+    try_query_fast_pow2_slowcat_static_int, try_query_single_uniform_window,
 };
 
 mod folds;
@@ -7828,6 +8345,21 @@ mod tests {
                                         .with_steps(Some(Fraction::ONE));
                                     spec.apply_to(pattern, Some(values))
                                 }
+                            }
+                            ChainArgument::FlatNumbers {
+                                values,
+                                locs,
+                                len,
+                                slowcat,
+                            } => {
+                                let n = usize::from(len);
+                                let pat = super::pattern_of_flat_numbers(
+                                    &values[..n],
+                                    &locs[..n],
+                                    slowcat,
+                                )
+                                .expect("flat numbers convert to sequence pattern");
+                                spec.apply_to(pattern, Some(pat))
                             }
                             ChainArgument::Wave(wave, steps, math_inside, op_flags) => spec
                                 .apply_to(

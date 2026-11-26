@@ -2655,6 +2655,15 @@ fn range_pattern(start: f64, end: f64) -> Pattern {
     if count == 1 {
         return pure(Value::F64(start));
     }
+    let step_neg = start > end;
+    if start.fract() == 0.0
+        && (!start.is_sign_negative() || start != 0.0)
+        && start >= f64::from(i32::MIN)
+        && start <= f64::from(i32::MAX)
+        && let Ok(count_u32) = u32::try_from(count)
+    {
+        return rustel_core::int_range(start as i32, count_u32, step_neg);
+    }
     let direction = if start <= end { 1.0 } else { -1.0 };
     let mut vals = Vec::new();
     if vals.try_reserve_exact(count).is_err() {
@@ -3627,6 +3636,118 @@ pub enum WordConstant {
     One(Value),
     Pair(Value, Value),
     Many(std::sync::Arc<[Value]>),
+}
+
+/// Parsed flat numeric sequence (`"0.8 0.6"`) or flat numeric slow alternation
+/// (`"<0.15 0.3 0.2 0.25>"`) of 2..=8 finite numbers with exact source ranges.
+#[derive(Clone, Copy, Debug)]
+pub struct FlatNumberMini {
+    pub values: [f64; 8],
+    pub locs: [(u32, u16); 8],
+    pub len: u8,
+    pub slowcat: bool,
+}
+
+/// Extract a flat sequence or slow alternation of 2..=8 plain finite numbers
+/// without allocating an AST, `Layer`, or `Pattern`.
+pub fn flat_number_sequence_parts(src: &str, offset: usize) -> Option<FlatNumberMini> {
+    if src.len() > usize::from(u16::MAX) {
+        return None;
+    }
+    let bytes = src.as_bytes();
+    let mut pos = 0usize;
+    while pos < bytes.len() && matches!(bytes[pos], b' ' | b'\t' | b'\r' | b'\n') {
+        pos += 1;
+    }
+    if pos >= bytes.len() || bytes[pos] == b'^' {
+        return None;
+    }
+    let mut limit = bytes.len();
+    while limit > pos && matches!(bytes[limit - 1], b' ' | b'\t' | b'\r' | b'\n') {
+        limit -= 1;
+    }
+    let mut slowcat = false;
+    if bytes[pos] == b'<' {
+        if bytes[limit - 1] != b'>' {
+            return None;
+        }
+        slowcat = true;
+        pos += 1;
+        limit -= 1;
+        while pos < limit && matches!(bytes[pos], b' ' | b'\t' | b'\r' | b'\n') {
+            pos += 1;
+        }
+        while limit > pos && matches!(bytes[limit - 1], b' ' | b'\t' | b'\r' | b'\n') {
+            limit -= 1;
+        }
+        if pos >= limit || bytes[pos] == b'^' {
+            return None;
+        }
+    }
+    let mut values = [0.0f64; 8];
+    let mut locs = [(0u32, 0u16); 8];
+    let mut len = 0usize;
+    while pos < limit {
+        let start = pos;
+        let mut end = start;
+        let mut prev_dot = false;
+        while end < limit {
+            let b = bytes[end];
+            if !ASCII_STEP_CHARS[usize::from(b)] {
+                break;
+            }
+            if b == b'.' {
+                if prev_dot {
+                    return None;
+                }
+                prev_dot = true;
+            } else {
+                prev_dot = false;
+            }
+            end += 1;
+        }
+        if end == start {
+            return None;
+        }
+        if end < limit {
+            let mut next = end;
+            while next < limit && matches!(bytes[next], b' ' | b'\t' | b'\r' | b'\n') {
+                next += 1;
+            }
+            if next == end {
+                return None;
+            }
+            pos = next;
+        } else {
+            pos = limit;
+        }
+        if len >= values.len() {
+            return None;
+        }
+        let wlen = end - start;
+        if wlen == 1 && matches!(bytes[start], b'~' | b'-' | b'.' | b'_') {
+            return None;
+        }
+        let num = js_atom_number(&src[start..end])?;
+        if !num.is_finite() {
+            return None;
+        }
+        let (lb, le) = leaf_place(src, offset, &Span { start, end });
+        let loc_begin = u32::try_from(lb).ok()?;
+        let loc_len = u16::try_from(le.checked_sub(lb)?).ok()?;
+        values[len] = num;
+        locs[len] = (loc_begin, loc_len);
+        len += 1;
+    }
+    if len < 2 {
+        return None;
+    }
+    Some(FlatNumberMini {
+        values,
+        locs,
+        len: len as u8,
+        slowcat,
+    })
 }
 
 /// Extract the value and location of a single-word or colon-separated compound
@@ -5388,7 +5509,8 @@ fn flat_sequence_core(
     Some(pattern.with_steps(steps_meta))
 }
 
-/// Fast path for a single plain ASCII Euclidean rhythm (`"sd(3,8)"`, `"hh(7,16,2)"`)
+/// Fast path for a plain ASCII space-separated sequence containing one or more
+/// Euclidean rhythms (`"sd(3,8)"`, `"hh(7,16,2)"`, `"bd(3,8) sd(5,8,2) hh*8"`)
 /// directly on stack-allocated `SourceStep`s, skipping `Room`, `Parser`, and `Plans`.
 fn flat_euclid(src: &str, offset: usize) -> Option<Pattern> {
     flat_euclid_core(src, offset, None)
@@ -5403,27 +5525,44 @@ fn flat_euclid_core(
         return None;
     }
     let bytes = src.as_bytes();
-    let start = score_whitespace_end(bytes, 0);
-    if start >= bytes.len() || bytes[start] == b'^' {
+    let mut pos = score_whitespace_end(bytes, 0);
+    if pos >= bytes.len() || bytes[pos] == b'^' {
         return None;
     }
     let mut limit = bytes.len();
-    while limit > start && matches!(bytes[limit - 1], b' ' | b'\t' | b'\r' | b'\n') {
+    while limit > pos && matches!(bytes[limit - 1], b' ' | b'\t' | b'\r' | b'\n') {
         limit -= 1;
     }
-    let word_end = flat_word_end(src, bytes, start, limit)?;
-    let word = &src[start..word_end];
-    let open = score_whitespace_end(bytes, word_end).min(limit);
-    if open >= limit || bytes[open] != b'(' {
-        return None;
-    }
     // Reject tabs/newlines inside the expression so span trimming stays trivial.
-    if bytes[start..limit]
+    if bytes[pos..limit]
         .iter()
         .any(|&b| matches!(b, b'\t' | b'\r' | b'\n'))
     {
         return None;
     }
+
+    #[derive(Clone, Copy)]
+    enum EuclidItemKind {
+        Word,
+        Fast(u32, usize, usize),
+        Euclid {
+            pulses: u32,
+            steps: u32,
+            rot: i32,
+            p_span: (usize, usize),
+            s_span: (usize, usize),
+            r_span: Option<(usize, usize)>,
+        },
+    }
+
+    #[derive(Clone, Copy)]
+    struct EuclidItem {
+        word_start: usize,
+        word_end: usize,
+        item_end: usize,
+        kind: EuclidItemKind,
+    }
+
     let parse_u32 = |at: usize| -> Option<(u32, usize, usize)> {
         let s = score_whitespace_end(bytes, at).min(limit);
         let mut e = s;
@@ -5439,118 +5578,302 @@ fn flat_euclid_core(
         }
         Some((val, s, e))
     };
-    let (pulses, p_start, p_end) = parse_u32(open + 1)?;
-    let comma = score_whitespace_end(bytes, p_end).min(limit);
-    if comma >= limit || bytes[comma] != b',' {
-        return None;
-    }
-    let (steps, s_start, s_end) = parse_u32(comma + 1)?;
-    if pulses < 1 || steps < pulses || steps > 64 {
-        return None;
-    }
-    let mut after = score_whitespace_end(bytes, s_end).min(limit);
-    let (rot, rot_span) = if after < limit && bytes[after] == b')' {
-        (0i32, None)
-    } else {
-        if after < limit && bytes[after] == b',' {
-            after = score_whitespace_end(bytes, after + 1).min(limit);
-        }
-        let r_start = after;
-        let neg = after < limit && bytes[after] == b'-';
-        if neg {
-            after += 1;
-        }
-        let mut r_end = after;
-        let mut r_val = 0i32;
-        while r_end < limit && bytes[r_end].is_ascii_digit() {
-            r_val = r_val
-                .checked_mul(10)?
-                .checked_add(i32::from(bytes[r_end] - b'0'))?;
-            r_end += 1;
-        }
-        if r_end == after || r_val > 64 {
-            return None;
-        }
-        after = score_whitespace_end(bytes, r_end).min(limit);
-        if after >= limit || bytes[after] != b')' {
-            return None;
-        }
-        (if neg { -r_val } else { r_val }, Some((r_start, r_end)))
+
+    const MAX_ITEMS: usize = 16;
+    let empty_item = EuclidItem {
+        word_start: 0,
+        word_end: 0,
+        item_end: 0,
+        kind: EuclidItemKind::Word,
     };
-    if after + 1 != limit {
+    let mut items = [empty_item; MAX_ITEMS];
+    let mut item_len = 0usize;
+    let mut has_euclid = false;
+    let mut sub_ticks = 1u32;
+
+    while pos < limit {
+        if item_len >= MAX_ITEMS || bytes[pos] == b'^' {
+            return None;
+        }
+        let word_start = pos;
+        let word_end = flat_word_end(src, bytes, word_start, limit)?;
+        let word = &src[word_start..word_end];
+        let mut cur = word_end;
+        // Allow optional whitespace before `(` only for single-item expressions.
+        let peek = score_whitespace_end(bytes, cur).min(limit);
+        let (kind, item_end, item_sub) = if peek < limit && bytes[peek] == b'(' {
+            let (pulses, p_start, p_end) = parse_u32(peek + 1)?;
+            let comma = score_whitespace_end(bytes, p_end).min(limit);
+            if comma >= limit || bytes[comma] != b',' {
+                return None;
+            }
+            let (steps, s_start, s_end) = parse_u32(comma + 1)?;
+            if pulses < 1 || steps < pulses || steps > 64 {
+                return None;
+            }
+            let mut after = score_whitespace_end(bytes, s_end).min(limit);
+            let (rot, r_span) = if after < limit && bytes[after] == b')' {
+                (0i32, None)
+            } else {
+                if after < limit && bytes[after] == b',' {
+                    after = score_whitespace_end(bytes, after + 1).min(limit);
+                }
+                let r_start = after;
+                let neg = after < limit && bytes[after] == b'-';
+                if neg {
+                    after += 1;
+                }
+                let mut r_end = after;
+                let mut r_val = 0i32;
+                while r_end < limit && bytes[r_end].is_ascii_digit() {
+                    r_val = r_val
+                        .checked_mul(10)?
+                        .checked_add(i32::from(bytes[r_end] - b'0'))?;
+                    r_end += 1;
+                }
+                if r_end == after || r_val > 64 {
+                    return None;
+                }
+                after = score_whitespace_end(bytes, r_end).min(limit);
+                if after >= limit || bytes[after] != b')' {
+                    return None;
+                }
+                (if neg { -r_val } else { r_val }, Some((r_start, r_end)))
+            };
+            has_euclid = true;
+            cur = after + 1;
+            if cur < limit && bytes[cur] != b' ' {
+                return None;
+            }
+            (
+                EuclidItemKind::Euclid {
+                    pulses,
+                    steps,
+                    rot,
+                    p_span: (p_start, p_end),
+                    s_span: (s_start, s_end),
+                    r_span,
+                },
+                cur,
+                steps,
+            )
+        } else if cur < limit && bytes[cur] == b'*' {
+            let k_start = cur + 1;
+            if k_start >= limit || !bytes[k_start].is_ascii_digit() {
+                return None;
+            }
+            let mut k_end = k_start;
+            let mut k_val = 0u32;
+            while k_end < limit && bytes[k_end].is_ascii_digit() {
+                k_val = k_val
+                    .checked_mul(10)?
+                    .checked_add(u32::from(bytes[k_end] - b'0'))?;
+                k_end += 1;
+            }
+            if !(1..=64).contains(&k_val) || (k_end < limit && bytes[k_end] != b' ') {
+                return None;
+            }
+            cur = k_end;
+            (EuclidItemKind::Fast(k_val, k_start, k_end), cur, k_val)
+        } else if cur == limit || bytes[cur] == b' ' {
+            (EuclidItemKind::Word, cur, 1u32)
+        } else {
+            return None;
+        };
+        if word.contains(':') && item_len > 0 {
+            return None;
+        }
+        // Compute lcm(sub_ticks, item_sub).
+        let (mut a, mut b) = (sub_ticks, item_sub);
+        while b != 0 {
+            let r = a % b;
+            a = b;
+            b = r;
+        }
+        sub_ticks = (sub_ticks / a).checked_mul(item_sub)?;
+        if sub_ticks > 256 {
+            return None;
+        }
+        items[item_len] = EuclidItem {
+            word_start,
+            word_end,
+            item_end,
+            kind,
+        };
+        item_len += 1;
+        pos = score_whitespace_end(bytes, cur).min(limit);
+    }
+
+    if item_len == 0 || !has_euclid {
         return None;
     }
-    let steps_meta = Some(Fraction::ONE);
-    if matches!(word, "~" | "-") {
+    let total_ticks = (item_len as u32).checked_mul(sub_ticks)?;
+    let ticks_nz = std::num::NonZeroU32::new(total_ticks)?;
+    if total_ticks > u32::from(u16::MAX) {
+        return None;
+    }
+    let steps_meta = Some(Fraction::int(item_len as i128));
+    let mut raw_steps = [(0u16, 0u16, 0u16, 0u8); 64];
+    let mut step_len = 0usize;
+    let mut loc_buf = [[(0usize, 0usize); 4]; MAX_ITEMS];
+    let mut loc_lens = [0usize; MAX_ITEMS];
+    let mut seen_words = [(0usize, 0usize); MAX_ITEMS];
+    let mut seen_len = 0usize;
+    let mut mask_buf = [0u8; 64];
+
+    for (item_idx, item) in items[..item_len].iter().enumerate() {
+        let word = &src[item.word_start..item.word_end];
+        if matches!(word, "~" | "-") {
+            continue;
+        }
+        let val_idx = match seen_words[..seen_len]
+            .iter()
+            .position(|&(s, e)| &src[s..e] == word)
+        {
+            Some(existing) => existing as u16,
+            None => {
+                let idx = seen_len as u16;
+                seen_words[seen_len] = (item.word_start, item.word_end);
+                seen_len += 1;
+                idx
+            }
+        };
+        let slot_base = (item_idx as u32) * sub_ticks;
+        let word_span_end = if item_len == 1 && word.contains(':') {
+            item.item_end
+        } else {
+            item.word_end
+        };
+        let word_place = leaf_place(
+            src,
+            offset,
+            &Span {
+                start: item.word_start,
+                end: word_span_end,
+            },
+        );
+        match item.kind {
+            EuclidItemKind::Word => {
+                if step_len >= raw_steps.len() {
+                    return None;
+                }
+                loc_buf[item_idx][0] = word_place;
+                loc_lens[item_idx] = 1;
+                raw_steps[step_len] = (
+                    slot_base as u16,
+                    (slot_base + sub_ticks) as u16,
+                    val_idx,
+                    item_idx as u8,
+                );
+                step_len += 1;
+            }
+            EuclidItemKind::Fast(k, ks, ke) => {
+                let w = sub_ticks / k;
+                if step_len + (k as usize) > raw_steps.len() {
+                    return None;
+                }
+                loc_buf[item_idx][0] = word_place;
+                loc_buf[item_idx][1] = leaf_place(src, offset, &Span { start: ks, end: ke });
+                loc_lens[item_idx] = 2;
+                for r in 0..k {
+                    let b = slot_base + r * w;
+                    raw_steps[step_len] = (b as u16, (b + w) as u16, val_idx, item_idx as u8);
+                    step_len += 1;
+                }
+            }
+            EuclidItemKind::Euclid {
+                pulses,
+                steps,
+                rot,
+                p_span,
+                s_span,
+                r_span,
+            } => {
+                let mask_len = rustel_core::euclid::euclid_rot_into(
+                    pulses as i32,
+                    steps as usize,
+                    rot as isize,
+                    &mut mask_buf,
+                )
+                .ok()?;
+                let w = sub_ticks / steps;
+                loc_buf[item_idx][0] = word_place;
+                loc_buf[item_idx][1] = leaf_place(
+                    src,
+                    offset,
+                    &Span {
+                        start: p_span.0,
+                        end: p_span.1,
+                    },
+                );
+                loc_buf[item_idx][2] = leaf_place(
+                    src,
+                    offset,
+                    &Span {
+                        start: s_span.0,
+                        end: s_span.1,
+                    },
+                );
+                loc_lens[item_idx] = if let Some((rs, re)) = r_span {
+                    loc_buf[item_idx][3] = leaf_place(src, offset, &Span { start: rs, end: re });
+                    4
+                } else {
+                    3
+                };
+                for (i, &set) in mask_buf[..mask_len].iter().enumerate() {
+                    if set == 0 {
+                        continue;
+                    }
+                    if step_len >= raw_steps.len() {
+                        return None;
+                    }
+                    let b = slot_base + (i as u32) * w;
+                    raw_steps[step_len] = (b as u16, (b + w) as u16, val_idx, item_idx as u8);
+                    step_len += 1;
+                }
+            }
+        }
+    }
+
+    if step_len == 0 {
         return Some(if into.is_some() {
             silence()
         } else {
             silence().with_steps(steps_meta)
         });
     }
-    let mask = rustel_core::euclid::euclid_rot(pulses as i32, steps as usize, rot as isize).ok()?;
-    let mut locs = rustel_core::Locations::new();
-    locs.push(leaf_place(
-        src,
-        offset,
-        &Span {
-            start,
-            end: if word.contains(':') { limit } else { word_end },
-        },
-    ));
-    locs.push(leaf_place(
-        src,
-        offset,
-        &Span {
-            start: p_start,
-            end: p_end,
-        },
-    ));
-    locs.push(leaf_place(
-        src,
-        offset,
-        &Span {
-            start: s_start,
-            end: s_end,
-        },
-    ));
-    if let Some((rs, re)) = rot_span {
-        locs.push(leaf_place(src, offset, &Span { start: rs, end: re }));
+    let layer_values: std::sync::Arc<[Value]> = if seen_len == 1 {
+        rustel_core::arc_single_value(flat_atom_value(&src[seen_words[0].0..seen_words[0].1]))
+    } else {
+        seen_words[..seen_len]
+            .iter()
+            .map(|&(s, e)| flat_atom_value(&src[s..e]))
+            .collect()
+    };
+    let mut loc_slices: [&[(usize, usize)]; MAX_ITEMS] = [&[]; MAX_ITEMS];
+    for idx in 0..item_len {
+        loc_slices[idx] = &loc_buf[idx][..loc_lens[idx]];
     }
-    let mut source_steps: [rustel_core::SourceStep; 64] =
-        std::array::from_fn(|_| rustel_core::SourceStep {
-            begin: Fraction::ZERO,
-            end: Fraction::ZERO,
-            value: 0,
-            locations: rustel_core::Locations::new(),
-        });
-    let mut len = 0usize;
-    let denom = i128::from(steps);
-    for (i, &set) in mask.iter().enumerate() {
-        if set == 0 {
-            continue;
-        }
-        let begin = Fraction::new(i as i128, denom);
-        let end = Fraction::new((i + 1) as i128, denom);
-        source_steps[len] = rustel_core::SourceStep {
-            begin,
-            end,
-            value: 0,
-            locations: locs.clone(),
-        };
-        len += 1;
-    }
-    let layer_values: std::sync::Arc<[Value]> =
-        rustel_core::arc_single_value(flat_atom_value(word));
     if let Some(builder) = into {
-        builder.push_indexed_slice(Fraction::ONE, layer_values, true, &mut source_steps[..len]);
+        if !builder.push_indexed_ticks_plain(
+            Fraction::ONE,
+            ticks_nz,
+            layer_values,
+            true,
+            &raw_steps[..step_len],
+            &loc_slices[..item_len],
+        ) {
+            return None;
+        }
         return Some(silence());
     }
-    let pattern = rustel_core::sequence_of_indexed_slice(
+    let pattern = rustel_core::sequence_of_indexed_ticks_plain(
         Fraction::ONE,
+        ticks_nz,
         layer_values,
         true,
-        &mut source_steps[..len],
+        &raw_steps[..step_len],
+        &loc_slices[..item_len],
     )?;
     Some(pattern.with_steps(steps_meta))
 }
@@ -5611,6 +5934,19 @@ fn flat_range(src: &str, offset: usize) -> Option<Pattern> {
         ),
         leaf_place(src, offset, &Span { start, end: a_end }),
     ];
+    let step_neg = start_f > end_f;
+    if start_f.fract() == 0.0
+        && (!start_f.is_sign_negative() || start_f != 0.0)
+        && start_f >= f64::from(i32::MIN)
+        && start_f <= f64::from(i32::MAX)
+        && let Ok(count) = checked_range_count(start_f, end_f)
+        && let Ok(count_u32) = u32::try_from(count)
+    {
+        return Some(
+            rustel_core::int_range_at(start_f as i32, count_u32, step_neg, &spans)
+                .with_steps(Some(Fraction::ONE)),
+        );
+    }
     Some(
         range_pattern(start_f, end_f)
             .with_added_context_slice(&spans)
@@ -5808,15 +6144,18 @@ pub fn mini_non_word_in(room: &mut Room, src: &str, offset: usize) -> Result<Pat
             }
             if (mask & CLS_COMMA) != 0 {
                 if (mask & CLS_PLUS) == 0 {
+                    if (mask & CLS_PAREN) != 0
+                        && let Some(pattern) = flat_euclid(src, offset)
+                    {
+                        return Ok(pattern);
+                    }
                     if let Some(stacked) = try_flat_stack(src, offset) {
                         if let Some(pattern) = stacked {
                             return Ok(pattern);
                         }
-                    } else if (mask & CLS_PAREN) == 0 {
-                        if let Some(pattern) = flat_sequence(src, offset) {
-                            return Ok(pattern);
-                        }
-                    } else if let Some(pattern) = flat_euclid(src, offset) {
+                    } else if (mask & CLS_PAREN) == 0
+                        && let Some(pattern) = flat_sequence(src, offset)
+                    {
                         return Ok(pattern);
                     }
                 }
@@ -6029,7 +6368,7 @@ mod tests {
     fn patterned_slow_zero_is_silent_without_losing_other_factors() {
         let shape = |haps: Vec<rustel_core::Hap>| {
             haps.into_iter()
-                .map(|hap| (hap.whole, hap.part, hap.value))
+                .map(|hap| (hap.whole(), hap.part(), hap.value))
                 .collect::<Vec<_>>()
         };
         for (source, silent_factor) in [("bd/[0 2]", "bd/[~ 2]"), ("bd/<0 2>", "bd/<~ 2>")] {
@@ -6249,7 +6588,7 @@ mod tests {
                 .query_arc_sorted(Fraction::ZERO, Fraction::int(2))
                 .into_iter()
                 .map(|hap| {
-                    let whole = hap.whole.expect("euclid event");
+                    let whole = hap.whole().expect("euclid event");
                     (whole.begin, whole.end)
                 })
                 .collect::<Vec<_>>()
@@ -6286,7 +6625,7 @@ mod tests {
                 .unwrap_or_else(|error| panic!("{source} did not parse: {error:?}"))
                 .query_arc_sorted(Fraction::ZERO, Fraction::ONE)
                 .into_iter()
-                .map(|hap| (hap.part.begin, hap.part.end, hap.value))
+                .map(|hap| (hap.part().begin, hap.part().end, hap.value))
                 .collect::<Vec<_>>()
         };
         let a = || rustel_core::Value::Str("a".into());
@@ -6439,8 +6778,8 @@ mod tests {
                 .query_arc(Fraction::ZERO, Fraction::ONE);
             assert_eq!(haps.len(), 1, "{source} produced {haps:?}");
             assert_eq!(haps[0].value, rustel_core::Value::Str("sd".into()));
-            assert_eq!(haps[0].part.begin, Fraction::ZERO, "{source}: {haps:?}");
-            assert_eq!(haps[0].part.end, Fraction::ONE, "{source}: {haps:?}");
+            assert_eq!(haps[0].part().begin, Fraction::ZERO, "{source}: {haps:?}");
+            assert_eq!(haps[0].part().end, Fraction::ONE, "{source}: {haps:?}");
         }
     }
 
@@ -6480,15 +6819,15 @@ mod tests {
             .query_arc(Fraction::ZERO, Fraction::ONE);
         assert_eq!(haps.len(), 1, "{haps:?}");
         assert_eq!(haps[0].value, rustel_core::Value::Str("bd".into()));
-        assert_eq!(haps[0].part.begin, Fraction::ZERO);
-        assert_eq!(haps[0].part.end, Fraction::ONE);
+        assert_eq!(haps[0].part().begin, Fraction::ZERO);
+        assert_eq!(haps[0].part().end, Fraction::ONE);
 
         let haps = mini("[bd@1e-10] sd")
             .expect("parses")
             .query_arc(Fraction::ZERO, Fraction::ONE);
         assert_eq!(haps.len(), 2, "{haps:?}");
         assert_eq!(haps[0].value, rustel_core::Value::Str("bd".into()));
-        assert_eq!(haps[0].part.end, Fraction::new(1, 2), "{haps:?}");
+        assert_eq!(haps[0].part().end, Fraction::new(1, 2), "{haps:?}");
         assert_eq!(
             rustel_core::take_query_error(),
             None,
@@ -6554,7 +6893,7 @@ mod tests {
             .query_arc(Fraction::ZERO, Fraction::ONE);
         assert_eq!(haps.len(), 2, "{haps:?}");
         assert_eq!(
-            haps[0].part.end,
+            haps[0].part().end,
             Fraction::new(1, 2),
             "bd must keep a full slot"
         );
@@ -6573,26 +6912,26 @@ mod tests {
             .expect("parses")
             .query_arc(Fraction::ZERO, Fraction::ONE);
         assert_eq!(haps.len(), 1, "zero replicas must still delete the step");
-        assert_eq!(haps[0].part.begin, Fraction::new(1, 2));
-        assert_eq!(haps[0].part.end, Fraction::ONE);
+        assert_eq!(haps[0].part().begin, Fraction::new(1, 2));
+        assert_eq!(haps[0].part().end, Fraction::ONE);
 
         let haps = mini("bd@0@2 sd")
             .expect("parses")
             .query_arc(Fraction::ZERO, Fraction::ONE);
         assert_eq!(haps.len(), 2, "the second @ must accumulate from raw zero");
-        assert_eq!(haps[0].part.end, Fraction::new(1, 2));
+        assert_eq!(haps[0].part().end, Fraction::new(1, 2));
 
         let haps = mini("bd!0@2 sd")
             .expect("parses")
             .query_arc(Fraction::ZERO, Fraction::ONE);
         assert_eq!(haps.len(), 1, "the replicated child remains silent");
-        assert_eq!(haps[0].part.begin, Fraction::new(1, 2));
+        assert_eq!(haps[0].part().begin, Fraction::new(1, 2));
 
         let haps = mini("bd!0!2 sd")
             .expect("parses")
             .query_arc(Fraction::ZERO, Fraction::ONE);
         assert_eq!(haps.len(), 2, "a later ! restores one replica");
-        assert_eq!(haps[0].part.end, Fraction::new(1, 2));
+        assert_eq!(haps[0].part().end, Fraction::new(1, 2));
     }
 
     #[test]
@@ -6612,7 +6951,7 @@ mod tests {
         assert!(
             haps.iter()
                 .any(|hap| hap.value == rustel_core::Value::Str("sd".into())
-                    && hap.part.begin == Fraction::new(1, 2)),
+                    && hap.part().begin == Fraction::new(1, 2)),
             "the silent replicated step lost its half-slot: {haps:?}"
         );
     }
@@ -7059,8 +7398,8 @@ mod tests {
             let haps_slow = slow.query_arc_sorted(Fraction::ZERO, Fraction::from(8));
             assert_eq!(haps_fast.len(), haps_slow.len(), "len mismatch on {source}");
             for (i, (a, b)) in haps_fast.iter().zip(&haps_slow).enumerate() {
-                assert_eq!(a.whole, b.whole, "whole[{i}] on {source}");
-                assert_eq!(a.part, b.part, "part[{i}] on {source}");
+                assert_eq!(a.whole(), b.whole(), "whole[{i}] on {source}");
+                assert_eq!(a.part(), b.part(), "part[{i}] on {source}");
                 assert_eq!(a.value, b.value, "value[{i}] on {source}");
                 assert_eq!(
                     a.context.iter().collect::<Vec<_>>(),
@@ -7100,8 +7439,8 @@ mod tests {
             .count();
         assert_eq!(y_count, 126, "all 126 euclid pulses must play y, not x");
         for (i, (a, b)) in haps_fast.iter().zip(&haps_slow).enumerate() {
-            assert_eq!(a.whole, b.whole, "whole[{i}]");
-            assert_eq!(a.part, b.part, "part[{i}]");
+            assert_eq!(a.whole(), b.whole(), "whole[{i}]");
+            assert_eq!(a.part(), b.part(), "part[{i}]");
             assert_eq!(a.value, b.value, "value[{i}]");
             assert_eq!(
                 a.context.iter().collect::<Vec<_>>(),
@@ -7145,8 +7484,8 @@ mod tests {
                 "len mismatch on {source:?}"
             );
             for (i, (a, b)) in haps_fast.iter().zip(&haps_slow).enumerate() {
-                assert_eq!(a.whole, b.whole, "whole[{i}] on {source:?}");
-                assert_eq!(a.part, b.part, "part[{i}] on {source:?}");
+                assert_eq!(a.whole(), b.whole(), "whole[{i}] on {source:?}");
+                assert_eq!(a.part(), b.part(), "part[{i}] on {source:?}");
                 assert_eq!(a.value, b.value, "value[{i}] on {source:?}");
                 assert_eq!(
                     a.context.iter().collect::<Vec<_>>(),
