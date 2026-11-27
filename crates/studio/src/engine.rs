@@ -43,6 +43,16 @@ use ui_state::StudioUiState;
 
 use super::settings::LoadMode;
 use super::wav::{TakeStatus, TakeWriter};
+#[cfg(test)]
+use rustel_runtime::audition::audition_cut_group;
+use rustel_runtime::audition::{
+    AUDITION_LEAD_SECS, AUDITION_LOAD_TIMEOUT, AUDITION_RUN_LEAD_SECS, AUDITION_VISUALS,
+    AuditionOutcome, AuditionRequest, CHORD_AUDITION_LOAD_TIMEOUT, prepare_audition,
+    push_audition_choke_at, push_audition_stop, push_prepared_audition,
+};
+pub use rustel_runtime::audition::{
+    AUDITION_UI_VISUAL_SLOT, MAX_AUDITION_NOTES, MAX_AUDITION_RUN_NOTES,
+};
 use rustel_runtime::midi_clock::{self, ClockEstimate, ClockIn, ClockOut};
 use rustel_runtime::sounds::Variants;
 use rustel_runtime::ui_analysis::UiAudioAnalysisSet;
@@ -96,14 +106,6 @@ const GRACEFUL_STOP_SILENCE_HOLD: Duration = Duration::from_millis(250);
 /// closes and gives back its rings, pools and DSP. Long enough that a stop
 /// and the next start reuse the stream, which on some hosts saves a click.
 const PARKED_OUTPUT_IDLE: Duration = Duration::from_secs(30);
-/// How long a preview waits for its sample to load before giving up. A
-/// long recording or a video decodes for seconds, and the list says
-/// `loading` while it does: the wait is the studio's stop window, so a
-/// preview that comes late is one Space can still stop.
-const AUDITION_LOAD_TIMEOUT: Duration = Duration::from_secs(20);
-/// How long a chord preview waits for the bank it plays on. A chord heard
-/// long after its key is no preview of it.
-const CHORD_AUDITION_LOAD_TIMEOUT: Duration = Duration::from_secs(4);
 /// Default ceiling on decoded PCM the sounding score does not name.
 pub const DEFAULT_PREVIEW_BUDGET_BYTES: usize = 64 * 1024 * 1024;
 /// Default pause after the last preview before unused samples are dropped.
@@ -207,26 +209,6 @@ struct ProtectionKey {
     /// out at once.
     allowance: usize,
 }
-/// How far ahead of the device clock a preview is placed.
-const AUDITION_LEAD_SECS: f64 = 0.06;
-/// How far ahead of its own moment a run's note is handed to the device.
-/// Wide enough that a slow engine turn - a busy small machine renders its
-/// turns hundreds of milliseconds apart - still hands each note over
-/// before its moment, so the device places it at the time it belongs to
-/// and the run keeps its tempo. A note already handed over cannot be
-/// taken back; `stop_audition` cuts each of those at its own start.
-const AUDITION_RUN_LEAD_SECS: f64 = 0.15;
-/// Gate length of a preview; a one-shot sample plays to its end anyway.
-const AUDITION_GATE_SECS: f64 = 2.0;
-/// A chord is held a little longer than a one-shot: the ear needs the
-/// notes to overlap long enough to hear them as one sound.
-const AUDITION_CHORD_GATE_SECS: f64 = 2.6;
-/// Most notes one preview sounds at once. A chord nobody writes is still
-/// a chord the browser must not turn into a wall of voices.
-pub const MAX_AUDITION_NOTES: usize = 8;
-/// A run is heard one note at a time, so it can afford more of them than a
-/// chord can: two octaves of a scale and its return.
-pub const MAX_AUDITION_RUN_NOTES: usize = 24;
 /// Computer-key slots, independent of browser and generated previews.
 const PIANO_KEYS: usize = 16;
 const PIANO_RELEASE_SECS: f64 = 0.02;
@@ -3056,33 +3038,6 @@ impl RunningAudition {
     }
 }
 
-/// What one preview plays: a sound on its own (`bd:3`, the samples
-/// browser), or a chord of MIDI notes played on that sound (the chord
-/// browser). A sample preview is the no-notes case of the same request,
-/// so both take one resolve-and-push path.
-#[derive(Clone, Debug)]
-struct AuditionRequest {
-    sound: String,
-    /// MIDI numbers, 60 being middle C. Empty plays the sound itself.
-    notes: Vec<f32>,
-    gain: f32,
-    /// Seconds between one note and the next. Zero is a chord - every
-    /// note at once; anything else is a run, each note a step later, which
-    /// is how a scale is heard.
-    step_secs: f64,
-    /// Where in the reserved choke block this request's voices sit. A run
-    /// hands its notes over one push at a time, so each push must claim a
-    /// different slot or the notes cut each other and the scale comes out
-    /// as a single note repeating.
-    slot: usize,
-    /// The device clock second this request's first voice belongs to.
-    /// `None` is "as soon as the device will take it", which is what a
-    /// chord or a one-shot wants. A run names the moment instead: its
-    /// notes are a step apart from each other, not a step apart from
-    /// whenever the tick loop got round to handing each one over.
-    at: Option<f64>,
-}
-
 struct PendingAudition {
     request: AuditionRequest,
     deadline: Instant,
@@ -3106,27 +3061,6 @@ impl Clone for PendingAudition {
 #[derive(Clone, Copy, Debug)]
 struct StopDrain {
     silent_since: Option<Duration>,
-}
-
-/// Retire every onset that has not started yet, without touching the voices
-/// already sounding: an empty generation takes over at the current frame,
-/// exactly as a live reload's cutover would.
-/// The visual-analysis slot auditions are tagged into: the top one, which a
-/// score would only reach by carrying 64 audio-reactive visuals. The samples
-/// browser reads this slot for its preview-only scope.
-pub const AUDITION_UI_VISUAL_SLOT: u8 = 63;
-/// Every preview is tagged into that slot, so the browser's scope shows the
-/// preview alone rather than the whole mix.
-const AUDITION_VISUALS: u64 = 1 << AUDITION_UI_VISUAL_SLOT;
-/// A choke group holds one voice: a second voice in it silences the first.
-/// A browser wants that between previews and not inside a chord, where the
-/// notes must ring together: in one shared group a triad sounds as a single
-/// note. So each note of a preview takes a group of its own, from a
-/// reserved block at the top of the float range where nothing a score
-/// writes can collide, and the next preview's note cuts the one that stood
-/// in its place.
-fn audition_cut_group(slot: usize) -> f32 {
-    f32::from_bits(f32::MAX.to_bits() - slot.min(MAX_AUDITION_RUN_NOTES) as u32)
 }
 
 fn piano_cut_group(key: usize) -> f32 {

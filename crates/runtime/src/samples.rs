@@ -52,8 +52,9 @@ pub use cache::{
     score_sample_cache_dir,
 };
 pub use catalog::{
+    CacheState, ManifestState, SampleCatalogue, SampleCataloguePack, SampleCatalogueSound,
     deduplicated_global_sources, deduplicated_global_sources_with_owners, folder_of_spec,
-    source_is_local,
+    samples_import_hint, source_is_local, source_shortcut,
 };
 use manifests::*;
 
@@ -275,6 +276,9 @@ pub struct DefaultSource {
     /// how its banks are told apart from the others' once they are all
     /// merged into one map.
     pub base: String,
+    /// Browser category declared by the pin file, or [`SoundCategory::Font`]
+    /// for the pinned General MIDI soundfonts.
+    pub category: SoundCategory,
 }
 
 /// What caching a shipped pack onto disk asked for.
@@ -390,6 +394,20 @@ pub enum SoundOrigin {
     /// A folder or pack the player imported in Settings, which every set
     /// sees.
     Global,
+}
+
+impl SoundOrigin {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Default => "default",
+            Self::Score => "score",
+            Self::Font => "gm",
+            Self::Synth => "synth",
+            Self::Input => "input",
+            Self::Set => "set",
+            Self::Global => "global",
+        }
+    }
 }
 
 /// What kind of sound a browser files an entry under: the pinned banks
@@ -1311,11 +1329,78 @@ struct Shared {
     /// changed, so a reader that samples it before asking for a sound and
     /// sees it unchanged afterwards knows the answer it got still stands.
     settled_epoch: AtomicU64,
+    /// Load status of each pinned default manifest queued for this library,
+    /// keyed by its manifest URL.
+    default_manifest_states: Mutex<HashMap<String, DefaultManifestEntry>>,
+}
+
+#[derive(Clone, Debug)]
+struct DefaultManifestEntry {
+    name: String,
+    alias_only: bool,
+    state: SourceState,
 }
 
 impl Shared {
     fn note_settled(&self) {
         self.settled_epoch.fetch_add(1, Ordering::AcqRel);
+    }
+
+    fn init_default_manifests(&self, sources: &[PinnedSource], seeded: &HashSet<String>) {
+        let mut states = self
+            .default_manifest_states
+            .lock()
+            .expect("default manifest states");
+        for source in sources {
+            let state = if seeded.contains(&source.url) {
+                SourceState::Ready
+            } else {
+                SourceState::Loading
+            };
+            states.insert(
+                source.url.clone(),
+                DefaultManifestEntry {
+                    name: source.name.clone(),
+                    alias_only: source.base.is_none(),
+                    state,
+                },
+            );
+        }
+    }
+
+    fn note_default_manifest(&self, source: &PinnedSource, state: SourceState) {
+        self.default_manifest_states
+            .lock()
+            .expect("default manifest states")
+            .insert(
+                source.url.clone(),
+                DefaultManifestEntry {
+                    name: source.name.clone(),
+                    alias_only: source.base.is_none(),
+                    state,
+                },
+            );
+    }
+
+    fn note_default_manifest_if_not_ready(&self, source: &PinnedSource, state: SourceState) {
+        let mut states = self
+            .default_manifest_states
+            .lock()
+            .expect("default manifest states");
+        if states
+            .get(&source.url)
+            .is_some_and(|entry| entry.state == SourceState::Ready)
+        {
+            return;
+        }
+        states.insert(
+            source.url.clone(),
+            DefaultManifestEntry {
+                name: source.name.clone(),
+                alias_only: source.base.is_none(),
+                state,
+            },
+        );
     }
 
     /// Record where `map` stands and return where it stood. A failure

@@ -913,6 +913,8 @@ fn load_default_manifests(
 ) -> Result<(), String> {
     let mut banks = HashMap::new();
     let mut aliases = Vec::new();
+    let mut first_error: Option<String> = None;
+    let mut loaded_any = false;
     let hash_of = |bytes: &[u8]| {
         let mut hasher = Sha256::new();
         hasher.update(bytes);
@@ -922,78 +924,120 @@ fn load_default_manifests(
             .map(|byte| format!("{byte:02x}"))
             .collect::<String>()
     };
+    let mark_remaining_failed = |from: usize, error: &str| {
+        for remaining in &sources[from..] {
+            context.shared.note_default_manifest_if_not_ready(
+                remaining,
+                SourceState::Failed(error.to_owned()),
+            );
+        }
+    };
 
-    for source in sources {
-        budget.check()?;
-        let path = cache_path(dir, &source.url);
-        let cached = read_manifest_cache(&path).ok();
-        budget.check()?;
-        let verified = match cached {
-            Some(bytes) if hash_of(&bytes) == source.sha256 => bytes,
-            _ => {
-                let bytes = fetch_manifest_located_with_budget(&source.url, budget)?;
-                if hash_of(&bytes) != source.sha256 {
-                    return Err(format!(
-                        "bank \"{}\" ({}) does not match the installed manifest pin",
-                        source.name, source.url
-                    ));
-                }
-                budget.check()?;
-                if publish_manifest_cache(&path, &bytes, &context.shared.publication, budget)
-                    .is_err()
-                {
+    for (index, source) in sources.iter().enumerate() {
+        if let Err(spent) = budget.check() {
+            mark_remaining_failed(index, &spent);
+            return Err(spent);
+        }
+        let outcome: Result<(), String> = (|| {
+            let path = cache_path(dir, &source.url);
+            let cached = read_manifest_cache(&path).ok();
+            budget.check()?;
+            let verified = match cached {
+                Some(bytes) if hash_of(&bytes) == source.sha256 => bytes,
+                _ => {
+                    let bytes = fetch_manifest_located_with_budget(&source.url, budget)?;
+                    if hash_of(&bytes) != source.sha256 {
+                        return Err(format!(
+                            "bank \"{}\" ({}) does not match the installed manifest pin",
+                            source.name, source.url
+                        ));
+                    }
                     budget.check()?;
+                    if publish_manifest_cache(&path, &bytes, &context.shared.publication, budget)
+                        .is_err()
+                    {
+                        budget.check()?;
+                    }
+                    bytes
                 }
-                bytes
-            }
-        };
-        let json: serde_json::Value = serde_json::from_slice(&verified)
-            .map_err(|error| format!("{}: {error}", source.url))?;
-        let object = json
-            .as_object()
-            .ok_or_else(|| format!("{} is not a JSON object", source.url))?;
-        match &source.base {
-            None => {
-                for (canonical, value) in object {
-                    match value {
-                        serde_json::Value::String(alias) => {
-                            aliases.push((canonical.clone(), alias.clone()));
-                        }
-                        serde_json::Value::Array(list) => {
-                            for alias in list {
-                                if let Some(alias) = alias.as_str() {
-                                    aliases.push((canonical.clone(), alias.to_owned()));
+            };
+            let json: serde_json::Value = serde_json::from_slice(&verified)
+                .map_err(|error| format!("{}: {error}", source.url))?;
+            let object = json
+                .as_object()
+                .ok_or_else(|| format!("{} is not a JSON object", source.url))?;
+            match &source.base {
+                None => {
+                    for (canonical, value) in object {
+                        match value {
+                            serde_json::Value::String(alias) => {
+                                aliases.push((canonical.clone(), alias.clone()));
+                            }
+                            serde_json::Value::Array(list) => {
+                                for alias in list {
+                                    if let Some(alias) = alias.as_str() {
+                                        aliases.push((canonical.clone(), alias.to_owned()));
+                                    }
                                 }
                             }
+                            _ => {}
                         }
-                        _ => {}
+                    }
+                }
+                Some(base) => {
+                    for (name, entry) in object {
+                        budget.check()?;
+                        if !name.starts_with('_')
+                            && let Some(bank) = parse_bank(entry, base)
+                        {
+                            banks.insert(name.clone(), bank);
+                        }
                     }
                 }
             }
-            Some(base) => {
-                for (name, entry) in object {
-                    budget.check()?;
-                    if !name.starts_with('_')
-                        && let Some(bank) = parse_bank(entry, base)
-                    {
-                        banks.insert(name.clone(), bank);
-                    }
+            Ok(())
+        })();
+
+        match outcome {
+            Ok(()) => {
+                loaded_any = true;
+                context
+                    .shared
+                    .note_default_manifest(source, SourceState::Ready);
+            }
+            Err(error) => {
+                if let Err(spent) = budget.check() {
+                    mark_remaining_failed(index, &spent);
+                    return Err(spent);
+                }
+                context
+                    .shared
+                    .note_default_manifest(source, SourceState::Failed(error.clone()));
+                if first_error.is_none() {
+                    first_error = Some(error);
                 }
             }
         }
     }
+
     budget.check()?;
-    expand_bank_aliases(&mut banks, &aliases);
-    expand_case_insensitive(&mut banks);
-    let _publication = context
-        .shared
-        .publication
-        .enter(PublicationKind::Defaults, budget)?;
-    context.banks.write().expect("default banks").extend(banks);
-    Ok(())
+    if loaded_any {
+        expand_bank_aliases(&mut banks, &aliases);
+        expand_case_insensitive(&mut banks);
+        let _publication = context
+            .shared
+            .publication
+            .enter(PublicationKind::Defaults, budget)?;
+        context.banks.write().expect("default banks").extend(banks);
+    }
+    match first_error {
+        Some(error) => Err(error),
+        None => Ok(()),
+    }
 }
 
-/// Seed the default bank map from already verified manifest-cache files.
+/// Seed the default bank map from already verified manifest-cache files,
+/// returning the manifest URLs that verified and parsed cleanly.
 ///
 /// The asynchronous worker still refreshes the full pinned set. This small
 /// synchronous disk pass means a returning Studio session can draw the whole
@@ -1003,8 +1047,9 @@ pub(super) fn seed_cached_default_manifests(
     banks: &mut HashMap<String, Bank>,
     sources: &[PinnedSource],
     dir: &Path,
-) {
+) -> HashSet<String> {
     let mut aliases = Vec::new();
+    let mut seeded = HashSet::new();
     for source in sources {
         let path = cache_path(dir, &source.url);
         let Ok(bytes) = read_manifest_cache(&path) else {
@@ -1023,6 +1068,7 @@ pub(super) fn seed_cached_default_manifests(
         let Ok(serde_json::Value::Object(object)) = serde_json::from_slice(&bytes) else {
             continue;
         };
+        seeded.insert(source.url.clone());
         match &source.base {
             None => {
                 for (canonical, value) in object {
@@ -1053,6 +1099,7 @@ pub(super) fn seed_cached_default_manifests(
     }
     expand_bank_aliases(banks, &aliases);
     expand_case_insensitive(banks);
+    seeded
 }
 
 /// Walk a folder batch, one folder at a time.
@@ -1131,9 +1178,12 @@ pub(super) fn run_manifest_worker(context: ManifestContext, jobs: ManifestJobs) 
         // The maps a stop leaves failed, said with it.
         let mut stopped = Vec::new();
         let result = match job.work {
-            ManifestWork::Defaults { sources, cache_dir } => budget
-                .check()
-                .and_then(|()| load_default_manifests(&context, &sources, &cache_dir, &budget)),
+            // Check the budget inside `load_default_manifests` so a batch that
+            // arrives spent still marks unreached uncached pins failed rather
+            // than leaving them `Loading`.
+            ManifestWork::Defaults { sources, cache_dir } => {
+                load_default_manifests(&context, &sources, &cache_dir, &budget)
+            }
             // The folder arm checks its own budget, so a batch that arrives
             // spent still reaches it: it names the walk on every row it never
             // got to, where a pre-check here in the lobby would leave those

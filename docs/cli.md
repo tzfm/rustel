@@ -240,6 +240,10 @@ See [Csound](csound.md) for instruments, examples and exports.
 
 ```sh
 rustel play song.strudel --allow-local-samples ~/kits
+rustel samples list
+rustel samples list --pack Dirt-Samples --json
+rustel samples audition bd:2
+rustel samples audition --stdio
 rustel samples cache --list
 rustel samples cache piano
 rustel samples cache
@@ -252,6 +256,15 @@ A score loads samples only from an allowed source.
 a domain or an address, and `--strict-sample-origins` turns off the four
 built-in sources. See
 [Local samples](local-samples.md) and [Security](../SECURITY.md).
+
+`samples list` prints shipped or custom packs, sound names, variant counts, and
+cache status. Pass `--json` for a machine-readable catalogue, `--pack`,
+`--category`, or `--cached` to filter, and `--source` to inspect an external or
+local sample map. When a remote manifest fails or times out, cached packs still
+appear, `complete` is `false` in JSON, and warnings name the missing manifests.
+`samples audition` plays one sound or chord immediately, or
+starts a persistent `--stdio` worker for editor previews. See
+[Integrations](integrations.md#sample-catalogue) for schemas and wire commands.
 
 `samples cache` downloads the shipped packs for offline use. Repeat it to
 resume an interrupted download. `samples clear` removes all downloaded samples;

@@ -549,6 +549,106 @@ impl SampleLibrary {
         Self::load_default_from(PINNED_BANKS, PINNED_GM_FONTS, true, cache_dir())
     }
 
+    /// Build a library for a subset of shipped packs without fetching remote
+    /// manifests for unselected packs. Passing `None` loads every shipped pack.
+    pub fn load_default_sources_async(selected_packs: Option<&[&str]>) -> Result<Self, String> {
+        let Some(selected) = selected_packs else {
+            return Self::load_default_from(PINNED_BANKS, PINNED_GM_FONTS, true, cache_dir());
+        };
+        let pinned: PinnedFile = serde_json::from_str(PINNED_BANKS)
+            .map_err(|error| format!("pinned sample-banks.json: {error}"))?;
+        let manifest_cache_dir = cache_dir();
+        let wants = |name: &str| selected.contains(&name);
+        let inline_name = inline_pack_name(&pinned.inline.base);
+        let mut banks = if wants(&inline_name) {
+            inline_banks_from(&pinned)
+        } else {
+            HashMap::new()
+        };
+        let sources: Vec<PinnedSource> = pinned
+            .sources
+            .into_iter()
+            .filter(|source| match source.base {
+                Some(_) => wants(&source.name),
+                // Include an alias-only pin (such as tidal-drum-machines-alias)
+                // when any selected pack name prefixes it.
+                None => selected.iter().any(|name| source.name.starts_with(name)),
+            })
+            .collect();
+        let seeded = if !sources.is_empty() {
+            seed_cached_default_manifests(&mut banks, &sources, &manifest_cache_dir)
+        } else {
+            HashSet::new()
+        };
+
+        let (gm, font_base) = if wants("gm soundfonts") {
+            let pinned_fonts: PinnedFonts = serde_json::from_str(PINNED_GM_FONTS)
+                .map_err(|error| format!("pinned gm-fonts.json: {error}"))?;
+            let gm = pinned_fonts
+                .fonts
+                .into_iter()
+                .map(|(name, fonts)| {
+                    (
+                        name,
+                        fonts
+                            .into_iter()
+                            .map(|font| Arc::from(font.as_str()))
+                            .collect(),
+                    )
+                })
+                .collect();
+            (gm, pinned_fonts.base)
+        } else {
+            (HashMap::new(), String::new())
+        };
+
+        let library = Self::with_background_loaders(banks, Vec::new(), gm, font_base)?;
+        if !sources.is_empty() {
+            library.shared.init_default_manifests(&sources, &seeded);
+            library.enqueue_manifest_work_async(ManifestWork::Defaults {
+                sources,
+                cache_dir: manifest_cache_dir,
+            })?;
+        }
+        Ok(library)
+    }
+
+    /// Build a library loaded only from explicit `samples(...)` source specs
+    /// under `access`, without loading the shipped default manifests.
+    pub fn load_for_sources(
+        specs: &[String],
+        access: &ScoreSampleAccess,
+        timeout: Duration,
+        stop: impl Fn() -> bool,
+    ) -> Result<Self, String> {
+        let library = Self::with_background_loaders(
+            HashMap::new(),
+            Vec::new(),
+            HashMap::new(),
+            String::new(),
+        )?;
+        library.set_direct_diagnostic_logging(false);
+        for spec in specs {
+            library.look_up_samples_source(spec, access)?;
+        }
+        library.wait_until_idle_cancellable(timeout, &stop);
+        if stop() {
+            return Err("sample source lookup interrupted".to_owned());
+        }
+        for spec in specs {
+            match library.samples_source_state(spec) {
+                Some(SourceState::Ready) => {}
+                Some(SourceState::Failed(reason)) => {
+                    return Err(format!("{spec}: {reason}"));
+                }
+                Some(SourceState::Loading) | None => {
+                    return Err(format!("{spec}: timed out waiting for sample source"));
+                }
+            }
+        }
+        Ok(library)
+    }
+
     pub(super) fn load_default_from(
         pinned_banks: &str,
         pinned_fonts: &str,
@@ -558,9 +658,11 @@ impl SampleLibrary {
         let pinned: PinnedFile = serde_json::from_str(pinned_banks)
             .map_err(|error| format!("pinned sample-banks.json: {error}"))?;
         let mut banks = inline_banks_from(&pinned);
-        if asynchronous {
-            seed_cached_default_manifests(&mut banks, &pinned.sources, &manifest_cache_dir);
-        }
+        let seeded = if asynchronous {
+            seed_cached_default_manifests(&mut banks, &pinned.sources, &manifest_cache_dir)
+        } else {
+            HashSet::new()
+        };
 
         let pinned_fonts: PinnedFonts = serde_json::from_str(pinned_fonts)
             .map_err(|error| format!("pinned gm-fonts.json: {error}"))?;
@@ -580,6 +682,11 @@ impl SampleLibrary {
         let font_base = pinned_fonts.base;
 
         let library = Self::with_background_loaders(banks, Vec::new(), gm, font_base)?;
+        if !pinned.sources.is_empty() {
+            library
+                .shared
+                .init_default_manifests(&pinned.sources, &seeded);
+        }
         let work = ManifestWork::Defaults {
             sources: pinned.sources,
             cache_dir: manifest_cache_dir,
@@ -662,6 +769,7 @@ impl SampleLibrary {
             publication,
             render_rate: AtomicU32::new(crate::session::DEFAULT_SAMPLE_RATE),
             settled_epoch: AtomicU64::new(0),
+            default_manifest_states: Mutex::new(HashMap::new()),
         });
         // A worker must not keep `Shared` alive: worker -> Shared -> queue
         // would otherwise form a cycle and leak one thread per discarded
@@ -1201,7 +1309,7 @@ impl SampleLibrary {
     /// The offline wait with a stop of the host: the wait returns once
     /// `stop` gives true. Stopping this wait leaves the library and its
     /// background loaders available to the host.
-    pub(crate) fn wait_until_idle_cancellable(
+    pub fn wait_until_idle_cancellable(
         &self,
         deadline: std::time::Duration,
         stop: impl Fn() -> bool,
@@ -2233,6 +2341,7 @@ pub(super) mod tests {
                 publication: Arc::new(PublicationGate::new()),
                 render_rate: AtomicU32::new(crate::session::DEFAULT_SAMPLE_RATE),
                 settled_epoch: AtomicU64::new(0),
+                default_manifest_states: Mutex::new(HashMap::new()),
             }
         }
 
@@ -2486,6 +2595,7 @@ pub(super) mod tests {
                 name: "drums".to_owned(),
                 url: "https://example.test/drums.json".to_owned(),
                 base: "https://example.test/drums".to_owned(),
+                category: SoundCategory::Drums,
             };
             assert_eq!(library.default_source_holds(&pack), (1, 2));
             assert_eq!(library.pending_cache_under(&pack.base), 0);
@@ -2536,6 +2646,7 @@ pub(super) mod tests {
                 name: "drums".to_owned(),
                 url: "https://example.test/drums.json".to_owned(),
                 base: "https://example.test/drums".to_owned(),
+                category: SoundCategory::Drums,
             };
             assert_eq!(library.default_source_holds(&pack), (5, 2));
         }
@@ -2569,6 +2680,7 @@ pub(super) mod tests {
                 name: "drums".to_owned(),
                 url: "https://example.test/drums.json".to_owned(),
                 base: "https://example.test/drums".to_owned(),
+                category: SoundCategory::Drums,
             };
             assert_eq!(
                 library.default_source_files(&pack),
@@ -2753,6 +2865,7 @@ pub(super) mod tests {
                 name: "gm soundfonts".to_owned(),
                 url: "https://example.test/sound".to_owned(),
                 base: "https://example.test/sound".to_owned(),
+                category: SoundCategory::Font,
             };
             assert_eq!(library.default_source_holds(&fonts), (2, 2));
             let asked = library.cache_default_source(&fonts);

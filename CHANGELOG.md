@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- Added `rustel samples list` (with `--json`, filters, and manifest load warnings), `rustel samples audition` (one-shot and `--stdio`), and `ui_control` `audition`/`audition_stop` commands for editor sample browsers.
 - VST3 plugins exposing `IMidiMapping` now accept MIDI CCs and expression in `.vsti()` via named keys (`modwheel`, `aftertouch`, `pitchbend`, `cc0`..`cc127`), `{ cc: { ... } }` maps, and chained `.midibend()`, `.miditouch()`, and `.ccn().ccv()`.
 - `.lfo()`, `.env()`, and `.bmod()` now continuously modulate `.vsti()` and `.vst()` plugin parameters and mapped MIDI CCs.
 - Added global forms for composition operators, missing `_name` pattern methods, and no-op stand-ins that log once for unsupported strudel.cc names. Prebakes with computed writes now keep unknown-function checks active.

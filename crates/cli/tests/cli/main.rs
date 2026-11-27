@@ -6672,3 +6672,253 @@ fn a_pick_name_not_in_the_lookup_is_named() {
     assert!(!said.contains("NaN"), "{said}");
     assert!(!said.contains("x.value"), "{said}");
 }
+
+fn minimal_pcm16_wav_bytes() -> Vec<u8> {
+    let frames = 240u32;
+    let data_bytes = frames * 2;
+    let mut wav = Vec::with_capacity(44 + data_bytes as usize);
+    wav.extend_from_slice(b"RIFF");
+    wav.extend_from_slice(&(36 + data_bytes).to_le_bytes());
+    wav.extend_from_slice(b"WAVE");
+    wav.extend_from_slice(b"fmt ");
+    wav.extend_from_slice(&16u32.to_le_bytes());
+    wav.extend_from_slice(&1u16.to_le_bytes());
+    wav.extend_from_slice(&1u16.to_le_bytes());
+    wav.extend_from_slice(&48_000u32.to_le_bytes());
+    wav.extend_from_slice(&96_000u32.to_le_bytes());
+    wav.extend_from_slice(&2u16.to_le_bytes());
+    wav.extend_from_slice(&16u16.to_le_bytes());
+    wav.extend_from_slice(b"data");
+    wav.extend_from_slice(&data_bytes.to_le_bytes());
+    for index in 0..frames {
+        let sample = if index % 16 < 8 { 8_000i16 } else { -8_000i16 };
+        wav.extend_from_slice(&sample.to_le_bytes());
+    }
+    wav
+}
+
+#[test]
+fn samples_list_emits_versioned_json_catalogue_for_shipped_and_local_sources() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let cache = temp.path().join("cache");
+    std::fs::create_dir_all(&cache).expect("cache dir");
+
+    let shipped = rustel()
+        .args(["samples", "list", "--pack", "Dirt-Samples", "--json"])
+        .env("RUSTEL_SAMPLE_CACHE", &cache)
+        .output()
+        .expect("run samples list");
+    assert!(
+        shipped.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&shipped.stderr)
+    );
+    let catalogue: serde_json::Value =
+        serde_json::from_slice(&shipped.stdout).expect("valid catalogue JSON");
+    assert_eq!(catalogue["version"], 1);
+    assert_eq!(catalogue["complete"], true);
+    assert_eq!(catalogue["warnings"], serde_json::json!([]));
+    let packs = catalogue["packs"].as_array().expect("packs array");
+    assert_eq!(packs.len(), 1);
+    assert_eq!(packs[0]["pack"], "Dirt-Samples");
+    assert_eq!(packs[0]["category"], "dirt");
+    assert_eq!(packs[0]["built_in"], true);
+    assert!(packs[0]["import"].is_null());
+    assert_eq!(packs[0]["cache_state"], "uncached");
+    assert_eq!(packs[0]["manifest_state"], "ready");
+    assert!(packs[0]["manifest_error"].is_null());
+
+    let casio = catalogue["sounds"]
+        .as_array()
+        .expect("sounds array")
+        .iter()
+        .find(|entry| entry["sound"] == "casio")
+        .expect("casio entry");
+    assert_eq!(casio["pack"], "Dirt-Samples");
+    assert_eq!(casio["variants"], 3);
+    assert_eq!(casio["category"], "dirt");
+    assert_eq!(casio["origin"], "default");
+    assert_eq!(casio["cache_state"], "uncached");
+
+    let local_root = temp.path().join("samples");
+    let snare_dir = local_root.join("kits").join("snare");
+    std::fs::create_dir_all(&snare_dir).expect("snare dir");
+    std::fs::write(snare_dir.join("snap.wav"), minimal_pcm16_wav_bytes()).expect("write wav");
+
+    let local = rustel()
+        .args([
+            "samples",
+            "list",
+            "--source",
+            "local:kits",
+            "--allow-local-samples",
+            local_root.to_str().expect("utf-8 root"),
+            "--cached",
+            "--json",
+        ])
+        .env("RUSTEL_SAMPLE_CACHE", &cache)
+        .output()
+        .expect("run local samples list");
+    assert!(
+        local.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&local.stderr)
+    );
+    let local_json: serde_json::Value =
+        serde_json::from_slice(&local.stdout).expect("valid local catalogue JSON");
+    assert_eq!(local_json["complete"], true);
+    assert_eq!(local_json["warnings"], serde_json::json!([]));
+    assert_eq!(local_json["packs"][0]["shortcut"], "local:kits");
+    assert_eq!(local_json["packs"][0]["import"], "samples(\"local:kits\")");
+    assert_eq!(local_json["packs"][0]["cache_state"], "cached");
+    assert_eq!(local_json["packs"][0]["manifest_state"], "ready");
+    assert!(local_json["packs"][0]["manifest_error"].is_null());
+    let snare = &local_json["sounds"][0];
+    assert_eq!(snare["sound"], "snare");
+    assert_eq!(snare["variants"], 1);
+    assert_eq!(snare["variant_names"], serde_json::json!(["snap"]));
+    assert_eq!(snare["cache_state"], "cached");
+}
+
+#[cfg(feature = "device-audio")]
+#[test]
+fn samples_audition_and_play_ui_control_audition_work_on_silent_output() {
+    use std::io::Write;
+
+    let temp = tempfile::tempdir().expect("tempdir");
+    let cache = temp.path().join("cache");
+    let local_root = temp.path().join("samples");
+    let ping_dir = local_root.join("kits").join("ping");
+    std::fs::create_dir_all(&cache).expect("cache dir");
+    std::fs::create_dir_all(&ping_dir).expect("ping dir");
+    std::fs::write(ping_dir.join("01.wav"), minimal_pcm16_wav_bytes()).expect("write wav");
+
+    // 1. One-shot standalone audition of a local sample.
+    let once = rustel()
+        .args([
+            "samples",
+            "audition",
+            "ping",
+            "--source",
+            "local:kits",
+            "--allow-local-samples",
+            local_root.to_str().expect("utf-8 root"),
+            "--duration",
+            "0.05",
+            "--output",
+            "silent",
+            "--json",
+        ])
+        .env("RUSTEL_SAMPLE_CACHE", &cache)
+        .output()
+        .expect("run one-shot audition");
+    assert!(
+        once.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&once.stderr)
+    );
+    let once_json: serde_json::Value =
+        serde_json::from_slice(&once.stdout).expect("valid one-shot JSON");
+    assert_eq!(once_json["audition"]["sound"], "ping");
+    assert_eq!(once_json["audition"]["played"], true);
+
+    // 2. Persistent standalone `--stdio` audition worker.
+    let mut stdio_child = rustel()
+        .args([
+            "samples",
+            "audition",
+            "--stdio",
+            "--allow-local-samples",
+            local_root.to_str().expect("utf-8 root"),
+            "--output",
+            "silent",
+        ])
+        .env("RUSTEL_SAMPLE_CACHE", &cache)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn samples audition --stdio");
+    {
+        let mut stdin = stdio_child.stdin.take().expect("stdin");
+        for line in [
+            r#"{"ui_control":{"version":1,"kind":"audition","sound":"ping","source":"local:kits","duration":0.05,"request":"a-local"}}"#,
+            r#"{"ui_control":{"version":1,"kind":"audition","sound":"sine","notes":["c4","e4"],"duration":0.05,"request":"a-synth"}}"#,
+            r#"{"ui_control":{"version":1,"kind":"audition","sound":"sine","gain":99,"request":"a-bad"}}"#,
+            r#"{"ui_control":{"version":1,"kind":"audition_stop","request":"a-stop"}}"#,
+        ] {
+            writeln!(stdin, "{line}").expect("write stdio command");
+        }
+        stdin.flush().expect("flush stdin");
+    }
+    let stdio_out = wait_for_output(stdio_child, &["samples", "audition", "--stdio"]);
+    assert!(
+        stdio_out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&stdio_out.stderr)
+    );
+    let acks: Vec<serde_json::Value> = String::from_utf8_lossy(&stdio_out.stdout)
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .map(|line| serde_json::from_str(line).expect("ack json"))
+        .collect();
+    assert_eq!(acks.len(), 4, "acks: {acks:?}");
+    assert_eq!(acks[0]["ui_control_ack"]["request"], "a-local");
+    assert_eq!(acks[0]["ui_control_ack"]["accepted"], true);
+    assert_eq!(acks[1]["ui_control_ack"]["request"], "a-synth");
+    assert_eq!(acks[1]["ui_control_ack"]["accepted"], true);
+    assert_eq!(acks[2]["ui_control_ack"]["request"], "a-bad");
+    assert_eq!(acks[2]["ui_control_ack"]["accepted"], false);
+    assert_eq!(acks[3]["ui_control_ack"]["request"], "a-stop");
+    assert_eq!(acks[3]["ui_control_ack"]["accepted"], true);
+
+    // 3. `rustel play --ui-events` handles `audition` and `audition_stop` on stdin.
+    let score = temp.path().join("live.strudel");
+    std::fs::write(&score, "$: note(\"c4\").s(\"sine\").gain(0.2)\n").expect("write score");
+    let mut live_child = rustel()
+        .args([
+            "play",
+            score.to_str().expect("utf-8 score"),
+            "--ui-events",
+            "--output",
+            "silent",
+        ])
+        .env("RUSTEL_SAMPLE_CACHE", &cache)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn play --ui-events");
+    {
+        let mut stdin = live_child.stdin.take().expect("stdin");
+        for line in [
+            r#"{"ui_control":{"version":1,"kind":"audition","sound":"sine","note":"a4","duration":0.05,"request":"live-aud"}}"#,
+            r#"{"ui_control":{"version":1,"kind":"audition_stop","request":"live-stop"}}"#,
+            r#"{"ui_control":{"version":1,"kind":"transport","action":"stop","request":"live-end"}}"#,
+        ] {
+            writeln!(stdin, "{line}").expect("write live control");
+        }
+        stdin.flush().expect("flush live stdin");
+    }
+    let live_out = wait_for_output(live_child, &["play", "--ui-events"]);
+    assert!(
+        live_out.status.code().is_some() && live_out.status.code() != Some(101),
+        "unexpected exit {:?}\nstderr: {}",
+        live_out.status.code(),
+        String::from_utf8_lossy(&live_out.stderr)
+    );
+    let live_acks: Vec<serde_json::Value> = String::from_utf8_lossy(&live_out.stdout)
+        .lines()
+        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        .filter(|value| value.get("ui_control_ack").is_some())
+        .collect();
+    for request in ["live-aud", "live-stop", "live-end"] {
+        assert!(
+            live_acks.iter().any(|ack| {
+                ack["ui_control_ack"]["request"] == request
+                    && ack["ui_control_ack"]["accepted"] == true
+            }),
+            "missing accepted ack for {request}: {live_acks:?}"
+        );
+    }
+}

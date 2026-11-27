@@ -154,6 +154,185 @@ pub(super) fn default_categories() -> &'static DefaultCategories {
     })
 }
 
+/// Cache presence for a pack or sound on local disk.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum CacheState {
+    Cached,
+    Partial,
+    Uncached,
+}
+
+impl CacheState {
+    pub fn from_counts(cached_files: usize, total_files: usize) -> Self {
+        if total_files > 0 && cached_files >= total_files {
+            Self::Cached
+        } else if cached_files > 0 {
+            Self::Partial
+        } else {
+            Self::Uncached
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Cached => "cached",
+            Self::Partial => "partial",
+            Self::Uncached => "uncached",
+        }
+    }
+}
+
+/// Load state of the manifest behind a pack in [`SampleCatalogue`].
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, serde::Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ManifestState {
+    #[default]
+    Ready,
+    Loading,
+    Failed,
+}
+
+impl ManifestState {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Ready => "ready",
+            Self::Loading => "loading",
+            Self::Failed => "failed",
+        }
+    }
+}
+
+/// Summary of one sample pack or imported source in [`SampleCatalogue`].
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SampleCataloguePack {
+    pub pack: String,
+    pub category: SoundCategory,
+    pub source: String,
+    pub shortcut: Option<String>,
+    pub import: Option<String>,
+    pub built_in: bool,
+    pub sounds: usize,
+    pub files: usize,
+    pub cached_files: usize,
+    pub cached_bytes: u64,
+    pub cache_state: CacheState,
+    pub manifest_state: ManifestState,
+    pub manifest_error: Option<String>,
+}
+
+/// One sound entry in [`SampleCatalogue`].
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SampleCatalogueSound {
+    pub pack: String,
+    pub sound: String,
+    pub variants: usize,
+    pub files: usize,
+    pub pitched: bool,
+    pub category: SoundCategory,
+    pub origin: SoundOrigin,
+    pub source: String,
+    pub shortcut: Option<String>,
+    pub import: Option<String>,
+    pub cached_files: usize,
+    pub cached_bytes: u64,
+    pub cache_state: CacheState,
+    pub variant_names: Vec<String>,
+}
+
+/// Machine-readable snapshot of sample packs, sounds, variant counts, and disk cache state.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SampleCatalogue {
+    pub complete: bool,
+    pub warnings: Vec<String>,
+    pub packs: Vec<SampleCataloguePack>,
+    pub sounds: Vec<SampleCatalogueSound>,
+}
+
+impl Default for SampleCatalogue {
+    fn default() -> Self {
+        Self {
+            complete: true,
+            warnings: Vec::new(),
+            packs: Vec::new(),
+            sounds: Vec::new(),
+        }
+    }
+}
+
+/// Format a `samples(...)` score expression for `spec`, preferring a valid
+/// shorthand such as `github:user/repo` when one applies.
+pub fn samples_import_hint(spec: &str) -> String {
+    let shortcut = source_shortcut(spec);
+    let preferred = shortcut.as_deref().unwrap_or(spec);
+    let quoted = serde_json::to_string(preferred).unwrap_or_else(|_| format!("{preferred:?}"));
+    format!("samples({quoted})")
+}
+
+/// Return a `samples(...)` shorthand for `source` when one exists.
+///
+/// Preserves existing shorthands (`github:`, `bubo:`, `shabda:`, `local:`),
+/// maps GitHub repository pages, and turns pinned `raw.githubusercontent.com`
+/// manifest URLs back into their `github:` shorthand.
+pub fn source_shortcut(source: &str) -> Option<String> {
+    let trimmed = source.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    if SHORTHANDS
+        .iter()
+        .any(|shorthand| shorthand.read(trimmed).is_some())
+    {
+        return Some(trimmed.to_owned());
+    }
+    if let Some(shorthand) = repo_page_source(trimmed) {
+        return Some(shorthand);
+    }
+    let parsed = Url::parse(trimmed).ok()?;
+    if parsed.scheme() != "https" || parsed.host_str() != Some("raw.githubusercontent.com") {
+        return None;
+    }
+    let segments: Vec<&str> = parsed
+        .path_segments()?
+        .filter(|segment| !segment.is_empty())
+        .collect();
+    if segments.len() < 4 {
+        return None;
+    }
+    let user = segments[0];
+    let repo = segments[1];
+    let branch = segments[2];
+    let rest = &segments[3..];
+    if rest == [GITHUB_SAMPLE_MANIFEST] {
+        return Some(if branch == "main" {
+            format!("github:{user}/{repo}")
+        } else {
+            format!("github:{user}/{repo}/{branch}")
+        });
+    }
+    if rest.last() == Some(&GITHUB_SAMPLE_MANIFEST) {
+        let dir = rest[..rest.len() - 1].join("/");
+        return Some(format!("github:{user}/{repo}/{branch}/{dir}"));
+    }
+    if rest
+        .last()
+        .is_some_and(|name| name.to_ascii_lowercase().ends_with(".json"))
+    {
+        let tail = rest.join("/");
+        return Some(format!("github:{user}/{repo}/{branch}/{tail}"));
+    }
+    None
+}
+
+pub(super) fn inline_pack_name(base: &str) -> String {
+    base.trim_end_matches('/')
+        .rsplit('/')
+        .next()
+        .filter(|name| !name.is_empty())
+        .unwrap_or("built-in")
+        .to_owned()
+}
+
 /// The shipped packs a pin file and a font map describe. Only the packs
 /// that bring files: an alias-only pin has no row's worth of anything.
 pub(super) fn default_sources_from(pinned_banks: &str, pinned_fonts: &str) -> Vec<DefaultSource> {
@@ -165,21 +344,17 @@ pub(super) fn default_sources_from(pinned_banks: &str, pinned_fonts: &str) -> Ve
                     name: source.name,
                     url: source.url,
                     base,
+                    category: source.category.unwrap_or(SoundCategory::Other),
                 });
             }
         }
         if !pinned.inline.banks.is_empty() {
             let base = pinned.inline.base;
             sources.push(DefaultSource {
-                name: base
-                    .trim_end_matches('/')
-                    .rsplit('/')
-                    .next()
-                    .filter(|name| !name.is_empty())
-                    .unwrap_or("built-in")
-                    .to_owned(),
+                name: inline_pack_name(&base),
                 url: base.clone(),
                 base,
+                category: pinned.inline.category.unwrap_or(SoundCategory::Other),
             });
         }
     }
@@ -190,6 +365,7 @@ pub(super) fn default_sources_from(pinned_banks: &str, pinned_fonts: &str) -> Ve
             name: "gm soundfonts".to_owned(),
             url: fonts.base.clone(),
             base: fonts.base,
+            category: SoundCategory::Font,
         });
     }
     sources
@@ -1151,6 +1327,8 @@ impl SampleLibrary {
             });
             banks.extend(inline_banks_from(&pinned));
         }
+        self.shared
+            .init_default_manifests(&pinned.sources, &HashSet::new());
         self.enqueue_manifest_work_async(ManifestWork::Defaults {
             sources: pinned.sources,
             cache_dir: self.shared.host_cache.clone(),
@@ -2272,6 +2450,454 @@ impl SampleLibrary {
     fn default_font_files(&self) -> HashSet<Arc<str>> {
         self.gm.values().flatten().cloned().collect()
     }
+
+    /// Size in bytes of `url` on local disk, checking local paths, the host
+    /// sample cache, and the score-selected cache namespace.
+    fn cached_bytes_for_url(&self, url: &str) -> Option<u64> {
+        if let Some(path) = url.strip_prefix("file://") {
+            if let Ok(meta) = std::fs::metadata(path)
+                && meta.is_file()
+            {
+                return Some(meta.len());
+            }
+            if let Ok(parsed) = Url::parse(url)
+                && let Ok(file_path) = parsed.to_file_path()
+                && let Ok(meta) = std::fs::metadata(&file_path)
+                && meta.is_file()
+            {
+                return Some(meta.len());
+            }
+            return None;
+        }
+        if let Some(bytes) = cache_entry_bytes(&self.shared.host_cache, url) {
+            return Some(bytes);
+        }
+        let score_path = self.shared.score_cache.path(url, ScoreCacheKind::Audio);
+        let file = open_regular_cache_entry(&score_path).ok().flatten()?;
+        let len = file.metadata().ok()?.len();
+        (len > 0).then_some(len)
+    }
+
+    /// Machine-readable catalogue of sample packs, sounds, variant counts,
+    /// source/import metadata, and disk cache state.
+    ///
+    /// Pass `Some(packs)` to restrict shipped default packs (including `Some(&[])`
+    /// to inspect only custom/imported sources); pass `None` to include every
+    /// shipped pack in [`Self::default_sources`].
+    pub fn detailed_catalogue(&self, default_packs: Option<&[DefaultSource]>) -> SampleCatalogue {
+        let mut url_bytes: HashMap<Arc<str>, Option<u64>> = HashMap::new();
+        let mut cached_len = |url: &Arc<str>| -> Option<u64> {
+            if let Some(&cached) = url_bytes.get(url) {
+                return cached;
+            }
+            let len = self.cached_bytes_for_url(url);
+            url_bytes.insert(Arc::clone(url), len);
+            len
+        };
+
+        let mut complete = true;
+        let mut warnings = Vec::new();
+        let mut packs = Vec::new();
+        let mut sounds = Vec::new();
+
+        // 1. Imported / score-registered sources (`self.custom`).
+        {
+            struct GroupedBank {
+                name: String,
+                bank: Bank,
+                origin: SoundOrigin,
+                category: SoundCategory,
+                import_spec: Option<String>,
+            }
+            let custom = self.custom.read().expect("custom banks");
+            let owners = self.shared.bank_owners.read().expect("bank owners");
+            // Group custom banks by their import label so each external source
+            // produces one pack summary and a sorted sound list.
+            let mut grouped: BTreeMap<String, Vec<GroupedBank>> = BTreeMap::new();
+            for (name, bank) in custom.iter() {
+                let (pack_name, origin, category, import_spec) = match owners.get(name) {
+                    Some(BankOwner::Import(spec)) => (
+                        spec.to_string(),
+                        SoundOrigin::Score,
+                        SoundCategory::Score,
+                        Some(spec.to_string()),
+                    ),
+                    Some(BankOwner::Set { .. }) => {
+                        ("set".to_owned(), SoundOrigin::Set, SoundCategory::Set, None)
+                    }
+                    None => (
+                        "custom".to_owned(),
+                        SoundOrigin::Score,
+                        SoundCategory::Score,
+                        None,
+                    ),
+                };
+                grouped.entry(pack_name).or_default().push(GroupedBank {
+                    name: name.clone(),
+                    bank: bank.clone(),
+                    origin,
+                    category,
+                    import_spec,
+                });
+            }
+            drop(owners);
+            drop(custom);
+
+            for (pack_name, mut entries) in grouped {
+                entries.sort_by(|a, b| {
+                    a.name
+                        .to_ascii_lowercase()
+                        .cmp(&b.name.to_ascii_lowercase())
+                        .then_with(|| a.name.cmp(&b.name))
+                });
+                let first_category = entries[0].category;
+                let import_spec = entries[0].import_spec.clone();
+                let source = import_spec.clone().unwrap_or_else(|| pack_name.clone());
+                let shortcut = source_shortcut(&source);
+                let import = import_spec.as_deref().map(samples_import_hint);
+                let mut pack_urls: HashSet<Arc<str>> = HashSet::new();
+                let mut sound_count = 0usize;
+
+                for entry in entries {
+                    let GroupedBank {
+                        name,
+                        bank,
+                        origin,
+                        category,
+                        ..
+                    } = entry;
+                    let variants = match &bank {
+                        Bank::Array(urls) => urls.len(),
+                        Bank::Notes(notes) => {
+                            notes.iter().map(|(_, urls)| urls.len()).max().unwrap_or(1)
+                        }
+                    };
+                    let pitched = matches!(bank, Bank::Notes(_));
+                    let distinct_urls: HashSet<Arc<str>> =
+                        bank_file_urls(&bank).into_iter().cloned().collect();
+                    let files = distinct_urls.len();
+                    let mut cached_files = 0usize;
+                    let mut cached_bytes = 0u64;
+                    for url in &distinct_urls {
+                        if let Some(len) = cached_len(url) {
+                            cached_files += 1;
+                            cached_bytes = cached_bytes.saturating_add(len);
+                        }
+                    }
+                    pack_urls.extend(distinct_urls);
+                    sound_count += 1;
+                    sounds.push(SampleCatalogueSound {
+                        pack: pack_name.clone(),
+                        sound: name,
+                        variants,
+                        files,
+                        pitched,
+                        category,
+                        origin,
+                        source: source.clone(),
+                        shortcut: shortcut.clone(),
+                        import: import.clone(),
+                        cached_files,
+                        cached_bytes,
+                        cache_state: CacheState::from_counts(cached_files, files),
+                        variant_names: local_variant_names(&bank),
+                    });
+                }
+
+                let total_files = pack_urls.len();
+                let mut pack_cached_files = 0usize;
+                let mut pack_cached_bytes = 0u64;
+                for url in &pack_urls {
+                    if let Some(len) = cached_len(url) {
+                        pack_cached_files += 1;
+                        pack_cached_bytes = pack_cached_bytes.saturating_add(len);
+                    }
+                }
+                packs.push(SampleCataloguePack {
+                    pack: pack_name,
+                    category: first_category,
+                    source,
+                    shortcut,
+                    import,
+                    built_in: false,
+                    sounds: sound_count,
+                    files: total_files,
+                    cached_files: pack_cached_files,
+                    cached_bytes: pack_cached_bytes,
+                    cache_state: CacheState::from_counts(pack_cached_files, total_files),
+                    manifest_state: ManifestState::Ready,
+                    manifest_error: None,
+                });
+            }
+        }
+
+        // 2. Shipped default packs (pinned manifests, inline Dirt-Samples, GM fonts).
+        let shipped = match default_packs {
+            Some(packs) => packs,
+            None => Self::default_sources(),
+        };
+        if !shipped.is_empty() {
+            let manifest_states: HashMap<String, DefaultManifestEntry> = self
+                .shared
+                .default_manifest_states
+                .lock()
+                .expect("default manifest states")
+                .clone();
+            // Snapshot default banks once so we never hold the RwLock during disk stat calls.
+            let default_banks: Vec<(String, Bank)> = self
+                .banks
+                .read()
+                .expect("default banks")
+                .iter()
+                .map(|(name, bank)| (name.clone(), bank.clone()))
+                .collect();
+
+            // Match each default bank to the shipped pack with the longest matching base prefix.
+            let mut prefixes: Vec<(usize, String)> = shipped
+                .iter()
+                .enumerate()
+                .filter(|(_, pack)| !self.is_font_source(pack))
+                .map(|(index, pack)| (index, source_prefix(&pack.base).into_owned()))
+                .collect();
+            prefixes.sort_by(|a, b| b.1.len().cmp(&a.1.len()).then_with(|| a.0.cmp(&b.0)));
+
+            let mut banks_by_pack: Vec<Vec<(String, Bank)>> = vec![Vec::new(); shipped.len()];
+            for (name, bank) in default_banks {
+                let first_url = match &bank {
+                    Bank::Array(urls) => urls.first(),
+                    Bank::Notes(notes) => notes.iter().find_map(|(_, urls)| urls.first()),
+                };
+                if let Some(first_url) = first_url
+                    && let Some(&(pack_index, _)) = prefixes
+                        .iter()
+                        .find(|(_, prefix)| first_url.starts_with(prefix.as_str()))
+                {
+                    banks_by_pack[pack_index].push((name, bank));
+                }
+            }
+
+            for (pack_index, pack) in shipped.iter().enumerate() {
+                let shortcut = source_shortcut(&pack.url);
+                if self.is_font_source(pack) {
+                    let mut gm_entries: Vec<(&String, &Vec<Arc<str>>)> = self.gm.iter().collect();
+                    gm_entries.sort_by(|a, b| {
+                        a.0.to_ascii_lowercase()
+                            .cmp(&b.0.to_ascii_lowercase())
+                            .then_with(|| a.0.cmp(b.0))
+                    });
+                    let mut pack_urls: HashSet<Arc<str>> = HashSet::new();
+                    for (name, fonts) in &gm_entries {
+                        let distinct_urls: HashSet<Arc<str>> = fonts
+                            .iter()
+                            .map(|font| Arc::from(font_file_url(&self.shared.font_base, font)))
+                            .collect();
+                        let files = distinct_urls.len();
+                        let mut cached_files = 0usize;
+                        let mut cached_bytes = 0u64;
+                        for url in &distinct_urls {
+                            if let Some(len) = cached_len(url) {
+                                cached_files += 1;
+                                cached_bytes = cached_bytes.saturating_add(len);
+                            }
+                        }
+                        pack_urls.extend(distinct_urls);
+                        sounds.push(SampleCatalogueSound {
+                            pack: pack.name.clone(),
+                            sound: (*name).clone(),
+                            variants: fonts.len(),
+                            files,
+                            pitched: true,
+                            category: SoundCategory::Font,
+                            origin: SoundOrigin::Font,
+                            source: pack.url.clone(),
+                            shortcut: shortcut.clone(),
+                            import: None,
+                            cached_files,
+                            cached_bytes,
+                            cache_state: CacheState::from_counts(cached_files, files),
+                            variant_names: Vec::new(),
+                        });
+                    }
+                    let total_files = pack_urls.len();
+                    let mut pack_cached_files = 0usize;
+                    let mut pack_cached_bytes = 0u64;
+                    for url in &pack_urls {
+                        if let Some(len) = cached_len(url) {
+                            pack_cached_files += 1;
+                            pack_cached_bytes = pack_cached_bytes.saturating_add(len);
+                        }
+                    }
+                    packs.push(SampleCataloguePack {
+                        pack: pack.name.clone(),
+                        category: pack.category,
+                        source: pack.url.clone(),
+                        shortcut,
+                        import: None,
+                        built_in: true,
+                        sounds: gm_entries.len(),
+                        files: total_files,
+                        cached_files: pack_cached_files,
+                        cached_bytes: pack_cached_bytes,
+                        cache_state: CacheState::from_counts(pack_cached_files, total_files),
+                        manifest_state: ManifestState::Ready,
+                        manifest_error: None,
+                    });
+                    continue;
+                }
+
+                let pack_banks = &banks_by_pack[pack_index];
+                // Mirror `default_source_files`: omit lowercase lookup copies
+                // whose ordered URL list matches a canonical mixed-case bank.
+                let mut lookup_copies: HashMap<String, HashSet<Vec<&Arc<str>>>> = HashMap::new();
+                for (name, bank) in pack_banks {
+                    let lowercase = name.to_lowercase();
+                    if lowercase != *name {
+                        lookup_copies
+                            .entry(lowercase)
+                            .or_default()
+                            .insert(bank_file_urls(bank));
+                    }
+                }
+                let mut visible: Vec<&(String, Bank)> = pack_banks
+                    .iter()
+                    .filter(|(name, bank)| {
+                        let urls = bank_file_urls(bank);
+                        !(name == &name.to_lowercase()
+                            && lookup_copies
+                                .get(name)
+                                .is_some_and(|copies| copies.contains(&urls)))
+                    })
+                    .collect();
+                visible.sort_by(|a, b| {
+                    a.0.to_ascii_lowercase()
+                        .cmp(&b.0.to_ascii_lowercase())
+                        .then_with(|| a.0.cmp(&b.0))
+                });
+
+                let mut pack_urls: HashSet<Arc<str>> = HashSet::new();
+                for (name, bank) in &visible {
+                    let variants = match bank {
+                        Bank::Array(urls) => urls.len(),
+                        Bank::Notes(notes) => {
+                            notes.iter().map(|(_, urls)| urls.len()).max().unwrap_or(1)
+                        }
+                    };
+                    let pitched = matches!(bank, Bank::Notes(_));
+                    let distinct_urls: HashSet<Arc<str>> =
+                        bank_file_urls(bank).into_iter().cloned().collect();
+                    let files = distinct_urls.len();
+                    let mut cached_files = 0usize;
+                    let mut cached_bytes = 0u64;
+                    for url in &distinct_urls {
+                        if let Some(len) = cached_len(url) {
+                            cached_files += 1;
+                            cached_bytes = cached_bytes.saturating_add(len);
+                        }
+                    }
+                    pack_urls.extend(distinct_urls);
+                    sounds.push(SampleCatalogueSound {
+                        pack: pack.name.clone(),
+                        sound: name.clone(),
+                        variants,
+                        files,
+                        pitched,
+                        category: pack.category,
+                        origin: SoundOrigin::Default,
+                        source: pack.url.clone(),
+                        shortcut: shortcut.clone(),
+                        import: None,
+                        cached_files,
+                        cached_bytes,
+                        cache_state: CacheState::from_counts(cached_files, files),
+                        variant_names: local_variant_names(bank),
+                    });
+                }
+
+                let total_files = pack_urls.len();
+                let mut pack_cached_files = 0usize;
+                let mut pack_cached_bytes = 0u64;
+                for url in &pack_urls {
+                    if let Some(len) = cached_len(url) {
+                        pack_cached_files += 1;
+                        pack_cached_bytes = pack_cached_bytes.saturating_add(len);
+                    }
+                }
+                let (manifest_state, manifest_error) = match manifest_states.get(&pack.url) {
+                    None
+                    | Some(DefaultManifestEntry {
+                        state: SourceState::Ready,
+                        ..
+                    }) => (ManifestState::Ready, None),
+                    Some(DefaultManifestEntry {
+                        state: SourceState::Loading,
+                        ..
+                    }) => {
+                        complete = false;
+                        warnings.push(format!("{}: manifest is still loading", pack.name));
+                        (ManifestState::Loading, None)
+                    }
+                    Some(DefaultManifestEntry {
+                        state: SourceState::Failed(error),
+                        ..
+                    }) => {
+                        complete = false;
+                        warnings.push(format!("{}: manifest failed to load: {error}", pack.name));
+                        (ManifestState::Failed, Some(error.clone()))
+                    }
+                };
+                packs.push(SampleCataloguePack {
+                    pack: pack.name.clone(),
+                    category: pack.category,
+                    source: pack.url.clone(),
+                    shortcut,
+                    import: None,
+                    built_in: true,
+                    sounds: visible.len(),
+                    files: total_files,
+                    cached_files: pack_cached_files,
+                    cached_bytes: pack_cached_bytes,
+                    cache_state: CacheState::from_counts(pack_cached_files, total_files),
+                    manifest_state,
+                    manifest_error,
+                });
+            }
+
+            let mut alias_entries: Vec<&DefaultManifestEntry> = manifest_states
+                .values()
+                .filter(|entry| {
+                    entry.alias_only
+                        && (default_packs.is_none()
+                            || shipped
+                                .iter()
+                                .any(|pack| entry.name.starts_with(&pack.name)))
+                })
+                .collect();
+            alias_entries.sort_by(|a, b| a.name.cmp(&b.name));
+            for entry in alias_entries {
+                match &entry.state {
+                    SourceState::Ready => {}
+                    SourceState::Loading => {
+                        complete = false;
+                        warnings.push(format!("{}: alias manifest is still loading", entry.name));
+                    }
+                    SourceState::Failed(error) => {
+                        complete = false;
+                        warnings.push(format!(
+                            "{}: alias manifest failed to load: {error}",
+                            entry.name
+                        ));
+                    }
+                }
+            }
+        }
+
+        SampleCatalogue {
+            complete,
+            warnings,
+            packs,
+            sounds,
+        }
+    }
 }
 
 /// The grants and banks of a score registration under the policy the last
@@ -3134,5 +3760,351 @@ mod tests {
             "policy refusals must be cleared on new grant: {:?}",
             tables.states.keys().collect::<Vec<_>>()
         );
+    }
+
+    #[test]
+    fn detailed_catalogue_reports_shortcuts_imports_variants_and_cache_states() {
+        assert_eq!(
+            source_shortcut("https://raw.githubusercontent.com/user/pack/main/strudel.json")
+                .as_deref(),
+            Some("github:user/pack")
+        );
+        assert_eq!(
+            source_shortcut("https://raw.githubusercontent.com/user/pack/dev/drums/strudel.json")
+                .as_deref(),
+            Some("github:user/pack/dev/drums")
+        );
+        assert_eq!(
+            source_shortcut("https://github.com/user/pack").as_deref(),
+            Some("github:user/pack")
+        );
+        assert_eq!(source_shortcut("local:kits").as_deref(), Some("local:kits"));
+        assert_eq!(
+            samples_import_hint("https://raw.githubusercontent.com/user/pack/main/strudel.json"),
+            "samples(\"github:user/pack\")"
+        );
+        assert_eq!(
+            samples_import_hint("https://example.com/samples.json"),
+            "samples(\"https://example.com/samples.json\")"
+        );
+
+        // Local custom source via `load_for_sources` reports shortcut, import hint,
+        // variant stems, and full cached status.
+        let local_root = tempfile::tempdir().expect("local root");
+        let kick_dir = local_root.path().join("kits").join("kick");
+        std::fs::create_dir_all(&kick_dir).expect("kick dir");
+        std::fs::write(kick_dir.join("01_punch.wav"), b"RIFF0000").expect("wav 1");
+        std::fs::write(kick_dir.join("02_sub.wav"), b"RIFF1111").expect("wav 2");
+
+        let mut access = ScoreSampleAccess::denied();
+        access
+            .permit_local_root(local_root.path())
+            .expect("permit local root");
+        let local_lib = SampleLibrary::load_for_sources(
+            &["local:kits".to_owned()],
+            &access,
+            std::time::Duration::from_secs(5),
+            || false,
+        )
+        .expect("load local source");
+        let local_cat = local_lib.detailed_catalogue(Some(&[]));
+        assert_eq!(local_cat.packs.len(), 1);
+        assert_eq!(local_cat.packs[0].pack, "local:kits");
+        assert!(!local_cat.packs[0].built_in);
+        assert_eq!(local_cat.packs[0].shortcut.as_deref(), Some("local:kits"));
+        assert_eq!(
+            local_cat.packs[0].import.as_deref(),
+            Some("samples(\"local:kits\")")
+        );
+        assert_eq!(local_cat.packs[0].cache_state, CacheState::Cached);
+        assert_eq!(local_cat.sounds.len(), 1);
+        assert_eq!(local_cat.sounds[0].sound, "kick");
+        assert_eq!(local_cat.sounds[0].variants, 2);
+        assert_eq!(local_cat.sounds[0].variant_names, ["01_punch", "02_sub"]);
+        assert_eq!(local_cat.sounds[0].cache_state, CacheState::Cached);
+
+        // Shipped pack cache states transition from uncached -> partial -> cached.
+        let cache = tempfile::tempdir().expect("cache dir");
+        let base = "https://example.invalid/test-pack/";
+        let url_a = format!("{base}hat/0.wav");
+        let url_b = format!("{base}hat/1.wav");
+        let mut banks = HashMap::new();
+        banks.insert(
+            "hat".to_owned(),
+            Bank::Array(vec![Arc::from(url_a.as_str()), Arc::from(url_b.as_str())]),
+        );
+        let lib = SampleLibrary::with_background_loaders_at(
+            banks,
+            Vec::new(),
+            HashMap::new(),
+            String::new(),
+            cache.path().to_path_buf(),
+            Loading::InBackground,
+        )
+        .expect("library with temp cache");
+        let shipped = [DefaultSource {
+            name: "Test-Pack".to_owned(),
+            url: base.to_owned(),
+            base: base.to_owned(),
+            category: SoundCategory::Drums,
+        }];
+
+        let uncached = lib.detailed_catalogue(Some(&shipped));
+        assert_eq!(uncached.packs[0].cache_state, CacheState::Uncached);
+        assert_eq!(uncached.sounds[0].cache_state, CacheState::Uncached);
+        assert!(uncached.sounds[0].import.is_none());
+
+        let path_a = cache_path(cache.path(), &url_a);
+        std::fs::create_dir_all(path_a.parent().expect("parent")).expect("dir");
+        std::fs::write(&path_a, b"12345678").expect("cache a");
+        let partial = lib.detailed_catalogue(Some(&shipped));
+        assert_eq!(partial.packs[0].cache_state, CacheState::Partial);
+        assert_eq!(partial.sounds[0].cached_files, 1);
+        assert_eq!(partial.sounds[0].cached_bytes, 8);
+        assert_eq!(partial.sounds[0].cache_state, CacheState::Partial);
+
+        let path_b = cache_path(cache.path(), &url_b);
+        std::fs::create_dir_all(path_b.parent().expect("parent")).expect("dir");
+        std::fs::write(&path_b, b"1234").expect("cache b");
+        let cached = lib.detailed_catalogue(Some(&shipped));
+        assert!(cached.complete);
+        assert!(cached.warnings.is_empty());
+        assert_eq!(cached.packs[0].cache_state, CacheState::Cached);
+        assert_eq!(cached.packs[0].manifest_state, ManifestState::Ready);
+        assert!(cached.packs[0].manifest_error.is_none());
+        assert_eq!(cached.sounds[0].cached_files, 2);
+        assert_eq!(cached.sounds[0].cached_bytes, 12);
+        assert_eq!(cached.sounds[0].cache_state, CacheState::Cached);
+    }
+
+    #[test]
+    fn detailed_catalogue_reports_failed_loading_and_alias_default_manifests() {
+        use crate::samples::manifest_worker_tests::drain_request;
+        use std::io::Write;
+
+        let digest = |bytes: &[u8]| -> String {
+            let mut hasher = Sha256::new();
+            hasher.update(bytes);
+            hasher
+                .finalize()
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect()
+        };
+
+        // 1. Mixed partial failure: healthy remote pack + failing remote pack
+        //    + failing alias-only pin + inline pack.
+        let good_body = r#"{"good_kick":"good/0.wav"}"#;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind server");
+        let origin = format!("http://{}", listener.local_addr().expect("addr"));
+        let good_response = good_body.to_owned();
+        let server = std::thread::spawn(move || {
+            // Two runs (async + blocking) * 3 URLs = 6 requests.
+            for _ in 0..6 {
+                let Ok((mut stream, _)) = listener.accept() else {
+                    break;
+                };
+                let mut req = Vec::new();
+                let mut chunk = [0u8; 512];
+                while !req.windows(4).any(|w| w == b"\r\n\r\n") {
+                    let Ok(n) = stream.read(&mut chunk) else {
+                        break;
+                    };
+                    if n == 0 {
+                        break;
+                    }
+                    req.extend_from_slice(&chunk[..n]);
+                }
+                let head = String::from_utf8_lossy(&req);
+                let first_line = head.lines().next().unwrap_or("");
+                if first_line.contains("/good.json") {
+                    let _ = write!(
+                        stream,
+                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{good_response}",
+                        good_response.len()
+                    );
+                } else if first_line.contains("/bad-alias.json") {
+                    let wrong = r#"{"wrong":true}"#;
+                    let _ = write!(
+                        stream,
+                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{wrong}",
+                        wrong.len()
+                    );
+                } else {
+                    let body = "not found";
+                    let _ = write!(
+                        stream,
+                        "HTTP/1.1 404 Not Found\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                }
+            }
+        });
+
+        let pinned = serde_json::json!({
+            "sources": [
+                {
+                    "name": "bad-pack",
+                    "url": format!("{origin}/bad.json"),
+                    "base": format!("{origin}/bad/"),
+                    "category": "drums",
+                    "sha256": digest(b"{}")
+                },
+                {
+                    "name": "good-pack",
+                    "url": format!("{origin}/good.json"),
+                    "base": format!("{origin}/good/"),
+                    "category": "drums",
+                    "sha256": digest(good_body.as_bytes())
+                },
+                {
+                    "name": "good-pack-alias",
+                    "url": format!("{origin}/bad-alias.json"),
+                    "base": null,
+                    "sha256": digest(b"{}")
+                }
+            ],
+            "inline": {
+                "base": "https://example.invalid/Inline-Pack/",
+                "category": "dirt",
+                "banks": {
+                    "casio": ["casio/0.wav"]
+                }
+            }
+        })
+        .to_string();
+        let fonts = r#"{"base":"","fonts":{}}"#;
+        let shipped = default_sources_from(&pinned, fonts);
+
+        let async_cache = tempfile::tempdir().expect("async cache");
+        let async_lib = SampleLibrary::load_default_from(
+            &pinned,
+            fonts,
+            true,
+            async_cache.path().to_path_buf(),
+        )
+        .expect("async library starts");
+        async_lib.set_direct_diagnostic_logging(false);
+        async_lib.wait_until_idle(Duration::from_secs(5));
+        let cat = async_lib.detailed_catalogue(Some(&shipped));
+        assert!(!cat.complete);
+        assert!(
+            cat.warnings
+                .iter()
+                .any(|warning| warning.starts_with("bad-pack: manifest failed to load:")),
+            "warnings: {:?}",
+            cat.warnings
+        );
+        assert!(
+            cat.warnings
+                .iter()
+                .any(|warning| warning
+                    .starts_with("good-pack-alias: alias manifest failed to load:")),
+            "warnings: {:?}",
+            cat.warnings
+        );
+
+        let good = cat
+            .packs
+            .iter()
+            .find(|pack| pack.pack == "good-pack")
+            .expect("good-pack");
+        assert_eq!(good.manifest_state, ManifestState::Ready);
+        assert!(good.manifest_error.is_none());
+        assert_eq!(good.sounds, 1);
+
+        let inline = cat
+            .packs
+            .iter()
+            .find(|pack| pack.pack == "Inline-Pack")
+            .expect("Inline-Pack");
+        assert_eq!(inline.manifest_state, ManifestState::Ready);
+        assert!(inline.manifest_error.is_none());
+        assert_eq!(inline.sounds, 1);
+
+        let bad = cat
+            .packs
+            .iter()
+            .find(|pack| pack.pack == "bad-pack")
+            .expect("bad-pack");
+        assert_eq!(bad.manifest_state, ManifestState::Failed);
+        assert!(bad.manifest_error.as_deref().is_some_and(|e| !e.is_empty()));
+        assert_eq!(bad.sounds, 0);
+
+        // Blocking `load_default_from` preserves its error return on manifest failure.
+        let blocking_cache = tempfile::tempdir().expect("blocking cache");
+        assert!(
+            SampleLibrary::load_default_from(
+                &pinned,
+                fonts,
+                false,
+                blocking_cache.path().to_path_buf(),
+            )
+            .is_err()
+        );
+        drop(async_lib);
+        server.join().expect("partial-failure server");
+
+        // 2. Stalled manifest transitions cleanly from Loading (incomplete) to Ready (complete).
+        let slow_body = r#"{"slow_hat":"slow/0.wav"}"#;
+        let slow_listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind slow");
+        let slow_origin = format!("http://{}", slow_listener.local_addr().expect("addr"));
+        let (entered_tx, entered_rx) = mpsc::sync_channel(1);
+        let (release_tx, release_rx) = mpsc::sync_channel(1);
+        let slow_resp = slow_body.to_owned();
+        let slow_server = std::thread::spawn(move || {
+            let (stream, _) = slow_listener.accept().expect("accept slow");
+            let mut stream = drain_request(stream);
+            let _ = entered_tx.send(());
+            let _ = release_rx.recv_timeout(Duration::from_secs(5));
+            let _ = write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{slow_resp}",
+                slow_resp.len()
+            );
+        });
+        let slow_pinned = serde_json::json!({
+            "sources": [{
+                "name": "slow-pack",
+                "url": format!("{slow_origin}/slow.json"),
+                "base": format!("{slow_origin}/slow/"),
+                "category": "drums",
+                "sha256": digest(slow_body.as_bytes())
+            }],
+            "inline": { "base": "", "banks": {} }
+        })
+        .to_string();
+        let slow_shipped = default_sources_from(&slow_pinned, fonts);
+        let slow_cache = tempfile::tempdir().expect("slow cache");
+        let slow_lib = SampleLibrary::load_default_from(
+            &slow_pinned,
+            fonts,
+            true,
+            slow_cache.path().to_path_buf(),
+        )
+        .expect("slow async library");
+        entered_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("slow request arrived");
+
+        let loading_cat = slow_lib.detailed_catalogue(Some(&slow_shipped));
+        assert!(!loading_cat.complete);
+        assert_eq!(loading_cat.packs[0].manifest_state, ManifestState::Loading);
+        assert!(loading_cat.packs[0].manifest_error.is_none());
+        assert_eq!(
+            loading_cat.warnings,
+            ["slow-pack: manifest is still loading"]
+        );
+
+        release_tx.send(()).expect("release slow server");
+        slow_server.join().expect("slow server");
+        slow_lib.wait_until_idle(Duration::from_secs(5));
+
+        let ready_cat = slow_lib.detailed_catalogue(Some(&slow_shipped));
+        assert!(ready_cat.complete);
+        assert!(ready_cat.warnings.is_empty());
+        assert_eq!(ready_cat.packs[0].manifest_state, ManifestState::Ready);
+        assert!(ready_cat.packs[0].manifest_error.is_none());
+        assert_eq!(ready_cat.packs[0].sounds, 1);
     }
 }

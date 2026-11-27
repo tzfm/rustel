@@ -55,6 +55,335 @@ fn resolve_packs(
     Ok(found)
 }
 
+fn parse_sound_category(input: &str) -> Result<rustel_runtime::samples::SoundCategory, String> {
+    let needle = input.trim().to_ascii_lowercase();
+    for category in rustel_runtime::samples::SoundCategory::ALL {
+        if category.label() == needle {
+            return Ok(category);
+        }
+    }
+    let known = rustel_runtime::samples::SoundCategory::ALL
+        .iter()
+        .map(|category| category.label())
+        .collect::<Vec<_>>()
+        .join(", ");
+    Err(format!(
+        "unknown sample category {input:?}: valid categories are {known}"
+    ))
+}
+
+pub(super) fn apply_manifest_wait_timeout(
+    catalogue: &mut rustel_runtime::samples::SampleCatalogue,
+    timed_out: bool,
+) {
+    if !timed_out {
+        return;
+    }
+    const TIMEOUT_REASON: &str = "timed out waiting for manifest";
+    for pack in &mut catalogue.packs {
+        if pack.manifest_state == rustel_runtime::samples::ManifestState::Loading {
+            pack.manifest_error = Some(TIMEOUT_REASON.to_owned());
+        }
+    }
+    for warning in &mut catalogue.warnings {
+        if let Some(prefix) = warning.strip_suffix(": manifest is still loading") {
+            *warning = format!("{prefix}: {TIMEOUT_REASON}");
+        } else if let Some(prefix) = warning.strip_suffix(": alias manifest is still loading") {
+            *warning = format!("{prefix}: timed out waiting for alias manifest");
+        }
+    }
+    if catalogue.complete {
+        catalogue.complete = false;
+        catalogue.warnings.push(TIMEOUT_REASON.to_owned());
+    }
+}
+
+pub(super) fn filter_samples_catalogue(
+    catalogue: &mut rustel_runtime::samples::SampleCatalogue,
+    requested_packs: &[String],
+    wanted_category: Option<rustel_runtime::samples::SoundCategory>,
+    cached_only: bool,
+    has_sources: bool,
+) {
+    if has_sources && !requested_packs.is_empty() {
+        let needles: Vec<String> = requested_packs
+            .iter()
+            .map(|pack| pack.to_lowercase())
+            .collect();
+        catalogue.sounds.retain(|sound| {
+            let lower = sound.pack.to_lowercase();
+            needles.iter().any(|needle| lower.contains(needle))
+        });
+    }
+    if let Some(wanted) = wanted_category {
+        catalogue.sounds.retain(|sound| sound.category == wanted);
+    }
+    if cached_only {
+        catalogue.sounds.retain(|sound| sound.cached_files > 0);
+    }
+
+    // Keep pack summaries aligned with any sound-level filter while leaving
+    // `catalogue.complete` and `catalogue.warnings` untouched.
+    let filtered =
+        wanted_category.is_some() || cached_only || (has_sources && !requested_packs.is_empty());
+    if filtered {
+        let mut totals: std::collections::HashMap<&str, (usize, usize, usize, u64)> =
+            std::collections::HashMap::new();
+        for sound in &catalogue.sounds {
+            let entry = totals.entry(sound.pack.as_str()).or_default();
+            entry.0 += 1;
+            entry.1 += sound.files;
+            entry.2 += sound.cached_files;
+            entry.3 = entry.3.saturating_add(sound.cached_bytes);
+        }
+        catalogue.packs.retain_mut(|pack| {
+            let Some(&(sounds, files, cached_files, cached_bytes)) = totals.get(pack.pack.as_str())
+            else {
+                return false;
+            };
+            pack.sounds = sounds;
+            pack.files = files;
+            pack.cached_files = cached_files;
+            pack.cached_bytes = cached_bytes;
+            pack.cache_state =
+                rustel_runtime::samples::CacheState::from_counts(cached_files, files);
+            sounds > 0
+        });
+    }
+}
+
+pub(super) fn samples_list_json_snapshot(
+    catalogue: &rustel_runtime::samples::SampleCatalogue,
+    sample_cache: &std::path::Path,
+) -> serde_json::Value {
+    let packs_json: Vec<serde_json::Value> = catalogue
+        .packs
+        .iter()
+        .map(|pack| {
+            serde_json::json!({
+                "pack": pack.pack,
+                "category": pack.category.label(),
+                "source": pack.source,
+                "shortcut": pack.shortcut,
+                "import": pack.import,
+                "built_in": pack.built_in,
+                "sounds": pack.sounds,
+                "files": pack.files,
+                "cached_files": pack.cached_files,
+                "cached_bytes": pack.cached_bytes,
+                "cache_state": pack.cache_state.label(),
+                "manifest_state": pack.manifest_state.label(),
+                "manifest_error": pack.manifest_error,
+            })
+        })
+        .collect();
+    let sounds_json: Vec<serde_json::Value> = catalogue
+        .sounds
+        .iter()
+        .map(|sound| {
+            let mut object = serde_json::json!({
+                "pack": sound.pack,
+                "sound": sound.sound,
+                "variants": sound.variants,
+                "files": sound.files,
+                "pitched": sound.pitched,
+                "category": sound.category.label(),
+                "origin": sound.origin.label(),
+                "source": sound.source,
+                "shortcut": sound.shortcut,
+                "import": sound.import,
+                "cached_files": sound.cached_files,
+                "cached_bytes": sound.cached_bytes,
+                "cache_state": sound.cache_state.label(),
+            });
+            if !sound.variant_names.is_empty() {
+                object["variant_names"] = serde_json::json!(sound.variant_names);
+            }
+            object
+        })
+        .collect();
+    serde_json::json!({
+        "version": 1,
+        "complete": catalogue.complete,
+        "warnings": catalogue.warnings,
+        "sample_cache": sample_cache.display().to_string(),
+        "packs": packs_json,
+        "sounds": sounds_json,
+    })
+}
+
+pub(super) fn format_samples_list_text(
+    catalogue: &rustel_runtime::samples::SampleCatalogue,
+    on: bool,
+) -> (Vec<String>, Vec<String>) {
+    use rustel_runtime::samples::ManifestState;
+
+    let mut lines = Vec::new();
+    let warnings: Vec<String> = catalogue
+        .warnings
+        .iter()
+        .map(|warning| format!("warning: {}", style::safe_source(warning)))
+        .collect();
+    let has_incomplete_packs = catalogue
+        .packs
+        .iter()
+        .any(|pack| pack.manifest_state != ManifestState::Ready);
+    if catalogue.sounds.is_empty() && !has_incomplete_packs {
+        lines.push(style::dim(on, "No matching sounds."));
+        return (lines, warnings);
+    }
+
+    let mut sounds_by_pack: std::collections::HashMap<
+        &str,
+        Vec<&rustel_runtime::samples::SampleCatalogueSound>,
+    > = std::collections::HashMap::new();
+    for sound in &catalogue.sounds {
+        sounds_by_pack
+            .entry(sound.pack.as_str())
+            .or_default()
+            .push(sound);
+    }
+    for (index, pack) in catalogue.packs.iter().enumerate() {
+        if index > 0 {
+            lines.push(String::new());
+        }
+        let manifest_note = match pack.manifest_state {
+            ManifestState::Ready => String::new(),
+            ManifestState::Loading => format!("  {}", style::yellow(on, "manifest loading")),
+            ManifestState::Failed => format!("  {}", style::yellow(on, "manifest failed")),
+        };
+        lines.push(format!(
+            "{}  [{}]  {} sound(s)  {}/{} files  {}{}",
+            style::bold(on, &style::safe_source(&pack.pack)),
+            pack.category.label(),
+            pack.sounds,
+            pack.cached_files,
+            pack.files,
+            pack.cache_state.label(),
+            manifest_note,
+        ));
+        if let Some(error) = &pack.manifest_error {
+            lines.push(format!(
+                "  {}",
+                style::yellow(
+                    on,
+                    &format!("manifest error: {}", style::safe_source(error))
+                )
+            ));
+        }
+        if let Some(import) = &pack.import {
+            lines.push(format!(
+                "  {}",
+                style::dim(on, &format!("import: {}", style::safe_source(import)))
+            ));
+        } else if let Some(shortcut) = &pack.shortcut {
+            lines.push(format!(
+                "  {}",
+                style::dim(on, &format!("shortcut: {}", style::safe_source(shortcut)))
+            ));
+        }
+        if let Some(entries) = sounds_by_pack.get(pack.pack.as_str()) {
+            for entry in entries {
+                let kind = if entry.pitched { "pitched" } else { "variants" };
+                lines.push(format!(
+                    "  {:<28} {:>3} {:<8} {:>4}/{:<4} {:<8}",
+                    style::safe_source(&entry.sound),
+                    entry.variants,
+                    kind,
+                    entry.cached_files,
+                    entry.files,
+                    entry.cache_state.label(),
+                ));
+            }
+        }
+    }
+    (lines, warnings)
+}
+
+/// `rustel samples list`: emit a machine-readable or human-readable catalogue
+/// of sample packs, sounds, variant counts, import hints, and cache states.
+pub(super) fn run_samples_list(
+    requested_packs: &[String],
+    category: Option<&str>,
+    cached_only: bool,
+    sources: &[String],
+    sample_access: &SampleAccessArgs,
+    json: bool,
+) -> Result<(), RuntimeError> {
+    let wanted_category = category
+        .map(parse_sound_category)
+        .transpose()
+        .map_err(RuntimeError::Message)?;
+
+    let mut catalogue = if !sources.is_empty() {
+        let access =
+            with_sample_access(SessionConfig::default(), sample_access)?.score_sample_access;
+        let library = rustel_runtime::samples::SampleLibrary::load_for_sources(
+            sources,
+            &access,
+            std::time::Duration::from_secs(30),
+            || interrupted_by().is_some(),
+        )
+        .map_err(|error| {
+            if interrupted_by().is_some() {
+                RuntimeError::Cancelled
+            } else {
+                RuntimeError::Message(error)
+            }
+        })?;
+        library.detailed_catalogue(Some(&[]))
+    } else {
+        let packs = resolve_packs(requested_packs).map_err(RuntimeError::Message)?;
+        let selected_names: Vec<&str> = packs.iter().map(|pack| pack.name.as_str()).collect();
+        let library = rustel_runtime::samples::SampleLibrary::load_default_sources_async(
+            (!requested_packs.is_empty()).then_some(selected_names.as_slice()),
+        )
+        .map_err(|error| {
+            RuntimeError::Message(format!("the sample library could not start: {error}"))
+        })?;
+        library.set_direct_diagnostic_logging(false);
+        library.wait_until_idle_cancellable(std::time::Duration::from_secs(30), || {
+            interrupted_by().is_some()
+        });
+        if interrupted_by().is_some() {
+            return Err(RuntimeError::Cancelled);
+        }
+        let timed_out = library.manifests_pending() > 0;
+        let mut catalogue = library.detailed_catalogue(Some(&packs));
+        apply_manifest_wait_timeout(&mut catalogue, timed_out);
+        catalogue
+    };
+
+    filter_samples_catalogue(
+        &mut catalogue,
+        requested_packs,
+        wanted_category,
+        cached_only,
+        !sources.is_empty(),
+    );
+
+    if json {
+        let snapshot = samples_list_json_snapshot(&catalogue, &sample_cache_dir());
+        outln!(
+            "{}",
+            serde_json::to_string_pretty(&snapshot).map_err(json_err)?
+        );
+        return Ok(());
+    }
+
+    let (lines, warnings) = format_samples_list_text(&catalogue, style::stdout_on());
+    for line in lines {
+        outln!("{line}");
+    }
+    if !quiet_asked() {
+        let err_on = style::stderr_on();
+        for warning in warnings {
+            eprintln!("{}", style::yellow(err_on, &warning));
+        }
+    }
+    Ok(())
+}
+
 /// `rustel samples cache`: fetch the shipped sample packs onto disk.
 ///
 /// One pass of the studio's own pack caching, walked from a terminal: the

@@ -12,11 +12,14 @@ impl StudioEngine {
     pub fn audition(&mut self, sound: &str, gain: f32) -> Result<(), RuntimeError> {
         self.audition_request(AuditionRequest {
             sound: sound.to_owned(),
+            variant: None,
             notes: Vec::new(),
             gain,
+            duration_secs: None,
             step_secs: 0.0,
             slot: 0,
             at: None,
+            ui_visuals: AUDITION_VISUALS,
         })
     }
 
@@ -54,11 +57,14 @@ impl StudioEngine {
         // partway, because a queued event cannot be unqueued.
         let request = AuditionRequest {
             sound: sound.to_owned(),
+            variant: None,
             notes,
             gain,
+            duration_secs: None,
             step_secs: step_secs.clamp(0.0, 1.0),
             slot: 0,
             at: None,
+            ui_visuals: AUDITION_VISUALS,
         };
         self.stop_audition();
         self.audition_horizon_frame = 0;
@@ -98,8 +104,10 @@ impl StudioEngine {
             let note = run.request.notes[run.next];
             let one = AuditionRequest {
                 sound: run.request.sound.clone(),
+                variant: None,
                 notes: vec![note],
                 gain: run.request.gain,
+                duration_secs: None,
                 // One note at a time: the run's step decides its length,
                 // not a chord's.
                 step_secs: run.request.step_secs,
@@ -109,6 +117,7 @@ impl StudioEngine {
                 // The moment this note belongs to, not the moment the tick
                 // loop happened to hand it over.
                 at: Some(at),
+                ui_visuals: AUDITION_VISUALS,
             };
             match self.push_audition(&one) {
                 Ok(AuditionPush::Played) => {}
@@ -160,11 +169,14 @@ impl StudioEngine {
             .collect::<Vec<_>>();
         self.audition_request(AuditionRequest {
             sound: sound.to_owned(),
+            variant: None,
             notes,
             gain,
+            duration_secs: None,
             step_secs: 0.0,
             slot: 0,
             at: None,
+            ui_visuals: AUDITION_VISUALS,
         })
     }
 
@@ -573,24 +585,7 @@ impl StudioEngine {
                 }
                 let cut_at = frame_at(handed_at + 1.0 / rate, rate_hz);
                 let slot = index % MAX_AUDITION_RUN_NOTES;
-                let _ = live.device.push(AudioEvent {
-                    onset_id: u64::MAX,
-                    generation: live.device.generation(),
-                    target_frame: cut_at,
-                    onset_lead: 0.0,
-                    freq_hz: 440.0,
-                    gain: 0.0,
-                    duration_secs: 0.01,
-                    ui_visuals: AUDITION_VISUALS,
-                    controls: rustel_audio::OscillatorControls {
-                        choke_only: true,
-                        ..Default::default()
-                    },
-                    sample: None,
-                    wavetable: None,
-                    synth: None,
-                    cut: Some(audition_cut_group(slot)),
-                });
+                push_audition_choke_at(&live.device, slot, cut_at, AUDITION_VISUALS, true);
             }
             // The audition analysis window holds its last content once no
             // voice feeds it. The queued strays sound after the ordinary
@@ -625,32 +620,10 @@ impl StudioEngine {
         let Some(live) = self.live.as_ref() else {
             return;
         };
-        let target_time = live.device.clock_seconds() + AUDITION_LEAD_SECS;
-        let target_frame = frame_at(target_time, live.device.sample_rate());
         // An explicit stop makes the choke itself the preview horizon. The
         // next engine turn may then retire a transport that exists only for
         // this audition instead of waiting out the sound's original length.
-        self.audition_horizon_frame = target_frame;
-        // Every note of the widest preview has its own group, so silence
-        // takes one choke each: a chord must not keep ringing because
-        // only its first note was told to stop.
-        for slot in 0..=MAX_AUDITION_RUN_NOTES {
-            let _ = live.device.push(AudioEvent {
-                onset_id: u64::MAX,
-                generation: live.device.generation(),
-                target_frame,
-                onset_lead: 0.0,
-                freq_hz: 440.0,
-                gain: 0.0,
-                duration_secs: 0.01,
-                ui_visuals: AUDITION_VISUALS,
-                controls: Default::default(),
-                sample: None,
-                wavetable: None,
-                synth: None,
-                cut: Some(audition_cut_group(slot)),
-            });
-        }
+        self.audition_horizon_frame = push_audition_stop(&live.device, AUDITION_VISUALS);
     }
 
     fn push_audition(&mut self, request: &AuditionRequest) -> Result<AuditionPush, RuntimeError> {
@@ -662,151 +635,27 @@ impl StudioEngine {
         let Some(live) = self.live.as_ref() else {
             return Err(RuntimeError::Message("nothing is playing".into()));
         };
-        let (name, index) = match request.sound.split_once(':') {
-            Some((name, index)) => (name, index.parse::<f64>().unwrap_or(0.0)),
-            None => (request.sound.as_str(), 0.0),
+        let prepared = match prepare_audition(
+            request,
+            library.as_ref(),
+            &self.retained_samples,
+            live.device.sample_rate(),
+            live.device.clock_seconds(),
+            live.device.generation(),
+            self.session.cps(),
+        )? {
+            AuditionOutcome::Loading => return Ok(AuditionPush::Loading),
+            AuditionOutcome::Ready(prepared) => prepared,
         };
-        // A chord is one value per note on the same sound; a sample
-        // preview is the same thing with no note to carry.
-        let values: Vec<serde_json::Value> = if request.notes.is_empty() {
-            vec![serde_json::json!({ "s": name, "n": index })]
-        } else {
-            request
-                .notes
-                .iter()
-                .map(|note| serde_json::json!({ "s": name, "n": index, "note": note }))
-                .collect()
-        };
-        let gate = if request.step_secs > 0.0 {
-            // A note of a run rings well past the next one: a scale on a
-            // piano is a hand rolling through it, not a row of clicks.
-            (request.step_secs * 5.0).clamp(0.45, 0.9)
-        } else if request.notes.is_empty() {
-            AUDITION_GATE_SECS
-        } else {
-            AUDITION_CHORD_GATE_SECS
-        };
-        // Eight voices at full gain is eight times the level of one. Each
-        // note takes its share of the room the way a mix does, so a chord
-        // sits beside a one-shot rather than clipping over it. One voice
-        // divides by one and is untouched. A run sounds one note at a
-        // time, so it keeps its full level.
-        let spread = if request.step_secs > 0.0 {
-            1.0
-        } else {
-            1.0 / (values.len() as f32).sqrt()
-        };
-        // One target time for every voice makes a chord; a step between
-        // them makes a run. A request that names its own moment lands on
-        // it, never earlier than the device can take it.
-        let earliest = live.device.clock_seconds() + AUDITION_LEAD_SECS;
-        let first_time = request.at.map_or(earliest, |at| at.max(earliest));
-        let mut events = Vec::with_capacity(values.len());
-        for (step, value) in values.iter().enumerate() {
-            let target_time = first_time + step as f64 * request.step_secs;
-            let onset = match rustel_voice::resolve_voice_with_samples(
-                value,
-                u64::MAX,
-                gate,
-                target_time,
-                live.device.sample_rate(),
-                self.session.cps(),
-                library.as_ref(),
-            ) {
-                Ok(onset) => onset,
-                Err(message) if message.contains("still loading") => {
-                    return Ok(AuditionPush::Loading);
-                }
-                Err(message) => return Err(RuntimeError::Message(message)),
-            };
-            // The device only plays samples it has been handed; one that just
-            // finished downloading arrives through `install_ready_samples` on
-            // a later tick. A chord waits for all of its notes rather than
-            // sounding half of itself.
-            if let Some(sample) = &onset.sample
-                && !self.retained_samples.contains_key(&sample.sample)
-            {
-                return Ok(AuditionPush::Loading);
-            }
-            if let Some(sample) = &onset.sample {
-                self.sample_last_used.insert(sample.sample, Instant::now());
-            }
-            events.push(AudioEvent {
-                onset_id: u64::MAX,
-                generation: live.device.generation(),
-                target_frame: onset.onset_frame,
-                onset_lead: onset.onset_lead,
-                freq_hz: onset.freq_hz,
-                // The preview's own volume, over the onset's: a browser next to
-                // a playing set needs headroom past unity to be heard.
-                gain: onset.gain * request.gain * spread,
-                duration_secs: onset.duration_secs,
-                ui_visuals: AUDITION_VISUALS,
-                controls: onset.controls,
-                sample: onset.sample,
-                wavetable: onset.wavetable,
-                synth: onset.synth,
-                // One preview at a time: a new audition cuts the preview that
-                // still rings, so auditions down a bank do not pile up. Each
-                // note takes a choke group of its own, so the notes of a chord
-                // ring together and the note of the next preview cuts the note
-                // in the same position.
-                cut: Some(audition_cut_group(request.slot + step)),
-            });
+        let now = Instant::now();
+        for sample in &prepared.used_samples {
+            self.sample_last_used.insert(*sample, now);
         }
-        let sample_rate = u64::from(live.device.sample_rate());
-        self.audition_horizon_frame = self.audition_horizon_frame.max(
-            events
-                .iter()
-                .map(|event| {
-                    let duration_frames =
-                        (event.duration_secs.max(0.0) * sample_rate as f32).ceil() as u64;
-                    event.target_frame.saturating_add(duration_frames)
-                })
-                .max()
-                .unwrap_or(0),
-        );
-        let mut reverbs = LiveReverbBatch::default();
-        for event in &events {
-            reverbs
-                .observe(&live.device, event)
-                .map_err(RuntimeError::ResourceLimit)?;
-        }
-        reverbs.flush(&live.device);
-        // A three-note chord after a seven-note one leaves four groups
-        // holding voices nobody cut: hush the tail of the block before the
-        // new preview lands. A run's notes arrive one push at a time and
-        // must not hush each other, so only a chord clears the tail.
-        let tail = if request.step_secs > 0.0 {
-            MAX_AUDITION_RUN_NOTES + 1
-        } else {
-            values.len()
-        };
-        for slot in tail..=MAX_AUDITION_RUN_NOTES {
-            let _ = live.device.push(AudioEvent {
-                onset_id: u64::MAX,
-                generation: live.device.generation(),
-                target_frame: frame_at(first_time, live.device.sample_rate()),
-                onset_lead: 0.0,
-                freq_hz: 440.0,
-                gain: 0.0,
-                duration_secs: 0.01,
-                ui_visuals: AUDITION_VISUALS,
-                controls: Default::default(),
-                sample: None,
-                wavetable: None,
-                synth: None,
-                cut: Some(audition_cut_group(slot)),
-            });
-        }
-        for event in events {
-            if !live.device.push(event.clone()) {
-                return Err(RuntimeError::Message(
-                    "the device is busy; try the preview again".into(),
-                ));
-            }
+        self.audition_horizon_frame = self.audition_horizon_frame.max(prepared.horizon_frame);
+        push_prepared_audition(&live.device, &prepared, AUDITION_VISUALS)?;
+        for event in &prepared.events {
             note_sample_use(
-                &event,
+                event,
                 &self.retained_samples,
                 self.session.sample_library().map(Arc::as_ref),
                 &mut self.sample_use_until,
@@ -907,11 +756,14 @@ mod tests {
         let mut run = RunningAudition {
             request: AuditionRequest {
                 sound: "triangle".into(),
+                variant: None,
                 notes,
                 gain: 1.0,
+                duration_secs: None,
                 step_secs: step,
                 slot: 0,
                 at: None,
+                ui_visuals: AUDITION_VISUALS,
             },
             next: 0,
             due: clock + AUDITION_LEAD_SECS,
@@ -943,11 +795,14 @@ mod tests {
         let mut run = RunningAudition {
             request: AuditionRequest {
                 sound: "triangle".into(),
+                variant: None,
                 notes: vec![60.0, 62.0, 64.0],
                 gain: 1.0,
+                duration_secs: None,
                 step_secs: step,
                 slot: 0,
                 at: None,
+                ui_visuals: AUDITION_VISUALS,
             },
             next: 0,
             due: clock + AUDITION_LEAD_SECS,

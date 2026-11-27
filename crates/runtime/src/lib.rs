@@ -7,6 +7,9 @@
 /// Replacing a file's contents in one rename.
 mod atomic_file;
 pub use atomic_file::replace_file_bytes;
+/// Immediate sample and synth audition shared by Studio and CLI integrations.
+#[cfg(feature = "device-audio")]
+pub mod audition;
 mod capabilities;
 mod capability_report;
 mod csound;

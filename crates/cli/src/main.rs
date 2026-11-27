@@ -52,6 +52,7 @@ mod style;
 mod replay_plan;
 use replay_plan::{ReplayOpening, ReplayPlan};
 
+mod audition;
 mod bench;
 mod completions;
 mod devices;
@@ -63,6 +64,7 @@ mod replay;
 mod sample_cache;
 mod vst;
 
+use audition::run_samples_audition;
 use completions::{install_completions, run_completions, shell_from_environment};
 #[cfg(all(test, feature = "device-audio"))]
 use devices::doctor_device_report;
@@ -71,8 +73,6 @@ use devices::midi_summary_json;
 use devices::{run_devices, run_doctor, run_gamepad_monitor, run_midi_list, run_midi_monitor};
 #[cfg(all(test, feature = "device-audio"))]
 use live::read_ui_controls;
-#[cfg(feature = "device-audio")]
-use live::read_ui_controls_with_commands;
 #[cfg(all(test, feature = "device-audio", feature = "midi"))]
 use live::sync_live_midi_inputs;
 #[cfg(all(
@@ -88,13 +88,17 @@ use live::{
     UiDiscreteApplyOutcome, apply_ui_discrete_control, apply_ui_slider_control,
     build_live_producer, install_sample_batch, live_engine_pressure_detail,
     live_engine_pressure_event, observe_ui_layout_if_audible,
-    observe_ui_layout_if_audible_with_lanes, runtime_device_error,
+    observe_ui_layout_if_audible_with_lanes,
 };
+#[cfg(feature = "device-audio")]
+use live::{install_ready_samples, read_ui_controls_with_commands, runtime_device_error};
 use live::{play, play_live, run_musician, watch_file};
 #[cfg(feature = "device-audio")]
 use replay::announce_active_score;
 use replay::{render_active_score, run_replay};
-use sample_cache::{confirm_cache_clear, directory_sizes, run_samples_cache, run_samples_clear};
+use sample_cache::{
+    confirm_cache_clear, directory_sizes, run_samples_cache, run_samples_clear, run_samples_list,
+};
 
 /// The help colours, as cargo uses them: bold green headings, bold cyan
 /// literals and cyan placeholders. Clap disables them on a pipe and when
@@ -350,6 +354,7 @@ fn human_live_event(event: &serde_json::Value, verbosity: u8) -> Option<String> 
                     | "serial-baud"
                     | "serial-trouble"
                     | "live-recovered"
+                    | "audition"
                     | rustel_runtime::PLUGIN_DIAGNOSTIC
             )
         ) {
@@ -791,6 +796,76 @@ enum SamplesCommand {
         #[arg(short = 'j', long)]
         json: bool,
     },
+    /// List available sample packs, sound names, variant counts, import hints,
+    /// and local cache states.
+    List {
+        /// Filter by pack name (case-insensitive substring). Repeatable.
+        #[arg(long, value_name = "PACK")]
+        pack: Vec<String>,
+        /// Filter by category (drums, percussion, piano, orchestra, wavetable,
+        /// dirt, gm, synth, score, set, mine, other).
+        #[arg(long, value_name = "CATEGORY")]
+        category: Option<String>,
+        /// Show only sounds with at least one file cached on disk.
+        #[arg(long)]
+        cached: bool,
+        /// Inspect one or more external `samples(...)` sources instead of the
+        /// shipped packs (for example `github:eddyflux/crate` or `local:kits`).
+        #[arg(long, value_name = "SOURCE")]
+        source: Vec<String>,
+        #[command(flatten)]
+        sample_access: SampleAccessArgs,
+        /// Emit the full versioned catalogue as JSON for editor tooling.
+        #[arg(short = 'j', long)]
+        json: bool,
+    },
+    /// Preview one sound immediately without writing a score, or keep a
+    /// persistent stdio audition session open with `--stdio`.
+    Audition {
+        /// Sound name and optional variant (`bd`, `bd:2`, `crate_sd:1`).
+        #[arg(
+            value_name = "SOUND",
+            required_unless_present = "stdio",
+            conflicts_with = "stdio"
+        )]
+        sound: Option<String>,
+        /// Keep one audio output open and accept `ui_control` NDJSON commands
+        /// on stdin, writing `ui_control_ack` records to stdout.
+        #[arg(long)]
+        stdio: bool,
+        /// External `samples(...)` source to load (`github:eddyflux/crate`,
+        /// `local:kits`, or an HTTPS manifest URL).
+        #[arg(long, value_name = "SOURCE")]
+        source: Option<String>,
+        /// Pitch to play as a MIDI number or note name (`60`, `c4`). Repeat to
+        /// audition a chord.
+        #[arg(long, value_name = "NOTE", conflicts_with = "stdio")]
+        note: Vec<String>,
+        /// Linear gain (0..=4).
+        #[arg(long, default_value_t = 1.0, conflicts_with = "stdio")]
+        gain: f32,
+        /// Maximum preview length in seconds (0.01..=30).
+        #[arg(long, value_name = "SECS", conflicts_with = "stdio")]
+        duration: Option<f64>,
+        /// Audio output device name, or `silent` for headless playback.
+        #[arg(long, value_name = "NAME")]
+        output: Option<String>,
+        /// Output buffer size in frames (32..=16384).
+        #[arg(
+            long,
+            value_name = "FRAMES",
+            value_parser = clap::value_parser!(u32).range(
+                i64::from(rustel_audio::AudioBufferPreference::MIN_FRAMES)
+                    ..=i64::from(rustel_audio::AudioBufferPreference::MAX_FRAMES),
+            )
+        )]
+        buffer_frames: Option<u32>,
+        #[command(flatten)]
+        sample_access: SampleAccessArgs,
+        /// Print a JSON summary on stdout in one-shot mode.
+        #[arg(short = 'j', long)]
+        json: bool,
+    },
     /// Remove every downloaded sample file - the shipped packs' cache and
     /// the score-selected responses beside it - and say how much that was.
     ///
@@ -814,7 +889,8 @@ impl SamplesCommand {
     /// error envelope follow the same switch as its report.
     fn wants_json(&self) -> bool {
         match self {
-            Self::Cache { json, .. } | Self::Clear { json, .. } => *json,
+            Self::Cache { json, .. } | Self::Clear { json, .. } | Self::List { json, .. } => *json,
+            Self::Audition { stdio, json, .. } => *stdio || *json,
         }
     }
 }
@@ -877,9 +953,11 @@ enum Command {
         #[command(flatten)]
         options: ClearOptions,
     },
-    /// Manage the downloaded sample library: fetch the shipped packs onto
-    /// disk, or empty the cache.
+    /// Manage and inspect the sample library: list sounds, preview sounds,
+    /// fetch shipped packs onto disk, or empty the cache.
     ///
+    ///     rustel samples list --json  # catalogue of packs, sounds, and cache state
+    ///     rustel samples audition bd  # preview one sound immediately
     ///     rustel samples cache        # every pack, with a progress bar
     ///     rustel samples cache piano  # one pack, by name
     ///     rustel samples cache --list # what each pack holds, what is here
@@ -2327,6 +2405,45 @@ fn run_command(
         }
         Command::Samples { command } => match command {
             SamplesCommand::Cache { packs, list, json } => run_samples_cache(&packs, list, json),
+            SamplesCommand::List {
+                pack,
+                category,
+                cached,
+                source,
+                sample_access,
+                json,
+            } => run_samples_list(
+                &pack,
+                category.as_deref(),
+                cached,
+                &source,
+                &sample_access,
+                json,
+            ),
+            SamplesCommand::Audition {
+                sound,
+                stdio,
+                source,
+                note,
+                gain,
+                duration,
+                output,
+                buffer_frames,
+                sample_access,
+                json,
+            } => run_samples_audition(
+                sound,
+                stdio,
+                source,
+                note,
+                gain,
+                duration,
+                output,
+                buffer_frames,
+                sample_access,
+                json,
+                dispatch,
+            ),
             SamplesCommand::Clear { json, options } => run_samples_clear(json, &options),
         },
         Command::WatchCode => run_watch_code(),
@@ -3556,6 +3673,42 @@ enum UiTransportAction {
 }
 
 #[cfg(feature = "device-audio")]
+#[derive(Clone, Debug, PartialEq, serde::Deserialize)]
+#[serde(untagged)]
+enum UiAuditionNote {
+    Number(f32),
+    Name(String),
+}
+
+#[cfg(feature = "device-audio")]
+impl UiAuditionNote {
+    fn parse_midi(&self) -> Result<f32, String> {
+        match self {
+            Self::Number(midi) => {
+                if midi.is_finite() && (0.0..=127.0).contains(midi) {
+                    Ok(*midi)
+                } else {
+                    Err(format!("MIDI note {midi} must be within 0..=127"))
+                }
+            }
+            Self::Name(name) => rustel_runtime::audition::parse_audition_note(name),
+        }
+    }
+}
+
+#[cfg(feature = "device-audio")]
+#[derive(Clone, Debug, PartialEq)]
+struct UiAuditionControl {
+    sound: String,
+    n: Option<f64>,
+    note: Option<UiAuditionNote>,
+    notes: Option<Vec<UiAuditionNote>>,
+    gain: Option<f32>,
+    duration: Option<f64>,
+    source: Option<String>,
+}
+
+#[cfg(feature = "device-audio")]
 #[derive(Clone, Debug, serde::Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 enum UiControlBody {
@@ -3607,6 +3760,27 @@ enum UiControlBody {
         #[serde(default)]
         request: Option<String>,
     },
+    Audition {
+        sound: String,
+        #[serde(default)]
+        n: Option<f64>,
+        #[serde(default)]
+        note: Option<UiAuditionNote>,
+        #[serde(default)]
+        notes: Option<Vec<UiAuditionNote>>,
+        #[serde(default)]
+        gain: Option<f32>,
+        #[serde(default)]
+        duration: Option<f64>,
+        #[serde(default)]
+        source: Option<String>,
+        #[serde(default)]
+        request: Option<String>,
+    },
+    AuditionStop {
+        #[serde(default)]
+        request: Option<String>,
+    },
 }
 
 #[cfg(feature = "device-audio")]
@@ -3617,6 +3791,8 @@ enum UiDiscreteControlKind {
     LaneTranspose { lane: u32, semitones: i16 },
     Tempo { cps: Option<f64>, bpm: Option<f64> },
     Transport { action: UiTransportAction },
+    Audition(UiAuditionControl),
+    AuditionStop,
 }
 
 #[cfg(feature = "device-audio")]
@@ -3784,6 +3960,45 @@ impl UiControlWire {
                     .wire_valid()
                     .then_some(ParsedUiControl::Discrete(command))
             }
+            UiControlBody::Audition {
+                sound,
+                n,
+                note,
+                notes,
+                gain,
+                duration,
+                source,
+                request,
+            } => {
+                let command = UiDiscreteControl {
+                    kind: UiDiscreteControlKind::Audition(UiAuditionControl {
+                        sound,
+                        n,
+                        note,
+                        notes,
+                        gain,
+                        duration,
+                        source,
+                    }),
+                    generation: None,
+                    source_revision: None,
+                    request,
+                };
+                command
+                    .wire_valid()
+                    .then_some(ParsedUiControl::Discrete(command))
+            }
+            UiControlBody::AuditionStop { request } => {
+                let command = UiDiscreteControl {
+                    kind: UiDiscreteControlKind::AuditionStop,
+                    generation: None,
+                    source_revision: None,
+                    request,
+                };
+                command
+                    .wire_valid()
+                    .then_some(ParsedUiControl::Discrete(command))
+            }
         }
     }
 }
@@ -3830,6 +4045,22 @@ impl UiControlInbox {
             .try_iter()
             .take(MAX_PENDING_UI_COMMANDS)
             .collect()
+    }
+
+    fn drain_commands_with_eof(&self) -> (Vec<UiDiscreteControl>, bool) {
+        let mut drained = Vec::new();
+        let mut eof = false;
+        while drained.len() < MAX_PENDING_UI_COMMANDS {
+            match self.commands.try_recv() {
+                Ok(command) => drained.push(command),
+                Err(std::sync::mpsc::TryRecvError::Empty) => break,
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    eof = true;
+                    break;
+                }
+            }
+        }
+        (drained, eof)
     }
 }
 
@@ -7723,12 +7954,283 @@ mod tests {
             vec!["query", "-e", "pure(1)"],
             vec!["trace", "-e", "pure(1)"],
             vec!["bench", "-e", "pure(1)"],
+            vec!["samples", "list"],
         ] {
             assert!(!wants(&command), "{command:?} asked for JSON unprompted");
             let mut asked = command.clone();
             asked.push("--json");
             assert!(wants(&asked), "{asked:?} asked and was not heard");
         }
+        assert!(wants(&["samples", "audition", "--stdio"]));
+        assert!(wants(&["samples", "audition", "bd", "--json"]));
+        assert!(!wants(&["samples", "audition", "bd"]));
+    }
+
+    #[test]
+    fn ui_control_audition_commands_parse_validate_and_ack() {
+        let lines = [
+            serde_json::json!({
+                "ui_control": {
+                    "version": 1,
+                    "kind": "audition",
+                    "sound": "sine",
+                    "notes": ["c4", 64, "g4"],
+                    "gain": 0.75,
+                    "duration": 0.2,
+                    "request": "aud-ok"
+                }
+            }),
+            serde_json::json!({
+                "ui_control": {
+                    "version": 1,
+                    "kind": "audition",
+                    "sound": "sine",
+                    "gain": 99.0,
+                    "request": "aud-bad-gain"
+                }
+            }),
+            serde_json::json!({
+                "ui_control": {
+                    "version": 1,
+                    "kind": "audition",
+                    "sound": "sine",
+                    "note": "c4",
+                    "notes": ["e4"],
+                    "request": "aud-both-notes"
+                }
+            }),
+            serde_json::json!({
+                "ui_control": {
+                    "version": 1,
+                    "kind": "audition",
+                    "sound": "definitely_missing_sound",
+                    "request": "aud-missing"
+                }
+            }),
+            serde_json::json!({
+                "ui_control": {
+                    "version": 1,
+                    "kind": "audition_stop",
+                    "request": "aud-stop"
+                }
+            }),
+        ];
+        let mut wire = Vec::new();
+        for line in &lines {
+            wire.extend_from_slice(line.to_string().as_bytes());
+            wire.push(b'\n');
+        }
+        let pending = std::sync::Mutex::new(std::collections::BTreeMap::new());
+        let (tx, rx) = std::sync::mpsc::sync_channel(MAX_PENDING_UI_COMMANDS);
+        read_ui_controls_with_commands(std::io::Cursor::new(wire), &pending, Some(&tx));
+        drop(tx);
+        let commands: Vec<UiDiscreteControl> = rx.try_iter().collect();
+        assert_eq!(commands.len(), 5);
+
+        #[cfg(feature = "device-audio")]
+        {
+            let library = rustel_runtime::samples::SampleLibrary::empty();
+            let access = ScoreSampleAccess::denied();
+            let device = rustel_audio::LiveScalarDevice::start_output(
+                Some(rustel_audio::SILENT_OUTPUT_NAME),
+                1,
+            )
+            .expect("silent device");
+            let retained = std::collections::HashMap::new();
+            let mut tracker = rustel_runtime::audition::AuditionTracker::new();
+
+            let acks: Vec<_> = commands
+                .into_iter()
+                .map(|command| {
+                    audition::apply_ui_audition_command(
+                        &command.kind,
+                        command.request,
+                        Some(&library),
+                        &access,
+                        &device,
+                        &retained,
+                        0.5,
+                        3,
+                        &mut tracker,
+                    )
+                    .expect("ack")
+                    .ui_control_ack
+                })
+                .collect();
+
+            assert_eq!(acks[0].request, "aud-ok");
+            assert!(acks[0].accepted);
+            assert_eq!(acks[0].generation, 3);
+            assert!(acks[0].message.is_none());
+
+            for bad in &acks[1..4] {
+                assert!(!bad.accepted, "{bad:?}");
+                assert!(bad.message.as_deref().is_some_and(|msg| !msg.is_empty()));
+            }
+
+            assert_eq!(acks[4].request, "aud-stop");
+            assert!(acks[4].accepted);
+            assert!(acks[4].message.is_none());
+
+            device.stop_and_wait(std::time::Duration::from_millis(200));
+        }
+    }
+
+    #[test]
+    fn samples_list_surfaces_incomplete_failed_and_timed_out_manifests() {
+        use rustel_runtime::samples::{
+            CacheState, ManifestState, SampleCatalogue, SampleCataloguePack, SampleCatalogueSound,
+            SoundCategory, SoundOrigin,
+        };
+
+        let mut catalogue = SampleCatalogue {
+            complete: false,
+            warnings: vec![
+                "piano: manifest failed to load: offline".to_owned(),
+                "vcsl: manifest is still loading".to_owned(),
+                "tidal-drum-machines-alias: alias manifest is still loading".to_owned(),
+            ],
+            packs: vec![
+                SampleCataloguePack {
+                    pack: "Dirt-Samples".to_owned(),
+                    category: SoundCategory::Dirt,
+                    source: "https://strudel.b-cdn.net/Dirt-Samples/".to_owned(),
+                    shortcut: None,
+                    import: None,
+                    built_in: true,
+                    sounds: 1,
+                    files: 3,
+                    cached_files: 0,
+                    cached_bytes: 0,
+                    cache_state: CacheState::Uncached,
+                    manifest_state: ManifestState::Ready,
+                    manifest_error: None,
+                },
+                SampleCataloguePack {
+                    pack: "piano".to_owned(),
+                    category: SoundCategory::Piano,
+                    source: "https://strudel.b-cdn.net/piano.json".to_owned(),
+                    shortcut: None,
+                    import: None,
+                    built_in: true,
+                    sounds: 0,
+                    files: 0,
+                    cached_files: 0,
+                    cached_bytes: 0,
+                    cache_state: CacheState::Uncached,
+                    manifest_state: ManifestState::Failed,
+                    manifest_error: Some("offline".to_owned()),
+                },
+                SampleCataloguePack {
+                    pack: "vcsl".to_owned(),
+                    category: SoundCategory::Orchestra,
+                    source: "https://strudel.b-cdn.net/vcsl.json".to_owned(),
+                    shortcut: None,
+                    import: None,
+                    built_in: true,
+                    sounds: 0,
+                    files: 0,
+                    cached_files: 0,
+                    cached_bytes: 0,
+                    cache_state: CacheState::Uncached,
+                    manifest_state: ManifestState::Loading,
+                    manifest_error: None,
+                },
+            ],
+            sounds: vec![SampleCatalogueSound {
+                pack: "Dirt-Samples".to_owned(),
+                sound: "casio".to_owned(),
+                variants: 3,
+                files: 3,
+                pitched: false,
+                category: SoundCategory::Dirt,
+                origin: SoundOrigin::Default,
+                source: "https://strudel.b-cdn.net/Dirt-Samples/".to_owned(),
+                shortcut: None,
+                import: None,
+                cached_files: 0,
+                cached_bytes: 0,
+                cache_state: CacheState::Uncached,
+                variant_names: Vec::new(),
+            }],
+        };
+
+        sample_cache::apply_manifest_wait_timeout(&mut catalogue, true);
+        assert_eq!(
+            catalogue.packs[2].manifest_error.as_deref(),
+            Some("timed out waiting for manifest")
+        );
+        assert_eq!(
+            catalogue.warnings,
+            [
+                "piano: manifest failed to load: offline",
+                "vcsl: timed out waiting for manifest",
+                "tidal-drum-machines-alias: timed out waiting for alias manifest",
+            ]
+        );
+
+        let snapshot =
+            sample_cache::samples_list_json_snapshot(&catalogue, std::path::Path::new("/cache"));
+        assert_eq!(snapshot["complete"], false);
+        assert_eq!(snapshot["warnings"].as_array().expect("warnings").len(), 3);
+        assert_eq!(snapshot["packs"][0]["manifest_state"], "ready");
+        assert!(snapshot["packs"][0]["manifest_error"].is_null());
+        assert_eq!(snapshot["packs"][1]["manifest_state"], "failed");
+        assert_eq!(snapshot["packs"][1]["manifest_error"], "offline");
+        assert_eq!(snapshot["packs"][2]["manifest_state"], "loading");
+        assert_eq!(
+            snapshot["packs"][2]["manifest_error"],
+            "timed out waiting for manifest"
+        );
+
+        let (lines, warnings) = sample_cache::format_samples_list_text(&catalogue, false);
+        let text = lines.join("\n");
+        assert!(
+            text.contains("Dirt-Samples") && text.contains("casio"),
+            "{text}"
+        );
+        assert!(text.contains("manifest failed"), "{text}");
+        assert!(text.contains("manifest error: offline"), "{text}");
+        assert!(text.contains("manifest loading"), "{text}");
+        assert!(
+            text.contains("manifest error: timed out waiting for manifest"),
+            "{text}"
+        );
+        assert_eq!(warnings.len(), 3);
+        assert!(warnings[0].starts_with("warning: piano:"));
+
+        // Filtering with --cached drops 0-sound packs but keeps `complete: false` and warnings.
+        let mut filtered = catalogue.clone();
+        sample_cache::filter_samples_catalogue(&mut filtered, &[], None, true, false);
+        assert!(!filtered.complete);
+        assert_eq!(filtered.warnings.len(), 3);
+        assert!(filtered.packs.is_empty());
+        assert!(filtered.sounds.is_empty());
+        let (filtered_lines, filtered_warnings) =
+            sample_cache::format_samples_list_text(&filtered, false);
+        assert_eq!(filtered_lines, ["No matching sounds."]);
+        assert_eq!(filtered_warnings.len(), 3);
+
+        // When only a failed pack was requested (no sounds), text mode still shows the failed pack.
+        let failed_only = SampleCatalogue {
+            complete: false,
+            warnings: vec!["piano: manifest failed to load: offline".to_owned()],
+            packs: vec![catalogue.packs[1].clone()],
+            sounds: Vec::new(),
+        };
+        let (failed_lines, failed_warnings) =
+            sample_cache::format_samples_list_text(&failed_only, false);
+        let failed_text = failed_lines.join("\n");
+        assert!(
+            !failed_text.contains("No matching sounds."),
+            "{failed_text}"
+        );
+        assert!(failed_text.contains("piano") && failed_text.contains("manifest failed"));
+        assert!(failed_text.contains("manifest error: offline"));
+        assert_eq!(
+            failed_warnings,
+            ["warning: piano: manifest failed to load: offline"]
+        );
     }
 }
 
