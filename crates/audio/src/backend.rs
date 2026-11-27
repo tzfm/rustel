@@ -578,6 +578,14 @@ pub enum ModTarget {
     LfoParam(u8, ModulatorParam),
     /// The same for an `env()`.
     EnvParam(u8, EnvelopeParam),
+    /// A VST3 insert parameter (or MIDI CC mapped via `IMidiMapping`) on the
+    /// voice's insert chain. `stage` is the effect stage `0..EFFECT_CHAIN`
+    /// (in call order at voice resolution, remapped to the seated stage on
+    /// activation) or `EFFECT_CHAIN as u8` for the chain's instrument.
+    InsertParam {
+        stage: u8,
+        param_id: u32,
+    },
 }
 
 /// Which param of another `lfo()` a modulator rides; when none is named,

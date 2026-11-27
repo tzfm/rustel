@@ -238,7 +238,7 @@ pub(crate) fn ordered_stages(
 /// The value of `param` that a note of `generation` gives the copy of `key`
 /// in `slot`: the value a slider moved, when the move has that generation
 /// or a newer one, else the value of the note.
-fn moved(
+pub(super) fn moved(
     values: &[crate::insert::InsertValue],
     slot: crate::insert::InsertSlot,
     key: crate::insert::InsertKey,

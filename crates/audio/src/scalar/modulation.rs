@@ -1,5 +1,90 @@
 use super::*;
 
+/// Maximum VST3 insert parameter modulation points collected per 128-frame
+/// sub-block without heap allocation.
+const MAX_INSERT_MOD_POINTS: usize = 64;
+
+/// One modulated parameter point for a VST3 insert inside the current sub-block.
+#[derive(Clone, Copy, Default)]
+pub(super) struct InsertModPoint {
+    pub(super) bus: u8,
+    pub(super) stage: u8,
+    pub(super) param_id: u32,
+    pub(super) offset: u16,
+    pub(super) base: f32,
+    pub(super) delta: f32,
+    voice_id: u64,
+}
+
+/// Stack-allocated collector of VST3 insert parameter modulation updates for one
+/// sub-block. Multiple modulators on the same voice sum together; a newer voice
+/// on the same shared insert parameter replaces an older voice so chords do not
+/// multiply modulation depth.
+pub(super) struct InsertModBuffer {
+    points: [InsertModPoint; MAX_INSERT_MOD_POINTS],
+    len: usize,
+}
+
+impl InsertModBuffer {
+    pub(super) fn new() -> Self {
+        Self {
+            points: [InsertModPoint::default(); MAX_INSERT_MOD_POINTS],
+            len: 0,
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn record(
+        &mut self,
+        bus: usize,
+        stage: u8,
+        param_id: u32,
+        offset: usize,
+        base: f32,
+        delta: f32,
+        voice_id: u64,
+    ) {
+        if usize::from(stage) > crate::insert::EFFECT_CHAIN
+            || bus >= crate::insert::MAX_INSERT_BUSES
+        {
+            return;
+        }
+        let bus = bus as u8;
+        let offset = offset as u16;
+        if let Some(entry) = self.points[..self.len].iter_mut().find(|point| {
+            point.bus == bus
+                && point.stage == stage
+                && point.param_id == param_id
+                && point.offset == offset
+        }) {
+            if voice_id == entry.voice_id {
+                entry.delta += delta;
+            } else if voice_id > entry.voice_id {
+                entry.voice_id = voice_id;
+                entry.base = base;
+                entry.delta = delta;
+            }
+            return;
+        }
+        if self.len < MAX_INSERT_MOD_POINTS {
+            self.points[self.len] = InsertModPoint {
+                bus,
+                stage,
+                param_id,
+                offset,
+                base,
+                delta,
+                voice_id,
+            };
+            self.len += 1;
+        }
+    }
+
+    pub(super) fn points(&self) -> &[InsertModPoint] {
+        &self.points[..self.len]
+    }
+}
+
 impl FxStageAdds {
     /// `gain` is relative to the value the modulator was built against, the
     /// same ratio the main chain uses.
@@ -187,6 +272,9 @@ impl ModAdds {
                     }
                 }
             }
+            // Insert parameters are routed directly to the chain's plugin
+            // slots in `process_block`.
+            ModTarget::InsertParam { .. } => {}
         }
     }
 
@@ -372,6 +460,7 @@ pub(super) fn nan_param_default(target: crate::backend::ModTarget, source: &Voic
         ModTarget::EnvParam(_, EnvelopeParam::Decay) => 0.14,
         ModTarget::EnvParam(_, EnvelopeParam::Sustain) => 0.0,
         ModTarget::EnvParam(_, EnvelopeParam::Release) => 0.1,
+        ModTarget::InsertParam { .. } => 0.0,
     }
 }
 

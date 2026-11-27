@@ -2250,3 +2250,167 @@ fn kabel_delivery_render_and_delay_reset_have_no_callback_allocation() {
     assert!(heard);
     assert_eq!(backend.missing_kabel_events(), 0);
 }
+
+#[test]
+fn continuous_insert_param_modulation_has_no_callback_allocation() {
+    use rustel_audio::{
+        BusMod, EFFECT_CHAIN, EnvMod, InsertControls, InsertKey, InsertParam, InsertSlot, LfoMod,
+        ModTarget, OrbitInsert,
+    };
+    use std::sync::Arc;
+    use std::sync::atomic::AtomicU32;
+
+    struct SpyInsert {
+        key: InsertKey,
+        seen: Arc<[AtomicU32; 3]>,
+        param: f32,
+    }
+
+    impl OrbitInsert for SpyInsert {
+        fn key(&self) -> InsertKey {
+            self.key
+        }
+
+        fn set_param(&mut self, param: InsertParam, _frames: u32) {
+            self.param = param.value;
+            let idx = match param.id {
+                201 => 0,
+                202 => 1,
+                203 => 2,
+                _ => return,
+            };
+            self.seen[idx].store(param.value.to_bits(), Ordering::Relaxed);
+        }
+
+        fn process(&mut self, left: &mut [f32], right: &mut [f32]) {
+            for (l, r) in left.iter_mut().zip(right.iter_mut()) {
+                *l = 0.2 * (1.0 + self.param);
+                *r = *l;
+            }
+        }
+
+        fn busy(&self) -> bool {
+            true
+        }
+    }
+
+    let _serial = serial_tripwire_test();
+    let mut backend = ScalarBackend::prepared(48_000, 8).unwrap();
+    backend.forbid_inline_reverb();
+    let key = InsertKey {
+        plugin: 7,
+        preset: 0,
+    };
+    let seen = Arc::new([AtomicU32::new(0), AtomicU32::new(0), AtomicU32::new(0)]);
+    let spy = Box::new(SpyInsert {
+        key,
+        seen: Arc::clone(&seen),
+        param: 0.0,
+    });
+    assert!(
+        backend
+            .install_insert(InsertSlot::instrument(1), spy)
+            .is_none()
+    );
+
+    let mut bus_sender = OscillatorControls {
+        bus: Some(0),
+        busgain: 1.0,
+        envelope: Envelope {
+            attack_secs: 0.0,
+            decay_secs: 0.0,
+            sustain: 1.0,
+            release_secs: 0.01,
+        },
+        ..OscillatorControls::default()
+    };
+    bus_sender.limit = None;
+    let sender = OnsetEvent::new(0, 440.0, 1.0, 1.0)
+        .with_optional_synth(Some(rustel_audio::SynthSource::One))
+        .with_controls(bus_sender)
+        .into_prepared();
+
+    let mut controls = OscillatorControls {
+        instrument: Some(InsertControls::new(key)),
+        insert_chain: Some(1),
+        worklet_begin_secs: 0.0,
+        lfo_end_secs: 1.0,
+        ..OscillatorControls::default()
+    };
+    controls.lfos[0] = Some(LfoMod {
+        fxi: None,
+        target: ModTarget::InsertParam {
+            stage: EFFECT_CHAIN as u8,
+            param_id: 201,
+        },
+        frequency_hz: 2.0,
+        phase0: 0.0,
+        depth: 0.5,
+        dcoffset: 0.0,
+        skew: 0.5,
+        curve: 1.0,
+        shape: 2, // ramp
+        min: 0.0,
+        max: 0.5,
+        param_base: 0.0,
+        filter: None,
+        id: Some(0),
+    });
+    controls.envs[0] = Some(EnvMod {
+        fxi: None,
+        target: ModTarget::InsertParam {
+            stage: EFFECT_CHAIN as u8,
+            param_id: 202,
+        },
+        attack_secs: 0.01,
+        decay_secs: 0.0,
+        sustain: 1.0,
+        release_secs: 0.01,
+        a_curve: 0.0,
+        d_curve: 0.0,
+        r_curve: 0.0,
+        depth: 0.4,
+        min: -1.0,
+        max: 1.0,
+        sustain_secs: 1.0,
+        param_base: 0.0,
+        id: Some(0),
+    });
+    controls.bus_mods[0] = Some(BusMod {
+        fxi: None,
+        bus: 0,
+        target: ModTarget::InsertParam {
+            stage: EFFECT_CHAIN as u8,
+            param_id: 203,
+        },
+        depth: 1.0 / 0.3,
+        dc: 0.0,
+        min: -10.0,
+        max: 10.0,
+        param_base: 0.0,
+    });
+    let note = OnsetEvent::new(0, 440.0, 1.0, 1.0)
+        .with_controls(controls)
+        .into_prepared();
+
+    let mut out = [0.0f32; 128 * 2];
+    let before = Violations::capture();
+    tripwire::audio_scope(|| {
+        assert!(backend.try_note_prepared(sender));
+        assert!(backend.try_note_prepared(note));
+        for _ in 0..8 {
+            backend.process_block(&mut out, 128);
+        }
+    });
+    let delta = Violations::capture().since(before);
+    assert!(
+        delta.clean(),
+        "insert param modulation allocated in callback: {delta:?}"
+    );
+    let lfo_val = f32::from_bits(seen[0].load(Ordering::Relaxed));
+    let env_val = f32::from_bits(seen[1].load(Ordering::Relaxed));
+    let bmod_val = f32::from_bits(seen[2].load(Ordering::Relaxed));
+    assert!(lfo_val > 0.01, "lfo_val={lfo_val}");
+    assert!(env_val > 0.1, "env_val={env_val}");
+    assert!(bmod_val > 0.5, "bmod_val={bmod_val}");
+}

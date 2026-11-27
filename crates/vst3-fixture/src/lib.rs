@@ -53,6 +53,20 @@ const MAX_DELAY: usize = 4096;
 /// 0.5, the effect plays as before and refuses the block. A state carries
 /// no fault, so a preset never breaks the plugin.
 pub const PARAM_FAULT: u32 = 104;
+/// Instrument parameter "Gain": scales the output level, 1 at the start.
+pub const TONE_PARAM_GAIN: u32 = 200;
+/// Hidden instrument parameter mapped to MIDI CC 1 (mod wheel), 0 at the start.
+/// Scales output level by `1 + modwheel`.
+pub const TONE_PARAM_MODWHEEL: u32 = 201;
+/// Hidden instrument parameter mapped to MIDI channel aftertouch, 0 at the
+/// start. Scales output level by `1 + 0.5 * aftertouch`.
+pub const TONE_PARAM_AFTERTOUCH: u32 = 202;
+/// Hidden instrument parameter mapped to MIDI pitch bend, 0.5 at the start.
+/// Bends pitch by `(pitchbend - 0.5) * 4` semitones.
+pub const TONE_PARAM_PITCHBEND: u32 = 203;
+/// Visible instrument parameter "Brightness" mapped to MIDI CC 74, 0 at the
+/// start. Adds a second harmonic scaled by `0.5 * brightness`.
+pub const TONE_PARAM_BRIGHTNESS: u32 = 204;
 
 const PROCESSOR: TUID = uid(0x52757374, 0x656C4669, 0x78747572, 0x65507263);
 const CONTROLLER: TUID = uid(0x52757374, 0x656C4669, 0x78747572, 0x6543746C);
@@ -956,9 +970,59 @@ struct ToneVoice {
 /// of 128 frames, so a host runs silent blocks before the first note.
 const TONE_DEAF_CALLS: u32 = 4;
 
-/// The instrument: an event input, a stereo output, and one sine for each
-/// note.
+/// Parameter values for the instrument fixture, including hidden parameters
+/// exposed via `IMidiMapping`.
+struct ToneValues {
+    gain: AtomicU64,
+    modwheel: AtomicU64,
+    aftertouch: AtomicU64,
+    pitchbend: AtomicU64,
+    brightness: AtomicU64,
+}
+
+impl ToneValues {
+    fn new() -> Self {
+        Self {
+            gain: AtomicU64::new(1.0f64.to_bits()),
+            modwheel: AtomicU64::new(0.0f64.to_bits()),
+            aftertouch: AtomicU64::new(0.0f64.to_bits()),
+            pitchbend: AtomicU64::new(0.5f64.to_bits()),
+            brightness: AtomicU64::new(0.0f64.to_bits()),
+        }
+    }
+
+    fn slot(&self, id: u32) -> Option<&AtomicU64> {
+        match id {
+            TONE_PARAM_GAIN => Some(&self.gain),
+            TONE_PARAM_MODWHEEL => Some(&self.modwheel),
+            TONE_PARAM_AFTERTOUCH => Some(&self.aftertouch),
+            TONE_PARAM_PITCHBEND => Some(&self.pitchbend),
+            TONE_PARAM_BRIGHTNESS => Some(&self.brightness),
+            _ => None,
+        }
+    }
+
+    fn get(&self, id: u32) -> f64 {
+        self.slot(id)
+            .map_or(0.0, |slot| f64::from_bits(slot.load(Ordering::Relaxed)))
+    }
+
+    fn set(&self, id: u32, value: f64) -> bool {
+        match self.slot(id) {
+            Some(slot) => {
+                slot.store(value.to_bits(), Ordering::Relaxed);
+                true
+            }
+            None => false,
+        }
+    }
+}
+
+/// The instrument: an event input, a stereo output, one sine for each note,
+/// and `IMidiMapping` support for mod wheel, aftertouch, pitch bend, and CC 74.
 struct Tone {
+    values: ToneValues,
+    handler: RefCell<Option<ComPtr<IComponentHandler>>>,
     sample_rate: Cell<f64>,
     voices: RefCell<Vec<ToneVoice>>,
     /// The process calls so far: see [`TONE_DEAF_CALLS`].
@@ -982,6 +1046,8 @@ impl Drop for Tone {
 impl Tone {
     fn new() -> Self {
         Self {
+            values: ToneValues::new(),
+            handler: RefCell::new(None),
             sample_rate: Cell::new(48_000.0),
             // Room for a note on each key, with no allocation in the audio
             // call.
@@ -1017,7 +1083,7 @@ impl Tone {
 }
 
 impl Class for Tone {
-    type Interfaces = (IComponent, IAudioProcessor);
+    type Interfaces = (IComponent, IAudioProcessor, IEditController, IMidiMapping);
 }
 
 impl IPluginBaseTrait for Tone {
@@ -1174,6 +1240,35 @@ impl IAudioProcessorTrait for Tone {
                 slice::from_raw_parts_mut(*output.__field0.channelBuffers32.add(1), frames),
             )
         };
+        let mut gain = self.values.get(TONE_PARAM_GAIN) as f32;
+        let mut modwheel = self.values.get(TONE_PARAM_MODWHEEL) as f32;
+        let mut aftertouch = self.values.get(TONE_PARAM_AFTERTOUCH) as f32;
+        let mut pitchbend = self.values.get(TONE_PARAM_PITCHBEND);
+        let mut brightness = self.values.get(TONE_PARAM_BRIGHTNESS) as f32;
+        let mut points = [(0usize, 0u32, 0.0f64); 32];
+        let mut point_count = 0usize;
+        if let Some(changes) = unsafe { ComRef::from_raw(data.inputParameterChanges) } {
+            for index in 0..unsafe { changes.getParameterCount() } {
+                let Some(queue) = (unsafe { ComRef::from_raw(changes.getParameterData(index)) })
+                else {
+                    continue;
+                };
+                let id = unsafe { queue.getParameterId() };
+                for point in 0..unsafe { queue.getPointCount() } {
+                    let (mut offset, mut value) = (0, 0.0);
+                    if unsafe { queue.getPoint(point, &mut offset, &mut value) } != kResultOk {
+                        continue;
+                    }
+                    self.values.set(id, value);
+                    if point_count < points.len() {
+                        points[point_count] = (offset.max(0) as usize, id, value);
+                        point_count += 1;
+                    }
+                }
+            }
+        }
+        points[..point_count].sort_unstable_by_key(|point| point.0);
+        let mut next_point = 0usize;
         let events = unsafe { ComRef::from_raw(data.inputEvents) };
         let calls = self.calls.get();
         self.calls.set(calls.saturating_add(1));
@@ -1183,6 +1278,18 @@ impl IAudioProcessorTrait for Tone {
             .map_or(0, |events| unsafe { events.getEventCount() });
         let mut next = 0;
         for frame in 0..frames {
+            while next_point < point_count && points[next_point].0 <= frame {
+                let (_, id, value) = points[next_point];
+                match id {
+                    TONE_PARAM_GAIN => gain = value as f32,
+                    TONE_PARAM_MODWHEEL => modwheel = value as f32,
+                    TONE_PARAM_AFTERTOUCH => aftertouch = value as f32,
+                    TONE_PARAM_PITCHBEND => pitchbend = value,
+                    TONE_PARAM_BRIGHTNESS => brightness = value as f32,
+                    _ => {}
+                }
+                next_point += 1;
+            }
             // Each event takes effect at its own frame.
             while next < count {
                 let mut event: Event = unsafe { std::mem::zeroed() };
@@ -1195,10 +1302,22 @@ impl IAudioProcessorTrait for Tone {
                 self.apply(&event);
                 next += 1;
             }
+            let level_scale = gain * (1.0 + modwheel) * (1.0 + 0.5 * aftertouch);
+            let bend_ratio = if (pitchbend - 0.5).abs() < 1e-12 {
+                1.0
+            } else {
+                (((pitchbend - 0.5) * 4.0) / 12.0).exp2()
+            };
             let mut sample = 0.0;
             for voice in self.voices.borrow_mut().iter_mut() {
-                sample += voice.phase.sin() as f32 * voice.level;
-                voice.phase += voice.step;
+                let fundamental = voice.phase.sin() as f32;
+                let harmonic = if brightness != 0.0 {
+                    brightness * 0.5 * (2.0 * voice.phase).sin() as f32
+                } else {
+                    0.0
+                };
+                sample += (fundamental + harmonic) * voice.level * level_scale;
+                voice.phase += voice.step * bend_ratio;
             }
             left[frame] = sample;
             right[frame] = sample;
@@ -1208,6 +1327,124 @@ impl IAudioProcessorTrait for Tone {
 
     unsafe fn getTailSamples(&self) -> u32 {
         0
+    }
+}
+
+impl IEditControllerTrait for Tone {
+    unsafe fn setComponentState(&self, _state: *mut IBStream) -> tresult {
+        kResultOk
+    }
+
+    unsafe fn setState(&self, _state: *mut IBStream) -> tresult {
+        kResultOk
+    }
+
+    unsafe fn getState(&self, _state: *mut IBStream) -> tresult {
+        kResultOk
+    }
+
+    unsafe fn getParameterCount(&self) -> i32 {
+        5
+    }
+
+    unsafe fn getParameterInfo(&self, index: i32, info: *mut ParameterInfo) -> tresult {
+        let (id, title, default, hidden) = match index {
+            0 => (TONE_PARAM_GAIN, "Gain", 1.0, false),
+            1 => (TONE_PARAM_MODWHEEL, "Mod Wheel", 0.0, true),
+            2 => (TONE_PARAM_AFTERTOUCH, "Aftertouch", 0.0, true),
+            3 => (TONE_PARAM_PITCHBEND, "Pitch Bend", 0.5, true),
+            4 => (TONE_PARAM_BRIGHTNESS, "Brightness", 0.0, false),
+            _ => return kInvalidArgument,
+        };
+        let info = unsafe { &mut *info };
+        info.id = id;
+        copy_wstring(title, &mut info.title);
+        copy_wstring(title, &mut info.shortTitle);
+        copy_wstring("", &mut info.units);
+        info.stepCount = 0;
+        info.defaultNormalizedValue = default;
+        info.unitId = 0;
+        info.flags = ParameterInfo_::ParameterFlags_::kCanAutomate;
+        if hidden {
+            info.flags |= ParameterInfo_::ParameterFlags_::kIsHidden;
+        }
+        kResultOk
+    }
+
+    unsafe fn getParamStringByValue(
+        &self,
+        _id: u32,
+        value: f64,
+        string: *mut String128,
+    ) -> tresult {
+        copy_wstring(&format!("{value:.2}"), unsafe { &mut *string });
+        kResultOk
+    }
+
+    unsafe fn getParamValueByString(
+        &self,
+        _id: u32,
+        _string: *mut TChar,
+        _value: *mut f64,
+    ) -> tresult {
+        kNotImplemented
+    }
+
+    unsafe fn normalizedParamToPlain(&self, _id: u32, value: f64) -> f64 {
+        value
+    }
+
+    unsafe fn plainParamToNormalized(&self, _id: u32, value: f64) -> f64 {
+        value
+    }
+
+    unsafe fn getParamNormalized(&self, id: u32) -> f64 {
+        self.values.get(id)
+    }
+
+    unsafe fn setParamNormalized(&self, id: u32, value: f64) -> tresult {
+        if self.values.set(id, value) {
+            kResultOk
+        } else {
+            kInvalidArgument
+        }
+    }
+
+    unsafe fn setComponentHandler(&self, handler: *mut IComponentHandler) -> tresult {
+        let handler = unsafe { ComRef::from_raw(handler) }.map(|handler| handler.to_com_ptr());
+        *self.handler.borrow_mut() = handler;
+        kResultOk
+    }
+
+    unsafe fn createView(&self, _name: *const c_char) -> *mut IPlugView {
+        ptr::null_mut()
+    }
+}
+
+impl IMidiMappingTrait for Tone {
+    unsafe fn getMidiControllerAssignment(
+        &self,
+        bus_index: int32,
+        channel: int16,
+        midi_controller_number: CtrlNumber,
+        id: *mut ParamID,
+    ) -> tresult {
+        if bus_index != 0 || channel != 0 || id.is_null() {
+            return kResultFalse;
+        }
+        let mapped = match midi_controller_number as u32 {
+            1 => Some(TONE_PARAM_MODWHEEL),
+            74 => Some(TONE_PARAM_BRIGHTNESS),
+            128 => Some(TONE_PARAM_AFTERTOUCH),
+            129 => Some(TONE_PARAM_PITCHBEND),
+            _ => None,
+        };
+        let Some(param_id) = mapped else {
+            return kResultFalse;
+        };
+        // SAFETY: `id` was checked non-null above and is the host's out-pointer.
+        unsafe { *id = param_id };
+        kResultOk
     }
 }
 

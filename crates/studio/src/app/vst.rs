@@ -101,9 +101,10 @@ fn plugin_words(words: &PluginWords) -> (Vec<String>, Vec<String>) {
                 Vec::new(),
             )
         }
-        PluginWords::Keys(name) => {
-            key_words(loaded(name).as_ref().map_or(&[], |plugin| plugin.params()))
-        }
+        PluginWords::Keys(name) => match loaded(name) {
+            Some(plugin) => key_words(plugin.params(), plugin.midi_ccs()),
+            None => key_words(&[], &[]),
+        },
         // The preset folder has the name of the plugin, not the name the
         // score wrote.
         PluginWords::Presets(name) => {
@@ -826,11 +827,13 @@ impl App {
                 && matches!(panel.plugin_words(), Some(PluginWords::Keys(_)))
         });
         if keys && let Some((plugin, typed)) = self.plugin_key_at_caret() {
-            let params = match vst::host().resolve(&plugin, false) {
-                vst::Resolved::Ready(_, plugin) => plugin.params().to_vec(),
-                _ => Vec::new(),
+            let (params, midi_ccs) = match vst::host().resolve(&plugin, false) {
+                vst::Resolved::Ready(_, plugin) => {
+                    (plugin.params().to_vec(), plugin.midi_ccs().to_vec())
+                }
+                _ => (Vec::new(), Vec::new()),
             };
-            let text = VstTab::key_text(&params, &text)?;
+            let text = VstTab::key_text(&params, &midi_ccs, &text)?;
             let (_, open) = self.plugin_call_at_caret()?;
             let source = self.editor().source();
             let typed = typed.start.0..typed.end.0;
@@ -1406,6 +1409,7 @@ mod tests {
             categories: "Synth".into(),
             status: Status::Ready,
             params: vec![param].into(),
+            midi_ccs: std::sync::Arc::default(),
             instrument: true,
             running: 0,
             load_time: std::time::Duration::ZERO,

@@ -640,6 +640,10 @@ impl SampleLookup for Lookup<'_> {
         self.samples.insert(request)
     }
 
+    fn insert_param(&self, name: &str, instrument: bool, param: &str) -> Option<(u32, f64)> {
+        self.samples.insert_param(name, instrument, param)
+    }
+
     fn insert_speech(&self, request: &SpeechRequest<'_>) -> Result<SampleResolution, String> {
         self.samples.insert_speech(request)
     }
@@ -682,6 +686,10 @@ impl SampleLookup for ValidationLookup<'_> {
         request: &rustel_voice::PluginRequest<'_>,
     ) -> Result<Option<InsertControls>, String> {
         self.0.insert(request)
+    }
+
+    fn insert_param(&self, name: &str, instrument: bool, param: &str) -> Option<(u32, f64)> {
+        self.0.insert_param(name, instrument, param)
     }
 
     fn insert_speech(&self, request: &SpeechRequest<'_>) -> Result<SampleResolution, String> {

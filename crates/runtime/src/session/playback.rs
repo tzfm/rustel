@@ -2393,4 +2393,104 @@ mod plugin_render_tests {
         let play = session.play(1.0).expect("play");
         assert_eq!(play.duration_secs, 1.0);
     }
+
+    /// MIDI CCs (`IMidiMapping`) and continuous `.lfo()`, `.env()`, and
+    /// `.bmod()` modulation work end-to-end on `.vsti()` and `.vst()`.
+    #[test]
+    fn vsti_midi_ccs_and_continuous_plugin_modulation() {
+        let (_one, _folder) = super::super::tests::fixture_plugins();
+        let render = |score: &str, secs: f64| plugin_session(score).render_pcm(secs).expect(score);
+        let rms = |pcm: &[f32], start: usize, end: usize| {
+            let sum: f64 = (start..end)
+                .map(|frame| f64::from(pcm[frame * 2]).powi(2))
+                .sum();
+            (sum / (end - start) as f64).sqrt() as f32
+        };
+        let crossings = |pcm: &[f32], start: usize, end: usize| {
+            (start + 1..end)
+                .filter(|&f| pcm[(f - 1) * 2] <= 0.0 && pcm[f * 2] > 0.0)
+                .count()
+        };
+
+        let dry = render(r#"note("a4").vsti("Rustel Fixture Tone")"#, 0.5);
+        let dry_rms = rms(&dry, 4_800, 19_200);
+        assert!(dry_rms > 0.1, "baseline tone should sound: {dry_rms}");
+        let ratio = |score: &str| rms(&render(score, 0.5), 4_800, 19_200) / dry_rms;
+
+        // Named keys, `{ cc: { ... } }`, chained MIDI controls, and explicit param override.
+        assert!(
+            (ratio(r#"note("a4").vsti("Rustel Fixture Tone", { modwheel: 1 })"#) - 2.0).abs()
+                < 0.05
+        );
+        assert!(
+            (ratio(r#"note("a4").vsti("Rustel Fixture Tone", { cc: { 1: 1 } })"#) - 2.0).abs()
+                < 0.05
+        );
+        assert!(
+            (ratio(r#"note("a4").vsti("Rustel Fixture Tone").ccn(1).ccv(1)"#) - 2.0).abs() < 0.05
+        );
+        assert!(
+            (ratio(r#"note("a4").vsti("Rustel Fixture Tone", { modwheel: 0 }).ccn(1).ccv(1)"#)
+                - 1.0)
+                .abs()
+                < 0.05
+        );
+        assert!(
+            (ratio(r#"note("a4").vsti("Rustel Fixture Tone").miditouch(1)"#) - 1.5).abs() < 0.05
+        );
+
+        let bent = render(r#"note("a4").vsti("Rustel Fixture Tone").midibend(1)"#, 0.5);
+        let pitch_ratio =
+            crossings(&bent, 4_800, 19_200) as f32 / crossings(&dry, 4_800, 19_200) as f32;
+        assert!(
+            (pitch_ratio - 2.0f32.powf(2.0 / 12.0)).abs() < 0.03,
+            "pitch_ratio={pitch_ratio}"
+        );
+
+        // Continuous LFO, Env (from note 0), and BusMod on vsti modwheel.
+        let lfo = render(
+            r#"note("a4").vsti("Rustel Fixture Tone").lfo({ sc: "modwheel", r: 1, da: 1, dc: 0, sh: "ramp", rt: 1 })"#,
+            1.0,
+        );
+        assert!(rms(&lfo, 38_400, 43_200) > rms(&lfo, 2_400, 7_200) * 1.45);
+
+        let env = render(
+            r#"note("a4").vsti("Rustel Fixture Tone").env({ sc: "modwheel", a: 0.4, d: 0, s: 1, da: 1 })"#,
+            0.8,
+        );
+        assert!(rms(&env, 24_000, 33_600) > rms(&env, 1_200, 4_800) * 1.5);
+
+        let bmod = render(
+            "$: s(\"one\").sustain(1).gain(1).dry(0).bus(\"mod\")\n\
+             $: note(\"a4\").vsti(\"Rustel Fixture Tone\").bmod({ b: \"mod\", sc: \"modwheel\", da: 1 })",
+            0.5,
+        );
+        assert!((rms(&bmod, 4_800, 19_200) / dry_rms - 2.0).abs() < 0.1);
+
+        // Chords keep 1x LFO depth on a shared plugin instance.
+        let single_ratio = ratio(
+            r#"note("a4").vsti("Rustel Fixture Tone").lfo({ sc: "modwheel", r: 0, da: 0.5, dc: 1, sh: "square", sk: 1 })"#,
+        );
+        let chord_dry = rms(
+            &render(r#"note("a4,e5,a5").vsti("Rustel Fixture Tone")"#, 0.5),
+            4_800,
+            19_200,
+        );
+        let chord_lfo = rms(
+            &render(
+                r#"note("a4,e5,a5").vsti("Rustel Fixture Tone").lfo({ sc: "modwheel", r: 0, da: 0.5, dc: 1, sh: "square", sk: 1 })"#,
+                0.5,
+            ),
+            4_800,
+            19_200,
+        );
+        assert!((single_ratio - chord_lfo / chord_dry).abs() < 0.08);
+
+        // Continuous LFO on a `.vst()` effect parameter (including explicit `vst0` stage).
+        let vst_lfo = render(
+            r#"note("a4").s("sine").sustain(1).vst("Rustel Fixture", { gain: 0.1 }).vst("Rustel Fixture", { gain: 1 }).lfo({ c: "vst0", sc: "gain", r: 1, da: 0.9, dc: 0, sh: "ramp", rt: 1 })"#,
+            1.0,
+        );
+        assert!(rms(&vst_lfo, 38_400, 43_200) > rms(&vst_lfo, 2_400, 7_200) * 3.0);
+    }
 }

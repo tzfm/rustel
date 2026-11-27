@@ -2698,7 +2698,7 @@ pub(super) const REFERENCE_ENTRIES: &[ReferenceEntry] = &[
         name: "vst",
         synonyms: &[],
         summary: "Sends the note through a VST3 effect plugin.",
-        description: "Sends the note through a VST3 effect plugin in the pattern's chain. A second `.vst()` call adds an effect after the first, and one chain holds 4 effects at most. Separate patterns on the same orbit keep separate chains. A note with no `.vst()` stays dry. For a plugin that makes the sound, such as a synth, see `vsti`.\n\nThe first argument is the plugin name, as the vst tab of the reference panel lists the plugins. Upper case, spaces and punctuation in the name do not matter: `\"valhalla supermassive\"` finds `ValhallaSupermassive`.\n\nThe second argument sets parameters by name, each from 0 to 1. Each value is a pattern, so a slider or a mini-notation string gives one value to each note. A note carries 16 parameter values at most. `preset` names a `.vstpreset` file in `~/.rustel/vst/<plugin name>/`.\n\nThe plugin shows no window. A plugin not yet loaded takes a moment, and the first notes play dry.",
+        description: "Sends the note through a VST3 effect plugin in the pattern's chain. A second `.vst()` call adds an effect after the first, and one chain holds 4 effects at most. Separate patterns on the same orbit keep separate chains. A note with no `.vst()` stays dry. For a plugin that makes the sound, such as a synth, see `vsti`.\n\nThe first argument is the plugin name, as the vst tab of the reference panel lists the plugins. Upper case, spaces and punctuation in the name do not matter: `\"valhalla supermassive\"` finds `ValhallaSupermassive`.\n\nThe second argument sets parameters by name, each from 0 to 1. Each value is a pattern, so a slider or a mini-notation string gives one value to each note. A note carries 16 parameter values at most. `preset` names a `.vstpreset` file in `~/.rustel/vst/<plugin name>/`. Chain `.lfo({ sc: \"mix\" })`, `.env({ sc: \"mix\" })`, or `.bmod({ b: \"mod\", sc: \"mix\" })` to modulate a parameter continuously (use `c: \"vst0\"`..`\"vst3\"` to target a specific effect stage).\n\nThe plugin shows no window. A plugin not yet loaded takes a moment, and the first notes play dry.",
         params: &[
             ReferenceParam {
                 name: "name",
@@ -2731,7 +2731,7 @@ pub(super) const REFERENCE_ENTRIES: &[ReferenceEntry] = &[
         name: "vsti",
         synonyms: &[],
         summary: "Plays the note on a VST3 instrument plugin.",
-        description: "Plays the note on a VST3 instrument plugin, such as a synth. The plugin gets the pitch, velocity and length of the note, and makes the sound with its own envelope: `attack`, `decay`, `sustain` and `release` do not reach the plugin. `gain` sets the instrument's audio level before effects. `postgain` sets the level after the complete effect chain. The sound of the engine for the note, `s` included, is silent. Each chain holds one instrument. Separate instrument chains share an orbit without sharing their sound or effects.\n\nWith `.vst()` on the same note, the instrument goes through the effect plugins: `.vsti(\"serum 2\").vst(\"ott\")`. `vsti(\"serum 2\")` starts a chain too, with one note for each cycle.\n\nThe arguments are the arguments of `vst`: the plugin name, then parameter values by name from 0 to 1, and `preset`.\n\nThe plugin shows no window. The notes are silent until the plugin is loaded.",
+        description: "Plays the note on a VST3 instrument plugin, such as a synth. The plugin gets the pitch, velocity and length of the note, and makes the sound with its own envelope: `attack`, `decay`, `sustain` and `release` do not reach the plugin. `gain` sets the instrument's audio level before effects. `postgain` sets the level after the complete effect chain. The sound of the engine for the note, `s` included, is silent. Each chain holds one instrument. Separate instrument chains share an orbit without sharing their sound or effects.\n\nWith `.vst()` on the same note, the instrument goes through the effect plugins: `.vsti(\"serum 2\").vst(\"ott\")`. `vsti(\"serum 2\")` starts a chain too, with one note for each cycle.\n\nThe arguments are the arguments of `vst`: the plugin name, then parameter values by name from 0 to 1, and `preset`. Plugins exposing `IMidiMapping` also accept MIDI controller keys (`modwheel`, `aftertouch`, `pitchbend`, `breath`, `expression`, `sustain`, `cc0`..`cc127`), a `cc` map (`{ cc: { 1: 0.5, 64: 1 } }`), and chained `.midibend()` (`-1..1`), `.miditouch()` (`0..1`), or `.ccn().ccv()`. Chain `.lfo({ sc: \"modwheel\" })`, `.env({ sc: \"cutoff\" })`, or `.bmod({ b: \"mod\", sc: \"cutoff\" })` to modulate parameters or MIDI CCs continuously.\n\nThe plugin shows no window. The notes are silent until the plugin is loaded.",
         params: &[
             ReferenceParam {
                 name: "name",
@@ -2741,18 +2741,24 @@ pub(super) const REFERENCE_ENTRIES: &[ReferenceEntry] = &[
             ReferenceParam {
                 name: "config",
                 r#type: "Object",
-                description: "Parameter values by name, each from 0 to 1.",
+                description: "Parameter and MIDI CC values by name, each from 0 to 1.",
             },
             ReferenceParam {
                 name: "config.preset",
                 r#type: "string",
                 description: "Name of a `.vstpreset` file of the plugin.",
             },
+            ReferenceParam {
+                name: "config.cc",
+                r#type: "Object",
+                description: "Map of MIDI CC numbers (0-127) or names to 0..1 values or patterns.",
+            },
         ],
         examples: &[
             "note(\"c2 eb2 g2 bb2\").vsti(\"serum 2\")",
             "vsti(\"serum 2\").seg(8).note(\"<c2 eb2>\")",
-            "note(\"<c3 eb3>*4\").vsti(\"serum 2\", { macro1: slider(0.2, 0, 1) })\n  .vst(\"ott\", { depth: 0.6 })",
+            "note(\"<c3 eb3>*4\").vsti(\"serum 2\", { macro1: slider(0.2, 0, 1), cc: { 1: \"0 0.5\" } })\n  .vst(\"ott\", { depth: 0.6 })",
+            "note(\"c3\").vsti(\"serum 2\").lfo({ sc: \"modwheel\", r: 2, da: 0.5, dc: 0.5 })",
         ],
         tags: &["orbit", "audio", "experimental"],
         no_autocomplete: false,

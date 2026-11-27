@@ -26,7 +26,8 @@ use std::time::Duration;
 
 use rustel_audio::InsertControls;
 pub use rustel_vst3::{
-    Host, ParamInfo, ParamRole, PluginInfo, Resolved, ScanProgress, Status, canonical, serve,
+    Host, MidiCcInfo, ParamInfo, ParamRole, PluginInfo, Resolved, ScanProgress, Status, canonical,
+    serve,
 };
 
 /// Folders with plugins, in place of the standard VST3 folders of the
@@ -428,6 +429,12 @@ pub(crate) fn controls(
         rustel_voice::plugin_value_skipped(request, &reason);
     }
     Ok(Some(controls))
+}
+
+/// Resolves a parameter or mapped MIDI controller name on an already-loaded
+/// plugin without starting the plugin host or waiting on a load.
+pub(crate) fn param(name: &str, instrument: bool, param: &str) -> Option<(u32, f64)> {
+    started()?.param(name, instrument, param)
 }
 
 /// The provider of the plugin copies of a render to a file: see

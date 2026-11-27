@@ -142,7 +142,7 @@ fn apply_modulator_value(
         _ => rustel_core::OrderedMap::from_entries([("control".into(), default_value)]),
     };
     if !matches!(setting, Value::Undefined) {
-        let value = if key == "control" || key == "subControl" {
+        let value = if key == "control" {
             canonical_control_value(setting)
         } else {
             rustel_core::materialize_js_value(setting)

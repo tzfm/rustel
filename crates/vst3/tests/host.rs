@@ -1958,6 +1958,49 @@ fn an_instrument_plays_the_note_it_gets() {
             .all(|sample| *sample == 0.0)
     );
 
+    // Hidden IMidiMapping parameters restore on the next note with zero callback allocations.
+    assert_eq!(
+        tone.param_with_default("modwheel"),
+        Some((rustel_vst3_fixture::TONE_PARAM_MODWHEEL, 0.0))
+    );
+    assert_eq!(
+        tone.param_with_default("pitchbend"),
+        Some((rustel_vst3_fixture::TONE_PARAM_PITCHBEND, 0.5))
+    );
+    let long = InsertNote {
+        pitch: 69.0,
+        velocity: 1.0,
+        frames: 4800,
+    };
+    let before = Violations::capture();
+    let (mod_peak, restored_peak) = tripwire::audio_scope(|| {
+        insert.restore_params(0);
+        insert.set_param(
+            InsertParam {
+                id: rustel_vst3_fixture::TONE_PARAM_MODWHEEL,
+                value: 1.0,
+            },
+            0,
+        );
+        insert.note(long, 0);
+        let mut peak = |insert: &mut dyn OrbitInsert| {
+            let mut max = 0.0f32;
+            for _ in 0..4 {
+                left.fill(0.0);
+                right.fill(0.0);
+                insert.process(&mut left, &mut right);
+                max = max.max(left.iter().fold(0.0f32, |m, s| m.max(s.abs())));
+            }
+            max
+        };
+        let high = peak(insert.as_mut());
+        insert.restore_params(0);
+        (high, peak(insert.as_mut()))
+    });
+    assert!(Violations::capture().since(before).clean());
+    assert!((mod_peak - 2.0 * TONE_LEVEL).abs() < 0.02, "{mod_peak}");
+    assert!((restored_peak - TONE_LEVEL).abs() < 0.02, "{restored_peak}");
+
     // An engine with 2 plugin workers plays the note on a copy, and an
     // engine with no workers plays it on a second copy: the samples are the
     // same. The first engine leaves each block of 32 frames or more to the
