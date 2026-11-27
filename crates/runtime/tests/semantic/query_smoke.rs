@@ -494,13 +494,13 @@ fn restored_free_exports_preserve_method_and_curry_semantics() {
 }
 
 #[test]
-fn the_visual_helpers_are_native_and_the_dough_ones_are_absent() {
+fn the_visual_helpers_are_native_and_dough_is_a_standin() {
     // `initHydra`, `clearHydra` and `H` exist in every build, and in NEITHER
     // build do they emulate a browser. Without the `hydra` feature they are a
     // no-op that logs once, so a file carried over from a build that has the
     // visuals window keeps playing its drums instead of failing to load; with
     // it, they record a sketch for a window in another thread. `initDough`
-    // has no such native answer and stays absent.
+    // is a strudel.cc compatibility stand-in that returns silence.
     let mut session = Session::new().expect("session");
     session
         .evaluate(
@@ -510,6 +510,7 @@ fn the_visual_helpers_are_native_and_the_dough_ones_are_absent() {
                 typeof clearHydra,
                 typeof H,
                 typeof initDough,
+                initDough() instanceof Pattern,
                 isNote(new String('c4')),
                 midi2note(-1),
                 (() => { try { freqToMidi(440n); return false; } catch (_) { return true; } })(),
@@ -522,13 +523,13 @@ fn the_visual_helpers_are_native_and_the_dough_ones_are_absent() {
     let rustel_core::Value::List(values) = &haps[0].value else {
         panic!("expected result list: {haps:?}");
     };
-    for value in &values[..3] {
+    for value in &values[..4] {
         assert_eq!(value, &rustel_core::Value::Str("function".into()));
     }
-    assert_eq!(values[3], rustel_core::Value::Str("undefined".into()));
     assert_eq!(values[4], rustel_core::Value::Bool(true));
-    assert!(matches!(values[5], rustel_core::Value::F64(value) if value.is_nan()));
-    assert_eq!(values[6], rustel_core::Value::Bool(true));
+    assert_eq!(values[5], rustel_core::Value::Bool(true));
+    assert!(matches!(values[6], rustel_core::Value::F64(value) if value.is_nan()));
+    assert_eq!(values[7], rustel_core::Value::Bool(true));
 }
 
 #[test]

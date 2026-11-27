@@ -315,6 +315,22 @@ pub(super) fn install<'js>(
     globals
         .set("drawLine", draw_line)
         .map_err(|error| error.to_string())?;
+    define_method(
+        proto,
+        "drawLine",
+        Function::new(
+            ctx.clone(),
+            |ctx: Ctx<'js>,
+             this: rquickjs::function::This<rquickjs::Value<'js>>,
+             args: rquickjs::function::Rest<rquickjs::Value<'js>>| {
+                let mut full = Vec::with_capacity(args.0.len() + 1);
+                full.push(this.0);
+                full.extend(args.0);
+                callbacks::draw_line(ctx, rquickjs::function::Rest(full))
+            },
+        )
+        .map_err(|error| error.to_string())?,
+    )?;
 
     let console: rquickjs::Value = globals.get("console").map_err(|error| error.to_string())?;
     if console.is_null() || console.is_undefined() {

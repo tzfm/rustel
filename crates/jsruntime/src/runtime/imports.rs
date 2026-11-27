@@ -56,15 +56,21 @@ impl JsRuntime {
         };
         let effects = with_ctx(self, |ctx| {
             let globals = ctx.globals();
-            let before = match scope {
+            let (before_score, before_shared) = match scope {
                 ImportScope::Score => {
                     // A name the last score registered goes back first. The
                     // script then takes the name from the surface, and the
                     // value of that score does not become the base.
                     restore_registration_surface(&ctx).map_err(script_error)?;
-                    Some(import_surface::snapshot(&ctx).map_err(script_error)?)
+                    (
+                        Some(import_surface::snapshot(&ctx).map_err(script_error)?),
+                        None,
+                    )
                 }
-                ImportScope::Shared => None,
+                ImportScope::Shared => (
+                    None,
+                    Some(import_surface::snapshot_descriptors(&ctx).map_err(script_error)?),
+                ),
             };
             let outer: rquickjs::Value = globals.get("strudelMirror").map_err(script_error)?;
             globals
@@ -92,11 +98,19 @@ impl JsRuntime {
             };
             let effects = run();
             globals.set("strudelMirror", outer).map_err(script_error)?;
-            if let (Ok(_), Some(before)) = (&effects, before) {
-                self.import_surface
-                    .borrow_mut()
-                    .record(&ctx, specifier, &before)
-                    .map_err(script_error)?;
+            if effects.is_ok() {
+                if let Some(before) = before_score {
+                    self.import_surface
+                        .borrow_mut()
+                        .record(&ctx, specifier, &before)
+                        .map_err(script_error)?;
+                }
+                if let Some(before) = before_shared {
+                    let names = import_surface::diff_descriptors(&ctx, &before);
+                    self.import_surface
+                        .borrow_mut()
+                        .record_shared_names(specifier, names);
+                }
             }
             effects
         })?;

@@ -17,18 +17,20 @@ use oxc_ast::ast::{
     Argument, ArrayExpression, ArrayExpressionElement, ArrowFunctionExpression,
     AssignmentExpression, AwaitExpression, BindingPattern, CallExpression, ExportAllDeclaration,
     ExportDeclaration, ExportDefaultDeclaration, ExportFromDeclaration, ExportNamedDeclaration,
-    Expression, ForOfStatement, Function, IfStatement, ImportDeclaration, ImportExpression,
-    ImportMeta, JSXAttributeValue, JSXText, NewExpression, ObjectExpression, ObjectPropertyKind,
-    Program, PropertyKey, RegExpLiteral, Statement, TemplateLiteral, VariableDeclarationKind,
-    VariableDeclarator,
+    Expression, ForOfStatement, ForStatementLeft, Function, IfStatement, ImportDeclaration,
+    ImportExpression, ImportMeta, JSXAttributeValue, JSXText, MemberExpression, NewExpression,
+    ObjectExpression, ObjectPropertyKind, Program, PropertyKey, RegExpLiteral, Statement,
+    TemplateLiteral, VariableDeclarationKind, VariableDeclarator,
 };
 use oxc_ast_visit::{Visit, VisitMut, walk, walk_mut};
 use oxc_codegen::{Codegen, CodegenOptions};
 use oxc_parser::Parser;
 use oxc_semantic::{Scoping, SemanticBuilder};
 use oxc_span::{GetSpan, SourceType};
-use oxc_syntax::{scope::ScopeFlags, symbol::SymbolId, xml_entities::XML_ENTITIES};
-use std::collections::HashSet;
+use oxc_syntax::{
+    operator::BinaryOperator, scope::ScopeFlags, symbol::SymbolId, xml_entities::XML_ENTITIES,
+};
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
 mod arrange_marks;
@@ -111,6 +113,9 @@ impl LineMap {
 pub struct RegistrationHints {
     pub names: Vec<String>,
     pub has_dynamic_names: bool,
+    /// Earliest byte offset of a `register(...)` or `setFunction(...)` call
+    /// whose name could not be resolved statically.
+    pub first_dynamic_offset: Option<usize>,
     /// A bare final `register(...)` evaluates to its curried function (or, for
     /// an array of names, an object), not a Pattern. Live editors use this to
     /// distinguish a valid definition-only buffer from an accidental scalar
@@ -1836,11 +1841,31 @@ pub struct SetupDefinitions {
     pub names: Vec<String>,
     /// A definition whose name is not in the text - `globalThis[key] = …`,
     /// `Object.assign(globalThis, helpers)`, a computed `register(...)`, an
-    /// `import(...)` of a script. A checker that cannot read the name must
-    /// not refuse any later call as unknown.
+    /// `import(...)` of a script.
     pub has_dynamic_names: bool,
+    /// A dynamic write to `globalThis`/`window`, a computed `register(...)`,
+    /// or an `import(...)`.
+    pub has_dynamic_globals: bool,
+    /// A dynamic write to `Pattern.prototype`, a computed `register(...)`, a
+    /// dynamic `setFunction(...)`, or an `import(...)`.
+    pub has_dynamic_methods: bool,
+    /// Earliest byte offset of an `import(...)` expression, if any.
+    pub first_import_offset: Option<usize>,
+    /// Earliest byte offset of an unresolved dynamic global definition.
+    pub first_dynamic_global_offset: Option<usize>,
+    /// Earliest byte offset of an unresolved dynamic method definition.
+    pub first_dynamic_method_offset: Option<usize>,
     /// Direct children of the program only.
     pub top_level_declarations: Vec<TopLevelDeclaration>,
+}
+
+/// Maximum number of names expanded statically from one computed-key loop or
+/// string expression before falling back to dynamic tracking.
+const MAX_STATIC_SETUP_NAMES: usize = 256;
+
+fn record_min_offset(slot: &mut Option<usize>, offset: u32) {
+    let offset = offset as usize;
+    *slot = Some(slot.map_or(offset, |current| current.min(offset)));
 }
 
 /// Read what a setup file defines, without executing it.
@@ -1859,16 +1884,31 @@ pub fn setup_definitions(source: &str) -> SetupDefinitions {
         if parsed.panicked {
             return SetupDefinitions::default();
         }
-        let mut collector = SetupCollector::default();
+        let semantic = SemanticBuilder::new().build(&parsed.program).semantic;
+        let scoping = semantic.scoping();
+        let mut collector = SetupCollector::new(scoping);
         collector.visit_program(&parsed.program);
         let mut names = collector.names;
         // A registered name is reachable exactly like a global one, so the
         // two lists are one list to a caller.
-        let registrations = registration_hints_from_program(&parsed.program);
+        let registrations = registration_hints_with(&parsed.program, scoping);
         names.extend(registrations.names);
+        let mut first_dynamic_global_offset = collector.first_dynamic_global_offset;
+        let mut first_dynamic_method_offset = collector.first_dynamic_method_offset;
+        if let Some(offset) = registrations.first_dynamic_offset {
+            record_min_offset(&mut first_dynamic_global_offset, offset as u32);
+            record_min_offset(&mut first_dynamic_method_offset, offset as u32);
+        }
+        let has_dynamic_globals = collector.has_dynamic_globals || registrations.has_dynamic_names;
+        let has_dynamic_methods = collector.has_dynamic_methods || registrations.has_dynamic_names;
         SetupDefinitions {
             names,
-            has_dynamic_names: collector.has_dynamic_names || registrations.has_dynamic_names,
+            has_dynamic_names: has_dynamic_globals || has_dynamic_methods,
+            has_dynamic_globals,
+            has_dynamic_methods,
+            first_import_offset: collector.first_import_offset,
+            first_dynamic_global_offset,
+            first_dynamic_method_offset,
             top_level_declarations: top_level_declarations(&parsed.program),
         }
     })
@@ -1926,53 +1966,334 @@ fn is_shared_global(expression: &Expression<'_>) -> bool {
     expression.is_specific_id("globalThis") || expression.is_specific_id("window")
 }
 
-#[derive(Default)]
-struct SetupCollector {
+struct SetupCollector<'s> {
+    scoping: &'s Scoping,
     names: Vec<String>,
-    has_dynamic_names: bool,
+    has_dynamic_globals: bool,
+    has_dynamic_methods: bool,
+    first_import_offset: Option<usize>,
+    first_dynamic_global_offset: Option<usize>,
+    first_dynamic_method_offset: Option<usize>,
+    /// Immutable local string bindings and active loop-variable string sets.
+    const_strings: HashMap<SymbolId, Vec<String>>,
+    /// Immutable local arrays of strings (`const xs = ['a', 'b']`).
+    const_lists: HashMap<SymbolId, Vec<String>>,
+    /// Immutable local object literals with all static property keys.
+    const_object_keys: HashMap<SymbolId, Vec<String>>,
 }
 
-impl SetupCollector {
+impl<'s> SetupCollector<'s> {
+    fn new(scoping: &'s Scoping) -> Self {
+        Self {
+            scoping,
+            names: Vec::new(),
+            has_dynamic_globals: false,
+            has_dynamic_methods: false,
+            first_import_offset: None,
+            first_dynamic_global_offset: None,
+            first_dynamic_method_offset: None,
+            const_strings: HashMap::new(),
+            const_lists: HashMap::new(),
+            const_object_keys: HashMap::new(),
+        }
+    }
+
     fn push(&mut self, name: &str) {
         self.names.push(name.to_owned());
     }
 
-    /// The keys of an object literal being merged onto a global. Anything
-    /// spread or computed is a name this cannot read.
-    fn collect_assign_target(&mut self, argument: Option<&Argument<'_>>) {
-        let Some(Argument::ObjectExpression(object)) = argument else {
-            self.has_dynamic_names = true;
-            return;
-        };
+    fn mark_dynamic_global(&mut self, offset: u32) {
+        self.has_dynamic_globals = true;
+        record_min_offset(&mut self.first_dynamic_global_offset, offset);
+    }
+
+    fn mark_dynamic_method(&mut self, offset: u32) {
+        self.has_dynamic_methods = true;
+        record_min_offset(&mut self.first_dynamic_method_offset, offset);
+    }
+
+    fn mark_dynamic(&mut self, is_global: bool, offset: u32) {
+        if is_global {
+            self.mark_dynamic_global(offset);
+        } else {
+            self.mark_dynamic_method(offset);
+        }
+    }
+
+    fn resolved_symbol(
+        &self,
+        identifier: &oxc_ast::ast::IdentifierReference<'_>,
+    ) -> Option<SymbolId> {
+        identifier
+            .reference_id
+            .get()
+            .and_then(|id| self.scoping.get_reference(id).symbol_id())
+    }
+
+    fn static_object_keys(object: &ObjectExpression<'_>) -> Option<Vec<String>> {
+        let mut keys = Vec::new();
         for property in &object.properties {
             match property {
                 ObjectPropertyKind::ObjectProperty(property) if !property.computed => {
-                    match property.key.static_name() {
-                        Some(name) => self.push(&name),
-                        None => self.has_dynamic_names = true,
+                    let name = property.key.static_name()?;
+                    keys.push(name.into_owned());
+                    if keys.len() > MAX_STATIC_SETUP_NAMES {
+                        return None;
                     }
                 }
-                _ => self.has_dynamic_names = true,
+                _ => return None,
             }
+        }
+        Some(keys)
+    }
+
+    fn eval_string_expr(&self, expr: &Expression<'_>) -> Option<Vec<String>> {
+        match expr.get_inner_expression() {
+            Expression::StringLiteral(literal) => Some(vec![literal.value.to_string()]),
+            Expression::Identifier(identifier) => {
+                let symbol = self.resolved_symbol(identifier)?;
+                self.const_strings.get(&symbol).cloned()
+            }
+            Expression::TemplateLiteral(template) => {
+                let mut acc = vec![template.quasis.first()?.value.cooked?.to_string()];
+                for (expr, quasi) in template
+                    .expressions
+                    .iter()
+                    .zip(template.quasis.iter().skip(1))
+                {
+                    let parts = self.eval_string_expr(expr)?;
+                    let suffix = quasi.value.cooked?;
+                    let mut next = Vec::new();
+                    for prefix in &acc {
+                        for part in &parts {
+                            if next.len() >= MAX_STATIC_SETUP_NAMES {
+                                return None;
+                            }
+                            let mut combined =
+                                String::with_capacity(prefix.len() + part.len() + suffix.len());
+                            combined.push_str(prefix);
+                            combined.push_str(part);
+                            combined.push_str(suffix.as_str());
+                            next.push(combined);
+                        }
+                    }
+                    acc = next;
+                }
+                Some(acc)
+            }
+            Expression::BinaryExpression(binary) if binary.operator == BinaryOperator::Addition => {
+                let left = self.eval_string_expr(&binary.left)?;
+                let right = self.eval_string_expr(&binary.right)?;
+                let mut out = Vec::new();
+                for l in &left {
+                    for r in &right {
+                        if out.len() >= MAX_STATIC_SETUP_NAMES {
+                            return None;
+                        }
+                        let mut combined = String::with_capacity(l.len() + r.len());
+                        combined.push_str(l);
+                        combined.push_str(r);
+                        out.push(combined);
+                    }
+                }
+                Some(out)
+            }
+            _ => None,
+        }
+    }
+
+    /// Evaluate a static list of strings or object keys, flagging whether each
+    /// item is a `[key, value]` pair (`Object.entries`).
+    fn eval_iterable_keys(&self, expr: &Expression<'_>) -> Option<(Vec<String>, bool)> {
+        match expr.get_inner_expression() {
+            Expression::ArrayExpression(array) => {
+                let mut out = Vec::new();
+                for element in &array.elements {
+                    let expr = element.as_expression()?;
+                    let values = self.eval_string_expr(expr)?;
+                    if out.len() + values.len() > MAX_STATIC_SETUP_NAMES {
+                        return None;
+                    }
+                    out.extend(values);
+                }
+                Some((out, false))
+            }
+            Expression::Identifier(identifier) => {
+                let symbol = self.resolved_symbol(identifier)?;
+                self.const_lists
+                    .get(&symbol)
+                    .cloned()
+                    .map(|list| (list, false))
+            }
+            Expression::CallExpression(call) => {
+                let entries = if call.callee.is_specific_member_access("Object", "keys") {
+                    false
+                } else if call.callee.is_specific_member_access("Object", "entries") {
+                    true
+                } else {
+                    return None;
+                };
+                let target = call
+                    .arguments
+                    .first()?
+                    .as_expression()?
+                    .get_inner_expression();
+                let keys = match target {
+                    Expression::ObjectExpression(object) => Self::static_object_keys(object)?,
+                    Expression::Identifier(identifier) => {
+                        let symbol = self.resolved_symbol(identifier)?;
+                        self.const_object_keys.get(&symbol)?.clone()
+                    }
+                    _ => return None,
+                };
+                Some((keys, entries))
+            }
+            _ => None,
+        }
+    }
+
+    fn binding_key_symbol(pattern: &BindingPattern<'_>, is_entries: bool) -> Option<SymbolId> {
+        if is_entries {
+            let BindingPattern::ArrayPattern(array) = pattern else {
+                return None;
+            };
+            let first = array.elements.first()?.as_ref()?;
+            let BindingPattern::BindingIdentifier(identifier) = first else {
+                return None;
+            };
+            identifier.symbol_id.get()
+        } else {
+            let BindingPattern::BindingIdentifier(identifier) = pattern else {
+                return None;
+            };
+            identifier.symbol_id.get()
+        }
+    }
+
+    /// The keys of an object being merged onto `globalThis` or `Pattern.prototype`.
+    fn collect_assign_target(
+        &mut self,
+        argument: Option<&Argument<'_>>,
+        is_global: bool,
+        offset: u32,
+    ) {
+        let Some(expr) = argument.and_then(Argument::as_expression) else {
+            self.mark_dynamic(is_global, offset);
+            return;
+        };
+        match expr.get_inner_expression() {
+            Expression::ObjectExpression(object) => {
+                for property in &object.properties {
+                    match property {
+                        ObjectPropertyKind::ObjectProperty(property) if !property.computed => {
+                            match property.key.static_name() {
+                                Some(name) => self.push(&name),
+                                None => self.mark_dynamic(is_global, offset),
+                            }
+                        }
+                        _ => self.mark_dynamic(is_global, offset),
+                    }
+                }
+            }
+            Expression::Identifier(identifier) => {
+                if let Some(symbol) = self.resolved_symbol(identifier)
+                    && let Some(keys) = self.const_object_keys.get(&symbol).cloned()
+                {
+                    for key in keys {
+                        self.push(&key);
+                    }
+                } else {
+                    self.mark_dynamic(is_global, offset);
+                }
+            }
+            _ => self.mark_dynamic(is_global, offset),
         }
     }
 }
 
-impl<'a> Visit<'a> for SetupCollector {
+impl<'a> Visit<'a> for SetupCollector<'_> {
+    fn visit_variable_declarator(&mut self, declarator: &VariableDeclarator<'a>) {
+        if let BindingPattern::BindingIdentifier(identifier) = &declarator.id
+            && let Some(symbol) = identifier.symbol_id.get()
+            && !self.scoping.symbol_is_mutated(symbol)
+            && let Some(init) = &declarator.init
+        {
+            match init.get_inner_expression() {
+                Expression::ObjectExpression(object) => {
+                    if let Some(keys) = Self::static_object_keys(object) {
+                        self.const_object_keys.insert(symbol, keys);
+                    }
+                }
+                Expression::ArrayExpression(_) => {
+                    if let Some((list, false)) = self.eval_iterable_keys(init) {
+                        self.const_lists.insert(symbol, list);
+                    }
+                }
+                _ => {
+                    if let Some(values) = self.eval_string_expr(init) {
+                        self.const_strings.insert(symbol, values);
+                    }
+                }
+            }
+        }
+        walk::walk_variable_declarator(self, declarator);
+    }
+
+    fn visit_for_of_statement(&mut self, statement: &ForOfStatement<'a>) {
+        let bound = self
+            .eval_iterable_keys(&statement.right)
+            .and_then(|(keys, is_entries)| {
+                let ForStatementLeft::VariableDeclaration(decl) = &statement.left else {
+                    return None;
+                };
+                let declarator = decl.declarations.first()?;
+                let symbol = Self::binding_key_symbol(&declarator.id, is_entries)?;
+                (!self.scoping.symbol_is_mutated(symbol)).then_some((symbol, keys))
+            });
+        if let Some((symbol, keys)) = bound {
+            let previous = self.const_strings.insert(symbol, keys);
+            walk::walk_for_of_statement(self, statement);
+            match previous {
+                Some(old) => {
+                    self.const_strings.insert(symbol, old);
+                }
+                None => {
+                    self.const_strings.remove(&symbol);
+                }
+            }
+        } else {
+            walk::walk_for_of_statement(self, statement);
+        }
+    }
+
     // An imported script defines names that this text does not show.
     fn visit_import_expression(&mut self, expression: &ImportExpression<'a>) {
-        self.has_dynamic_names = true;
+        record_min_offset(&mut self.first_import_offset, expression.span.start);
+        self.mark_dynamic_global(expression.span.start);
+        self.mark_dynamic_method(expression.span.start);
         walk::walk_import_expression(self, expression);
     }
 
     fn visit_assignment_expression(&mut self, assignment: &AssignmentExpression<'a>) {
         if let Some(member) = assignment.left.as_member_expression() {
             let object = member.object();
-            if is_shared_global(object) || object.is_specific_member_access("Pattern", "prototype")
-            {
+            let is_global = is_shared_global(object);
+            let is_proto = object.is_specific_member_access("Pattern", "prototype");
+            if is_global || is_proto {
                 match member.static_property_name() {
                     Some(name) => self.push(name),
-                    None => self.has_dynamic_names = true,
+                    None => match member {
+                        MemberExpression::ComputedMemberExpression(computed) => {
+                            if let Some(resolved) = self.eval_string_expr(&computed.expression) {
+                                for name in resolved {
+                                    self.push(&name);
+                                }
+                            } else {
+                                self.mark_dynamic(is_global, assignment.span.start);
+                            }
+                        }
+                        _ => self.mark_dynamic(is_global, assignment.span.start),
+                    },
                 }
             }
         }
@@ -1980,30 +2301,70 @@ impl<'a> Visit<'a> for SetupCollector {
     }
 
     fn visit_call_expression(&mut self, call: &CallExpression<'a>) {
-        if call.callee.is_specific_member_access("Object", "assign")
-            && call
-                .arguments
-                .first()
-                .and_then(Argument::as_expression)
-                .is_some_and(is_shared_global)
+        if let Some(member) = call.callee.as_member_expression()
+            && member.static_property_name() == Some("forEach")
+            && let Some((keys, is_entries)) = self.eval_iterable_keys(member.object())
+            && let Some(callback) = call.arguments.first().and_then(Argument::as_expression)
         {
-            self.collect_assign_target(call.arguments.get(1));
+            let symbol = match callback.get_inner_expression() {
+                Expression::ArrowFunctionExpression(arrow) => arrow
+                    .params
+                    .items
+                    .first()
+                    .and_then(|param| Self::binding_key_symbol(&param.pattern, is_entries)),
+                Expression::FunctionExpression(func) => func
+                    .params
+                    .items
+                    .first()
+                    .and_then(|param| Self::binding_key_symbol(&param.pattern, is_entries)),
+                _ => None,
+            }
+            .filter(|symbol| !self.scoping.symbol_is_mutated(*symbol));
+            if let Some(symbol) = symbol {
+                let previous = self.const_strings.insert(symbol, keys);
+                walk::walk_call_expression(self, call);
+                match previous {
+                    Some(old) => {
+                        self.const_strings.insert(symbol, old);
+                    }
+                    None => {
+                        self.const_strings.remove(&symbol);
+                    }
+                }
+                return;
+            }
+        }
+
+        if call.callee.is_specific_member_access("Object", "assign")
+            && let Some(target) = call.arguments.first().and_then(Argument::as_expression)
+        {
+            let is_global = is_shared_global(target);
+            let is_proto = target.is_specific_member_access("Pattern", "prototype");
+            if is_global || is_proto {
+                self.collect_assign_target(call.arguments.get(1), is_global, call.span.start);
+            }
         } else if call
             .callee
             .is_specific_member_access("Object", "defineProperty")
         {
             let target = call.arguments.first().and_then(Argument::as_expression);
-            let onto_global = target.is_some_and(|expression| {
-                is_shared_global(expression)
-                    || expression.is_specific_member_access("Pattern", "prototype")
+            let is_global = target.is_some_and(is_shared_global);
+            let is_proto = target.is_some_and(|expression| {
+                expression.is_specific_member_access("Pattern", "prototype")
             });
-            if onto_global {
-                match call.arguments.get(1).and_then(Argument::as_expression) {
-                    Some(Expression::StringLiteral(literal)) => {
-                        let name = literal.value.to_string();
-                        self.push(&name);
+            if is_global || is_proto {
+                match call
+                    .arguments
+                    .get(1)
+                    .and_then(Argument::as_expression)
+                    .and_then(|key| self.eval_string_expr(key))
+                {
+                    Some(names) => {
+                        for name in names {
+                            self.push(&name);
+                        }
                     }
-                    _ => self.has_dynamic_names = true,
+                    None => self.mark_dynamic(is_global, call.span.start),
                 }
             }
         }
@@ -2110,9 +2471,15 @@ struct RegistrationCollector<'s> {
     aliases: HashSet<SymbolId>,
     names: Vec<String>,
     has_dynamic_names: bool,
+    first_dynamic_offset: Option<usize>,
 }
 
 impl RegistrationCollector<'_> {
+    fn mark_dynamic(&mut self, offset: u32) {
+        self.has_dynamic_names = true;
+        record_min_offset(&mut self.first_dynamic_offset, offset);
+    }
+
     fn is_registration(&self, expression: &Expression<'_>) -> bool {
         match expression.get_inner_expression() {
             Expression::Identifier(identifier) => {
@@ -2142,14 +2509,14 @@ impl RegistrationCollector<'_> {
         self.names.push(name.to_owned());
     }
 
-    fn collect_argument(&mut self, argument: Option<&Argument<'_>>) {
+    fn collect_argument(&mut self, argument: Option<&Argument<'_>>, offset: u32) {
         match argument {
             Some(Argument::StringLiteral(literal)) => self.push(literal.value.as_str()),
             Some(Argument::TemplateLiteral(template)) => {
                 if let Some(name) = static_template_value(template) {
                     self.push(name);
                 } else {
-                    self.has_dynamic_names = true;
+                    self.mark_dynamic(offset);
                 }
             }
             Some(Argument::ArrayExpression(array)) => {
@@ -2162,14 +2529,14 @@ impl RegistrationCollector<'_> {
                             if let Some(name) = static_template_value(template) {
                                 self.push(name);
                             } else {
-                                self.has_dynamic_names = true;
+                                self.mark_dynamic(offset);
                             }
                         }
-                        _ => self.has_dynamic_names = true,
+                        _ => self.mark_dynamic(offset),
                     }
                 }
             }
-            _ => self.has_dynamic_names = true,
+            _ => self.mark_dynamic(offset),
         }
     }
 
@@ -2182,13 +2549,13 @@ impl RegistrationCollector<'_> {
                     self.scoping.get_reference(reference).symbol_id().is_none()))
     }
 
-    fn collect_set_function(&mut self, argument: Option<&Argument<'_>>) {
+    fn collect_set_function(&mut self, argument: Option<&Argument<'_>>, offset: u32) {
         let definition = match argument {
             // Refused when it runs, and it names nothing.
             None => return,
             Some(Argument::ObjectExpression(definition)) => definition,
             Some(_) => {
-                self.has_dynamic_names = true;
+                self.mark_dynamic(offset);
                 return;
             }
         };
@@ -2203,15 +2570,15 @@ impl RegistrationCollector<'_> {
                         Expression::TemplateLiteral(template) => {
                             match static_template_value(template) {
                                 Some(name) => self.push(name),
-                                None => self.has_dynamic_names = true,
+                                None => self.mark_dynamic(offset),
                             }
                         }
-                        _ => self.has_dynamic_names = true,
+                        _ => self.mark_dynamic(offset),
                     }
                     return;
                 }
                 ObjectPropertyKind::SpreadProperty(_) => {
-                    self.has_dynamic_names = true;
+                    self.mark_dynamic(offset);
                     return;
                 }
                 _ => {}
@@ -2237,9 +2604,9 @@ impl<'a> Visit<'a> for RegistrationCollector<'_> {
 
     fn visit_call_expression(&mut self, call: &CallExpression<'a>) {
         if self.is_registration(&call.callee) {
-            self.collect_argument(call.arguments.first());
+            self.collect_argument(call.arguments.first(), call.span.start);
         } else if self.is_set_function(&call.callee) {
-            self.collect_set_function(call.arguments.first());
+            self.collect_set_function(call.arguments.first(), call.span.start);
         }
         walk::walk_call_expression(self, call);
     }
@@ -2305,17 +2672,13 @@ pub fn awaits_in_code(source: &str) -> bool {
     .unwrap_or(true)
 }
 
-fn registration_hints_from_program(program: &Program<'_>) -> RegistrationHints {
-    let semantic = SemanticBuilder::new().build(program).semantic;
-    registration_hints_with(program, semantic.scoping())
-}
-
 fn registration_hints_with(program: &Program<'_>, scoping: &Scoping) -> RegistrationHints {
     let mut collector = RegistrationCollector {
         scoping,
         aliases: HashSet::new(),
         names: Vec::new(),
         has_dynamic_names: false,
+        first_dynamic_offset: None,
     };
     collector.visit_program(program);
     let final_expression_is_registration = program.body.last().is_some_and(|statement| {
@@ -2330,6 +2693,7 @@ fn registration_hints_with(program: &Program<'_>, scoping: &Scoping) -> Registra
     RegistrationHints {
         names: collector.names,
         has_dynamic_names: collector.has_dynamic_names,
+        first_dynamic_offset: collector.first_dynamic_offset,
         final_expression_is_registration,
     }
 }
@@ -7494,5 +7858,47 @@ p._scope({ text: "/* not a comment */" });"#;
             1,
             "actual `.scope()` member call must still register a widget"
         );
+    }
+
+    #[test]
+    fn setup_definitions_resolves_static_computed_writes_and_splits_dynamic_namespaces() {
+        let loop_writes = setup_definitions(
+            "const names = ['kick', 'hat'];\n\
+             for (const name of names) { window[name + 's'] = () => s(name); }",
+        );
+        assert!(!loop_writes.has_dynamic_names);
+        assert!(!loop_writes.has_dynamic_globals);
+        assert!(!loop_writes.has_dynamic_methods);
+        assert!(loop_writes.names.iter().any(|name| name == "kicks"));
+        assert!(loop_writes.names.iter().any(|name| name == "hats"));
+
+        let key_loop = setup_definitions(
+            "const bank = { snare: 'sd', clap: 'cp' };\n\
+             Object.keys(bank).forEach((k) => { globalThis[`play_${k}`] = () => s(bank[k]); });",
+        );
+        assert!(!key_loop.has_dynamic_names);
+        assert!(key_loop.names.iter().any(|name| name == "play_snare"));
+        assert!(key_loop.names.iter().any(|name| name == "play_clap"));
+
+        let assigned = setup_definitions(
+            "const helpers = { lead: () => note('c4'), bass: () => note('c2') };\n\
+             Object.assign(globalThis, helpers);",
+        );
+        assert!(!assigned.has_dynamic_names);
+        assert!(assigned.names.iter().any(|name| name == "lead"));
+        assert!(assigned.names.iter().any(|name| name == "bass"));
+
+        let dynamic_global =
+            setup_definitions("function add(name) { window[name + 's'] = () => s(name); }");
+        assert!(dynamic_global.has_dynamic_globals);
+        assert!(!dynamic_global.has_dynamic_methods);
+        assert!(dynamic_global.first_dynamic_global_offset.is_some());
+
+        let dynamic_method = setup_definitions(
+            "function add(name) { Pattern.prototype[name] = function() { return this; }; }",
+        );
+        assert!(!dynamic_method.has_dynamic_globals);
+        assert!(dynamic_method.has_dynamic_methods);
+        assert!(dynamic_method.first_dynamic_method_offset.is_some());
     }
 }

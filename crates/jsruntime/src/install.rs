@@ -141,7 +141,9 @@ impl JsRuntime {
             #[cfg(feature = "hydra")]
             hydra::install(self, &ctx, &surface.globals)?;
             install_midimap_surface(&ctx)?;
+            compat::install_aliases(&ctx, &surface.proto, &surface.globals)?;
             registration_seal.finish(&surface.proto)?;
+            compat::install_standins(self, &ctx, &surface.proto, &surface.globals)?;
             repl::install_clear_scope(&ctx)?;
             // Last: every layer that can replace a built-in method has run.
             seal_builtin_methods(&ctx, &surface.proto, &surface.globals)

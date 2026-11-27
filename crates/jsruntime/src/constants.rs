@@ -28,10 +28,25 @@ pub(super) const MAX_LIST_DEPTH: usize = 256;
 
 pub(super) const SUPPORTED_GLOBAL_NAMES: &str = include_str!("../assets/supported-globals.txt");
 pub(super) const SUPPORTED_GLOBAL_COUNT: usize = 51;
+pub(super) const STRUDEL_COMPAT_GLOBALS: &str = include_str!("../assets/strudel-globals.txt");
+pub(super) const STRUDEL_COMPAT_METHODS: &str = include_str!("../assets/strudel-methods.txt");
 
-pub fn supported_global_names() -> impl Iterator<Item = &'static str> {
-    SUPPORTED_GLOBAL_NAMES
-        .lines()
+fn name_list_lines(text: &'static str) -> impl Iterator<Item = &'static str> {
+    text.lines()
         .map(str::trim)
         .filter(|line| !line.is_empty() && !line.starts_with('#'))
+}
+
+pub fn supported_global_names() -> impl Iterator<Item = &'static str> {
+    name_list_lines(SUPPORTED_GLOBAL_NAMES)
+}
+
+/// Score-scope globals from strudel.cc tracked for compatibility.
+pub fn strudel_compat_globals() -> impl Iterator<Item = &'static str> {
+    name_list_lines(STRUDEL_COMPAT_GLOBALS)
+}
+
+/// Public Pattern methods from strudel.cc tracked for compatibility.
+pub fn strudel_compat_methods() -> impl Iterator<Item = &'static str> {
+    name_list_lines(STRUDEL_COMPAT_METHODS)
 }

@@ -783,25 +783,16 @@ impl App {
     /// global one sees only itself. Each also sees what it defines itself,
     /// so calling a helper three lines above is not an unknown function.
     pub(super) fn lint_context_for(&self, scene: &super::super::scenes::Scene) -> Arc<LintContext> {
-        let own = scene.editor.source();
         let mut context = match scene.prebake() {
             None => {
                 let mut context = LintContext::default();
                 for definitions in &self.applied_setup {
-                    context
-                        .setup_names
-                        .extend(definitions.names.iter().cloned());
-                    context.setup_has_dynamic_names |= definitions.has_dynamic_names;
+                    context.add_setup_definitions(definitions);
                 }
                 context
             }
-            Some(PrebakeScope::Global) => {
-                LintContext::from_setup_sources([own.as_str()]).as_setup()
-            }
-            Some(PrebakeScope::Local) => {
-                LintContext::from_setup_sources([self.global_prebake.as_str(), own.as_str()])
-                    .as_setup()
-            }
+            Some(PrebakeScope::Global) => LintContext::default().as_setup(),
+            Some(PrebakeScope::Local) => self.global_setup_lint_context(None).as_setup(),
         };
         if scene.is_score() {
             // Its own registrations are already read from the score itself.
@@ -811,13 +802,18 @@ impl App {
             // checker cannot read the script: judge no name unknown, as for
             // a score with an import of its own. The update still fails if
             // the name is missing when it runs.
-            context.setup_has_dynamic_names |= self.scenes.scenes().iter().any(|other| {
+            let other_score_imports = self.scenes.scenes().iter().any(|other| {
                 let source = other.editor.source();
                 other.id != scene.id
                     && other.is_score()
                     && source.contains("import")
                     && !rustel_transpiler::script_imports(&source).is_empty()
             });
+            if other_score_imports {
+                context.setup_has_dynamic_names = true;
+                context.setup_has_dynamic_globals = true;
+                context.setup_has_dynamic_methods = true;
+            }
         }
         context.input_channels = self.lint_input_channels();
         // What is plugged in right now, so a score naming a port that is

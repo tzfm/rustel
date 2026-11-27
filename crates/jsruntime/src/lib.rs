@@ -59,8 +59,8 @@ mod thread_state;
 mod value;
 
 pub use bridge::*;
-pub use constants::supported_global_names;
 use constants::*;
+pub use constants::{strudel_compat_globals, strudel_compat_methods, supported_global_names};
 use host::*;
 pub use install::{kabelsalat_reference_entries, reference_entries};
 use pattern::*;

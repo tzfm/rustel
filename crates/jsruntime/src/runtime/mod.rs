@@ -367,6 +367,12 @@ pub struct JsRuntime {
     /// Whether the semantic surface and the voicing globals are installed.
     pub(super) bindings_installed: Cell<bool>,
     pub(super) voicings_installed: Cell<bool>,
+    /// Compatibility stand-in names installed onto this realm because no native
+    /// binding claimed them.
+    pub(crate) compat_standins: RefCell<HashSet<&'static str>>,
+    /// Surface descriptors captured before a prebake runs, dropped on finish
+    /// or cancel so the prebake reports only the names it added or updated.
+    pub(super) pending_surface_capture: RefCell<Option<import_surface::SavedSurface>>,
     /// Depth of the bounded synchronous query turn currently using this
     /// runtime.
     pub(super) query_turn_depth: Cell<usize>,
