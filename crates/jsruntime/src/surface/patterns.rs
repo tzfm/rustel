@@ -63,12 +63,15 @@ pub(crate) fn native_gap<'js>(
 }
 
 /// The transpiler-facing `m(source, offset)`.
+///
+/// Helper scripts also call `m(text)` with one argument. Omitting `offset`
+/// uses `-1`, which parses without score source locations.
 pub(crate) fn native_mini<'js>(
     ctx: Ctx<'js>,
     source: String,
-    offset: i64,
+    offset: rquickjs::function::Opt<i64>,
 ) -> rquickjs::Result<rquickjs::Class<'js, NativePatternWrapper<'js>>> {
-    let pattern = transpiled_mini(&source, offset)
+    let pattern = transpiled_mini(&source, offset.0.unwrap_or(-1))
         .map_err(|error| rquickjs::Error::new_from_js_message("string", "Pattern", error))?;
     new_wrapper(&ctx, NativePatternWrapper::plain(pattern))
 }
