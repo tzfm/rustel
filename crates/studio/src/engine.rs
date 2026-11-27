@@ -2715,6 +2715,11 @@ impl StudioEngine {
         // A zero timeout leaves the stop ramp pending on a healthy callback;
         // an expired positive timeout means the callback cannot be reused.
         if keep_output && device.check_health().is_ok() && (acknowledged || timeout.is_zero()) {
+            if acknowledged {
+                // Drop peak readings from the stop fade so the next start or
+                // idle turn does not read the stopped set's tail as live audio.
+                let _ = device.take_levels();
+            }
             device.close_input();
             self.piano_output = Some(device);
         } else {
