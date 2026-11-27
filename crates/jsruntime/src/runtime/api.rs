@@ -45,6 +45,8 @@ impl JsRuntime {
             evaluated_natively: Cell::new(false),
             bindings_installed: Cell::new(false),
             voicings_installed: Cell::new(false),
+            compat_standins: RefCell::default(),
+            pending_surface_capture: RefCell::default(),
             query_turn_depth: Cell::new(0),
             effect_query_depth: Cell::new(0),
             heap_boundary_depth: Cell::new(0),
@@ -142,6 +144,68 @@ impl JsRuntime {
             self.install_voicings_prebake()?;
         }
         Ok(())
+    }
+
+    /// Names installed as no-op compatibility stand-ins on this runtime because
+    /// no native binding claimed them.
+    pub fn compat_standin_names(&self) -> Vec<&'static str> {
+        let mut names: Vec<&'static str> = self.compat_standins.borrow().iter().copied().collect();
+        names.sort_unstable();
+        names
+    }
+
+    /// Snapshot current surface property descriptors before a prebake runs.
+    pub fn begin_surface_write_capture(&self) {
+        if !self.script_engine_started() {
+            return;
+        }
+        let previous = self.pending_surface_capture.borrow_mut().take();
+        let next = with_ctx(self, |ctx| {
+            drop(previous);
+            import_surface::snapshot_saved(&ctx).ok()
+        });
+        *self.pending_surface_capture.borrow_mut() = next;
+    }
+
+    /// Finish a prebake surface capture and return every non-internal name
+    /// added or updated on `globalThis`, `Pattern.prototype`, or `rustelScope`,
+    /// together with names recorded for any already-loaded `shared_imports`.
+    pub fn finish_surface_write_capture(&self, shared_imports: &[String]) -> Vec<String> {
+        let saved = self.pending_surface_capture.borrow_mut().take();
+        let mut names = if self.script_engine_started() {
+            with_ctx(self, |ctx| {
+                let names = saved
+                    .as_ref()
+                    .map(|before| import_surface::diff_saved(&ctx, before))
+                    .unwrap_or_default();
+                drop(saved);
+                names
+            })
+        } else {
+            Vec::new()
+        };
+        if !shared_imports.is_empty() {
+            names.extend(
+                self.import_surface
+                    .borrow()
+                    .names_for_imports(shared_imports),
+            );
+            names.sort();
+            names.dedup();
+        }
+        names
+    }
+
+    /// Drop any in-progress prebake surface capture on error or cancellation.
+    pub fn cancel_surface_write_capture(&self) {
+        let saved = self.pending_surface_capture.borrow_mut().take();
+        if let Some(saved) = saved
+            && self.script_engine_started()
+        {
+            with_ctx(self, |_ctx| {
+                drop(saved);
+            });
+        }
     }
 
     /// Let scores the native tier proves skip JavaScript, or send every

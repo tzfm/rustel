@@ -2646,6 +2646,7 @@ mod tests {
                 request_id: 4_242,
                 scope: PrebakeScope::Global,
                 result: Ok(()),
+                defined_names: None,
             });
             app.pending_evaluation = None;
             app.inflight.clear();

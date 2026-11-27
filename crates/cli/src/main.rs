@@ -1560,9 +1560,10 @@ fn load_prebake(
         session.set_direct_diagnostic_logging(false);
     }
     session.evaluate_prebake_cancellable(&source, &EVALUATION_CANCELLED)?;
-    Ok(rustel_runtime::lint::LintContext::from_setup_sources([
-        source.as_str(),
-    ]))
+    Ok(rustel_runtime::lint::LintContext::from_evaluated_setup(
+        session.defined_setup_names().iter().cloned(),
+        [source.as_str()],
+    ))
 }
 
 /// Score and optional prebake loaded before live playback.

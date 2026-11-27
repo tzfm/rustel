@@ -84,10 +84,14 @@ pub struct LintContext {
     pub mode: LintMode,
     /// Names the setup that ran before this text defined.
     pub setup_names: Vec<String>,
-    /// That setup defined names this could not read. Nothing is then judged
-    /// unknown, for the same reason a dynamic `register()` stops the check:
-    /// there is no sound basis for refusing a call.
+    /// That setup defined names this could not read.
     pub setup_has_dynamic_names: bool,
+    /// That setup defined dynamic global names (`globalThis`/`window`,
+    /// computed `register()`, or `import()`).
+    pub setup_has_dynamic_globals: bool,
+    /// That setup defined dynamic `Pattern.prototype` methods (`Pattern.prototype`,
+    /// computed `register()`, or `import()`).
+    pub setup_has_dynamic_methods: bool,
     /// Verified channels on the active audio input device. Without a verified
     /// device, native input references still obey the engine's channel limit.
     pub input_channels: Option<usize>,
@@ -99,13 +103,45 @@ pub struct LintContext {
 }
 
 impl LintContext {
+    /// Merge static or runtime-resolved setup definitions into this context.
+    pub fn add_setup_definitions(&mut self, definitions: &rustel_transpiler::SetupDefinitions) {
+        self.setup_names.extend(definitions.names.iter().cloned());
+        self.setup_has_dynamic_globals |= definitions.has_dynamic_globals;
+        self.setup_has_dynamic_methods |= definitions.has_dynamic_methods;
+        self.setup_has_dynamic_names |= definitions.has_dynamic_names
+            || definitions.has_dynamic_globals
+            || definitions.has_dynamic_methods;
+    }
+
     /// The context a text creates for itself and for whatever follows it.
     pub fn from_setup_sources<'a>(sources: impl IntoIterator<Item = &'a str>) -> Self {
         let mut context = Self::default();
         for source in sources {
             let definitions = rustel_transpiler::setup_definitions(source);
-            context.setup_names.extend(definitions.names);
-            context.setup_has_dynamic_names |= definitions.has_dynamic_names;
+            context.add_setup_definitions(&definitions);
+        }
+        context
+    }
+
+    /// The context after evaluating setup sources in a session: runtime-defined
+    /// names replace static dynamic-name uncertainty.
+    pub fn from_evaluated_setup<'a>(
+        runtime_names: impl IntoIterator<Item = String>,
+        sources: impl IntoIterator<Item = &'a str>,
+    ) -> Self {
+        let mut context = Self::default();
+        let mut seen = HashSet::new();
+        for name in runtime_names {
+            if seen.insert(name.clone()) {
+                context.setup_names.push(name);
+            }
+        }
+        for source in sources {
+            for name in rustel_transpiler::setup_definitions(source).names {
+                if seen.insert(name.clone()) {
+                    context.setup_names.push(name);
+                }
+            }
         }
         context
     }
@@ -637,20 +673,45 @@ fn lint_with_scan(
             // recover its runtime arity, so retain the valid candidate.
             registered.insert(format!("_{name}"));
         }
-        // A computed registration name can legitimately be any later call.
-        // The checker never executes score code, so in that case there is no
-        // sound basis for an unknown-function refusal.
+        // Collect static definitions from this text. Dynamic writes are scoped
+        // by namespace (globals vs Pattern.prototype methods) and by position.
+        // Inside a setup file, computed writes such as `window[name + 's'] = …`
+        // create names for later scores and do not turn off unknown-name checks
+        // in the setup itself. Only an external `import(…)` suppresses checks
+        // for calls that follow it.
         let definitions = rustel_transpiler::setup_definitions(source);
         registered.extend(definitions.names);
-        let dynamic_names = output.registrations.has_dynamic_names
-            || context.setup_has_dynamic_names
-            || definitions.has_dynamic_names;
-        // Use parser scopes so local bindings can shadow global names.
-        let unresolved_reads = if dynamic_names {
-            Vec::new()
-        } else {
-            rustel_transpiler::unresolved_reads(source)
+        let legacy_dynamic = context.setup_has_dynamic_names
+            && !context.setup_has_dynamic_globals
+            && !context.setup_has_dynamic_methods;
+        let setup_dynamic_globals = context.setup_has_dynamic_globals || legacy_dynamic;
+        let setup_dynamic_methods = context.setup_has_dynamic_methods || legacy_dynamic;
+        let min_offset = |left: Option<usize>, right: Option<usize>| match (left, right) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
         };
+        let own_dynamic_global_from = match context.mode {
+            LintMode::Setup => definitions.first_import_offset,
+            LintMode::Score => min_offset(
+                definitions.first_dynamic_global_offset,
+                output.registrations.first_dynamic_offset,
+            ),
+        };
+        let own_dynamic_method_from = match context.mode {
+            LintMode::Setup => definitions.first_import_offset,
+            LintMode::Score => min_offset(
+                definitions.first_dynamic_method_offset,
+                output.registrations.first_dynamic_offset,
+            ),
+        };
+        let dynamic_global_at = |offset: usize| {
+            setup_dynamic_globals || own_dynamic_global_from.is_some_and(|at| offset >= at)
+        };
+        let dynamic_method_at = |offset: usize| {
+            setup_dynamic_methods || own_dynamic_method_from.is_some_and(|at| offset >= at)
+        };
+        // Use parser scopes so local bindings can shadow global names.
+        let unresolved_reads = rustel_transpiler::unresolved_reads(source);
         // A KabelSalat graph has its own node names and local registrations.
         // The graph compiler resolves them when an event is queried. The
         // score checker does not execute graph code or guess its namespace.
@@ -659,41 +720,46 @@ fn lint_with_scan(
             let after = calls.partition_point(|call| call.stringified.start <= at);
             after > 0 && calls[after - 1].stringified.contains(&at)
         };
-        let unknown = if dynamic_names {
-            Vec::new()
-        } else {
-            unknown_calls(source, known, &registered)
-                .into_iter()
-                .filter(|&(from, _)| !in_graph(from))
-                .collect()
-        };
+        let unknown: Vec<(usize, usize)> = unknown_calls(source, known, &registered)
+            .into_iter()
+            .filter(|&(from, _)| {
+                if in_graph(from) {
+                    return false;
+                }
+                let is_method = scan::dot_before(&code, from).is_some();
+                if is_method {
+                    !dynamic_method_at(from)
+                } else {
+                    !dynamic_global_at(from)
+                }
+            })
+            .collect();
         // Resolve non-call references too: a stray word is valid JavaScript,
         // but reading an undefined global fails just as surely as calling one.
         // The parser knows scopes, destructuring and property keys; a token
         // scan would mistake those for undefined names.
-        if !dynamic_names {
-            for (name, span) in &unresolved_reads {
-                if diagnostics.len() >= MAX_DIAGNOSTICS {
-                    break;
-                }
-                if known.contains(name.as_str())
-                    || registered.contains(name.as_str())
-                    || JAVASCRIPT_GLOBALS.contains(&name.as_str())
-                    || unknown.contains(&(span.start, span.end))
-                    || in_graph(span.start)
-                    || diagnostics
-                        .iter()
-                        .any(|d| d.from == span.start && d.to == span.end)
-                {
-                    continue;
-                }
-                diagnostics.push(Diagnostic {
-                    level: Level::Value,
-                    message: format!("unknown name `{name}`"),
-                    from: span.start,
-                    to: span.end,
-                });
+        for (name, span) in &unresolved_reads {
+            if diagnostics.len() >= MAX_DIAGNOSTICS {
+                break;
             }
+            if dynamic_global_at(span.start)
+                || known.contains(name.as_str())
+                || registered.contains(name.as_str())
+                || JAVASCRIPT_GLOBALS.contains(&name.as_str())
+                || unknown.contains(&(span.start, span.end))
+                || in_graph(span.start)
+                || diagnostics
+                    .iter()
+                    .any(|d| d.from == span.start && d.to == span.end)
+            {
+                continue;
+            }
+            diagnostics.push(Diagnostic {
+                level: Level::Value,
+                message: format!("unknown name `{name}`"),
+                from: span.start,
+                to: span.end,
+            });
         }
         for (from, to) in unknown {
             let name = &source[from..to];
@@ -739,7 +805,7 @@ fn lint_with_scan(
         // `note("c").sine` reads `undefined`: a sound or a global value is not
         // a pattern method, and the pattern queries as silence.
         for name in values_read_off_patterns(&code, &unresolved_reads, &registered) {
-            if in_graph(name.start) {
+            if in_graph(name.start) || dynamic_method_at(name.start) {
                 continue;
             }
             if diagnostics.len() >= MAX_DIAGNOSTICS {
@@ -855,6 +921,9 @@ struct EngineNames {
     /// Globals whose value is not a function: patterns such as `silence`
     /// and the signals, and objects such as `sliderValues`.
     values: HashSet<String>,
+    /// Compatibility stand-in names installed because no native binding claimed
+    /// them.
+    compat_standins: HashSet<String>,
 }
 
 fn engine_names() -> &'static EngineNames {
@@ -909,6 +978,7 @@ fn engine_names() -> &'static EngineNames {
             method_only,
             global_only,
             values: catalog.values,
+            compat_standins: catalog.compat_standins,
         }
     })
 }
@@ -990,32 +1060,42 @@ pub fn global_values() -> &'static HashSet<String> {
     &engine_names().values
 }
 
+/// Names installed as no-op strudel.cc compatibility stand-ins because no
+/// native binding claimed them.
+pub fn compat_standin_names() -> &'static HashSet<String> {
+    &engine_names().compat_standins
+}
+
 struct RuntimeCatalog {
     globals: HashSet<String>,
     proto: HashSet<String>,
     values: HashSet<String>,
+    compat_standins: HashSet<String>,
 }
 
 /// What a fresh runtime has on `globalThis`, and on `silence` and its
 /// prototype chain, kept apart so a method is not mistaken for a global.
 /// `silence`'s own fields count: every pattern has its own `query`.
 fn runtime_catalog() -> RuntimeCatalog {
+    let empty = || RuntimeCatalog {
+        globals: HashSet::new(),
+        proto: HashSet::new(),
+        values: HashSet::new(),
+        compat_standins: HashSet::new(),
+    };
     let Ok(runtime) = rustel_jsruntime::JsRuntime::new() else {
-        return RuntimeCatalog {
-            globals: HashSet::new(),
-            proto: HashSet::new(),
-            values: HashSet::new(),
-        };
+        return empty();
     };
     // The same bindings a session installs before its first evaluation.
     if runtime.install_semantic_bindings().is_err() {
-        return RuntimeCatalog {
-            globals: HashSet::new(),
-            proto: HashSet::new(),
-            values: HashSet::new(),
-        };
+        return empty();
     }
     let _ = runtime.install_voicings_prebake();
+    let compat_standins = runtime
+        .compat_standin_names()
+        .into_iter()
+        .map(str::to_owned)
+        .collect();
     let script = r#"globalThis.__rustel_known_names = JSON.stringify((() => {
         const globals = [...Object.getOwnPropertyNames(globalThis)]
             .filter((name) => !name.startsWith('__'));
@@ -1037,11 +1117,7 @@ fn runtime_catalog() -> RuntimeCatalog {
         return { globals, proto, values };
     })());"#;
     if runtime.eval(script).is_err() {
-        return RuntimeCatalog {
-            globals: HashSet::new(),
-            proto: HashSet::new(),
-            values: HashSet::new(),
-        };
+        return empty();
     }
     #[derive(serde::Deserialize, Default)]
     struct Names {
@@ -1060,6 +1136,7 @@ fn runtime_catalog() -> RuntimeCatalog {
         globals: names.globals.into_iter().collect(),
         proto: names.proto.into_iter().collect(),
         values: names.values.into_iter().collect(),
+        compat_standins,
     }
 }
 
@@ -2923,18 +3000,155 @@ mod tests {
         assert!(lint_with("$: s(\"bd\")._fromSetup(1)", false, None, &context).is_empty());
     }
 
-    /// A setup whose names cannot be read stops the check rather than
-    /// guessing, exactly as a computed register() does.
+    /// A setup whose names cannot be read suppresses unknown checks only for
+    /// the namespace it writes to: dynamic globals leave unknown methods
+    /// caught, while dynamic registrations or imports cover both.
     #[test]
-    fn a_setup_with_names_it_cannot_read_turns_the_unknown_call_check_off() {
-        let context = LintContext::from_setup_sources(["Object.assign(globalThis, helpers)"]);
-        assert!(context.setup_has_dynamic_names);
+    fn a_setup_with_names_it_cannot_read_scopes_dynamic_checks_by_namespace() {
+        let globals_only = LintContext::from_setup_sources(["Object.assign(globalThis, helpers)"]);
+        assert!(globals_only.setup_has_dynamic_names);
+        assert!(globals_only.setup_has_dynamic_globals);
+        assert!(!globals_only.setup_has_dynamic_methods);
         assert!(
-            lint_with("$: s(\"bd\").wobblez(2)", false, None, &context).is_empty(),
-            "a call was refused against a setup nobody could read"
+            lint_with("$: wobblez(s(\"bd\"))", false, None, &globals_only).is_empty(),
+            "a dynamic global call was refused against a setup writing globals"
+        );
+        assert!(
+            lint_with("$: s(\"bd\").wobblez(2)", false, None, &globals_only)
+                .iter()
+                .any(|finding| finding.message.contains("unknown function `wobblez`")),
+            "dynamic globals hid an unknown pattern method"
+        );
+
+        let dynamic_register =
+            LintContext::from_setup_sources(["register(dynamicName, (pat) => pat)"]);
+        assert!(dynamic_register.setup_has_dynamic_globals);
+        assert!(dynamic_register.setup_has_dynamic_methods);
+        assert!(
+            lint_with("$: s(\"bd\").wobblez(2)", false, None, &dynamic_register).is_empty(),
+            "a call was refused against a dynamic register() setup"
         );
         // A real syntax error is still a real syntax error.
-        assert!(!lint_with("$: s(\"bd [hh\")", false, None, &context).is_empty());
+        assert!(!lint_with("$: s(\"bd [hh\")", false, None, &dynamic_register).is_empty());
+    }
+
+    /// A computed global write inside a prebake creates names for later scores
+    /// and does not disable unknown-function checking inside the prebake.
+    #[test]
+    fn a_prebake_with_computed_writes_still_catches_unknown_functions() {
+        let setup = LintContext::default().as_setup();
+        let after_write = "function add(name) { window[name + 's'] = () => s(name); }\n\
+                           add('kick');\n\
+                           missingHelper();\n";
+        let findings = lint_with(after_write, false, None, &setup);
+        assert!(
+            findings
+                .iter()
+                .any(|finding| finding.message.contains("unknown function `missingHelper`")),
+            "computed write hid unknown function in prebake: {findings:?}"
+        );
+
+        let before_write = "missingHelper();\n\
+                            function add(name) { window[name + 's'] = () => s(name); }\n";
+        assert!(
+            lint_with(before_write, false, None, &setup)
+                .iter()
+                .any(|finding| finding.message.contains("unknown function `missingHelper`")),
+            "computed write hid earlier unknown function in prebake"
+        );
+
+        let with_import = "missingBefore();\n\
+                           await import('https://example.com/lib.js');\n\
+                           fromImport();\n";
+        let import_findings = lint_with(with_import, false, None, &setup);
+        assert!(
+            import_findings
+                .iter()
+                .any(|finding| finding.message.contains("unknown function `missingBefore`")),
+            "import hid unknown call before it: {import_findings:?}"
+        );
+        assert!(
+            import_findings
+                .iter()
+                .all(|finding| !finding.message.contains("fromImport")),
+            "call after import was refused: {import_findings:?}"
+        );
+    }
+
+    /// After a prebake runs, the session's runtime surface diff gives scores
+    /// the exact dynamically created names while still catching typos.
+    #[test]
+    fn an_evaluated_setup_exposes_runtime_names_and_catches_typos() {
+        let mut session = crate::Session::new().expect("session");
+        let setup_v1 = "function add(name) { window[name + 's'] = () => s(name); }\n\
+                        add('kick');\n\
+                        add('hat');\n";
+        session.evaluate_prebake(setup_v1).expect("setup v1");
+        let context_v1 = LintContext::from_evaluated_setup(
+            session.defined_setup_names().iter().cloned(),
+            [setup_v1],
+        );
+        assert!(lint_with("$: stack(kicks(), hats())", false, None, &context_v1).is_empty());
+        assert!(
+            lint_with("$: kickss()", false, None, &context_v1)
+                .iter()
+                .any(|finding| finding.message.contains("unknown function `kickss`")),
+            "typo slipped past evaluated setup"
+        );
+
+        // Re-evaluating an edited prebake keeps updated names and drops removed ones.
+        let setup_v2 = "function add(name) { window[name + 's'] = () => s(name).fast(2); }\n\
+                        add('kick');\n\
+                        add('snare');\n";
+        session.evaluate_prebake(setup_v2).expect("setup v2");
+        let context_v2 = LintContext::from_evaluated_setup(
+            session.defined_setup_names().iter().cloned(),
+            [setup_v2],
+        );
+        assert!(lint_with("$: stack(kicks(), snares())", false, None, &context_v2).is_empty());
+        assert!(
+            lint_with("$: hats()", false, None, &context_v2)
+                .iter()
+                .any(|finding| finding.message.contains("unknown function `hats`")),
+            "removed dynamic name was still accepted after setup edit"
+        );
+
+        // Untouched properties of any JS tag from earlier setups never leak
+        // into a subsequent prebake's diff.
+        session
+            .evaluate_prebake(
+                "globalThis.prevFn = () => note('c');\n\
+                 globalThis.prevInt = 7;\n\
+                 globalThis.prevBool = true;\n\
+                 globalThis.prevNull = null;\n\
+                 globalThis.prevUndef = undefined;\n\
+                 globalThis.prevNan = NaN;\n\
+                 Object.defineProperty(globalThis, 'prevAcc', { get() { return 1; }, configurable: true });",
+            )
+            .expect("setup with diverse tags");
+        session
+            .evaluate_prebake("globalThis.onlyNew = () => note('e');")
+            .expect("subsequent setup");
+        assert_eq!(session.defined_setup_names(), ["onlyNew"]);
+    }
+
+    /// Global operator forms, raw `_name` methods, and strudel.cc stand-ins
+    /// are all known to the checker.
+    #[test]
+    fn strudel_compat_surface_passes_lint() {
+        for score in [
+            "$: pow(2, note('c4'))",
+            "$: pure(3)._pow(2)",
+            "$: s('bd').mqtt()._mqtt()",
+            "$: accX.range(200, 2000)",
+            "$: getPerformanceTimeSeconds()",
+        ] {
+            let findings = lint(score, false, None);
+            assert!(
+                findings.is_empty(),
+                "unexpected lint finding for `{score}`: {findings:?}"
+            );
+        }
     }
 
     /// What a prebake may not do is refused in it, in the engine's words.
@@ -3409,8 +3623,8 @@ $: note("c").gain(local).sometimes(pat => pat.rev())
         );
     }
 
-    /// A free call of `scrub`, `slice` or `chunkInto`, whole or curried, is
-    /// not a finding; a free `plyWith(…)` is.
+    /// A free call of `scrub`, `slice`, `chunkInto`, or `plyWith` is not a
+    /// finding. A free `splitQueries(…)` is.
     #[test]
     fn an_upstream_exported_curried_function_used_free_is_not_a_finding() {
         for source in [
@@ -3419,17 +3633,21 @@ $: note("c").gain(local).sometimes(pat => pat.rev())
             r#"$: s("bd").sometimesBy(1, slice(4, "0 2"))"#,
             r#"$: s("bd sd ht lt").sometimesBy(.5, chunkInto(4, hurry(2)))"#,
             r#"$: chunkinto(4, p => p.rev(), s("bd sd ht lt"))"#,
+            r#"$: s("bd").sometimesBy(1, plyWith(2, p => p.rev()))"#,
         ] {
             assert!(check(source).is_empty(), "{source}: {:?}", check(source));
         }
 
-        let source = r#"$: s("bd").sometimesBy(1, plyWith(2, p => p.rev()))"#;
+        let source = r#"$: splitQueries(s("bd"))"#;
         let diagnostics = check(source);
         assert_eq!(diagnostics.len(), 1, "{diagnostics:?}");
-        assert_eq!(&source[diagnostics[0].from..diagnostics[0].to], "plyWith");
+        assert_eq!(
+            &source[diagnostics[0].from..diagnostics[0].to],
+            "splitQueries"
+        );
         assert_eq!(
             diagnostics[0].message,
-            "`plyWith` is a pattern method - write `.plyWith()`, not `plyWith(…)`"
+            "`splitQueries` is a pattern method - write `.splitQueries()`, not `splitQueries(…)`"
         );
     }
 
@@ -3706,11 +3924,11 @@ $: keys(".5").filterValues(x => x.log()).s("hh:4")"#;
         );
     }
 
-    /// A tagged template is a call, so an unknown tag is an unknown call:
-    /// `` tidal`c4` `` is refused as `tidal("c4")` is.
+    /// A tagged template is a call, so an unknown tag is an unknown call,
+    /// while strudel.cc stand-in tags pass lint.
     #[test]
     fn an_unknown_tagged_template_is_an_unknown_call() {
-        for source in ["$: tidal`c4 e4`", "$: mondo`s hh*8`"] {
+        for source in ["$: unknownTag`c4 e4`", "$: zzzq`s hh*8`"] {
             let findings = check(source);
             assert_eq!(findings.len(), 1, "{source}: {findings:?}");
             assert!(
@@ -3719,13 +3937,11 @@ $: keys(".5").filterValues(x => x.log()).s("hh:4")"#;
                 findings[0].message
             );
         }
-        // Backticks the engine DOES know are still fine, and so is an
-        // ordinary template that tags nothing.
-        assert!(
-            check("$: s(`bd*4`)").is_empty(),
-            "{:?}",
-            check("$: s(`bd*4`)")
-        );
+        // Backticks the engine knows (including compatibility stand-ins) pass,
+        // and so does an ordinary template that tags nothing.
+        for source in ["$: s(`bd*4`)", "$: tidal`c4 e4`", "$: mondo`s hh*8`"] {
+            assert!(check(source).is_empty(), "{source}: {:?}", check(source));
+        }
         let own = "const kit = (strings) => s(\"bd\")\n$: kit`anything`";
         assert!(check(own).is_empty(), "{:?}", check(own));
     }

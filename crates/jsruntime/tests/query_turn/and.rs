@@ -205,7 +205,7 @@ fn raw_and_is_lazy_truthy_metadata_safe_and_pins_bridge_residuals() {
                        && !Object.is(haps[0].value, selectedValue),
                        'selected unsupported identity residual changed');
                    }
-                   check(!Object.hasOwn(globalThis, 'and')
+                   check(Object.hasOwn(globalThis, 'and')
                      && !Object.hasOwn(rustelScope, 'and')
                      && Object.hasOwn(Pattern.prototype, '_or'),
                      'public destination or next raw residual changed');

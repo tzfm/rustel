@@ -70,6 +70,12 @@ impl Session {
         })
     }
 
+    /// Surface property names added or updated by the most recent successful
+    /// prebake evaluation and its shared imports.
+    pub fn defined_setup_names(&self) -> &[String] {
+        &self.last_prebake_defined_names
+    }
+
     pub(super) fn evaluate_prebake_guarded(
         &mut self,
         source: &str,
@@ -91,8 +97,12 @@ impl Session {
         // The setup and its imports keep what they register for every
         // score, so a score's own replacements go back before they run.
         self.js.restore_score_registrations()?;
-        self.load_script_imports(source, cancellation, ImportScope::Shared)
-            .inspect_err(|_| self.js.show_last_good_imports())?;
+        self.js.begin_surface_write_capture();
+        if let Err(error) = self.load_script_imports(source, cancellation, ImportScope::Shared) {
+            self.js.cancel_surface_write_capture();
+            self.js.show_last_good_imports();
+            return Err(error);
+        }
         // Setup code is not the active editor document. Locations created
         // here are bare byte offsets and would be indistinguishable from score
         // offsets if a helper returned its own mini-notation pattern later.
@@ -110,6 +120,13 @@ impl Session {
             None => self
                 .js
                 .evaluate_prelude_with_effects(source, &transpile_options, budget),
+        };
+        let defined_names = if result.is_ok() {
+            let shared = rustel_transpiler::script_imports(source);
+            Some(self.js.finish_surface_write_capture(&shared))
+        } else {
+            self.js.cancel_surface_write_capture();
+            None
         };
         // The prebake ran with no score import on the surface, so its names
         // are for every score. The playing score gets its own names back.
@@ -133,6 +150,9 @@ impl Session {
             }
             Err(error) => return Err(error.into()),
         };
+        if let Some(names) = defined_names {
+            self.last_prebake_defined_names = names;
+        }
         // A setup file is the natural home for `preload(...)`: it runs
         // before the score, which is exactly when the files should start
         // arriving. Registrations and preloads enter one ordered loader job

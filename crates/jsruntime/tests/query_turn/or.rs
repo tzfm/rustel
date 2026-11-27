@@ -210,10 +210,10 @@ fn raw_or_is_lazy_truthy_metadata_safe_and_pins_bridge_residuals() {
                        && !Object.is(haps[0].value, selectedValue),
                        'selected unsupported identity residual changed');
                    }
-                   check(!Object.hasOwn(globalThis, 'or')
+                   check(Object.hasOwn(globalThis, 'or')
                      && !Object.hasOwn(rustelScope, 'or')
-                     && !Object.hasOwn(Pattern.prototype, '_func')
-                     && !Object.hasOwn(Pattern.prototype, 'func'),
+                     && Object.hasOwn(Pattern.prototype, '_func')
+                     && Object.hasOwn(Pattern.prototype, 'func'),
                      'public destination or next raw residual changed');
 
                    phase = 'query-reassignment-residual';

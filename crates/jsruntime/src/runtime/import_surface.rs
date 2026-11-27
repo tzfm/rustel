@@ -33,6 +33,29 @@ pub enum ImportScope {
 /// accessor.
 pub(super) type Snapshot<'js> = Vec<HashMap<String, Option<rquickjs::Value<'js>>>>;
 
+/// An own property descriptor on a surface object, scoped to one QuickJS
+/// context. Separating data and accessor variants avoids comparing unused
+/// descriptor slots.
+pub(super) enum OwnProperty<'js> {
+    Data(rquickjs::Value<'js>),
+    Accessor(rquickjs::Value<'js>, rquickjs::Value<'js>),
+}
+
+/// An own property descriptor persisted across separate `with_ctx` turns while
+/// a prebake evaluates.
+pub(crate) enum SavedProperty {
+    Data(Saved),
+    Accessor(Saved, Saved),
+}
+
+/// The own property descriptors of each surface object, scoped to one QuickJS
+/// context.
+pub(super) type DescriptorSnapshot<'js> = Vec<HashMap<String, OwnProperty<'js>>>;
+
+/// The own property descriptors of each surface object, persisted across
+/// separate `with_ctx` turns while a prebake evaluates.
+pub(crate) type SavedSurface = Vec<HashMap<String, SavedProperty>>;
+
 #[derive(Default)]
 pub(crate) struct ImportSurface {
     /// The imports of scores, in load order. An index names an import.
@@ -42,6 +65,8 @@ pub(crate) struct ImportSurface {
     /// `shown` at the last score install.
     last_good: Vec<usize>,
     names: Vec<TrackedName>,
+    /// Surface property names added or updated when each shared import ran.
+    shared_names: HashMap<String, Vec<String>>,
 }
 
 struct ScoreImport {
@@ -146,7 +171,7 @@ impl ImportSurface {
                 };
                 let base = match before.and_then(|before| before.get(&name)) {
                     Some(None) => continue,
-                    Some(Some(value)) if *value == after => continue,
+                    Some(Some(value)) if same_js_value(ctx, value, &after) => continue,
                     Some(Some(value)) => Some(save(ctx, value.clone())),
                     None => None,
                 };
@@ -174,6 +199,30 @@ impl ImportSurface {
             }
         }
         Ok(())
+    }
+
+    /// Record the non-internal surface property names a shared import defined.
+    pub(super) fn record_shared_names(&mut self, specifier: &str, names: Vec<String>) {
+        self.shared_names.insert(specifier.to_owned(), names);
+    }
+
+    /// Surface property names recorded for `specifiers`, whether loaded as
+    /// shared imports or promoted from score imports.
+    pub(super) fn names_for_imports(&self, specifiers: &[String]) -> Vec<String> {
+        let mut out = Vec::new();
+        for specifier in specifiers {
+            if let Some(names) = self.shared_names.get(specifier) {
+                out.extend(names.iter().cloned());
+            }
+            if let Some(id) = self.position(specifier) {
+                for tracked in &self.names {
+                    if tracked.meanings.iter().any(|(owner, _)| *owner == id) {
+                        out.push(tracked.name.clone());
+                    }
+                }
+            }
+        }
+        out
     }
 
     /// Put on the surface the meanings for a score with the imports `listed`.
@@ -229,23 +278,174 @@ pub(super) fn snapshot<'js>(ctx: &Ctx<'js>) -> rquickjs::Result<Snapshot<'js>> {
         .collect())
 }
 
+/// The own property descriptors of each surface object (excluding internal
+/// `__`-prefixed keys), reading descriptors without invoking getters.
+pub(super) fn snapshot_descriptors<'js>(
+    ctx: &Ctx<'js>,
+) -> rquickjs::Result<DescriptorSnapshot<'js>> {
+    Ok(score_surface_objects(ctx)?
+        .iter()
+        .map(|target| {
+            own_names(target)
+                .filter(|name| !name.starts_with("__"))
+                .filter_map(|name| {
+                    let property = own_property(ctx, target, &name)?;
+                    Some((name, property))
+                })
+                .collect()
+        })
+        .collect())
+}
+
+/// Non-internal surface property names added or updated since `before`.
+pub(super) fn diff_descriptors<'js>(
+    ctx: &Ctx<'js>,
+    before: &DescriptorSnapshot<'js>,
+) -> Vec<String> {
+    let Ok(objects) = score_surface_objects(ctx) else {
+        return Vec::new();
+    };
+    let mut changed = Vec::new();
+    for (object, target) in objects.iter().enumerate() {
+        let previous = before.get(object);
+        for name in own_names(target) {
+            if name.starts_with("__") {
+                continue;
+            }
+            let Some(after) = own_property(ctx, target, &name) else {
+                continue;
+            };
+            let unchanged = previous
+                .and_then(|map| map.get(&name))
+                .is_some_and(|prev| same_own_property(ctx, prev, &after));
+            if !unchanged {
+                changed.push(name);
+            }
+        }
+    }
+    changed.sort();
+    changed.dedup();
+    changed
+}
+
+/// Persist the current surface descriptors so a prebake spanning multiple
+/// `with_ctx` turns can report every name it added or updated.
+pub(super) fn snapshot_saved(ctx: &Ctx<'_>) -> rquickjs::Result<SavedSurface> {
+    Ok(snapshot_descriptors(ctx)?
+        .into_iter()
+        .map(|entries| {
+            entries
+                .into_iter()
+                .map(|(name, property)| {
+                    let saved = match property {
+                        OwnProperty::Data(value) => SavedProperty::Data(save(ctx, value)),
+                        OwnProperty::Accessor(getter, setter) => {
+                            SavedProperty::Accessor(save(ctx, getter), save(ctx, setter))
+                        }
+                    };
+                    (name, saved)
+                })
+                .collect()
+        })
+        .collect())
+}
+
+/// Non-internal surface property names added or updated since `before`.
+pub(super) fn diff_saved(ctx: &Ctx<'_>, before: &SavedSurface) -> Vec<String> {
+    let Ok(objects) = score_surface_objects(ctx) else {
+        return Vec::new();
+    };
+    let mut changed = Vec::new();
+    for (object, target) in objects.iter().enumerate() {
+        let previous = before.get(object);
+        for name in own_names(target) {
+            if name.starts_with("__") {
+                continue;
+            }
+            let Some(after) = own_property(ctx, target, &name) else {
+                continue;
+            };
+            let unchanged =
+                previous
+                    .and_then(|map| map.get(&name))
+                    .is_some_and(|prev| match (prev, &after) {
+                        (SavedProperty::Data(saved), OwnProperty::Data(curr)) => saved
+                            .clone()
+                            .restore(ctx)
+                            .is_ok_and(|value| same_js_value(ctx, &value, curr)),
+                        (
+                            SavedProperty::Accessor(saved_get, saved_set),
+                            OwnProperty::Accessor(curr_get, curr_set),
+                        ) => {
+                            saved_get
+                                .clone()
+                                .restore(ctx)
+                                .is_ok_and(|value| same_js_value(ctx, &value, curr_get))
+                                && saved_set
+                                    .clone()
+                                    .restore(ctx)
+                                    .is_ok_and(|value| same_js_value(ctx, &value, curr_set))
+                        }
+                        _ => false,
+                    });
+            if !unchanged {
+                changed.push(name);
+            }
+        }
+    }
+    changed.sort();
+    changed.dedup();
+    changed
+}
+
+/// Compare two QuickJS values using QuickJS's own `Object.is` (`JS_IsSameValue`).
+///
+/// Unlike `rquickjs::Value::eq`, which compares all 64 bits of `JSValueUnion`
+/// even for 32-bit immediate tags (whose upper 32 bits can hold uninitialized
+/// stack bytes on 64-bit targets), `JS_IsSameValue` reads only the valid payload
+/// for each tag.
+fn same_js_value<'js>(
+    ctx: &Ctx<'js>,
+    left: &rquickjs::Value<'js>,
+    right: &rquickjs::Value<'js>,
+) -> bool {
+    // SAFETY: `ctx`, `left`, and `right` belong to one live runtime and
+    // `JS_IsSameValue` borrows both `JSValueConst` operands without freeing
+    // or allocating.
+    unsafe { rquickjs::qjs::JS_IsSameValue(ctx.as_raw().as_ptr(), left.as_raw(), right.as_raw()) }
+}
+
+fn same_own_property<'js>(
+    ctx: &Ctx<'js>,
+    left: &OwnProperty<'js>,
+    right: &OwnProperty<'js>,
+) -> bool {
+    match (left, right) {
+        (OwnProperty::Data(a), OwnProperty::Data(b)) => same_js_value(ctx, a, b),
+        (OwnProperty::Accessor(a_get, a_set), OwnProperty::Accessor(b_get, b_set)) => {
+            same_js_value(ctx, a_get, b_get) && same_js_value(ctx, a_set, b_set)
+        }
+        _ => false,
+    }
+}
+
 fn own_names<'js>(target: &rquickjs::Object<'js>) -> impl Iterator<Item = String> + use<'js> {
     target
         .own_keys::<String>(rquickjs::object::Filter::new().string())
         .flatten()
 }
 
-/// The value of an own data property. `None` for an accessor and for a name
-/// the object does not have. Reads the descriptor, so no getter runs.
-fn own_data_value<'js>(
+/// Read an own property descriptor as data or accessor without invoking any
+/// getter.
+fn own_property<'js>(
     ctx: &Ctx<'js>,
     target: &rquickjs::Object<'js>,
     name: &str,
-) -> Option<rquickjs::Value<'js>> {
+) -> Option<OwnProperty<'js>> {
     use rquickjs::qjs;
 
     let raw = ctx.as_raw().as_ptr();
-    let mut descriptor = std::mem::MaybeUninit::<qjs::JSPropertyDescriptor>::uninit();
+    let mut descriptor = std::mem::MaybeUninit::<qjs::JSPropertyDescriptor>::zeroed();
     // SAFETY: `ctx` and `target` are live and belong to one runtime. The atom
     // is freed before return. A result of 1 means QuickJS filled the
     // descriptor with three owned values, and each `Value` below takes one.
@@ -265,8 +465,25 @@ fn own_data_value<'js>(
         }
         let descriptor = descriptor.assume_init();
         let value = rquickjs::Value::from_raw(ctx.clone(), descriptor.value);
-        let _getter = rquickjs::Value::from_raw(ctx.clone(), descriptor.getter);
-        let _setter = rquickjs::Value::from_raw(ctx.clone(), descriptor.setter);
-        (descriptor.flags & qjs::JS_PROP_GETSET as i32 == 0).then_some(value)
+        let getter = rquickjs::Value::from_raw(ctx.clone(), descriptor.getter);
+        let setter = rquickjs::Value::from_raw(ctx.clone(), descriptor.setter);
+        if descriptor.flags & qjs::JS_PROP_GETSET as i32 == 0 {
+            Some(OwnProperty::Data(value))
+        } else {
+            Some(OwnProperty::Accessor(getter, setter))
+        }
+    }
+}
+
+/// The value of an own data property. `None` for an accessor and for a name
+/// the object does not have. Reads the descriptor, so no getter runs.
+fn own_data_value<'js>(
+    ctx: &Ctx<'js>,
+    target: &rquickjs::Object<'js>,
+    name: &str,
+) -> Option<rquickjs::Value<'js>> {
+    match own_property(ctx, target, name) {
+        Some(OwnProperty::Data(value)) => Some(value),
+        _ => None,
     }
 }

@@ -184,6 +184,12 @@ impl StudioEngine {
         Ok(())
     }
 
+    /// Surface property names added or updated by the most recent successful
+    /// prebake evaluation.
+    pub fn defined_setup_names(&self) -> Vec<String> {
+        self.session.defined_setup_names().to_vec()
+    }
+
     /// Replace the sounding score continuously: the reload is staged, the
     /// producer publishes the cutover transactionally. `None` when the
     /// session holds the edit for its plugin copies: see

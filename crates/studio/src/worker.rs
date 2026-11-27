@@ -67,6 +67,8 @@ pub struct PrebakeOutcome {
     pub request_id: u64,
     pub scope: PrebakeScope,
     pub result: Result<(), EngineFailure>,
+    /// Surface property names added or updated when the setup ran.
+    pub defined_names: Option<Vec<String>>,
 }
 
 /// A recording command's answer or an automatic final result, not a
@@ -1639,17 +1641,22 @@ fn process_command(
             // Shutdown is the only thing that cancels a setup: a Stop is
             // about the transport, and an interrupted setup would leave the
             // heap half-mutated with nothing able to say how.
-            let result = if shutdown_requested.load(Ordering::Acquire) {
-                Err(EngineFailure {
-                    kind: "cancelled".into(),
-                    message: "the studio was closing".into(),
-                    recoverable: true,
-                    playback_stopped: false,
-                })
+            let (result, defined_names) = if shutdown_requested.load(Ordering::Acquire) {
+                (
+                    Err(EngineFailure {
+                        kind: "cancelled".into(),
+                        message: "the studio was closing".into(),
+                        recoverable: true,
+                        playback_stopped: false,
+                    }),
+                    None,
+                )
             } else {
-                engine
+                let result = engine
                     .evaluate_prebake_guarded(&source, shutdown_requested)
-                    .map_err(|error| EngineFailure::runtime(&error, true))
+                    .map_err(|error| EngineFailure::runtime(&error, true));
+                let defined_names = result.is_ok().then(|| engine.defined_setup_names());
+                (result, defined_names)
             };
             push_control(
                 pending,
@@ -1657,6 +1664,7 @@ fn process_command(
                     request_id,
                     scope,
                     result,
+                    defined_names,
                 }),
             );
             false
