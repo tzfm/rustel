@@ -363,11 +363,11 @@ pub(super) fn callback_hap<'js>(
 ) -> rquickjs::Result<rquickjs::Value<'js>> {
     let stack = host_stack(ctx)?;
     let factory: Function = stack.as_object().get(HAP_FACTORY)?;
-    let whole: rquickjs::Value = match hap.whole {
+    let whole: rquickjs::Value = match hap.whole() {
         Some(span) => span_seed(ctx, span)?.into_value(),
         None => rquickjs::Value::new_undefined(ctx.clone()),
     };
-    let part = span_seed(ctx, hap.part)?;
+    let part = span_seed(ctx, hap.part())?;
     let value = to_js(ctx, &hap.value)?;
     let context = hap_context_to_js(ctx, hap)?;
     factory.call((whole, part, value, context))

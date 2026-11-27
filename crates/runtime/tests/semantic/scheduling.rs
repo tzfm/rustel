@@ -77,8 +77,8 @@ fn scheduled_onsets_agree_with_the_queried_haps() {
         // the same note.
         let mut want: Vec<(String, String)> = haps
             .iter()
-            .filter_map(|h| h.whole.map(|w| (w, h)))
-            .filter(|(w, h)| w.begin == h.part.begin)
+            .filter_map(|h| h.whole().map(|w| (w, h)))
+            .filter(|(w, h)| w.begin == h.part().begin)
             .filter(|(w, _)| w.begin >= Fraction::ZERO && w.begin < Fraction::ONE)
             .map(|(w, h)| (w.begin.show(), h.value.show()))
             .collect();

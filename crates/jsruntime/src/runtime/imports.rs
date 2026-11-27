@@ -11,6 +11,14 @@ const MAX_REPL_EVALUATIONS: usize = 8;
 const MAX_REPL_CODE_BYTES: usize = 1024 * 1024;
 
 impl JsRuntime {
+    /// Whether this realm has loaded any script import.
+    #[inline]
+    pub fn has_loaded_imports(&self) -> bool {
+        self.loaded_imports
+            .get()
+            .is_some_and(|loaded| !loaded.borrow().is_empty())
+    }
+
     /// Whether this realm has run the script that `specifier` names.
     pub fn import_loaded(&self, specifier: &str) -> bool {
         self.loaded_imports

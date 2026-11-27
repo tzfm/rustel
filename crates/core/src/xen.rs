@@ -1264,8 +1264,8 @@ mod tests {
         assert_eq!(after.len(), before.len());
         for (after, before) in after.iter().zip(before) {
             assert_eq!(after.value, before.value);
-            assert_eq!(after.whole, before.whole);
-            assert_eq!(after.part, before.part);
+            assert_eq!(after.whole(), before.whole());
+            assert_eq!(after.part(), before.part());
             assert_eq!(after.context, before.context);
         }
         let doubled = xen_patterns(

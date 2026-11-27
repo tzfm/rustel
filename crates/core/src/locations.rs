@@ -12,285 +12,443 @@ later version.
 //! oldest first. They drive the editor's highlighting.
 //!
 //! Every query copies them into each hap it returns, so the common case
-//! stays off the heap: up to [`INLINE`] ranges are kept in place, each as a
-//! begin that fits in `u32` and a length that fits in `u16`, which a word
-//! of a score is. Longer lists, and a list with any other range, share one
-//! allocation.
+//! stays off the heap in 16 bytes: up to [`INLINE`] (4) compact ranges are kept
+//! in place as `(begin << 11) | (length + 1)` (`begin < 2^20`, `length <= 2046`),
+//! covering scores up to 1 MiB. Every non-zero packed word has its top bit clear,
+//! so the final slot's high byte supplies a niche for the inline-vs-shared tag
+//! in 100% safe Rust. Longer lists (5..=7 compact ranges) spill into a single
+//! 48-byte `Arc<SharedLocs::Packed>`; only 8+ or wide ranges use a boxed slice.
 
 use std::fmt;
 use std::sync::Arc;
 
 /// Compact ranges kept in place before the list moves to the heap.
-const INLINE: usize = 7;
-/// Wide `(u32, u16)` ranges kept in place when a range exceeds the 20/12-bit
-/// packed layout.
-const WIDE_INLINE: usize = 5;
+const INLINE: usize = 4;
+/// Compact ranges kept in a single-allocation `SharedLocs::Packed`.
+const SHARED_PACKED: usize = 7;
 
-const PACKED_LEN_BITS: u32 = 12;
+const PACKED_LEN_BITS: u32 = 11;
 const PACKED_LEN_MASK: u32 = (1 << PACKED_LEN_BITS) - 1;
-const PACKED_BEGIN_LIMIT: u32 = 1 << (32 - PACKED_LEN_BITS);
+const PACKED_MAX_LEN: u32 = PACKED_LEN_MASK - 1;
+const PACKED_BEGIN_LIMIT: u32 = 1 << (31 - PACKED_LEN_BITS);
+
+macro_rules! define_hi7 {
+    ($($name:ident = $val:literal),* $(,)?) => {
+        #[derive(Clone, Copy, PartialEq, Eq)]
+        #[repr(u8)]
+        enum Hi7 {
+            $($name = $val,)*
+        }
+
+        impl Hi7 {
+            #[inline(always)]
+            const fn from_u8(b: u8) -> Self {
+                match b {
+                    $($val => Self::$name,)*
+                    _ => panic!("Hi7 value out of 7-bit range"),
+                }
+            }
+
+            #[inline(always)]
+            const fn as_u8(self) -> u8 {
+                self as u8
+            }
+        }
+    };
+}
+
+define_hi7!(
+    V0 = 0,
+    V1 = 1,
+    V2 = 2,
+    V3 = 3,
+    V4 = 4,
+    V5 = 5,
+    V6 = 6,
+    V7 = 7,
+    V8 = 8,
+    V9 = 9,
+    V10 = 10,
+    V11 = 11,
+    V12 = 12,
+    V13 = 13,
+    V14 = 14,
+    V15 = 15,
+    V16 = 16,
+    V17 = 17,
+    V18 = 18,
+    V19 = 19,
+    V20 = 20,
+    V21 = 21,
+    V22 = 22,
+    V23 = 23,
+    V24 = 24,
+    V25 = 25,
+    V26 = 26,
+    V27 = 27,
+    V28 = 28,
+    V29 = 29,
+    V30 = 30,
+    V31 = 31,
+    V32 = 32,
+    V33 = 33,
+    V34 = 34,
+    V35 = 35,
+    V36 = 36,
+    V37 = 37,
+    V38 = 38,
+    V39 = 39,
+    V40 = 40,
+    V41 = 41,
+    V42 = 42,
+    V43 = 43,
+    V44 = 44,
+    V45 = 45,
+    V46 = 46,
+    V47 = 47,
+    V48 = 48,
+    V49 = 49,
+    V50 = 50,
+    V51 = 51,
+    V52 = 52,
+    V53 = 53,
+    V54 = 54,
+    V55 = 55,
+    V56 = 56,
+    V57 = 57,
+    V58 = 58,
+    V59 = 59,
+    V60 = 60,
+    V61 = 61,
+    V62 = 62,
+    V63 = 63,
+    V64 = 64,
+    V65 = 65,
+    V66 = 66,
+    V67 = 67,
+    V68 = 68,
+    V69 = 69,
+    V70 = 70,
+    V71 = 71,
+    V72 = 72,
+    V73 = 73,
+    V74 = 74,
+    V75 = 75,
+    V76 = 76,
+    V77 = 77,
+    V78 = 78,
+    V79 = 79,
+    V80 = 80,
+    V81 = 81,
+    V82 = 82,
+    V83 = 83,
+    V84 = 84,
+    V85 = 85,
+    V86 = 86,
+    V87 = 87,
+    V88 = 88,
+    V89 = 89,
+    V90 = 90,
+    V91 = 91,
+    V92 = 92,
+    V93 = 93,
+    V94 = 94,
+    V95 = 95,
+    V96 = 96,
+    V97 = 97,
+    V98 = 98,
+    V99 = 99,
+    V100 = 100,
+    V101 = 101,
+    V102 = 102,
+    V103 = 103,
+    V104 = 104,
+    V105 = 105,
+    V106 = 106,
+    V107 = 107,
+    V108 = 108,
+    V109 = 109,
+    V110 = 110,
+    V111 = 111,
+    V112 = 112,
+    V113 = 113,
+    V114 = 114,
+    V115 = 115,
+    V116 = 116,
+    V117 = 117,
+    V118 = 118,
+    V119 = 119,
+    V120 = 120,
+    V121 = 121,
+    V122 = 122,
+    V123 = 123,
+    V124 = 124,
+    V125 = 125,
+    V126 = 126,
+    V127 = 127,
+);
 
 #[cfg(target_pointer_width = "64")]
-const _: () = assert!(std::mem::size_of::<Locations>() == 32);
+const _: () = assert!(std::mem::size_of::<Locations>() == 16);
 
 /// The source locations of a hap. See the module documentation.
 #[derive(Clone)]
 pub struct Locations(Repr);
 
-#[derive(Clone)]
-enum Repr {
-    /// Up to 7 compact ranges, each packed as `(begin << 12) | length`
-    /// (`begin < 2^20`, `length < 2^12`), covering scores up to 1 MiB.
-    /// Split into `first` plus three 8-byte-aligned `u64` pairs so copying
-    /// into `Hap` stays in registers without an overlapping stack bounce.
+enum SharedLocs {
+    /// 5..=7 compact ranges in a single 32-byte `Arc` payload (1 allocation).
     Packed {
         len: u8,
-        first: u32,
-        tail: [u64; 3],
+        spans: [u32; SHARED_PACKED],
     },
-    /// Up to 5 wide `(u32, u16)` ranges for offsets >= 1 MiB or spans >= 4 KiB.
-    Inline {
-        len: u8,
-        /// How long each range is.
-        lengths: [u16; WIDE_INLINE],
-        /// Where each range begins.
-        begins: [u32; WIDE_INLINE],
-    },
-    Shared(Arc<[(usize, usize)]>),
+    /// 8+ ranges or any range exceeding 20-bit begin / 2046-byte length.
+    Wide(Box<[(usize, usize)]>),
 }
 
-#[inline(always)]
-const fn pack_spans(spans: [u32; INLINE]) -> (u32, [u64; 3]) {
-    (
-        spans[0],
-        [
-            (spans[1] as u64) | ((spans[2] as u64) << 32),
-            (spans[3] as u64) | ((spans[4] as u64) << 32),
-            (spans[5] as u64) | ((spans[6] as u64) << 32),
-        ],
-    )
+impl SharedLocs {
+    fn from_ranges(ranges: &[(usize, usize)]) -> Arc<Self> {
+        if ranges.len() <= SHARED_PACKED {
+            let mut spans = [0u32; SHARED_PACKED];
+            let mut fits = true;
+            for (slot, &r) in spans[..ranges.len()].iter_mut().zip(ranges) {
+                if let Some(p) = pack_range(r) {
+                    *slot = p;
+                } else {
+                    fits = false;
+                    break;
+                }
+            }
+            if fits {
+                return Arc::new(Self::Packed {
+                    len: ranges.len() as u8,
+                    spans,
+                });
+            }
+        }
+        Arc::new(Self::Wide(Box::from(ranges)))
+    }
+
+    #[inline]
+    fn len(&self) -> usize {
+        match self {
+            Self::Packed { len, .. } => usize::from(*len),
+            Self::Wide(ranges) => ranges.len(),
+        }
+    }
+
+    #[inline]
+    fn get(&self, index: usize) -> Option<(usize, usize)> {
+        match self {
+            Self::Packed { len, spans } => {
+                (index < usize::from(*len)).then(|| unpack_range(spans[index]))
+            }
+            Self::Wide(ranges) => ranges.get(index).copied(),
+        }
+    }
 }
 
-#[inline(always)]
-const fn unpack_spans(first: u32, tail: [u64; 3]) -> [u32; INLINE] {
-    [
-        first,
-        tail[0] as u32,
-        (tail[0] >> 32) as u32,
-        tail[1] as u32,
-        (tail[1] >> 32) as u32,
-        tail[2] as u32,
-        (tail[2] >> 32) as u32,
-    ]
+#[derive(Clone)]
+enum Repr {
+    /// Up to 4 compact non-zero ranges (zero-terminated), each packed as
+    /// `(begin << 11) | (length + 1)` (`begin < 2^20`, `length <= 2046`).
+    /// `s3` is split so `s3_hi: Hi7` provides the enum discriminant niche.
+    Packed(PackedLocations),
+    /// 5+ ranges, or any range exceeding 20-bit begin / 2046-byte length.
+    /// Thin `Arc` pointer keeps `Locations` at 16 bytes.
+    Shared(Arc<SharedLocs>),
 }
 
-#[inline(always)]
-const fn get_packed_span(first: u32, tail: [u64; 3], idx: usize) -> u32 {
-    match idx {
-        0 => first,
-        1 => tail[0] as u32,
-        2 => (tail[0] >> 32) as u32,
-        3 => tail[1] as u32,
-        4 => (tail[1] >> 32) as u32,
-        5 => tail[2] as u32,
-        _ => (tail[2] >> 32) as u32,
+/// Already-split copyable snapshot of `Repr::Packed` so hot loops copy 16 bytes
+/// directly into `Locations` with zero bit-unpacking or discriminant checks.
+#[derive(Clone, Copy, PartialEq, Eq)]
+#[repr(C, align(8))]
+pub(crate) struct PackedLocations {
+    s0: u32,
+    s1: u32,
+    s2: u32,
+    s3_lo: [u8; 3],
+    s3_hi: Hi7,
+}
+
+impl PackedLocations {
+    pub(crate) const EMPTY: Self = Self {
+        s0: 0,
+        s1: 0,
+        s2: 0,
+        s3_lo: [0; 3],
+        s3_hi: Hi7::V0,
+    };
+
+    #[inline(always)]
+    const fn to_words(self) -> [u32; INLINE] {
+        [self.s0, self.s1, self.s2, join_s3(self.s3_lo, self.s3_hi)]
+    }
+
+    #[inline(always)]
+    pub(crate) const fn from_words(spans: [u32; INLINE]) -> Self {
+        let (s3_lo, s3_hi) = split_s3(spans[3]);
+        Self {
+            s0: spans[0],
+            s1: spans[1],
+            s2: spans[2],
+            s3_lo,
+            s3_hi,
+        }
     }
 }
 
 #[inline(always)]
-fn set_packed_span(first: &mut u32, tail: &mut [u64; 3], idx: usize, v: u32) {
-    match idx {
-        0 => *first = v,
-        1 => tail[0] = (tail[0] & !0xffff_ffff) | u64::from(v),
-        2 => tail[0] = (tail[0] & 0xffff_ffff) | (u64::from(v) << 32),
-        3 => tail[1] = (tail[1] & !0xffff_ffff) | u64::from(v),
-        4 => tail[1] = (tail[1] & 0xffff_ffff) | (u64::from(v) << 32),
-        5 => tail[2] = (tail[2] & !0xffff_ffff) | u64::from(v),
-        _ => tail[2] = (tail[2] & 0xffff_ffff) | (u64::from(v) << 32),
-    }
+const fn split_s3(s3: u32) -> ([u8; 3], Hi7) {
+    let b = s3.to_le_bytes();
+    ([b[0], b[1], b[2]], Hi7::from_u8(b[3]))
 }
 
-/// Pack `(begin, end)` into 32 bits when `begin < 2^20` and `length < 2^12`.
-#[inline]
+#[inline(always)]
+const fn join_s3(lo: [u8; 3], hi: Hi7) -> u32 {
+    u32::from_le_bytes([lo[0], lo[1], lo[2], hi.as_u8()])
+}
+
+/// Pack `(begin, end)` into a non-zero 31-bit `u32` when `begin < 2^20` and `length <= 2046`.
+#[inline(always)]
 fn pack_range((begin, end): (usize, usize)) -> Option<u32> {
     let length = end.checked_sub(begin)?;
     let begin = u32::try_from(begin).ok()?;
     let length = u32::try_from(length).ok()?;
-    (begin < PACKED_BEGIN_LIMIT && length <= PACKED_LEN_MASK)
-        .then_some((begin << PACKED_LEN_BITS) | length)
+    (begin < PACKED_BEGIN_LIMIT && length <= PACKED_MAX_LEN)
+        .then_some((begin << PACKED_LEN_BITS) | (length + 1))
 }
 
-#[inline]
+#[inline(always)]
 fn unpack_range(packed: u32) -> (usize, usize) {
     let begin = (packed >> PACKED_LEN_BITS) as usize;
-    let length = (packed & PACKED_LEN_MASK) as usize;
+    let length = ((packed & PACKED_LEN_MASK) - 1) as usize;
     (begin, begin + length)
-}
-
-/// `range` as a wide list in place holds it: its begin and its length. `None`
-/// for a range that takes more room.
-fn narrow((begin, end): (usize, usize)) -> Option<(u32, u16)> {
-    let length = end.checked_sub(begin)?;
-    Some((u32::try_from(begin).ok()?, u16::try_from(length).ok()?))
-}
-
-/// The range that begins at `begin` and is `length` long.
-fn wide(begin: u32, length: u16) -> (usize, usize) {
-    let begin = begin as usize;
-    (begin, begin + usize::from(length))
-}
-
-/// Copyable snapshot of a `Locations::Packed` payload for branch-free
-/// emission in hot sequence loops.
-#[derive(Clone, Copy)]
-pub(crate) struct PackedLocations {
-    len: u8,
-    first: u32,
-    tail: [u64; 3],
-}
-
-impl PackedLocations {
-    #[inline(always)]
-    pub(crate) const fn parts(self) -> (u8, u32, u64, u64, u64) {
-        (
-            self.len,
-            self.first,
-            self.tail[0],
-            self.tail[1],
-            self.tail[2],
-        )
-    }
 }
 
 impl Locations {
     /// No ranges.
     pub const fn new() -> Self {
-        Self(Repr::Packed {
-            len: 0,
-            first: 0,
-            tail: [0; 3],
-        })
+        Self(Repr::Packed(PackedLocations::EMPTY))
     }
 
     #[inline(always)]
     pub(crate) const fn as_packed_copy(&self) -> Option<PackedLocations> {
         match self.0 {
-            Repr::Packed { len, first, tail } => Some(PackedLocations { len, first, tail }),
-            _ => None,
+            Repr::Packed(p) => Some(p),
+            Repr::Shared(_) => None,
         }
     }
 
     #[inline(always)]
     pub(crate) const fn from_packed_copy(packed: PackedLocations) -> Self {
-        Self(Repr::Packed {
-            len: packed.len,
-            first: packed.first,
-            tail: packed.tail,
-        })
+        Self(Repr::Packed(packed))
     }
 
+    /// Pack `(begin, length)` into the canonical non-zero 31-bit format.
     #[inline(always)]
     pub(crate) const fn pack_small(begin: u32, length: u32) -> Option<u32> {
-        if begin < PACKED_BEGIN_LIMIT && length <= PACKED_LEN_MASK {
-            Some((begin << PACKED_LEN_BITS) | length)
+        if begin < PACKED_BEGIN_LIMIT && length <= PACKED_MAX_LEN {
+            Some((begin << PACKED_LEN_BITS) | (length + 1))
         } else {
             None
         }
     }
 
+    /// Pack `(begin, end)` into the canonical non-zero 31-bit format.
     #[inline(always)]
-    pub(crate) const fn from_packed_parts(len: u8, first: u32, t0: u64, t1: u64, t2: u64) -> Self {
-        Self(Repr::Packed {
-            len,
-            first,
-            tail: [t0, t1, t2],
-        })
+    pub(crate) fn pack_range_raw(range: (usize, usize)) -> Option<u32> {
+        pack_range(range)
     }
 
-    /// The one range that begins at `begin` and is `length` long, with no
-    /// check of the room, which one range always has.
-    pub(crate) const fn one(begin: u32, length: u16) -> Self {
-        if begin < PACKED_BEGIN_LIMIT && (length as u32) <= PACKED_LEN_MASK {
-            let first = (begin << PACKED_LEN_BITS) | (length as u32);
-            return Self(Repr::Packed {
-                len: 1,
-                first,
-                tail: [0; 3],
-            });
+    /// Unpack a non-zero word created by [`Self::pack_range_raw`] or [`Self::pack_small`].
+    #[inline(always)]
+    pub(crate) fn unpack_range_raw(packed: u32) -> (usize, usize) {
+        unpack_range(packed)
+    }
+
+    #[inline(always)]
+    pub(crate) const fn from_packed(spans: [u32; INLINE]) -> Self {
+        Self(Repr::Packed(PackedLocations::from_words(spans)))
+    }
+
+    /// The one range that begins at `begin` and is `length` long.
+    pub(crate) fn one(begin: u32, length: u16) -> Self {
+        if let Some(first) = Self::pack_small(begin, u32::from(length)) {
+            return Self(Repr::Packed(PackedLocations {
+                s0: first,
+                s1: 0,
+                s2: 0,
+                s3_lo: [0; 3],
+                s3_hi: Hi7::V0,
+            }));
         }
-        let mut begins = [0; WIDE_INLINE];
-        let mut lengths = [0; WIDE_INLINE];
-        begins[0] = begin;
-        lengths[0] = length;
-        Self(Repr::Inline {
-            len: 1,
-            begins,
-            lengths,
-        })
+        let start = begin as usize;
+        Self(Repr::Shared(SharedLocs::from_ranges(&[(
+            start,
+            start + usize::from(length),
+        )])))
     }
 
     /// How many ranges there are.
     #[inline]
     pub fn len(&self) -> usize {
         match &self.0 {
-            Repr::Packed { len, .. } | Repr::Inline { len, .. } => usize::from(*len),
-            Repr::Shared(ranges) => ranges.len(),
+            Repr::Packed(p) => {
+                if p.s0 == 0 {
+                    0
+                } else if p.s1 == 0 {
+                    1
+                } else if p.s2 == 0 {
+                    2
+                } else if join_s3(p.s3_lo, p.s3_hi) == 0 {
+                    3
+                } else {
+                    4
+                }
+            }
+            Repr::Shared(shared) => shared.len(),
         }
     }
 
     #[inline]
     pub fn is_empty(&self) -> bool {
-        self.len() == 0
+        match &self.0 {
+            Repr::Packed(p) => p.s0 == 0,
+            Repr::Shared(shared) => shared.len() == 0,
+        }
     }
 
-    /// Prepend one or two `Dress`-packed `(begin << 12) | (len + 1)` ranges
-    /// directly into a `Packed` list in place. Returns `false` if this list is
-    /// not `Packed` or does not have room.
+    /// Prepend one or two canonical packed ranges (`0` = absent) directly into
+    /// a `Packed` list in place. Returns `false` if not `Packed` or full.
     #[inline]
     pub(crate) fn prepend_packed(&mut self, p0: u32, p1: u32) -> bool {
-        let Repr::Packed { len, first, tail } = &mut self.0 else {
-            return false;
-        };
-        let cur = usize::from(*len);
-        if cur <= 1 {
-            let s0 = p0 - 1;
-            if p1 == 0 {
-                if cur == 0 {
-                    *first = s0;
-                    *len = 1;
-                } else {
-                    tail[0] = u64::from(*first);
-                    *first = s0;
-                    *len = 2;
-                }
-            } else {
-                let s1 = p1 - 1;
-                if cur == 0 {
-                    *first = s0;
-                    tail[0] = u64::from(s1);
-                    *len = 2;
-                } else {
-                    tail[0] = u64::from(s1) | (u64::from(*first) << 32);
-                    *first = s0;
-                    *len = 3;
-                }
-            }
+        if p0 == 0 {
             return true;
         }
-        let prefix_len = 1 + usize::from(p1 != 0);
-        if cur + prefix_len > INLINE {
+        let Repr::Packed(p) = &mut self.0 else {
             return false;
+        };
+        if p1 == 0 {
+            if join_s3(p.s3_lo, p.s3_hi) != 0 {
+                return false;
+            }
+            let (lo, hi) = split_s3(p.s2);
+            p.s3_lo = lo;
+            p.s3_hi = hi;
+            p.s2 = p.s1;
+            p.s1 = p.s0;
+            p.s0 = p0;
+        } else {
+            if p.s2 != 0 {
+                return false;
+            }
+            let (lo, hi) = split_s3(p.s1);
+            p.s3_lo = lo;
+            p.s3_hi = hi;
+            p.s2 = p.s0;
+            p.s1 = p1;
+            p.s0 = p0;
         }
-        let mut spans = unpack_spans(*first, *tail);
-        spans.copy_within(0..cur, prefix_len);
-        spans[0] = p0 - 1;
-        if p1 != 0 {
-            spans[1] = p1 - 1;
-        }
-        let (f, t) = pack_spans(spans);
-        *first = f;
-        *tail = t;
-        *len = (cur + prefix_len) as u8;
         true
     }
 
@@ -300,32 +458,16 @@ impl Locations {
         if prefix.is_empty() {
             return;
         }
-        if let (
-            Repr::Packed {
-                len: cur_len,
-                first: cur_first,
-                tail: cur_tail,
-            },
-            Repr::Packed {
-                len: pre_len,
-                first: pre_first,
-                tail: pre_tail,
-            },
-        ) = (&mut self.0, &prefix.0)
-        {
-            let cur = usize::from(*cur_len);
-            let pre = usize::from(*pre_len);
-            if cur + pre <= INLINE {
-                let mut cur_spans = unpack_spans(*cur_first, *cur_tail);
-                let pre_spans = unpack_spans(*pre_first, *pre_tail);
-                if cur > 0 {
-                    cur_spans.copy_within(0..cur, pre);
-                }
-                cur_spans[..pre].copy_from_slice(&pre_spans[..pre]);
-                let (f, t) = pack_spans(cur_spans);
-                *cur_first = f;
-                *cur_tail = t;
-                *cur_len = (cur + pre) as u8;
+        if let (Some(cur), Some(pre)) = (self.as_packed_copy(), prefix.as_packed_copy()) {
+            let cur_len = self.len();
+            let pre_len = prefix.len();
+            if cur_len + pre_len <= INLINE {
+                let cw = cur.to_words();
+                let pw = pre.to_words();
+                let mut merged = [0u32; INLINE];
+                merged[..pre_len].copy_from_slice(&pw[..pre_len]);
+                merged[pre_len..pre_len + cur_len].copy_from_slice(&cw[..cur_len]);
+                self.0 = Repr::Packed(PackedLocations::from_words(merged));
                 return;
             }
         }
@@ -337,16 +479,15 @@ impl Locations {
     /// Whether the ranges are kept in place, owning no heap memory.
     #[cfg(test)]
     pub(crate) fn is_inline(&self) -> bool {
-        matches!(self.0, Repr::Packed { .. } | Repr::Inline { .. })
+        matches!(self.0, Repr::Packed(_))
     }
 
     /// Fast `(begin, length)` extraction when stored as a single compact packed range.
     #[inline]
     pub(crate) fn single_packed_raw(&self) -> Option<(u32, u32)> {
         match &self.0 {
-            Repr::Packed { len: 1, first, .. } => {
-                let p = *first;
-                Some((p >> PACKED_LEN_BITS, p & PACKED_LEN_MASK))
+            Repr::Packed(p) if p.s0 != 0 && p.s1 == 0 => {
+                Some((p.s0 >> PACKED_LEN_BITS, (p.s0 & PACKED_LEN_MASK) - 1))
             }
             _ => None,
         }
@@ -356,14 +497,17 @@ impl Locations {
     #[inline]
     pub fn get(&self, index: usize) -> Option<(usize, usize)> {
         match &self.0 {
-            Repr::Packed { len, first, tail } => (index < usize::from(*len))
-                .then(|| unpack_range(get_packed_span(*first, *tail, index))),
-            Repr::Inline {
-                len,
-                begins,
-                lengths,
-            } => (index < usize::from(*len)).then(|| wide(begins[index], lengths[index])),
-            Repr::Shared(ranges) => ranges.get(index).copied(),
+            Repr::Packed(p) => {
+                let word = match index {
+                    0 => p.s0,
+                    1 => p.s1,
+                    2 => p.s2,
+                    3 => join_s3(p.s3_lo, p.s3_hi),
+                    _ => 0,
+                };
+                (word != 0).then(|| unpack_range(word))
+            }
+            Repr::Shared(shared) => shared.get(index),
         }
     }
 
@@ -386,42 +530,37 @@ impl Locations {
 
     /// Share or materialize these locations into a single `Arc<[(usize, usize)]>`.
     pub(crate) fn to_arc_slice(&self) -> Arc<[(usize, usize)]> {
-        match &self.0 {
-            Repr::Shared(shared) => Arc::clone(shared),
-            _ => self.iter().collect(),
-        }
+        self.iter().collect()
     }
 
     /// Pass these locations as a contiguous slice without heap allocation when
-    /// stored inline or already shared.
+    /// stored inline or in `SharedLocs::Packed`/`Wide`.
     pub(crate) fn with_slice<R>(&self, f: impl FnOnce(&[(usize, usize)]) -> R) -> R {
         match &self.0 {
-            Repr::Packed { len, first, tail } => {
-                let spans = unpack_spans(*first, *tail);
+            Repr::Packed(p) => {
+                let words = p.to_words();
                 let mut buf = [(0usize, 0usize); INLINE];
-                let count = usize::from(*len);
-                for (slot, &packed) in buf[..count].iter_mut().zip(&spans[..count]) {
-                    *slot = unpack_range(packed);
+                let mut count = 0usize;
+                for &w in &words {
+                    if w == 0 {
+                        break;
+                    }
+                    buf[count] = unpack_range(w);
+                    count += 1;
                 }
                 f(&buf[..count])
             }
-            Repr::Inline {
-                len,
-                begins,
-                lengths,
-            } => {
-                let mut buf = [(0usize, 0usize); WIDE_INLINE];
-                let count = usize::from(*len);
-                for ((slot, &begin), &length) in buf[..count]
-                    .iter_mut()
-                    .zip(&begins[..count])
-                    .zip(&lengths[..count])
-                {
-                    *slot = wide(begin, length);
+            Repr::Shared(shared) => match &**shared {
+                SharedLocs::Packed { len, spans } => {
+                    let count = usize::from(*len);
+                    let mut buf = [(0usize, 0usize); SHARED_PACKED];
+                    for (slot, &w) in buf[..count].iter_mut().zip(&spans[..count]) {
+                        *slot = unpack_range(w);
+                    }
+                    f(&buf[..count])
                 }
-                f(&buf[..count])
-            }
-            Repr::Shared(shared) => f(shared),
+                SharedLocs::Wide(ranges) => f(ranges),
+            },
         }
     }
 
@@ -433,11 +572,25 @@ impl Locations {
     /// when it fits, avoiding `usize` round-trips for grid run decoding.
     #[inline]
     pub(crate) fn push_narrow(&mut self, begin: u32, length: u32) {
-        if let Repr::Packed { len, first, tail } = &mut self.0 {
-            let idx = usize::from(*len);
-            if idx < INLINE && begin < PACKED_BEGIN_LIMIT && length <= PACKED_LEN_MASK {
-                set_packed_span(first, tail, idx, (begin << PACKED_LEN_BITS) | length);
-                *len += 1;
+        if let Repr::Packed(p) = &mut self.0
+            && let Some(packed) = Self::pack_small(begin, length)
+        {
+            if p.s0 == 0 {
+                p.s0 = packed;
+                return;
+            }
+            if p.s1 == 0 {
+                p.s1 = packed;
+                return;
+            }
+            if p.s2 == 0 {
+                p.s2 = packed;
+                return;
+            }
+            if join_s3(p.s3_lo, p.s3_hi) == 0 {
+                let (lo, hi) = split_s3(packed);
+                p.s3_lo = lo;
+                p.s3_hi = hi;
                 return;
             }
         }
@@ -449,95 +602,101 @@ impl Locations {
     /// whole list, so a caller with several ranges extends once instead.
     #[inline]
     pub fn push(&mut self, range: (usize, usize)) {
-        if let Repr::Packed { len, first, tail } = &mut self.0 {
-            let idx = usize::from(*len);
-            if idx < INLINE
-                && let Some(packed) = pack_range(range)
-            {
-                set_packed_span(first, tail, idx, packed);
-                *len += 1;
+        if let Repr::Packed(p) = &mut self.0
+            && let Some(packed) = pack_range(range)
+        {
+            if p.s0 == 0 {
+                p.s0 = packed;
+                return;
+            }
+            if p.s1 == 0 {
+                p.s1 = packed;
+                return;
+            }
+            if p.s2 == 0 {
+                p.s2 = packed;
+                return;
+            }
+            if join_s3(p.s3_lo, p.s3_hi) == 0 {
+                let (lo, hi) = split_s3(packed);
+                p.s3_lo = lo;
+                p.s3_hi = hi;
                 return;
             }
         }
         self.extend_from_slice(&[range]);
     }
 
-    /// Add `more` after the others. Past [`INLINE`] ranges this copies the
-    /// whole list once.
+    /// Add `more` after the others. Past [`INLINE`] ranges this builds a single
+    /// compact `SharedLocs` without an intermediate `Vec` for `<= 7` spans.
     pub fn extend_from_slice(&mut self, more: &[(usize, usize)]) {
         if more.is_empty() {
             return;
         }
-        match &mut self.0 {
-            Repr::Packed { len, first, tail } => {
-                let start = usize::from(*len);
-                let mut spans = unpack_spans(*first, *tail);
-                if start + more.len() <= INLINE {
-                    let mut packed = [0u32; INLINE];
-                    let fits = packed
-                        .iter_mut()
-                        .zip(more)
-                        .all(|(slot, range)| pack_range(*range).map(|v| *slot = v).is_some());
-                    if fits {
-                        spans[start..start + more.len()].copy_from_slice(&packed[..more.len()]);
-                        let (f, t) = pack_spans(spans);
-                        *first = f;
-                        *tail = t;
-                        *len += more.len() as u8;
-                        return;
+        let cur_len = self.len();
+        let total = cur_len + more.len();
+        if let Some(cur) = self.as_packed_copy() {
+            let cw = cur.to_words();
+            if total <= INLINE {
+                let mut merged = cw;
+                let mut fits = true;
+                for (slot, &range) in merged[cur_len..total].iter_mut().zip(more) {
+                    if let Some(v) = pack_range(range) {
+                        *slot = v;
+                    } else {
+                        fits = false;
+                        break;
                     }
                 }
-                if start + more.len() <= WIDE_INLINE {
-                    let mut begins = [0u32; WIDE_INLINE];
-                    let mut lengths = [0u16; WIDE_INLINE];
-                    for (at, &p) in spans[..start].iter().enumerate() {
-                        begins[at] = p >> PACKED_LEN_BITS;
-                        lengths[at] = (p & PACKED_LEN_MASK) as u16;
+                if fits {
+                    self.0 = Repr::Packed(PackedLocations::from_words(merged));
+                    return;
+                }
+            } else if total <= SHARED_PACKED {
+                let mut spans = [0u32; SHARED_PACKED];
+                spans[..cur_len].copy_from_slice(&cw[..cur_len]);
+                let mut fits = true;
+                for (slot, &range) in spans[cur_len..total].iter_mut().zip(more) {
+                    if let Some(v) = pack_range(range) {
+                        *slot = v;
+                    } else {
+                        fits = false;
+                        break;
                     }
-                    let fits = more.iter().enumerate().all(|(at, range)| {
-                        narrow(*range)
-                            .map(|(b, l)| {
-                                begins[start + at] = b;
-                                lengths[start + at] = l;
-                            })
-                            .is_some()
-                    });
-                    if fits {
-                        self.0 = Repr::Inline {
-                            len: (start + more.len()) as u8,
-                            begins,
-                            lengths,
-                        };
-                        return;
-                    }
+                }
+                if fits {
+                    self.0 = Repr::Shared(Arc::new(SharedLocs::Packed {
+                        len: total as u8,
+                        spans,
+                    }));
+                    return;
                 }
             }
-            Repr::Inline {
-                len,
-                begins,
-                lengths,
-            } => {
-                let start = usize::from(*len);
-                if start + more.len() <= WIDE_INLINE {
-                    let mut narrowed = [(0u32, 0u16); WIDE_INLINE];
-                    let fits = narrowed
-                        .iter_mut()
-                        .zip(more)
-                        .all(|(slot, range)| narrow(*range).map(|range| *slot = range).is_some());
-                    if fits {
-                        for (at, (begin, length)) in narrowed[..more.len()].iter().enumerate() {
-                            begins[start + at] = *begin;
-                            lengths[start + at] = *length;
-                        }
-                        *len += more.len() as u8;
-                        return;
-                    }
+        } else if total <= SHARED_PACKED
+            && let Repr::Shared(shared) = &self.0
+            && let SharedLocs::Packed { len, spans } = &**shared
+        {
+            let start = usize::from(*len);
+            let mut merged = *spans;
+            let mut fits = true;
+            for (slot, &range) in merged[start..total].iter_mut().zip(more) {
+                if let Some(v) = pack_range(range) {
+                    *slot = v;
+                } else {
+                    fits = false;
+                    break;
                 }
             }
-            Repr::Shared(_) => {}
+            if fits {
+                self.0 = Repr::Shared(Arc::new(SharedLocs::Packed {
+                    len: total as u8,
+                    spans: merged,
+                }));
+                return;
+            }
         }
-        let all: Arc<[(usize, usize)]> = self.iter().chain(more.iter().copied()).collect();
-        self.0 = Repr::Shared(all);
+        let all: Vec<(usize, usize)> = self.iter().chain(more.iter().copied()).collect();
+        self.0 = Repr::Shared(SharedLocs::from_ranges(&all));
     }
 
     /// Append every range of `other`, after this list's own.
@@ -550,25 +709,26 @@ impl Locations {
             *self = other.clone();
             return;
         }
-        if let (
-            Repr::Packed {
-                len: own,
-                first: own_first,
-                tail: own_tail,
-            },
-            Repr::Packed { len, first, tail },
-        ) = (&mut self.0, &other.0)
-        {
-            let start = usize::from(*own);
-            let add = usize::from(*len);
-            if start + add <= INLINE {
-                let mut own_spans = unpack_spans(*own_first, *own_tail);
-                let spans = unpack_spans(*first, *tail);
-                own_spans[start..start + add].copy_from_slice(&spans[..add]);
-                let (f, t) = pack_spans(own_spans);
-                *own_first = f;
-                *own_tail = t;
-                *own += *len;
+        if let (Some(own), Some(add)) = (self.as_packed_copy(), other.as_packed_copy()) {
+            let start = self.len();
+            let count = other.len();
+            let total = start + count;
+            let ow = own.to_words();
+            let aw = add.to_words();
+            if total <= INLINE {
+                let mut merged = ow;
+                merged[start..total].copy_from_slice(&aw[..count]);
+                self.0 = Repr::Packed(PackedLocations::from_words(merged));
+                return;
+            }
+            if total <= SHARED_PACKED {
+                let mut spans = [0u32; SHARED_PACKED];
+                spans[..start].copy_from_slice(&ow[..start]);
+                spans[start..total].copy_from_slice(&aw[..count]);
+                self.0 = Repr::Shared(Arc::new(SharedLocs::Packed {
+                    len: total as u8,
+                    spans,
+                }));
                 return;
             }
         }
@@ -576,48 +736,183 @@ impl Locations {
     }
 
     fn append_slow(&mut self, other: &Locations) {
-        match &other.0 {
-            Repr::Shared(ranges) => self.extend_from_slice(ranges),
-            Repr::Packed { len, first, tail } => {
-                let spans = unpack_spans(*first, *tail);
-                let mut buf = [(0, 0); INLINE];
-                let count = usize::from(*len);
-                for (slot, &p) in buf[..count].iter_mut().zip(&spans[..count]) {
-                    *slot = unpack_range(p);
-                }
-                self.extend_from_slice(&buf[..count]);
-            }
-            Repr::Inline {
-                len,
-                begins,
-                lengths,
-            } => {
-                let count = usize::from(*len);
-                if let Repr::Inline {
-                    len: own,
-                    begins: own_begins,
-                    lengths: own_lengths,
-                } = &mut self.0
-                {
-                    let start = usize::from(*own);
-                    if start + count <= WIDE_INLINE {
-                        own_begins[start..start + count].copy_from_slice(&begins[..count]);
-                        own_lengths[start..start + count].copy_from_slice(&lengths[..count]);
-                        *own += count as u8;
-                        return;
-                    }
-                }
-                let mut buf = [(0, 0); WIDE_INLINE];
-                for ((slot, &b), &l) in buf[..count]
-                    .iter_mut()
-                    .zip(&begins[..count])
-                    .zip(&lengths[..count])
-                {
-                    *slot = wide(b, l);
-                }
-                self.extend_from_slice(&buf[..count]);
+        other.with_slice(|slice| self.extend_from_slice(slice));
+    }
+
+    #[inline]
+    fn fast_eq(&self, other: &Self) -> bool {
+        match (&self.0, &other.0) {
+            (Repr::Packed(a), Repr::Packed(b)) => a == b,
+            (Repr::Shared(a), Repr::Shared(b)) => Arc::ptr_eq(a, b) || self == other,
+            _ => false,
+        }
+    }
+}
+
+/// Stack-resident deduplication cache for batch `Locations` merges (e.g.
+/// `pickRestart`, `join`, `AddContext`) when a fixed prefix or suffix pushes
+/// repeated haps past the 4-inline limit. Keeps identical spilled location
+/// lists sharing one `Arc<SharedLocs>` with zero TLS or retained heap memory.
+pub(crate) struct LocMergeCache {
+    slots: [(Locations, Locations); 8],
+    len: usize,
+    next: usize,
+}
+
+impl LocMergeCache {
+    #[inline]
+    pub(crate) const fn new() -> Self {
+        Self {
+            slots: [const { (Locations::new(), Locations::new()) }; 8],
+            len: 0,
+            next: 0,
+        }
+    }
+
+    #[inline]
+    pub(crate) fn prepend_into(&mut self, prefix: &Locations, target: &mut Locations) {
+        if prefix.is_empty() {
+            return;
+        }
+        if target.is_empty() {
+            *target = prefix.clone();
+            return;
+        }
+        if let (Some(cur), Some(pre)) = (target.as_packed_copy(), prefix.as_packed_copy()) {
+            let cur_len = target.len();
+            let pre_len = prefix.len();
+            if cur_len + pre_len <= INLINE {
+                let cw = cur.to_words();
+                let pw = pre.to_words();
+                let mut merged = [0u32; INLINE];
+                merged[..pre_len].copy_from_slice(&pw[..pre_len]);
+                merged[pre_len..pre_len + cur_len].copy_from_slice(&cw[..cur_len]);
+                target.0 = Repr::Packed(PackedLocations::from_words(merged));
+                return;
             }
         }
+        self.prepend_spilled(prefix, target);
+    }
+
+    #[inline(never)]
+    fn prepend_spilled(&mut self, prefix: &Locations, target: &mut Locations) {
+        for (src, out) in &self.slots[..self.len] {
+            if src.fast_eq(target) {
+                *target = out.clone();
+                return;
+            }
+        }
+        let mut merged = prefix.clone();
+        merged.append(target);
+        let idx = if self.len < self.slots.len() {
+            let i = self.len;
+            self.len += 1;
+            i
+        } else {
+            let i = self.next;
+            self.next = (self.next + 1) & 7;
+            i
+        };
+        let old = std::mem::replace(target, merged.clone());
+        self.slots[idx] = (old, merged);
+    }
+
+    #[inline]
+    pub(crate) fn append_into(&mut self, target: &mut Locations, suffix: &Locations) {
+        if suffix.is_empty() {
+            return;
+        }
+        if target.is_empty() {
+            *target = suffix.clone();
+            return;
+        }
+        if let (Some(own), Some(add)) = (target.as_packed_copy(), suffix.as_packed_copy()) {
+            let start = target.len();
+            let count = suffix.len();
+            if start + count <= INLINE {
+                let ow = own.to_words();
+                let aw = add.to_words();
+                let mut merged = ow;
+                merged[start..start + count].copy_from_slice(&aw[..count]);
+                target.0 = Repr::Packed(PackedLocations::from_words(merged));
+                return;
+            }
+        }
+        self.append_spilled(target, suffix);
+    }
+
+    #[inline(never)]
+    fn append_spilled(&mut self, target: &mut Locations, suffix: &Locations) {
+        for (src, out) in &self.slots[..self.len] {
+            if src.fast_eq(target) {
+                *target = out.clone();
+                return;
+            }
+        }
+        let mut merged = target.clone();
+        merged.append(suffix);
+        let idx = if self.len < self.slots.len() {
+            let i = self.len;
+            self.len += 1;
+            i
+        } else {
+            let i = self.next;
+            self.next = (self.next + 1) & 7;
+            i
+        };
+        let old = std::mem::replace(target, merged.clone());
+        self.slots[idx] = (old, merged);
+    }
+
+    #[inline]
+    pub(crate) fn extend_into(&mut self, target: &mut Locations, more: &[(usize, usize)]) {
+        if more.is_empty() {
+            return;
+        }
+        if let Some(cur) = target.as_packed_copy() {
+            let cur_len = target.len();
+            let total = cur_len + more.len();
+            if total <= INLINE {
+                let mut merged = cur.to_words();
+                let mut fits = true;
+                for (slot, &range) in merged[cur_len..total].iter_mut().zip(more) {
+                    if let Some(v) = pack_range(range) {
+                        *slot = v;
+                    } else {
+                        fits = false;
+                        break;
+                    }
+                }
+                if fits {
+                    target.0 = Repr::Packed(PackedLocations::from_words(merged));
+                    return;
+                }
+            }
+        }
+        self.extend_spilled(target, more);
+    }
+
+    #[inline(never)]
+    fn extend_spilled(&mut self, target: &mut Locations, more: &[(usize, usize)]) {
+        for (src, out) in &self.slots[..self.len] {
+            if src.fast_eq(target) {
+                *target = out.clone();
+                return;
+            }
+        }
+        let mut merged = target.clone();
+        merged.extend_from_slice(more);
+        let idx = if self.len < self.slots.len() {
+            let i = self.len;
+            self.len += 1;
+            i
+        } else {
+            let i = self.next;
+            self.next = (self.next + 1) & 7;
+            i
+        };
+        let old = std::mem::replace(target, merged.clone());
+        self.slots[idx] = (old, merged);
     }
 }
 
@@ -656,24 +951,14 @@ impl FromIterator<(usize, usize)> for Locations {
                 len += 1;
                 continue;
             }
-            let (first, tail) = pack_spans(spans);
-            let mut out = Self(Repr::Packed {
-                len: len as u8,
-                first,
-                tail,
-            });
+            let mut out = Self::from_packed(spans);
             out.push(range);
             for rest in iter {
                 out.push(rest);
             }
             return out;
         }
-        let (first, tail) = pack_spans(spans);
-        Self(Repr::Packed {
-            len: len as u8,
-            first,
-            tail,
-        })
+        Self::from_packed(spans)
     }
 }
 
@@ -763,7 +1048,10 @@ mod tests {
             let one = Locations::one(begin, length);
             let range = (begin as usize, begin as usize + usize::from(length));
             assert_eq!(one, Locations::from(&[range][..]));
-            assert!(one.is_inline());
+            assert_eq!(
+                one.is_inline(),
+                begin < PACKED_BEGIN_LIMIT && u32::from(length) <= PACKED_MAX_LEN
+            );
             assert_eq!(one.get(0), Some(range));
             assert_eq!(one.len(), 1);
         }
@@ -776,7 +1064,7 @@ mod tests {
             let mut locations = Locations::from(vec![(1, 2)]);
             locations.push(range);
             assert_eq!(locations.to_vec(), vec![(1, 2), range]);
-            assert_eq!(locations.is_inline(), range == (5, 5 + long - 1));
+            assert!(!locations.is_inline());
         }
     }
 
@@ -790,8 +1078,9 @@ mod tests {
     #[test]
     fn append_keeps_the_order_and_equality_ignores_the_storage() {
         let mut left = Locations::from(vec![(1, 2)]);
-        left.append(&Locations::from(vec![(3, 4), (5, 6)]));
-        assert_eq!(left, vec![(1, 2), (3, 4), (5, 6)]);
+        left.append(&Locations::from(vec![(3, 4), (5, 6), (7, 8)]));
+        assert!(left.is_inline());
+        assert_eq!(left, vec![(1, 2), (3, 4), (5, 6), (7, 8)]);
         let many: Vec<(usize, usize)> = (0..=INLINE).map(|index| (index, index + 1)).collect();
         let mut spilled = Locations::from(many.clone());
         spilled.append(&Locations::new());
@@ -803,8 +1092,8 @@ mod tests {
         assert_eq!(joined, many);
         assert_eq!(
             left.iter().rev().collect::<Vec<_>>(),
-            vec![(5, 6), (3, 4), (1, 2)]
+            vec![(7, 8), (5, 6), (3, 4), (1, 2)]
         );
-        assert_eq!(format!("{left:?}"), "[(1, 2), (3, 4), (5, 6)]");
+        assert_eq!(format!("{left:?}"), "[(1, 2), (3, 4), (5, 6), (7, 8)]");
     }
 }

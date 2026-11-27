@@ -49,7 +49,7 @@ fn a_control_pattern_is_discrete_where_a_signal_is_not() {
     let haps = session.query(Fraction::ZERO, Fraction::ONE).expect("query");
     assert_eq!(haps.len(), 1);
     assert!(
-        haps[0].whole.is_some(),
+        haps[0].whole().is_some(),
         "a control pattern must have a whole, or the scheduler drops it"
     );
 
@@ -60,7 +60,7 @@ fn a_control_pattern_is_discrete_where_a_signal_is_not() {
         .expect("evaluate");
     let haps = session.query(Fraction::ZERO, Fraction::ONE).expect("query");
     assert!(
-        haps.iter().all(|hap| hap.whole.is_none()),
+        haps.iter().all(|hap| hap.whole().is_none()),
         "sine was expected to be analog; this test's premise has changed"
     );
 }

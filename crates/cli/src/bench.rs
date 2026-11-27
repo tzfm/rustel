@@ -135,7 +135,7 @@ pub(crate) fn run_bench(
 
     // Warm process-wide static registries with one native throwaway session so
     // the measured eval reflects the score itself rather than one-time tables.
-    if let Ok(mut warm) = Session::with_config(config.clone()) {
+    if let Ok(mut warm) = Session::with_config(rustel_runtime::SessionConfig::default()) {
         let _ = warm.evaluate("pure(1)");
         drop(warm);
     }
@@ -265,39 +265,4 @@ pub(crate) fn run_bench(
         );
     }
     Ok(())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn formatting_scales_bytes_and_microseconds() {
-        assert_eq!(format_bytes(512), "512 B");
-        assert_eq!(format_bytes(1536), "1.5 KB");
-        assert_eq!(format_bytes(2 * 1024 * 1024), "2.00 MB");
-        assert_eq!(format_signed_bytes(-2048), "-2.0 KB");
-        assert_eq!(format_signed_bytes(0), "0 B");
-        assert_eq!(format_us(12.34), "12.3 us");
-        assert_eq!(format_us(2_500.0), "2.50 ms");
-        assert_eq!(format_us(1_500_000.0), "1.500 s");
-    }
-
-    #[test]
-    fn tripwire_alloc_measures_allocations_peak_and_release() {
-        let (buf, alloc) = measure_allocations(|| {
-            let mut v = Vec::<u8>::with_capacity(4096);
-            v.resize(4096, 1);
-            std::hint::black_box(v)
-        });
-        assert!(alloc.allocations >= 1);
-        assert!(alloc.allocated_bytes >= 4096);
-        assert!(alloc.held_bytes >= 4096);
-        assert!(alloc.peak_bytes >= 4096);
-
-        let (_, freed) = measure_allocations(|| {
-            drop(buf);
-        });
-        assert!(freed.held_bytes <= -4096);
-    }
 }

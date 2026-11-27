@@ -23,6 +23,11 @@ pub(super) struct LiveNumbers {
 }
 
 impl LiveNumbers {
+    #[inline]
+    pub(super) fn is_empty(&self) -> bool {
+        self.texts.is_empty()
+    }
+
     fn set(&mut self, revision: String, ranges: Arc<[LiveNumber]>) {
         self.texts.retain(|(kept, _)| *kept != revision);
         if ranges.is_empty() {

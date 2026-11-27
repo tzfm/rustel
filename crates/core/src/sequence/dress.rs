@@ -4,26 +4,16 @@ use crate::context_keys::ContextKeys;
 use crate::{Locations, Value};
 use std::sync::Arc;
 
-/// Pack a compact `(begin, end)` source range into a single non-zero `u32`:
-/// `begin` in the high 20 bits and `length + 1` in the low 12 bits, leaving
-/// `0` as the empty sentinel.
+/// Pack a compact `(begin, end)` source range into a single non-zero 31-bit
+/// `u32`, matching [`Locations`] directly.
 #[inline]
-fn pack_dress_loc((begin, end): (usize, usize)) -> Option<u32> {
-    const LEN_BITS: u32 = 12;
-    const MAX_LEN: u32 = (1 << LEN_BITS) - 2;
-    const MAX_BEGIN: u32 = (1 << (32 - LEN_BITS)) - 1;
-    let length = u32::try_from(end.checked_sub(begin)?).ok()?;
-    let begin = u32::try_from(begin).ok()?;
-    (begin <= MAX_BEGIN && length <= MAX_LEN).then_some((begin << LEN_BITS) | (length + 1))
+fn pack_dress_loc(range: (usize, usize)) -> Option<u32> {
+    Locations::pack_range_raw(range)
 }
 
 #[inline]
 pub(super) fn unpack_dress_loc(packed: u32) -> (usize, usize) {
-    const LEN_BITS: u32 = 12;
-    const LEN_MASK: u32 = (1 << LEN_BITS) - 1;
-    let begin = (packed >> LEN_BITS) as usize;
-    let length = ((packed & LEN_MASK) - 1) as usize;
-    (begin, begin + length)
+    Locations::unpack_range_raw(packed)
 }
 
 #[inline]
@@ -192,6 +182,11 @@ impl Dress {
         full.append(&self.before_locations());
         self.before_packed = [0, 0];
         self.tail.get_or_insert_with(Default::default).before = full;
+    }
+
+    #[inline]
+    pub(super) fn set_before_packed(&mut self, loc0: u32, loc1: u32) {
+        self.before_packed = [loc0, loc1];
     }
 
     pub(super) fn clear_before(&mut self) {
@@ -976,6 +971,16 @@ impl Dress {
             (DressSet::Single(k, v), DressSet::Builtin(m, _))
             | (DressSet::Builtin(m, _), DressSet::Single(k, v)) => {
                 m.keys() == [*k] && same_value(v, m.as_slice().value_at(0))
+            }
+            (DressSet::Builtin(a, ma), DressSet::Builtin(b, mb))
+                if self_no_other && other_no_other =>
+            {
+                Arc::ptr_eq(a, b)
+                    || (ma == mb
+                        && a.keys() == b.keys()
+                        && (0..a.keys().len()).all(|i| {
+                            same_value(a.as_slice().value_at(i), b.as_slice().value_at(i))
+                        }))
             }
             _ => match (self.set_value(), other.set_value()) {
                 (Some(a), Some(b)) => same_value(&a, &b),

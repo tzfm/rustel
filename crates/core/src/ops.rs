@@ -63,6 +63,8 @@ pub trait PatOps: Clone + Sized + Send + Sync + 'static {
     fn pat_slowcat(pats: Vec<Self>) -> Self;
     fn pat_slowcat_prime(pats: Vec<Self>) -> Self;
     fn pat_fastcat(pats: Vec<Self>) -> Self;
+    fn pat_iter(&self, times: Fraction, parts: u64, back: bool) -> Self;
+    fn pat_segment(&self, rate: Fraction) -> Self;
     fn pat_randrun(n: usize) -> Self;
     fn pat_irand_segment(n: usize) -> Self;
 
@@ -414,6 +416,12 @@ impl PatOps for Pattern {
     }
     fn pat_fastcat(pats: Vec<Self>) -> Self {
         crate::fastcat(pats)
+    }
+    fn pat_iter(&self, times: Fraction, parts: u64, back: bool) -> Self {
+        Pattern::pat_iter(self, times, parts, back)
+    }
+    fn pat_segment(&self, rate: Fraction) -> Self {
+        Pattern::pat_segment(self, rate)
     }
     fn pat_randrun(n: usize) -> Self {
         crate::signal::randrun(n)
@@ -831,6 +839,12 @@ impl PatOps for PurePattern {
         PurePattern::assert_pure(crate::fastcat(
             pats.into_iter().map(|p| p.pattern().clone()).collect(),
         ))
+    }
+    fn pat_iter(&self, times: Fraction, parts: u64, back: bool) -> Self {
+        PurePattern::assert_pure(self.pattern().pat_iter(times, parts, back))
+    }
+    fn pat_segment(&self, rate: Fraction) -> Self {
+        PurePattern::assert_pure(self.pattern().pat_segment(rate))
     }
     fn pat_randrun(n: usize) -> Self {
         PurePattern::assert_pure(crate::signal::randrun(n))

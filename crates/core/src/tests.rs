@@ -38,7 +38,7 @@ mod step_combination_overflow_tests {
         let haps = pattern
             .try_query_arc_sorted(Fraction::ZERO, Fraction::ONE)
             .expect("fastcat plays");
-        let wholes: Vec<_> = haps.into_iter().map(|hap| hap.whole).collect();
+        let wholes: Vec<_> = haps.into_iter().map(|hap| hap.whole()).collect();
         assert_eq!(
             wholes,
             [
@@ -384,9 +384,9 @@ mod slowcat_overflow_tests {
             .expect("the exact answer fits");
         assert_eq!(haps.len(), 1);
         assert_eq!(haps[0].value, Value::Str("bd".into()));
-        assert_eq!(haps[0].part, TimeSpan::new(begin, end));
+        assert_eq!(haps[0].part(), TimeSpan::new(begin, end));
         assert_eq!(
-            haps[0].whole,
+            haps[0].whole(),
             Some(TimeSpan::new(Fraction::ZERO, Fraction::ONE))
         );
     }
@@ -680,8 +680,8 @@ mod constant_values_tests {
             .into_iter()
             .map(|hap| {
                 (
-                    hap.whole.expect("a discrete hap"),
-                    hap.part,
+                    hap.whole().expect("a discrete hap"),
+                    hap.part(),
                     hap.value.as_f64().expect("a number"),
                 )
             })
@@ -1344,9 +1344,9 @@ mod value_signal_tests {
         let late = Pattern::of(Node::MapHapsOwned(Box::new((
             fastcat(vec![note(6.0), note(7.0), note(8.0)]),
             Arc::new(|mut hap: Hap| {
-                let whole = hap.whole?;
+                let whole = hap.whole()?;
                 let quarter = (whole.end - whole.begin) * Fraction::new(1, 4);
-                hap.whole = Some(TimeSpan::new(whole.begin + quarter, whole.end));
+                hap.set_whole(Some(TimeSpan::new(whole.begin + quarter, whole.end)));
                 Some(hap)
             }),
             SpanUse::Reads,
@@ -2411,7 +2411,7 @@ mod restart_tests {
         assert_eq!(orig.len(), 1);
         assert_eq!(moved.len(), 1);
         assert_eq!(
-            moved[0].part,
+            moved[0].part(),
             TimeSpan::new(Fraction::new(1, 2), Fraction::new(65_537, 131_072)),
             "shift by 1/2 on 131_072 ticks must not truncate to 0"
         );

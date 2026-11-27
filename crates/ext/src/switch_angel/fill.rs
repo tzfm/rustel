@@ -145,7 +145,7 @@ impl FillNode {
                 }
             }
         }));
-        if haps.iter().any(|hap| hap.whole.is_none()) {
+        if haps.iter().any(|hap| hap.whole().is_none()) {
             rustel_core::signal_query_error(|| {
                 "Cannot read properties of undefined (reading 'begin')".into()
             });
@@ -153,24 +153,26 @@ impl FillNode {
         }
         let mut onsets: Vec<Fraction> = haps
             .iter()
-            .map(|hap| hap.whole.expect("discrete").begin)
+            .map(|hap| hap.whole().expect("discrete").begin)
             .collect();
         onsets.sort();
         onsets.dedup();
         let mut output = Vec::new();
         for mut hap in haps {
-            if hap.part.begin >= original.end {
+            if hap.part().begin >= original.end {
                 continue;
             }
-            let whole = hap.whole.expect("discrete");
+            let whole = hap.whole().expect("discrete");
             let Some(&next) = onsets.get(onsets.partition_point(|onset| *onset < whole.end)) else {
                 continue;
             };
             if next <= original.begin {
                 continue;
             }
-            hap.whole = Some(TimeSpan::new(whole.begin, next));
-            hap.part = TimeSpan::new(hap.part.begin.max(original.begin), next.min(original.end));
+            hap.set_spans(
+                Some(TimeSpan::new(whole.begin, next)),
+                TimeSpan::new(hap.part().begin.max(original.begin), next.min(original.end)),
+            );
             output.push(hap);
         }
         output

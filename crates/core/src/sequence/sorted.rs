@@ -50,11 +50,7 @@ pub(crate) fn try_query_fast_pow2_slowcat_static_int(
     #[derive(Clone, Copy)]
     struct StaticSeqDesc {
         named_id: u16,
-        loc_len: u8,
-        loc_first: u32,
-        loc_t0: u64,
-        loc_t1: u64,
-        loc_t2: u64,
+        packed_loc: PackedLocations,
         ticks_shift: u8,
         total_shift: u8,
         len: u8,
@@ -66,11 +62,7 @@ pub(crate) fn try_query_fast_pow2_slowcat_static_int(
 
     let empty_desc = StaticSeqDesc {
         named_id: 0,
-        loc_len: 0,
-        loc_first: 0,
-        loc_t0: 0,
-        loc_t1: 0,
-        loc_t2: 0,
+        packed_loc: PackedLocations::EMPTY,
         ticks_shift: 0,
         total_shift: 0,
         len: 0,
@@ -99,7 +91,7 @@ pub(crate) fn try_query_fast_pow2_slowcat_static_int(
             return None;
         };
         let desc = layer.listing().with_grid_view(|grid| {
-            if grid.rare.is_some() || !grid.ticks.is_power_of_two() {
+            if grid.rare.is_some_and(SpareRare::has_cuts) || !grid.ticks.is_power_of_two() {
                 return None;
             }
             let GridStepsRef::Small(steps) = grid.steps else {
@@ -144,14 +136,10 @@ pub(crate) fn try_query_fast_pow2_slowcat_static_int(
                 Some(dress) => dress.around_owned(step_loc),
                 None => step_loc,
             };
-            let (loc_len, loc_first, loc_t0, loc_t1, loc_t2) = dressed.as_packed_copy()?.parts();
+            let packed_loc = dressed.as_packed_copy()?;
             Some(StaticSeqDesc {
                 named_id,
-                loc_len,
-                loc_first,
-                loc_t0,
-                loc_t1,
-                loc_t2,
+                packed_loc,
                 ticks_shift: ticks_shift as u8,
                 total_shift: total_shift as u8,
                 len: met as u8,
@@ -203,39 +191,44 @@ pub(crate) fn try_query_fast_pow2_slowcat_static_int(
         let total_shift = u32::from(d.total_shift);
         let met = usize::from(d.len);
         let named_id = d.named_id;
-        let (ll, lf, lt0, lt1, lt2) = (d.loc_len, d.loc_first, d.loc_t0, d.loc_t1, d.loc_t2);
+        let packed_loc = d.packed_loc;
         if d.uniform_unit {
-            let mut cur_b = Fraction::dyadic_i64_in_bounds(offset, total_shift);
+            let (mut cur_bn, mut cur_bd) = Fraction::dyadic_i64_parts(offset, total_shift);
             out.extend(d.ints[..met].iter().enumerate().map(|(i, &iv)| {
-                let b = cur_b;
-                let e = Fraction::dyadic_i64_in_bounds(offset + i as i64 + 1, total_shift);
-                cur_b = e;
-                let ts = TimeSpan::new(b, e);
-                Hap::of_sequence(
-                    ts,
-                    ts,
+                let (bn, bd) = (cur_bn, cur_bd);
+                let (en, ed) = Fraction::dyadic_i64_parts(offset + i as i64 + 1, total_shift);
+                cur_bn = en;
+                cur_bd = ed;
+                Hap::of_whole_parts(
+                    bn,
+                    bd,
+                    en,
+                    ed,
                     Value::Object(crate::OrderedMap::from_static_int(named_id, iv, false)),
-                    Locations::from_packed_parts(ll, lf, lt0, lt1, lt2),
+                    Locations::from_packed_copy(packed_loc),
                     ContextKeys::default(),
                 )
             }));
         } else {
-            let mut cur_b =
-                Fraction::dyadic_i64_in_bounds(offset + i64::from(d.part_begin0), total_shift);
+            let (mut cur_bn, mut cur_bd) =
+                Fraction::dyadic_i64_parts(offset + i64::from(d.part_begin0), total_shift);
             out.extend(
                 d.part_ends[..met]
                     .iter()
                     .zip(&d.ints[..met])
                     .map(|(&pe, &iv)| {
-                        let b = cur_b;
-                        let e = Fraction::dyadic_i64_in_bounds(offset + i64::from(pe), total_shift);
-                        cur_b = e;
-                        let ts = TimeSpan::new(b, e);
-                        Hap::of_sequence(
-                            ts,
-                            ts,
+                        let (bn, bd) = (cur_bn, cur_bd);
+                        let (en, ed) =
+                            Fraction::dyadic_i64_parts(offset + i64::from(pe), total_shift);
+                        cur_bn = en;
+                        cur_bd = ed;
+                        Hap::of_whole_parts(
+                            bn,
+                            bd,
+                            en,
+                            ed,
                             Value::Object(crate::OrderedMap::from_static_int(named_id, iv, false)),
-                            Locations::from_packed_parts(ll, lf, lt0, lt1, lt2),
+                            Locations::from_packed_copy(packed_loc),
                             ContextKeys::default(),
                         )
                     }),
@@ -275,7 +268,7 @@ pub(crate) fn push_whole_cycle_scaled_pow2(
     let cycle_i64 = i64::try_from(cycle).ok()?;
     let listing = layer.listing();
     listing.with_grid_view(|grid| {
-        if grid.rare.is_some() || !grid.ticks.is_power_of_two() {
+        if grid.rare.is_some_and(SpareRare::has_cuts) || !grid.ticks.is_power_of_two() {
             return None;
         }
         let GridStepsRef::Small(steps) = grid.steps else {
@@ -341,32 +334,33 @@ pub(crate) fn push_whole_cycle_scaled_pow2(
                         return Some(Err(SequenceStop::Query));
                     }
                     out.reserve(met);
-                    let (ll, lf, lt0, lt1, lt2) = packed_loc.parts();
                     let dyadic_in_bounds = total_shift < 24
                         && offset.abs() <= (1i64 << 36)
                         && ticks_i64 <= (1i64 << 24);
                     let step_pairs = steps.iter().zip(&ints[..met]);
                     if contiguous {
                         if dyadic_in_bounds {
-                            let mut cur_b = Fraction::dyadic_i64_in_bounds(
+                            let (mut cur_bn, mut cur_bd) = Fraction::dyadic_i64_parts(
                                 offset + i64::from(steps[0].part_begin),
                                 total_shift,
                             );
                             out.extend(step_pairs.map(|(&s, &iv)| {
-                                let b = cur_b;
-                                let e = Fraction::dyadic_i64_in_bounds(
+                                let (bn, bd) = (cur_bn, cur_bd);
+                                let (en, ed) = Fraction::dyadic_i64_parts(
                                     offset + i64::from(s.part_end),
                                     total_shift,
                                 );
-                                cur_b = e;
-                                let ts = TimeSpan::new(b, e);
-                                Hap::of_sequence(
-                                    ts,
-                                    ts,
+                                cur_bn = en;
+                                cur_bd = ed;
+                                Hap::of_whole_parts(
+                                    bn,
+                                    bd,
+                                    en,
+                                    ed,
                                     Value::Object(crate::OrderedMap::from_static_int(
                                         named_id, iv, false,
                                     )),
-                                    Locations::from_packed_parts(ll, lf, lt0, lt1, lt2),
+                                    Locations::from_packed_copy(packed_loc),
                                     ContextKeys::default(),
                                 )
                             }));
@@ -389,7 +383,7 @@ pub(crate) fn push_whole_cycle_scaled_pow2(
                                     Value::Object(crate::OrderedMap::from_static_int(
                                         named_id, iv, false,
                                     )),
-                                    Locations::from_packed_parts(ll, lf, lt0, lt1, lt2),
+                                    Locations::from_packed_copy(packed_loc),
                                     ContextKeys::default(),
                                 )
                             }));
@@ -431,7 +425,7 @@ pub(crate) fn push_whole_cycle_scaled_pow2(
                                 Value::Object(crate::OrderedMap::from_static_int(
                                     named_id, iv, false,
                                 )),
-                                Locations::from_packed_parts(ll, lf, lt0, lt1, lt2),
+                                Locations::from_packed_copy(packed_loc),
                                 ContextKeys::default(),
                             )
                         }));
@@ -522,7 +516,7 @@ fn emit_single_layer_static_int_contiguous(
         .is_power_of_two()
         .then(|| grid.ticks.trailing_zeros())
         .filter(|&shift| shift < 24);
-    let mut pairs = [(Fraction::ZERO, 0i64, 0i8); MAX_STEPS];
+    let mut pairs = [(0i64, std::num::NonZeroU32::MIN, 0i64, 0i8); MAX_STEPS];
     if let Some(shift) = ticks_pow2 {
         for (dst, &s) in pairs[..len].iter_mut().zip(steps.iter()) {
             let Some(iv) = values
@@ -531,13 +525,10 @@ fn emit_single_layer_static_int_contiguous(
             else {
                 return false;
             };
-            let base_e = Fraction::dyadic_i64_in_bounds(i64::from(s.part_end), shift);
-            let cur_e = if first_shift == 0 {
-                base_e
-            } else {
-                base_e.add_i64_in_bounds(first_shift)
-            };
-            *dst = (cur_e, base_e.inline_step_raw(p_i64), iv);
+            let (bn, bd) = Fraction::dyadic_i64_parts(i64::from(s.part_end), shift);
+            let step_n = p_i64 * i64::from(bd.get());
+            let cur_n = bn + first_shift * i64::from(bd.get());
+            *dst = (cur_n, bd, step_n, iv);
         }
     } else {
         for (dst, &s) in pairs[..len].iter_mut().zip(steps.iter()) {
@@ -548,40 +539,43 @@ fn emit_single_layer_static_int_contiguous(
                 return false;
             };
             let base_e = grid.made_small_with(i64::from(s.part_end), None);
-            let cur_e = if first_shift == 0 {
-                base_e
-            } else {
-                base_e.add_i64_in_bounds(first_shift)
-            };
-            *dst = (cur_e, base_e.inline_step_raw(p_i64), iv);
+            let bd = std::num::NonZeroU32::new(base_e.denom() as u32)
+                .unwrap_or(std::num::NonZeroU32::MIN);
+            let bn = base_e.numer() as i64;
+            let step_n = p_i64 * i64::from(bd.get());
+            let cur_n = bn + first_shift * i64::from(bd.get());
+            *dst = (cur_n, bd, step_n, iv);
         }
     }
-    let base_b0 = if let Some(shift) = ticks_pow2 {
-        Fraction::dyadic_i64_in_bounds(i64::from(steps[0].part_begin), shift)
+    let (mut cur_b0_n, cur_b0_d) = if let Some(shift) = ticks_pow2 {
+        let (bn, bd) = Fraction::dyadic_i64_parts(i64::from(steps[0].part_begin), shift);
+        (bn + first_shift * i64::from(bd.get()), bd)
     } else {
-        grid.made_small_with(i64::from(steps[0].part_begin), None)
+        let base_b0 = grid.made_small_with(i64::from(steps[0].part_begin), None);
+        let bd =
+            std::num::NonZeroU32::new(base_b0.denom() as u32).unwrap_or(std::num::NonZeroU32::MIN);
+        (
+            base_b0.numer() as i64 + first_shift * i64::from(bd.get()),
+            bd,
+        )
     };
-    let mut cur_b0 = if first_shift == 0 {
-        base_b0
-    } else {
-        base_b0.add_i64_in_bounds(first_shift)
-    };
-    let b0_inc = base_b0.inline_step_raw(p_i64);
+    let b0_inc = p_i64 * i64::from(cur_b0_d.get());
 
-    let (ll, lf, lt0, lt1, lt2) = packed_loc.parts();
     out.reserve_exact(total_haps);
     let pair_slice = &mut pairs[..len];
     {
-        let mut cur_b = cur_b0;
-        out.extend(pair_slice.iter().map(|&(e, _, iv)| {
-            let b = cur_b;
-            cur_b = e;
-            let ts = TimeSpan::new(b, e);
-            Hap::of_sequence(
-                ts,
-                ts,
+        let (mut cur_bn, mut cur_bd) = (cur_b0_n, cur_b0_d);
+        out.extend(pair_slice.iter().map(|&(en, ed, _, iv)| {
+            let (bn, bd) = (cur_bn, cur_bd);
+            cur_bn = en;
+            cur_bd = ed;
+            Hap::of_whole_parts(
+                bn,
+                bd,
+                en,
+                ed,
                 Value::Object(crate::OrderedMap::from_static_int(named_id, iv, false)),
-                Locations::from_packed_parts(ll, lf, lt0, lt1, lt2),
+                Locations::from_packed_copy(packed_loc),
                 ContextKeys::default(),
             )
         }));
@@ -591,19 +585,21 @@ fn emit_single_layer_static_int_contiguous(
             out.truncate(from);
             return true;
         }
-        cur_b0 = cur_b0.add_inline_step_raw(b0_inc);
-        let mut cur_b = cur_b0;
+        cur_b0_n += b0_inc;
+        let (mut cur_bn, mut cur_bd) = (cur_b0_n, cur_b0_d);
         out.extend(pair_slice.iter_mut().map(|p| {
-            let b = cur_b;
-            let e = p.0.add_inline_step_raw(p.1);
-            p.0 = e;
-            cur_b = e;
-            let ts = TimeSpan::new(b, e);
-            Hap::of_sequence(
-                ts,
-                ts,
-                Value::Object(crate::OrderedMap::from_static_int(named_id, p.2, false)),
-                Locations::from_packed_parts(ll, lf, lt0, lt1, lt2),
+            let (bn, bd) = (cur_bn, cur_bd);
+            p.0 += p.2;
+            let (en, ed) = (p.0, p.1);
+            cur_bn = en;
+            cur_bd = ed;
+            Hap::of_whole_parts(
+                bn,
+                bd,
+                en,
+                ed,
+                Value::Object(crate::OrderedMap::from_static_int(named_id, p.3, false)),
+                Locations::from_packed_copy(packed_loc),
                 ContextKeys::default(),
             )
         }));
@@ -646,13 +642,18 @@ fn query_single_layer_sorted_onto(
         || span_e.abs() > (1i128 << 30)
         || (span_e - span_b) > MAX_QUERY_SPAN_CYCLES
         || p_cycles > (1i128 << 20)
-        || span_b.rem_euclid(p_cycles) != 0
-        || span_e.rem_euclid(p_cycles) != 0
     {
         return false;
     }
     let start_turn = span_b.div_euclid(p_cycles);
-    let end_turn = span_e.div_euclid(p_cycles);
+    let start_rem = span_b.rem_euclid(p_cycles);
+    let last_turn = (span_e - 1).div_euclid(p_cycles);
+    let end_rem = (span_e - 1).rem_euclid(p_cycles) + 1;
+    let partial = start_rem != 0 || end_rem != p_cycles;
+    if partial && !layer.in_cycles() {
+        return false;
+    }
+    let end_turn = last_turn + 1;
     let Some(turn_count) = usize::try_from(end_turn - start_turn).ok() else {
         return false;
     };
@@ -672,7 +673,7 @@ fn query_single_layer_sorted_onto(
     layer
         .listing()
         .with_grid_view(|grid| {
-            if grid.rare.is_some() {
+            if grid.rare.is_some_and(SpareRare::has_cuts) {
                 return false;
             }
             let GridStepsRef::Small(steps) = grid.steps else {
@@ -710,9 +711,43 @@ fn query_single_layer_sorted_onto(
                 }
                 prev = s;
             }
-            let Some(total_haps) = len.checked_mul(turn_count) else {
-                return false;
+            let first_start = if start_rem == 0 {
+                0
+            } else {
+                let cut = (start_rem as u64) * u64::from(ticks_u32);
+                let idx = steps.partition_point(|s| u64::from(s.part_begin) < cut);
+                if idx > 0 && u64::from(steps[idx - 1].part_end) > cut {
+                    return false;
+                }
+                idx
             };
+            let last_end = if end_rem == p_cycles {
+                len
+            } else {
+                let cut = (end_rem as u64) * u64::from(ticks_u32);
+                let idx = steps.partition_point(|s| u64::from(s.part_begin) < cut);
+                if idx > 0 && u64::from(steps[idx - 1].part_end) > cut {
+                    return false;
+                }
+                idx
+            };
+            let total_haps = if turn_count == 1 {
+                last_end.saturating_sub(first_start)
+            } else {
+                let Some(mid) = (turn_count - 2).checked_mul(len) else {
+                    return false;
+                };
+                let Some(t) = (len - first_start)
+                    .checked_add(mid)
+                    .and_then(|v| v.checked_add(last_end))
+                else {
+                    return false;
+                };
+                t
+            };
+            if total_haps == 0 {
+                return true;
+            }
             if !thread.charge(total_haps) {
                 return true;
             }
@@ -728,7 +763,8 @@ fn query_single_layer_sorted_onto(
             // Zero-Arc contiguous `StaticInt` + uniform `PackedLocations` + empty
             // keys fast path: fuses time, step-delta, and value setup into one
             // pass with a small stack frame.
-            if contiguous
+            if !partial
+                && contiguous
                 && bounds_ok_by_ticks
                 && empty_keys
                 && uniform_loc
@@ -774,6 +810,8 @@ fn query_single_layer_sorted_onto(
                 end_i64,
                 first_shift,
                 last_shift,
+                first_start,
+                last_end,
                 total_haps,
                 from,
                 out,
@@ -798,12 +836,15 @@ fn emit_single_layer_general(
     end_i64: i64,
     first_shift: i64,
     last_shift: i64,
+    first_start: usize,
+    last_end: usize,
     total_haps: usize,
     from: usize,
     out: &mut Vec<Hap>,
 ) -> bool {
     const MAX_STEPS: usize = 64;
     let len = steps.len();
+    let partial = first_start != 0 || last_end != len;
     let ticks_pow2 = grid
         .ticks
         .is_power_of_two()
@@ -863,7 +904,8 @@ fn emit_single_layer_general(
         }
     }
 
-    if empty_keys
+    if !partial
+        && empty_keys
         && uniform_loc
         && maker.contexts.is_none()
         && let Values::SingleBuiltin(_, _, named_id, values) = maker.values
@@ -999,21 +1041,31 @@ fn emit_single_layer_general(
             None => step_loc,
         }
     });
-    let base_locs: Option<Vec<Locations>> = single_loc.is_none().then(|| {
-        (0..len)
-            .map(|i| {
-                if let Some(contexts) = maker.contexts {
-                    contexts[i].clone()
-                } else {
-                    let step_loc = grid.locations(i);
-                    match maker.loc_dress {
-                        Some(dress) => dress.around_owned(step_loc),
-                        None => step_loc,
-                    }
+    let mut base_locs: [Locations; MAX_STEPS] = [const { Locations::new() }; MAX_STEPS];
+    let mut packed_locs = [Locations::new().as_packed_copy().expect("empty packed"); MAX_STEPS];
+    let mut all_packed = false;
+    if single_loc.is_none() {
+        all_packed = true;
+        for i in 0..len {
+            let loc = if let Some(contexts) = maker.contexts {
+                contexts[i].clone()
+            } else {
+                let step_loc = grid.locations(i);
+                match maker.loc_dress {
+                    Some(dress) => dress.around_owned(step_loc),
+                    None => step_loc,
                 }
-            })
-            .collect()
-    });
+            };
+            if all_packed {
+                if let Some(p) = loc.as_packed_copy() {
+                    packed_locs[i] = p;
+                } else {
+                    all_packed = false;
+                }
+            }
+            base_locs[i] = loc;
+        }
+    }
     let single_packed = single_loc.as_ref().and_then(Locations::as_packed_copy);
 
     out.reserve_exact(total_haps);
@@ -1022,14 +1074,28 @@ fn emit_single_layer_general(
             out.truncate(from);
             return true;
         }
+        let lo = if turn_idx == start_i64 {
+            first_start
+        } else {
+            0
+        };
+        let hi = if turn_idx == end_i64 - 1 {
+            last_end
+        } else {
+            len
+        };
+        if lo >= hi {
+            continue;
+        }
         let shift = turn_idx * p_i64;
         if let Some(packed_loc) = single_packed {
             if contiguous {
-                let mut cur_b = base_b[0].add_i64_in_bounds(shift);
+                let first_b = if lo == 0 { base_b[0] } else { base_e[lo - 1] };
+                let mut cur_b = first_b.add_i64_in_bounds(shift);
                 out.extend(
-                    base_e[..len]
+                    base_e[lo..hi]
                         .iter()
-                        .zip(&base_values[..len])
+                        .zip(&base_values[lo..hi])
                         .map(|(&be, val)| {
                             let b = cur_b;
                             let e = be.add_i64_in_bounds(shift);
@@ -1050,7 +1116,7 @@ fn emit_single_layer_general(
                         }),
                 );
             } else {
-                out.extend((0..len).map(|i| {
+                out.extend((lo..hi).map(|i| {
                     let ts = TimeSpan::new(
                         base_b[i].add_i64_in_bounds(shift),
                         base_e[i].add_i64_in_bounds(shift),
@@ -1069,16 +1135,38 @@ fn emit_single_layer_general(
                     )
                 }));
             }
+        } else if all_packed && contiguous {
+            let first_b = if lo == 0 { base_b[0] } else { base_e[lo - 1] };
+            let mut cur_b = first_b.add_i64_in_bounds(shift);
+            out.extend((lo..hi).map(|i| {
+                let b = cur_b;
+                let e = base_e[i].add_i64_in_bounds(shift);
+                cur_b = e;
+                let ts = TimeSpan::new(b, e);
+                let keys = if empty_keys {
+                    ContextKeys::default()
+                } else {
+                    maker.keys.clone()
+                };
+                Hap::of_sequence(
+                    ts,
+                    ts,
+                    base_values[i].clone(),
+                    Locations::from_packed_copy(packed_locs[i]),
+                    keys,
+                )
+            }));
         } else if contiguous {
-            let mut cur_b = base_b[0].add_i64_in_bounds(shift);
-            out.extend((0..len).map(|i| {
+            let first_b = if lo == 0 { base_b[0] } else { base_e[lo - 1] };
+            let mut cur_b = first_b.add_i64_in_bounds(shift);
+            out.extend((lo..hi).map(|i| {
                 let b = cur_b;
                 let e = base_e[i].add_i64_in_bounds(shift);
                 cur_b = e;
                 let ts = TimeSpan::new(b, e);
                 let loc = match &single_loc {
                     Some(loc) => loc.clone(),
-                    None => base_locs.as_deref().expect("non-uniform locs")[i].clone(),
+                    None => base_locs[i].clone(),
                 };
                 let keys = if empty_keys {
                     ContextKeys::default()
@@ -1088,14 +1176,14 @@ fn emit_single_layer_general(
                 Hap::of_sequence(ts, ts, base_values[i].clone(), loc, keys)
             }));
         } else {
-            out.extend((0..len).map(|i| {
+            out.extend((lo..hi).map(|i| {
                 let ts = TimeSpan::new(
                     base_b[i].add_i64_in_bounds(shift),
                     base_e[i].add_i64_in_bounds(shift),
                 );
                 let loc = match &single_loc {
                     Some(loc) => loc.clone(),
-                    None => base_locs.as_deref().expect("non-uniform locs")[i].clone(),
+                    None => base_locs[i].clone(),
                 };
                 let keys = if empty_keys {
                     ContextKeys::default()
@@ -1130,6 +1218,12 @@ pub(crate) fn query_sequence_sorted_onto(
         return true;
     }
     let k = layers.len();
+    if (1..=16).contains(&k)
+        && state.span.begin < state.span.end
+        && (state.span.begin.denom() != 1 || state.span.end.denom() != 1)
+    {
+        return query_multi_window_sorted_onto(thread, layers, state, out);
+    }
     if k == 1 {
         return query_single_layer_sorted_onto(thread, layers, state, out);
     }
@@ -1140,6 +1234,1408 @@ pub(crate) fn query_sequence_sorted_onto(
         return query_multi_sorted_inner::<16, 128, 256>(thread, layers, state, out);
     }
     false
+}
+
+/// Fast single-cycle fractional window path (e.g. `1/8`-cycle playback windows)
+/// for `1..=16` periodic small-grid layers. Computes exact tick overlap in `i64`
+/// without `i128` division, `Fraction` division, or per-layer `Layer::query_onto`
+/// setup.
+pub(crate) fn query_multi_window_sorted_onto(
+    thread: &QueryThread,
+    layers: &Arc<[Layer]>,
+    state: &State,
+    out: &mut Vec<Hap>,
+) -> bool {
+    let from = out.len();
+    let budget = thread.hap_budget();
+    match query_multi_window_sorted_budgeted(layers, state, budget, out) {
+        Ok(true) => {
+            let added = out.len() - from;
+            if added > 0 {
+                thread.note_accumulated(added);
+                thread.note_materialised(added);
+            }
+            true
+        }
+        Ok(false) => false,
+        Err(limit) => {
+            refuse(limit);
+            true
+        }
+    }
+}
+
+/// Ultra-compact direct window emission for a single-layer `period == 1`
+/// `CompactGrid::Uniform(count)` sequence (e.g. `n("0 .. 7").scale(...).s(...)`).
+/// Computes active step indices in O(1) without binary search, step loads, or
+/// multi-layer frame setup.
+#[inline(never)]
+pub(crate) fn try_query_single_uniform_window(
+    layers: &Arc<[Layer]>,
+    state: &State,
+    hap_budget: u64,
+) -> Option<Result<Vec<Hap>, QueryLimit>> {
+    let layer = layers.first()?;
+    if layers.len() != 1 || layer.small_period_parts() != Some((1, 1)) || !layer.is_direct() {
+        return None;
+    }
+    let dress = layer.dress();
+    if dress.tail.is_some() {
+        return None;
+    }
+    let Some(FastSmallGrid::Uniform { count }) = layer.listing_fast_uncut() else {
+        return None;
+    };
+    let n = usize::from(count);
+    if n == 0 {
+        return Some(Ok(Vec::new()));
+    }
+    let span = state.span;
+    let (Ok(bn_i32), Ok(en_i32), Ok(sbd_u16), Ok(sed_u16)) = (
+        i32::try_from(span.begin.numer()),
+        i32::try_from(span.end.numer()),
+        u16::try_from(span.begin.denom()),
+        u16::try_from(span.end.denom()),
+    ) else {
+        return None;
+    };
+    let bn = i64::from(bn_i32);
+    let en = i64::from(en_i32);
+    let sbd = i64::from(sbd_u16);
+    let sed = i64::from(sed_u16);
+    if bn.abs() > (1i64 << 30)
+        || en.abs() > (1i64 << 30)
+        || bn * sed >= en * sbd
+        || !sbd_u16.is_power_of_two()
+        || !sed_u16.is_power_of_two()
+    {
+        return None;
+    }
+    let b_sh = sbd_u16.trailing_zeros();
+    let e_sh = sed_u16.trailing_zeros();
+    let cycle = bn >> b_sh;
+    if cycle != ((en - 1) >> e_sh) {
+        return None;
+    }
+    let ticks = u32::from(count);
+    if cycle
+        .unsigned_abs()
+        .saturating_mul(u64::from(ticks))
+        .saturating_add(u64::from(ticks))
+        > i32::MAX as u64
+    {
+        return None;
+    }
+    let sbn = bn - (cycle << b_sh);
+    let sen = en - (cycle << e_sh);
+    let t = i64::from(ticks);
+    let lo_num = sbn * t;
+    let hi_num = sen * t;
+    let i_lo = (lo_num >> b_sh).max(0) as usize;
+    let i_hi = (((hi_num + sed - 1) >> e_sh) as usize).min(n);
+    if i_lo >= i_hi {
+        return Some(Ok(Vec::new()));
+    }
+    let emit = i_hi - i_lo;
+    if emit as u64 > hap_budget {
+        return Some(Err(QueryLimit::HapBudget { budget: hap_budget }));
+    }
+    let shift_ticks = cycle * t;
+    let single_builtin_id =
+        if layer.is_direct_keyed() && layer.named_id != 0 && !dress.has_set_map() {
+            layer.named_id
+        } else {
+            0
+        };
+    let packed_ctx =
+        PackedLocations::from_words([dress.before_packed[0], dress.before_packed[1], 0, 0]);
+    let dress_keys = dress.keys();
+    let keys_empty = dress_keys.is_empty();
+    let span_bd_nz = std::num::NonZeroU16::new(sbd_u16).expect("positive span denom <= 65535");
+    let span_ed_nz = std::num::NonZeroU16::new(sed_u16).expect("positive span denom <= 65535");
+    let make_hap =
+        |i: usize, wbn: i64, wbd: std::num::NonZeroU32, wen: i64, wed: std::num::NonZeroU32| {
+            let sb = i as i64;
+            let se = sb + 1;
+            let value = if single_builtin_id != 0
+                && let Some(iv) = crate::value::static_int_of(&layer.values[i])
+            {
+                Value::Object(crate::OrderedMap::from_static_int(
+                    single_builtin_id,
+                    iv,
+                    false,
+                ))
+            } else {
+                Value::Object(crate::OrderedMap::from_seq_layer(layers, 0, i as u32))
+            };
+            let context = Locations::from_packed_copy(packed_ctx);
+            let keys = if keys_empty {
+                ContextKeys::default()
+            } else {
+                dress_keys.clone()
+            };
+            let clip_lo = (sb << b_sh) < lo_num;
+            let clip_hi = (se << e_sh) > hi_num;
+            if !clip_lo && !clip_hi {
+                Hap::of_whole_parts(wbn, wbd, wen, wed, value, context, keys)
+            } else {
+                let wbd16 =
+                    std::num::NonZeroU16::new(wbd.get() as u16).expect("grid denom <= 65535");
+                let wed16 =
+                    std::num::NonZeroU16::new(wed.get() as u16).expect("grid denom <= 65535");
+                let (pbn32, pbd16) = if clip_lo {
+                    (bn_i32, span_bd_nz)
+                } else {
+                    (wbn as i32, wbd16)
+                };
+                let (pen32, ped16) = if clip_hi {
+                    (en_i32, span_ed_nz)
+                } else {
+                    (wen as i32, wed16)
+                };
+                Hap::of_cut_small(
+                    pbn32, pbd16, pen32, ped16, wbn as i32, wbd16, wen as i32, wed16, value,
+                    context, keys,
+                )
+            }
+        };
+    let mut out = Vec::with_capacity(emit);
+    if ticks.is_power_of_two() {
+        let sh = ticks.trailing_zeros();
+        out.extend((i_lo..i_hi).map(|i| {
+            let sb = i as i64;
+            let (wbn, wbd) = Fraction::dyadic_i64_parts(shift_ticks + sb, sh);
+            let (wen, wed) = Fraction::dyadic_i64_parts(shift_ticks + sb + 1, sh);
+            make_hap(i, wbn, wbd, wen, wed)
+        }));
+    } else {
+        out.extend((i_lo..i_hi).map(|i| {
+            let sb = i as i64;
+            let (wbn, wbd) = crate::query::reduce_i64_u32(shift_ticks + sb, ticks);
+            let (wen, wed) = crate::query::reduce_i64_u32(shift_ticks + sb + 1, ticks);
+            make_hap(i, wbn, wbd, wen, wed)
+        }));
+    }
+    Some(Ok(out))
+}
+
+/// Budget-parameterized core of [`query_multi_window_sorted_onto`] so top-level
+/// leaf queries check the hap budget in a register without TLS round-trips.
+///
+/// The hot loop handles power-of-two fractional windows over direct, uncut,
+/// small-grid layers with zero `Fraction` construction, zero `GridView` stack
+/// spills, and zero `Option<Locations>` drop glue. Any rare layer (cuts,
+/// complex dress, spare locations, lazy `Table`, non-pow2 span) delegates to a
+/// cold out-of-line helper so this function stays tiny and register-resident.
+pub(crate) fn query_multi_window_sorted_budgeted(
+    layers: &Arc<[Layer]>,
+    state: &State,
+    hap_budget: Option<u64>,
+    out: &mut Vec<Hap>,
+) -> Result<bool, QueryLimit> {
+    let span = state.span;
+    let (Ok(span_bn_i32), Ok(span_en_i32), Ok(sbd_u16), Ok(sed_u16)) = (
+        i32::try_from(span.begin.numer()),
+        i32::try_from(span.end.numer()),
+        u16::try_from(span.begin.denom()),
+        u16::try_from(span.end.denom()),
+    ) else {
+        return Ok(false);
+    };
+    let bn = i64::from(span_bn_i32);
+    let en = i64::from(span_en_i32);
+    let sbd = i64::from(sbd_u16);
+    let sed = i64::from(sed_u16);
+    if bn.abs() > (1i64 << 30) || en.abs() > (1i64 << 30) || bn * sed >= en * sbd {
+        return Ok(false);
+    }
+    if !sbd_u16.is_power_of_two() || !sed_u16.is_power_of_two() {
+        return query_multi_window_sorted_general(layers, state, hap_budget, out);
+    }
+    let b_sh = sbd_u16.trailing_zeros();
+    let e_sh = sed_u16.trailing_zeros();
+    let cycle = bn >> b_sh;
+    if cycle != ((en - 1) >> e_sh) {
+        return Ok(false);
+    }
+    let sbn = bn - (cycle << b_sh);
+    let sen = en - (cycle << e_sh);
+    let span_bd_nz = std::num::NonZeroU16::new(sbd_u16).expect("positive span denom <= 65535");
+    let span_ed_nz = std::num::NonZeroU16::new(sed_u16).expect("positive span denom <= 65535");
+    let single_layer = layers.len() == 1;
+    let from = out.len();
+    let abs_cycle = cycle.unsigned_abs();
+
+    for (layer_idx, layer) in layers.iter().enumerate() {
+        let Some((p_num, p_den)) = layer.small_period_parts() else {
+            return query_layer_window_slow_from(layers, layer_idx, state, hap_budget, from, out);
+        };
+        let (p_cycles, q) = if p_den == 1 && p_num > 0 {
+            (p_num, 1i64)
+        } else if p_num == 1 && p_den > 1 && p_den <= 64 {
+            (1i64, p_den)
+        } else {
+            out.truncate(from);
+            return Ok(false);
+        };
+        let (shift, turn_off) = if q > 1 || p_cycles == 1 {
+            (cycle, 0i64)
+        } else if (p_cycles as u64).is_power_of_two() {
+            let t = cycle & (p_cycles - 1);
+            (cycle - t, t)
+        } else {
+            let t = cycle.rem_euclid(p_cycles);
+            (cycle - t, t)
+        };
+        let dress = layer.dress();
+        if !layer.is_direct() || dress.tail.is_some() {
+            match query_layer_window_slow(
+                layers,
+                layer_idx,
+                layer,
+                p_cycles,
+                q,
+                shift,
+                turn_off,
+                bn,
+                en,
+                sbd,
+                sed,
+                Some(b_sh),
+                Some(e_sh),
+                sbn,
+                sen,
+                span_bn_i32,
+                span_en_i32,
+                span_bd_nz,
+                span_ed_nz,
+                single_layer,
+                hap_budget,
+                from,
+                out,
+            )? {
+                true => continue,
+                false => {
+                    out.truncate(from);
+                    return Ok(false);
+                }
+            }
+        }
+        let Some(fast_grid) = layer.listing_fast_uncut() else {
+            match query_layer_window_slow(
+                layers,
+                layer_idx,
+                layer,
+                p_cycles,
+                q,
+                shift,
+                turn_off,
+                bn,
+                en,
+                sbd,
+                sed,
+                Some(b_sh),
+                Some(e_sh),
+                sbn,
+                sen,
+                span_bn_i32,
+                span_en_i32,
+                span_bd_nz,
+                span_ed_nz,
+                single_layer,
+                hap_budget,
+                from,
+                out,
+            )? {
+                true => continue,
+                false => {
+                    out.truncate(from);
+                    return Ok(false);
+                }
+            }
+        };
+        let single_builtin_id =
+            if layer.is_direct_keyed() && layer.named_id != 0 && !dress.has_set_map() {
+                layer.named_id
+            } else {
+                0
+            };
+        let (before0, before1) = (dress.before_packed[0], dress.before_packed[1]);
+        let direct_keys = dress.keys();
+        let direct_keys_empty = direct_keys.is_empty();
+
+        match fast_grid {
+            FastSmallGrid::Uniform { count } => {
+                let n = usize::from(count);
+                if n == 0 {
+                    continue;
+                }
+                let ticks_u32 = u32::from(count);
+                let t = i64::from(ticks_u32);
+                let (bound_ticks, sub_ticks, u_lo, u_hi) = if q > 1 {
+                    let st = if t == q {
+                        1i64
+                    } else if t % q == 0 {
+                        t / q
+                    } else {
+                        out.truncate(from);
+                        return Ok(false);
+                    };
+                    (st, st, (sbn * q) >> b_sh, (sen * q + sed - 1) >> e_sh)
+                } else {
+                    (p_cycles * t, 0i64, 0i64, 1i64)
+                };
+                if !layer.in_cycles() && t > bound_ticks {
+                    out.truncate(from);
+                    return Ok(false);
+                }
+                let (lo_num, hi_num) = if turn_off == 0 {
+                    (sbn * t, sen * t)
+                } else {
+                    (turn_off * t * sbd + sbn * t, turn_off * t * sed + sen * t)
+                };
+                let lo_tick = lo_num >> b_sh;
+                let hi_tick = (hi_num + sed - 1) >> e_sh;
+                if (q == 1 && (t <= lo_tick || hi_tick <= 0)) || u_lo >= u_hi {
+                    continue;
+                }
+                if abs_cycle
+                    .saturating_mul(u64::from(ticks_u32))
+                    .saturating_add(bound_ticks as u64)
+                    > i32::MAX as u64
+                {
+                    match query_layer_window_slow(
+                        layers,
+                        layer_idx,
+                        layer,
+                        p_cycles,
+                        q,
+                        shift,
+                        turn_off,
+                        bn,
+                        en,
+                        sbd,
+                        sed,
+                        Some(b_sh),
+                        Some(e_sh),
+                        sbn,
+                        sen,
+                        span_bn_i32,
+                        span_en_i32,
+                        span_bd_nz,
+                        span_ed_nz,
+                        single_layer,
+                        hap_budget,
+                        from,
+                        out,
+                    )? {
+                        true => continue,
+                        false => {
+                            out.truncate(from);
+                            return Ok(false);
+                        }
+                    }
+                }
+                let packed_ctx = PackedLocations::from_words([before0, before1, 0, 0]);
+                let ticks_pow2 = ticks_u32
+                    .is_power_of_two()
+                    .then(|| ticks_u32.trailing_zeros());
+                let shift_ticks = shift * t;
+                for u in u_lo..u_hi {
+                    let tick_off = u * sub_ticks;
+                    let i_lo = (lo_tick - tick_off).max(0) as usize;
+                    let i_hi = ((hi_tick - tick_off).max(0) as usize).min(n);
+                    for i in i_lo..i_hi {
+                        if let Some(limit) = hap_budget
+                            && (out.len() - from + 1) as u64 > limit
+                        {
+                            out.truncate(from);
+                            return Err(QueryLimit::HapBudget { budget: limit });
+                        }
+                        if out.capacity() == from {
+                            reserve_window_initial(
+                                out,
+                                from,
+                                single_layer,
+                                i_hi - i_lo,
+                                layers.len(),
+                            );
+                        }
+                        let sb = tick_off + i as i64;
+                        let se = sb + 1;
+                        let (wbn, wbd) = match ticks_pow2 {
+                            Some(sh) => Fraction::dyadic_i64_parts(shift_ticks + sb, sh),
+                            None => crate::query::reduce_i64_u32(shift_ticks + sb, ticks_u32),
+                        };
+                        let (wen, wed) = match ticks_pow2 {
+                            Some(sh) => Fraction::dyadic_i64_parts(shift_ticks + se, sh),
+                            None => crate::query::reduce_i64_u32(shift_ticks + se, ticks_u32),
+                        };
+                        let value = if single_builtin_id != 0
+                            && let Some(iv) = crate::value::static_int_of(&layer.values[i])
+                        {
+                            Value::Object(crate::OrderedMap::from_static_int(
+                                single_builtin_id,
+                                iv,
+                                false,
+                            ))
+                        } else {
+                            Value::Object(crate::OrderedMap::from_seq_layer(
+                                layers,
+                                layer_idx as u16,
+                                i as u32,
+                            ))
+                        };
+                        let context = Locations::from_packed_copy(packed_ctx);
+                        let keys = if direct_keys_empty {
+                            ContextKeys::default()
+                        } else {
+                            direct_keys.clone()
+                        };
+                        let clip_lo = (sb << b_sh) < lo_num;
+                        let clip_hi = (se << e_sh) > hi_num;
+                        let hap = if !clip_lo && !clip_hi {
+                            Hap::of_whole_parts(wbn, wbd, wen, wed, value, context, keys)
+                        } else {
+                            let wbd16 = std::num::NonZeroU16::new(wbd.get() as u16)
+                                .expect("grid denom <= 65535");
+                            let wed16 = std::num::NonZeroU16::new(wed.get() as u16)
+                                .expect("grid denom <= 65535");
+                            let (pbn32, pbd16) = if clip_lo {
+                                (span_bn_i32, span_bd_nz)
+                            } else {
+                                (wbn as i32, wbd16)
+                            };
+                            let (pen32, ped16) = if clip_hi {
+                                (span_en_i32, span_ed_nz)
+                            } else {
+                                (wen as i32, wed16)
+                            };
+                            Hap::of_cut_small(
+                                pbn32, pbd16, pen32, ped16, wbn as i32, wbd16, wen as i32, wed16,
+                                value, context, keys,
+                            )
+                        };
+                        out.push(hap);
+                    }
+                }
+            }
+            FastSmallGrid::OneStep {
+                ticks: ticks_u32,
+                base: grid_base,
+                part_begin,
+                part_end,
+                value: step_val,
+                loc: step_loc,
+            } => {
+                let t = i64::from(ticks_u32);
+                let (bound_ticks, sub_ticks, u_lo, u_hi) = if q > 1 {
+                    let st = if t == q {
+                        1i64
+                    } else if t % q == 0 {
+                        t / q
+                    } else {
+                        out.truncate(from);
+                        return Ok(false);
+                    };
+                    (st, st, (sbn * q) >> b_sh, (sen * q + sed - 1) >> e_sh)
+                } else {
+                    (p_cycles * t, 0i64, 0i64, 1i64)
+                };
+                if !layer.in_cycles() && i64::from(part_end) > bound_ticks {
+                    out.truncate(from);
+                    return Ok(false);
+                }
+                let (lo_num, hi_num) = if turn_off == 0 {
+                    (sbn * t, sen * t)
+                } else {
+                    (turn_off * t * sbd + sbn * t, turn_off * t * sed + sen * t)
+                };
+                let lo_tick = lo_num >> b_sh;
+                let hi_tick = (hi_num + sed - 1) >> e_sh;
+                if q == 1 && (i64::from(part_begin) >= hi_tick || i64::from(part_end) <= lo_tick) {
+                    continue;
+                }
+                if u_lo >= u_hi {
+                    continue;
+                }
+                if (step_loc & SmallGridStep::SPARE) != 0
+                    || abs_cycle
+                        .saturating_mul(u64::from(ticks_u32))
+                        .saturating_add(bound_ticks as u64)
+                        > i32::MAX as u64
+                {
+                    match query_layer_window_slow(
+                        layers,
+                        layer_idx,
+                        layer,
+                        p_cycles,
+                        q,
+                        shift,
+                        turn_off,
+                        bn,
+                        en,
+                        sbd,
+                        sed,
+                        Some(b_sh),
+                        Some(e_sh),
+                        sbn,
+                        sen,
+                        span_bn_i32,
+                        span_en_i32,
+                        span_bd_nz,
+                        span_ed_nz,
+                        single_layer,
+                        hap_budget,
+                        from,
+                        out,
+                    )? {
+                        true => continue,
+                        false => {
+                            out.truncate(from);
+                            return Ok(false);
+                        }
+                    }
+                }
+                let packed_ctx = if step_loc == 0 {
+                    PackedLocations::from_words([before0, before1, 0, 0])
+                } else {
+                    let begin = grid_base + u32::from(step_loc >> SmallGridStep::LENGTH_BITS);
+                    let length = u32::from((step_loc & SmallGridStep::LENGTH_MASK) - 1);
+                    let Some(sp) = Locations::pack_small(begin, length) else {
+                        match query_layer_window_slow(
+                            layers,
+                            layer_idx,
+                            layer,
+                            p_cycles,
+                            q,
+                            shift,
+                            turn_off,
+                            bn,
+                            en,
+                            sbd,
+                            sed,
+                            Some(b_sh),
+                            Some(e_sh),
+                            sbn,
+                            sen,
+                            span_bn_i32,
+                            span_en_i32,
+                            span_bd_nz,
+                            span_ed_nz,
+                            single_layer,
+                            hap_budget,
+                            from,
+                            out,
+                        )? {
+                            true => continue,
+                            false => {
+                                out.truncate(from);
+                                return Ok(false);
+                            }
+                        }
+                    };
+                    if before0 == 0 {
+                        PackedLocations::from_words([sp, 0, 0, 0])
+                    } else if before1 == 0 {
+                        PackedLocations::from_words([before0, sp, 0, 0])
+                    } else {
+                        PackedLocations::from_words([before0, before1, sp, 0])
+                    }
+                };
+                let static_int = if single_builtin_id != 0 {
+                    crate::value::static_int_of(&layer.values[usize::from(step_val)])
+                } else {
+                    None
+                };
+                let ticks_pow2 = ticks_u32
+                    .is_power_of_two()
+                    .then(|| ticks_u32.trailing_zeros());
+                let shift_ticks = shift * t;
+                let pb = i64::from(part_begin);
+                let pe = i64::from(part_end);
+                for u in u_lo..u_hi {
+                    let tick_off = u * sub_ticks;
+                    let sb = tick_off + pb;
+                    let se = tick_off + pe;
+                    if sb >= hi_tick || se <= lo_tick {
+                        continue;
+                    }
+                    if let Some(limit) = hap_budget
+                        && (out.len() - from + 1) as u64 > limit
+                    {
+                        out.truncate(from);
+                        return Err(QueryLimit::HapBudget { budget: limit });
+                    }
+                    if out.capacity() == from {
+                        reserve_window_initial(
+                            out,
+                            from,
+                            single_layer,
+                            (u_hi - u_lo) as usize,
+                            layers.len(),
+                        );
+                    }
+                    let (wbn, wbd) = match ticks_pow2 {
+                        Some(sh) => Fraction::dyadic_i64_parts(shift_ticks + sb, sh),
+                        None => crate::query::reduce_i64_u32(shift_ticks + sb, ticks_u32),
+                    };
+                    let (wen, wed) = match ticks_pow2 {
+                        Some(sh) => Fraction::dyadic_i64_parts(shift_ticks + se, sh),
+                        None => crate::query::reduce_i64_u32(shift_ticks + se, ticks_u32),
+                    };
+                    let value = match static_int {
+                        Some(n) => Value::Object(crate::OrderedMap::from_static_int(
+                            single_builtin_id,
+                            n,
+                            false,
+                        )),
+                        None => Value::Object(crate::OrderedMap::from_seq_layer(
+                            layers,
+                            layer_idx as u16,
+                            u32::from(step_val),
+                        )),
+                    };
+                    let context = Locations::from_packed_copy(packed_ctx);
+                    let keys = if direct_keys_empty {
+                        ContextKeys::default()
+                    } else {
+                        direct_keys.clone()
+                    };
+                    let clip_lo = (sb << b_sh) < lo_num;
+                    let clip_hi = (se << e_sh) > hi_num;
+                    let hap = if !clip_lo && !clip_hi {
+                        Hap::of_whole_parts(wbn, wbd, wen, wed, value, context, keys)
+                    } else {
+                        let wbd16 = std::num::NonZeroU16::new(wbd.get() as u16)
+                            .expect("grid denom <= 65535");
+                        let wed16 = std::num::NonZeroU16::new(wed.get() as u16)
+                            .expect("grid denom <= 65535");
+                        let (pbn32, pbd16) = if clip_lo {
+                            (span_bn_i32, span_bd_nz)
+                        } else {
+                            (wbn as i32, wbd16)
+                        };
+                        let (pen32, ped16) = if clip_hi {
+                            (span_en_i32, span_ed_nz)
+                        } else {
+                            (wen as i32, wed16)
+                        };
+                        Hap::of_cut_small(
+                            pbn32, pbd16, pen32, ped16, wbn as i32, wbd16, wen as i32, wed16,
+                            value, context, keys,
+                        )
+                    };
+                    out.push(hap);
+                }
+            }
+            FastSmallGrid::Slice {
+                ticks: ticks_u32,
+                base: grid_base,
+                steps,
+            } => {
+                if steps.is_empty() {
+                    continue;
+                }
+                if ticks_u32 > 65_535 {
+                    out.truncate(from);
+                    return Ok(false);
+                }
+                let t = i64::from(ticks_u32);
+                let (bound_ticks, sub_ticks, u_lo, u_hi) = if q > 1 {
+                    let st = if t == q {
+                        1i64
+                    } else if t % q == 0 {
+                        t / q
+                    } else {
+                        out.truncate(from);
+                        return Ok(false);
+                    };
+                    (st, st, (sbn * q) >> b_sh, (sen * q + sed - 1) >> e_sh)
+                } else {
+                    (p_cycles * t, 0i64, 0i64, 1i64)
+                };
+                if !layer.in_cycles() && i64::from(steps[steps.len() - 1].part_end) > bound_ticks {
+                    out.truncate(from);
+                    return Ok(false);
+                }
+                let (lo_num, hi_num) = if turn_off == 0 {
+                    (sbn * t, sen * t)
+                } else {
+                    (turn_off * t * sbd + sbn * t, turn_off * t * sed + sen * t)
+                };
+                let lo_tick = lo_num >> b_sh;
+                let hi_tick = (hi_num + sed - 1) >> e_sh;
+                if q == 1
+                    && (i64::from(steps[0].part_begin) >= hi_tick
+                        || i64::from(steps[steps.len() - 1].part_end) <= lo_tick)
+                {
+                    continue;
+                }
+                if u_lo >= u_hi {
+                    continue;
+                }
+                if abs_cycle
+                    .saturating_mul(u64::from(ticks_u32))
+                    .saturating_add(bound_ticks as u64)
+                    > i32::MAX as u64
+                {
+                    match query_layer_window_slow(
+                        layers,
+                        layer_idx,
+                        layer,
+                        p_cycles,
+                        q,
+                        shift,
+                        turn_off,
+                        bn,
+                        en,
+                        sbd,
+                        sed,
+                        Some(b_sh),
+                        Some(e_sh),
+                        sbn,
+                        sen,
+                        span_bn_i32,
+                        span_en_i32,
+                        span_bd_nz,
+                        span_ed_nz,
+                        single_layer,
+                        hap_budget,
+                        from,
+                        out,
+                    )? {
+                        true => continue,
+                        false => {
+                            out.truncate(from);
+                            return Ok(false);
+                        }
+                    }
+                }
+                let ticks_pow2 = ticks_u32
+                    .is_power_of_two()
+                    .then(|| ticks_u32.trailing_zeros());
+                let shift_ticks = shift * t;
+                let layer_from = out.len();
+                let mut need_slow = false;
+                'units: for u in u_lo..u_hi {
+                    let tick_off = u * sub_ticks;
+                    let local_lo = lo_tick - tick_off;
+                    let local_hi = hi_tick - tick_off;
+                    let start_idx = if steps.len() > 6 && local_lo > 0 {
+                        steps.partition_point(|s| i64::from(s.part_end) <= local_lo)
+                    } else {
+                        0
+                    };
+                    for (offset_i, &s) in steps[start_idx..].iter().enumerate() {
+                        if i64::from(s.part_begin) >= local_hi {
+                            break;
+                        }
+                        if i64::from(s.part_end) <= local_lo {
+                            continue;
+                        }
+                        if (s.loc & SmallGridStep::SPARE) != 0 {
+                            need_slow = true;
+                            break 'units;
+                        }
+                        let context = if s.loc == 0 {
+                            if before0 != 0 {
+                                Locations::from_packed([before0, before1, 0, 0])
+                            } else {
+                                Locations::new()
+                            }
+                        } else {
+                            let begin = grid_base + u32::from(s.loc >> SmallGridStep::LENGTH_BITS);
+                            let length = u32::from((s.loc & SmallGridStep::LENGTH_MASK) - 1);
+                            let Some(sp) = Locations::pack_small(begin, length) else {
+                                need_slow = true;
+                                break 'units;
+                            };
+                            if before0 == 0 {
+                                Locations::from_packed([sp, 0, 0, 0])
+                            } else if before1 == 0 {
+                                Locations::from_packed([before0, sp, 0, 0])
+                            } else {
+                                Locations::from_packed([before0, before1, sp, 0])
+                            }
+                        };
+                        if let Some(limit) = hap_budget
+                            && (out.len() - from + 1) as u64 > limit
+                        {
+                            out.truncate(from);
+                            return Err(QueryLimit::HapBudget { budget: limit });
+                        }
+                        if out.capacity() == from {
+                            let want = if single_layer {
+                                let i = start_idx + offset_i;
+                                let one_only = u + 1 == u_hi
+                                    && steps
+                                        .get(i + 1)
+                                        .is_none_or(|next| i64::from(next.part_begin) >= local_hi);
+                                if one_only {
+                                    1
+                                } else {
+                                    ((hi_tick - lo_tick) as usize).clamp(2, 8)
+                                }
+                            } else {
+                                layers.len().min(8)
+                            };
+                            reserve_window_initial(out, from, single_layer, want, layers.len());
+                        }
+                        let sb = tick_off + i64::from(s.part_begin);
+                        let se = tick_off + i64::from(s.part_end);
+                        let (wbn, wbd) = match ticks_pow2 {
+                            Some(sh) => Fraction::dyadic_i64_parts(shift_ticks + sb, sh),
+                            None => crate::query::reduce_i64_u32(shift_ticks + sb, ticks_u32),
+                        };
+                        let (wen, wed) = match ticks_pow2 {
+                            Some(sh) => Fraction::dyadic_i64_parts(shift_ticks + se, sh),
+                            None => crate::query::reduce_i64_u32(shift_ticks + se, ticks_u32),
+                        };
+                        let value = if single_builtin_id != 0 {
+                            if let Some(n) =
+                                crate::value::static_int_of(&layer.values[usize::from(s.value)])
+                            {
+                                Value::Object(crate::OrderedMap::from_static_int(
+                                    single_builtin_id,
+                                    n,
+                                    false,
+                                ))
+                            } else {
+                                Value::Object(crate::OrderedMap::from_seq_layer(
+                                    layers,
+                                    layer_idx as u16,
+                                    u32::from(s.value),
+                                ))
+                            }
+                        } else {
+                            Value::Object(crate::OrderedMap::from_seq_layer(
+                                layers,
+                                layer_idx as u16,
+                                u32::from(s.value),
+                            ))
+                        };
+                        let keys = if direct_keys_empty {
+                            ContextKeys::default()
+                        } else {
+                            direct_keys.clone()
+                        };
+                        let clip_lo = (sb << b_sh) < lo_num;
+                        let clip_hi = (se << e_sh) > hi_num;
+                        let hap = if !clip_lo && !clip_hi {
+                            Hap::of_whole_parts(wbn, wbd, wen, wed, value, context, keys)
+                        } else {
+                            let wbd16 = std::num::NonZeroU16::new(wbd.get() as u16)
+                                .expect("grid denom <= 65535");
+                            let wed16 = std::num::NonZeroU16::new(wed.get() as u16)
+                                .expect("grid denom <= 65535");
+                            let (pbn32, pbd16) = if clip_lo {
+                                (span_bn_i32, span_bd_nz)
+                            } else {
+                                (wbn as i32, wbd16)
+                            };
+                            let (pen32, ped16) = if clip_hi {
+                                (span_en_i32, span_ed_nz)
+                            } else {
+                                (wen as i32, wed16)
+                            };
+                            Hap::of_cut_small(
+                                pbn32, pbd16, pen32, ped16, wbn as i32, wbd16, wen as i32, wed16,
+                                value, context, keys,
+                            )
+                        };
+                        out.push(hap);
+                    }
+                }
+                if need_slow {
+                    out.truncate(layer_from);
+                    match query_layer_window_slow(
+                        layers,
+                        layer_idx,
+                        layer,
+                        p_cycles,
+                        q,
+                        shift,
+                        turn_off,
+                        bn,
+                        en,
+                        sbd,
+                        sed,
+                        Some(b_sh),
+                        Some(e_sh),
+                        sbn,
+                        sen,
+                        span_bn_i32,
+                        span_en_i32,
+                        span_bd_nz,
+                        span_ed_nz,
+                        single_layer,
+                        hap_budget,
+                        from,
+                        out,
+                    )? {
+                        true => {}
+                        false => {
+                            out.truncate(from);
+                            return Ok(false);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    let added = out.len() - from;
+    if !single_layer && added > 1 {
+        crate::hap::sort_small_window_haps(&mut out[from..]);
+    }
+    Ok(true)
+}
+
+#[inline(always)]
+fn reserve_window_initial(
+    out: &mut Vec<Hap>,
+    from: usize,
+    single_layer: bool,
+    want_single: usize,
+    layer_count: usize,
+) {
+    let want = if single_layer {
+        want_single.clamp(1, 8)
+    } else {
+        layer_count.min(8)
+    };
+    if out.capacity() - from < want {
+        if single_layer && want <= 4 {
+            out.reserve_exact(want);
+        } else {
+            out.reserve(want);
+        }
+    }
+}
+
+#[cold]
+#[inline(never)]
+fn query_layer_window_slow_from(
+    layers: &Arc<[Layer]>,
+    _start_layer: usize,
+    state: &State,
+    hap_budget: Option<u64>,
+    from: usize,
+    out: &mut Vec<Hap>,
+) -> Result<bool, QueryLimit> {
+    out.truncate(from);
+    query_multi_window_sorted_general(layers, state, hap_budget, out)
+}
+
+#[cold]
+#[inline(never)]
+#[allow(clippy::too_many_arguments)]
+fn query_layer_window_slow(
+    layers: &Arc<[Layer]>,
+    layer_idx: usize,
+    layer: &Layer,
+    p_cycles: i64,
+    q: i64,
+    shift: i64,
+    turn_off: i64,
+    bn: i64,
+    en: i64,
+    sbd: i64,
+    sed: i64,
+    sbd_pow2: Option<u32>,
+    sed_pow2: Option<u32>,
+    sbn: i64,
+    sen: i64,
+    span_bn_i32: i32,
+    span_en_i32: i32,
+    span_bd_nz: std::num::NonZeroU16,
+    span_ed_nz: std::num::NonZeroU16,
+    single_layer: bool,
+    hap_budget: Option<u64>,
+    from: usize,
+    out: &mut Vec<Hap>,
+) -> Result<bool, QueryLimit> {
+    if layer.source().is_some() {
+        return Ok(false);
+    }
+    let in_cycles = layer.in_cycles();
+    let is_direct = layer.is_direct();
+    let ok = layer
+        .listing()
+        .with_grid_view(|grid| {
+            let GridStepsRef::Small(steps) = grid.steps else {
+                return None;
+            };
+            if steps.is_empty() {
+                return Some(Ok(()));
+            }
+            let ticks_u32 = grid.ticks.get();
+            if ticks_u32 > 65_535 {
+                return None;
+            }
+            let has_cuts = grid.rare.is_some_and(SpareRare::has_cuts);
+            let t = i64::from(ticks_u32);
+            let (bound_ticks, sub_ticks, u_lo, u_hi) = if q > 1 {
+                if t % q != 0 {
+                    return None;
+                }
+                let st = t / q;
+                let ul = match sbd_pow2 {
+                    Some(sh) => (sbn * q) >> sh,
+                    None => (sbn * q) / sbd,
+                };
+                let uh = match sed_pow2 {
+                    Some(sh) => (sen * q + sed - 1) >> sh,
+                    None => (sen * q + sed - 1) / sed,
+                };
+                (st, st, ul, uh)
+            } else {
+                (p_cycles * t, 0i64, 0i64, 1i64)
+            };
+            if !in_cycles && i64::from(steps[steps.len() - 1].part_end) > bound_ticks {
+                return None;
+            }
+            let (lo_num, hi_num) = if turn_off == 0 {
+                (sbn * t, sen * t)
+            } else {
+                (turn_off * t * sbd + sbn * t, turn_off * t * sed + sen * t)
+            };
+            let lo_tick = match sbd_pow2 {
+                Some(sh) => lo_num >> sh,
+                None => lo_num / sbd,
+            };
+            let hi_tick = match sed_pow2 {
+                Some(sh) => (hi_num + sed - 1) >> sh,
+                None => (hi_num + sed - 1) / sed,
+            };
+            if q == 1
+                && (i64::from(steps[0].part_begin) >= hi_tick
+                    || i64::from(steps[steps.len() - 1].part_end) <= lo_tick)
+            {
+                return Some(Ok(()));
+            }
+            if u_lo >= u_hi {
+                return Some(Ok(()));
+            }
+            let ticks_pow2 = grid
+                .ticks
+                .is_power_of_two()
+                .then(|| grid.ticks.trailing_zeros())
+                .filter(|&sh| sh < 24);
+            let shift_ticks = shift * t;
+            let cut_fits_i32 = !has_cuts
+                && shift
+                    .unsigned_abs()
+                    .saturating_mul(u64::from(ticks_u32))
+                    .saturating_add(bound_ticks as u64)
+                    <= i32::MAX as u64;
+            let dress = layer.dress();
+            let single_builtin_id = if is_direct
+                && layer.is_direct_keyed()
+                && layer.named_id != 0
+                && !dress.has_set_map()
+            {
+                layer.named_id
+            } else {
+                0
+            };
+            let direct_keys = dress.keys();
+            let direct_keys_empty = direct_keys.is_empty();
+            let mut maker_opt = None;
+            for u in u_lo..u_hi {
+                let tick_off = u * sub_ticks;
+                let local_lo = lo_tick - tick_off;
+                let local_hi = hi_tick - tick_off;
+                let start_idx = if steps.len() > 6 && local_lo > 0 {
+                    steps.partition_point(|s| i64::from(s.part_end) <= local_lo)
+                } else {
+                    0
+                };
+                let mut cuts = if has_cuts {
+                    grid.cuts().starting_at(start_idx)
+                } else {
+                    CutsSlice::EMPTY
+                };
+                for (offset_i, &s) in steps[start_idx..].iter().enumerate() {
+                    let i = start_idx + offset_i;
+                    if i64::from(s.part_begin) >= local_hi {
+                        break;
+                    }
+                    if i64::from(s.part_end) <= local_lo {
+                        continue;
+                    }
+                    if let Some(limit) = hap_budget
+                        && (out.len() - from + 1) as u64 > limit
+                    {
+                        return Some(Err(QueryLimit::HapBudget { budget: limit }));
+                    }
+                    if out.len() == from {
+                        let want = if single_layer {
+                            let one_only = u + 1 == u_hi
+                                && steps
+                                    .get(i + 1)
+                                    .is_none_or(|next| i64::from(next.part_begin) >= local_hi);
+                            if one_only {
+                                1
+                            } else {
+                                ((hi_tick - lo_tick) as usize).clamp(2, 8)
+                            }
+                        } else {
+                            layers.len().min(8)
+                        };
+                        reserve_window_initial(out, from, single_layer, want, layers.len());
+                    }
+                    let sb = tick_off + i64::from(s.part_begin);
+                    let se = tick_off + i64::from(s.part_end);
+                    let (wb_tick, we_tick, is_cut) = if has_cuts {
+                        match cuts.split_first_at(i) {
+                            Some(cut) => (
+                                tick_off + i64::from(cut.begin),
+                                tick_off + i64::from(cut.end),
+                                true,
+                            ),
+                            None => (sb, se, false),
+                        }
+                    } else {
+                        (sb, se, false)
+                    };
+                    let reduce = |tick: i64| {
+                        if let Some(sh) = ticks_pow2 {
+                            Fraction::dyadic_i64_parts(shift_ticks + tick, sh)
+                        } else {
+                            crate::query::reduce_i64_u32(shift_ticks + tick, ticks_u32)
+                        }
+                    };
+                    let (wbn, wbd) = reduce(wb_tick);
+                    let (wen, wed) = reduce(we_tick);
+                    let (value, context, keys) = if is_direct {
+                        let val_idx = usize::from(s.value);
+                        let value = if single_builtin_id != 0 {
+                            if let Some(n) = crate::value::static_int_of(&layer.values[val_idx]) {
+                                Value::Object(crate::OrderedMap::from_static_int(
+                                    single_builtin_id,
+                                    n,
+                                    false,
+                                ))
+                            } else {
+                                Value::Object(crate::OrderedMap::from_seq_layer(
+                                    layers,
+                                    layer_idx as u16,
+                                    u32::from(s.value),
+                                ))
+                            }
+                        } else {
+                            Value::Object(crate::OrderedMap::from_seq_layer(
+                                layers,
+                                layer_idx as u16,
+                                u32::from(s.value),
+                            ))
+                        };
+                        let step_loc = grid.locations(i);
+                        let context = if dress.locates_alone() {
+                            step_loc
+                        } else {
+                            dress.around_owned(step_loc)
+                        };
+                        let keys = if direct_keys_empty {
+                            ContextKeys::default()
+                        } else {
+                            direct_keys.clone()
+                        };
+                        (value, context, keys)
+                    } else {
+                        let maker = maker_opt
+                            .get_or_insert_with(|| layer.maker(Some((layers, layer_idx as u16))));
+                        let value = maker
+                            .values
+                            .get(usize::from(s.value))
+                            .expect("a step holds a value of its layer");
+                        let context = maker.make_grid_small_context(grid, i, s.loc);
+                        let keys = if maker.keys.is_empty() {
+                            ContextKeys::default()
+                        } else {
+                            maker.keys.clone()
+                        };
+                        (value, context, keys)
+                    };
+                    let clip_lo = sb * sbd < lo_num;
+                    let clip_hi = se * sed > hi_num;
+                    if !is_cut && !clip_lo && !clip_hi {
+                        out.push(Hap::of_whole_parts(
+                            wbn, wbd, wen, wed, value, context, keys,
+                        ));
+                    } else if cut_fits_i32 {
+                        let wbd16 = std::num::NonZeroU16::new(wbd.get() as u16)
+                            .expect("grid denom <= 65535");
+                        let wed16 = std::num::NonZeroU16::new(wed.get() as u16)
+                            .expect("grid denom <= 65535");
+                        let (pbn32, pbd16) = if clip_lo {
+                            (span_bn_i32, span_bd_nz)
+                        } else {
+                            (wbn as i32, wbd16)
+                        };
+                        let (pen32, ped16) = if clip_hi {
+                            (span_en_i32, span_ed_nz)
+                        } else {
+                            (wen as i32, wed16)
+                        };
+                        out.push(Hap::of_cut_small(
+                            pbn32, pbd16, pen32, ped16, wbn as i32, wbd16, wen as i32, wed16,
+                            value, context, keys,
+                        ));
+                    } else {
+                        let (pbn, pbd) = if clip_lo {
+                            (
+                                bn,
+                                std::num::NonZeroU32::new(sbd as u32)
+                                    .unwrap_or(std::num::NonZeroU32::MIN),
+                            )
+                        } else if is_cut {
+                            reduce(sb)
+                        } else {
+                            (wbn, wbd)
+                        };
+                        let (pen, ped) = if clip_hi {
+                            (
+                                en,
+                                std::num::NonZeroU32::new(sed as u32)
+                                    .unwrap_or(std::num::NonZeroU32::MIN),
+                            )
+                        } else if is_cut {
+                            reduce(se)
+                        } else {
+                            (wen, wed)
+                        };
+                        if let (Ok(pbn32), Ok(pen32), Ok(wbn32), Ok(wen32)) = (
+                            i32::try_from(pbn),
+                            i32::try_from(pen),
+                            i32::try_from(wbn),
+                            i32::try_from(wen),
+                        ) && let (Some(pbd16), Some(ped16), Some(wbd16), Some(wed16)) = (
+                            std::num::NonZeroU16::new(pbd.get() as u16),
+                            std::num::NonZeroU16::new(ped.get() as u16),
+                            std::num::NonZeroU16::new(wbd.get() as u16),
+                            std::num::NonZeroU16::new(wed.get() as u16),
+                        ) {
+                            out.push(Hap::of_cut_small(
+                                pbn32, pbd16, pen32, ped16, wbn32, wbd16, wen32, wed16, value,
+                                context, keys,
+                            ));
+                        } else {
+                            let whole = TimeSpan::new(
+                                Fraction::from_reduced_parts_i64(wbn, wbd),
+                                Fraction::from_reduced_parts_i64(wen, wed),
+                            );
+                            let part = TimeSpan::new(
+                                Fraction::from_reduced_parts_i64(pbn, pbd),
+                                Fraction::from_reduced_parts_i64(pen, ped),
+                            );
+                            out.push(Hap::of_sequence(whole, part, value, context, keys));
+                        }
+                    }
+                }
+            }
+            Some(Ok(()))
+        })
+        .flatten();
+    match ok {
+        Some(Ok(())) => Ok(true),
+        Some(Err(limit)) => Err(limit),
+        None => Ok(false),
+    }
+}
+
+/// Cold general path for single-cycle windows with non-power-of-two span
+/// denominators or large-period layers.
+#[cold]
+#[inline(never)]
+fn query_multi_window_sorted_general(
+    layers: &Arc<[Layer]>,
+    state: &State,
+    hap_budget: Option<u64>,
+    out: &mut Vec<Hap>,
+) -> Result<bool, QueryLimit> {
+    let span = state.span;
+    let bn = span.begin.numer() as i64;
+    let en = span.end.numer() as i64;
+    let sbd = span.begin.denom() as i64;
+    let sed = span.end.denom() as i64;
+    let sbd_pow2 = (sbd > 0 && (sbd as u64).is_power_of_two()).then(|| sbd.trailing_zeros());
+    let sed_pow2 = (sed > 0 && (sed as u64).is_power_of_two()).then(|| sed.trailing_zeros());
+    let b_cycle = match sbd_pow2 {
+        Some(sh) => bn >> sh,
+        None => bn.div_euclid(sbd),
+    };
+    let e_last_cycle = match sed_pow2 {
+        Some(sh) => (en - 1) >> sh,
+        None => (en - 1).div_euclid(sed),
+    };
+    if b_cycle != e_last_cycle {
+        return Ok(false);
+    }
+    let cycle = b_cycle;
+    let sbn = bn - cycle * sbd;
+    let sen = en - cycle * sed;
+    let span_bn_i32 = bn as i32;
+    let span_en_i32 = en as i32;
+    let span_bd_nz = std::num::NonZeroU16::new(sbd as u16).expect("positive span denom <= 65535");
+    let span_ed_nz = std::num::NonZeroU16::new(sed as u16).expect("positive span denom <= 65535");
+    let single_layer = layers.len() == 1;
+    let from = out.len();
+    for (layer_idx, layer) in layers.iter().enumerate() {
+        let period = layer.period();
+        let (p_cycles, q) = if period.denom() == 1 && period.numer() > 0 && period.numer() <= 65_535
+        {
+            (period.numer() as i64, 1i64)
+        } else if period.numer() == 1 && period.denom() > 1 && period.denom() <= 64 {
+            (1i64, period.denom() as i64)
+        } else {
+            out.truncate(from);
+            return Ok(false);
+        };
+        let (shift, turn_off) = if q > 1 || p_cycles == 1 {
+            (cycle, 0i64)
+        } else {
+            (
+                cycle.div_euclid(p_cycles) * p_cycles,
+                cycle.rem_euclid(p_cycles),
+            )
+        };
+        if !query_layer_window_slow(
+            layers,
+            layer_idx,
+            layer,
+            p_cycles,
+            q,
+            shift,
+            turn_off,
+            bn,
+            en,
+            sbd,
+            sed,
+            sbd_pow2,
+            sed_pow2,
+            sbn,
+            sen,
+            span_bn_i32,
+            span_en_i32,
+            span_bd_nz,
+            span_ed_nz,
+            single_layer,
+            hap_budget,
+            from,
+            out,
+        )? {
+            out.truncate(from);
+            return Ok(false);
+        }
+    }
+    let added = out.len() - from;
+    if !single_layer && added > 1 {
+        crate::hap::sort_small_window_haps(&mut out[from..]);
+    }
+    Ok(true)
 }
 
 fn query_multi_sorted_inner<
@@ -1271,7 +2767,7 @@ fn query_multi_sorted_inner<
         let Some(step_len) = layer
             .listing()
             .with_grid_view(|grid| {
-                if grid.rare.is_some() {
+                if grid.rare.is_some_and(SpareRare::has_cuts) {
                     return None;
                 }
                 let GridStepsRef::Small(steps) = grid.steps else {
@@ -1605,18 +3101,28 @@ fn query_multi_sorted_inner<
                 let sp_i64 = sp as i64;
                 let start_i64 = start_super as i64;
                 let end_i64 = end_super as i64;
-                let tmpl_slice = &template[..tlen];
+                let mut fast_tmpl = [(
+                    0i64,
+                    std::num::NonZeroU32::MIN,
+                    0i64,
+                    std::num::NonZeroU32::MIN,
+                    0u16,
+                ); MAX_SUPER_HAPS];
+                for (dst, &(bs, slot, _)) in fast_tmpl[..tlen].iter_mut().zip(&template[..tlen]) {
+                    let bd = std::num::NonZeroU32::new(bs.begin.denom() as u32)
+                        .unwrap_or(std::num::NonZeroU32::MIN);
+                    let ed = std::num::NonZeroU32::new(bs.end.denom() as u32)
+                        .unwrap_or(std::num::NonZeroU32::MIN);
+                    *dst = (bs.begin.numer() as i64, bd, bs.end.numer() as i64, ed, slot);
+                }
+                let tmpl_slice = &fast_tmpl[..tlen];
                 for st in start_i64..end_i64 {
                     if st != start_i64 && ((st - start_i64) & 3) == 0 && thread.stop_requested() {
                         out.truncate(from);
                         return true;
                     }
                     let shift = st * sp_i64;
-                    out.extend(tmpl_slice.iter().map(|&(base_span, slot, _)| {
-                        let ts = TimeSpan::new(
-                            base_span.begin.add_i64_in_bounds(shift),
-                            base_span.end.add_i64_in_bounds(shift),
-                        );
+                    out.extend(tmpl_slice.iter().map(|&(bn, bd, en, ed, slot)| {
                         let slot_i = usize::from(slot) & (MAX_STEPS - 1);
                         let value = match base_fast_vals[slot_i] {
                             FastVal::StaticInt(id, iv) => {
@@ -1627,12 +3133,13 @@ fn query_multi_sorted_inner<
                             }
                             FastVal::Table(..) | FastVal::Held(..) => Value::Undefined,
                         };
-                        let (ll, lf, lt0, lt1, lt2) = base_packed_locs[slot_i].parts();
-                        Hap::of_sequence(
-                            ts,
-                            ts,
+                        Hap::of_whole_parts(
+                            bn + shift * i64::from(bd.get()),
+                            bd,
+                            en + shift * i64::from(ed.get()),
+                            ed,
                             value,
-                            Locations::from_packed_parts(ll, lf, lt0, lt1, lt2),
+                            Locations::from_packed_copy(base_packed_locs[slot_i]),
                             ContextKeys::default(),
                         )
                     }));
@@ -1641,26 +3148,37 @@ fn query_multi_sorted_inner<
                 let sp_i64 = sp as i64;
                 let start_i64 = start_super as i64;
                 let end_i64 = end_super as i64;
-                let tmpl_slice = &template[..tlen];
+                let mut fast_tmpl = [(
+                    0i64,
+                    std::num::NonZeroU32::MIN,
+                    0i64,
+                    std::num::NonZeroU32::MIN,
+                    0u16,
+                ); MAX_SUPER_HAPS];
+                for (dst, &(bs, slot, _)) in fast_tmpl[..tlen].iter_mut().zip(&template[..tlen]) {
+                    let bd = std::num::NonZeroU32::new(bs.begin.denom() as u32)
+                        .unwrap_or(std::num::NonZeroU32::MIN);
+                    let ed = std::num::NonZeroU32::new(bs.end.denom() as u32)
+                        .unwrap_or(std::num::NonZeroU32::MIN);
+                    *dst = (bs.begin.numer() as i64, bd, bs.end.numer() as i64, ed, slot);
+                }
+                let tmpl_slice = &fast_tmpl[..tlen];
                 for st in start_i64..end_i64 {
                     if st != start_i64 && ((st - start_i64) & 3) == 0 && thread.stop_requested() {
                         out.truncate(from);
                         return true;
                     }
                     let shift = st * sp_i64;
-                    out.extend(tmpl_slice.iter().map(|&(base_span, slot, _)| {
-                        let ts = TimeSpan::new(
-                            base_span.begin.add_i64_in_bounds(shift),
-                            base_span.end.add_i64_in_bounds(shift),
-                        );
+                    out.extend(tmpl_slice.iter().map(|&(bn, bd, en, ed, slot)| {
                         let slot_i = usize::from(slot) & (MAX_STEPS - 1);
                         let value = materialize_fast(base_fast_vals[slot_i]);
-                        let (ll, lf, lt0, lt1, lt2) = base_packed_locs[slot_i].parts();
-                        Hap::of_sequence(
-                            ts,
-                            ts,
+                        Hap::of_whole_parts(
+                            bn + shift * i64::from(bd.get()),
+                            bd,
+                            en + shift * i64::from(ed.get()),
+                            ed,
                             value,
-                            Locations::from_packed_parts(ll, lf, lt0, lt1, lt2),
+                            Locations::from_packed_copy(base_packed_locs[slot_i]),
                             ContextKeys::default(),
                         )
                     }));
@@ -1669,7 +3187,21 @@ fn query_multi_sorted_inner<
                 let sp_i64 = sp as i64;
                 let start_i64 = start_super as i64;
                 let end_i64 = end_super as i64;
-                let tmpl_slice = &template[..tlen];
+                let mut fast_tmpl = [(
+                    0i64,
+                    std::num::NonZeroU32::MIN,
+                    0i64,
+                    std::num::NonZeroU32::MIN,
+                    0u16,
+                ); MAX_SUPER_HAPS];
+                for (dst, &(bs, slot, _)) in fast_tmpl[..tlen].iter_mut().zip(&template[..tlen]) {
+                    let bd = std::num::NonZeroU32::new(bs.begin.denom() as u32)
+                        .unwrap_or(std::num::NonZeroU32::MIN);
+                    let ed = std::num::NonZeroU32::new(bs.end.denom() as u32)
+                        .unwrap_or(std::num::NonZeroU32::MIN);
+                    *dst = (bs.begin.numer() as i64, bd, bs.end.numer() as i64, ed, slot);
+                }
+                let tmpl_slice = &fast_tmpl[..tlen];
                 let values_vec = base_values.as_deref().expect("fallback values populated");
                 for st in start_i64..end_i64 {
                     if st != start_i64 && ((st - start_i64) & 3) == 0 && thread.stop_requested() {
@@ -1677,18 +3209,15 @@ fn query_multi_sorted_inner<
                         return true;
                     }
                     let shift = st * sp_i64;
-                    out.extend(tmpl_slice.iter().map(|&(base_span, slot, _)| {
-                        let ts = TimeSpan::new(
-                            base_span.begin.add_i64_in_bounds(shift),
-                            base_span.end.add_i64_in_bounds(shift),
-                        );
+                    out.extend(tmpl_slice.iter().map(|&(bn, bd, en, ed, slot)| {
                         let slot_i = usize::from(slot) & (MAX_STEPS - 1);
-                        let (ll, lf, lt0, lt1, lt2) = base_packed_locs[slot_i].parts();
-                        Hap::of_sequence(
-                            ts,
-                            ts,
+                        Hap::of_whole_parts(
+                            bn + shift * i64::from(bd.get()),
+                            bd,
+                            en + shift * i64::from(ed.get()),
+                            ed,
                             values_vec[slot_i].clone(),
-                            Locations::from_packed_parts(ll, lf, lt0, lt1, lt2),
+                            Locations::from_packed_copy(base_packed_locs[slot_i]),
                             ContextKeys::default(),
                         )
                     }));

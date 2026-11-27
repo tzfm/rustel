@@ -481,6 +481,35 @@ pub fn compose_number_owned(
     compose_owned(pat, &crate::pure(Value::F64(value)), op, how)
 }
 
+/// Owned variant of [`compose`] for a flat numeric control sequence right-hand
+/// side (e.g. `.add(note("<0 12>"))`): folds directly onto a same-key
+/// `Node::Sequence` without allocating a temporary RHS pattern or grid.
+pub fn compose_control_flat_numbers_owned(
+    pat: crate::Pattern,
+    spec_id: u16,
+    values: &[f64],
+    locs: &[(u32, u16)],
+    slowcat: bool,
+    op: ComposeOp,
+    how: Alignment,
+) -> Result<crate::Pattern, crate::Pattern> {
+    if op != ComposeOp::KeepIf && how == Alignment::In {
+        if pat.is_rest() && crate::sequence::folds(&pat) {
+            return Ok(pat);
+        }
+        return crate::sequence::composed_control_flat_numbers(
+            pat,
+            spec_id,
+            values,
+            locs,
+            slowcat,
+            op,
+            op.lookup_flow(),
+        );
+    }
+    Err(pat)
+}
+
 fn compose_inner<P: PatOps>(pat: &P, other: &P, op: ComposeOp, how: Alignment) -> P {
     let lookup_flow = op.lookup_flow();
     // `keepif` bypasses `_composeOp` so that `b`'s value is discarded rather

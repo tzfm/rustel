@@ -94,7 +94,7 @@ fn every_native_extension_answers_a_query() {
             };
             let haps = pattern.query_arc_sorted(Fraction::ZERO, Fraction::ONE);
             assert!(
-                haps.iter().all(|hap| hap.part.begin <= hap.part.end),
+                haps.iter().all(|hap| hap.part().begin <= hap.part().end),
                 "{name} with {count} arguments answered with a backwards span"
             );
         }

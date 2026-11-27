@@ -193,7 +193,7 @@ pub(super) fn draw_line<'js>(
             let matches: Vec<&rustel_core::Hap> = haps
                 .iter()
                 .filter(|hap| {
-                    hap.whole
+                    hap.whole()
                         .is_some_and(|whole| whole.begin <= slot_begin && whole.end >= slot_end)
                 })
                 .collect();
@@ -202,7 +202,7 @@ pub(super) fn draw_line<'js>(
             }
             for (index, line) in lines.iter_mut().enumerate() {
                 match matches.get(index) {
-                    Some(hap) if hap.whole.is_some_and(|whole| whole.begin == slot_begin) => {
+                    Some(hap) if hap.whole().is_some_and(|whole| whole.begin == slot_begin) => {
                         line.push_str(&hap.value.show());
                     }
                     Some(_) => line.push('-'),

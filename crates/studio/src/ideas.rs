@@ -793,7 +793,7 @@ mod tests {
                 let controls: Vec<_> = ["s", "note", "n", "speed", "begin"]
                     .map(|key| format!("{key}={:?}", event.value.get(key)))
                     .into();
-                format!("{:?} {}", event.whole, controls.join(" "))
+                format!("{:?} {}", event.whole(), controls.join(" "))
             })
             .collect();
         notes.sort();

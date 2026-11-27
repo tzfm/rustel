@@ -210,8 +210,8 @@ fn graph_input_timing_preserves_outer_wholes() {
         .iter()
         .map(|hap| {
             (
-                hap.whole.expect("whole").begin,
-                hap.whole.unwrap().end,
+                hap.whole().expect("whole").begin,
+                hap.whole().unwrap().end,
                 output(&hap.value)[0],
             )
         })
@@ -230,8 +230,8 @@ fn graph_input_timing_preserves_outer_wholes() {
         .expect("partial query");
     assert_eq!(partial.len(), 1);
     assert_eq!(output(&partial[0].value), [2.0; 2]);
-    assert_eq!(partial[0].whole.unwrap().begin, Fraction::ZERO);
-    assert_eq!(partial[0].whole.unwrap().end, Fraction::new(1, 2));
+    assert_eq!(partial[0].whole().unwrap().begin, Fraction::ZERO);
+    assert_eq!(partial[0].whole().unwrap().end, Fraction::new(1, 2));
     let slow = evaluate(&runtime, "note(\"c3 e3\").K(n(S(\"1 2 3\")).out()).slow(2)");
     assert_eq!(
         slow.iter()
@@ -241,7 +241,7 @@ fn graph_input_timing_preserves_outer_wholes() {
     );
     assert!(
         slow.iter()
-            .all(|hap| hap.whole.unwrap().end == Fraction::ONE)
+            .all(|hap| hap.whole().unwrap().end == Fraction::ONE)
     );
 }
 

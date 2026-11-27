@@ -37,6 +37,31 @@ pub fn catch_score_panic<R>(work: impl FnOnce() -> R) -> Result<R, String> {
     })
 }
 
+/// Like [`catch_score_panic`], but runs `work` directly when the thread is
+/// already inside a containment boundary with one TLS lookup instead of three.
+#[inline]
+pub(super) fn catch_score_panic_if_needed<R>(work: impl FnOnce() -> R) -> Result<R, String> {
+    CONTAINING.with(|flag| {
+        if flag.get() {
+            return Ok(work());
+        }
+        struct Reset<'a>(&'a std::cell::Cell<bool>);
+        impl Drop for Reset<'_> {
+            #[inline]
+            fn drop(&mut self) {
+                self.0.set(false);
+            }
+        }
+        flag.set(true);
+        let _reset = Reset(flag);
+        catch_unwind(AssertUnwindSafe(work)).map_err(|payload| {
+            let message = panic_message(&*payload);
+            drop_caught(payload);
+            message
+        })
+    })
+}
+
 fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
     payload
         .downcast_ref::<&str>()
@@ -75,7 +100,7 @@ struct RecoveryCheckpoint {
     document: u64,
     prebakes: Option<Arc<Vec<RecoveryPrebake>>>,
     csound: crate::CsoundSnapshot,
-    settings: RuntimeSettings,
+    settings: rustel_core::settings::RuntimeSettingsSnapshot,
     cps: f64,
     cycle: f64,
     query_hap_budget: u64,
@@ -197,12 +222,12 @@ impl Session {
         let (cps, cycle) = self.audible_source.as_ref().map_or((cps, cycle), |source| {
             (source.cps, (now - source.cycle_zero_time) * source.cps)
         });
-        let settings = self.js.snapshot_published_runtime_settings();
+        let settings = self.js.snapshot_published_runtime_settings_state();
         #[cfg(feature = "device-audio")]
         let settings = self
             .audible_source
             .as_ref()
-            .map_or(settings, |source| source.settings.clone());
+            .map_or(settings, |source| source.settings.snapshot_state());
         let csound = self.csound_snapshot();
         #[cfg(feature = "device-audio")]
         let csound = self

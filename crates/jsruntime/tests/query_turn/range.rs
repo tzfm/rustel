@@ -63,10 +63,10 @@ fn raw_range_pair_keep_scalar_timing_steps_and_tag_loss() {
         assert_eq!(
             haps.iter()
                 .map(|hap| (
-                    hap.part.begin,
-                    hap.part.end,
-                    hap.whole.expect("raw range whole").begin,
-                    hap.whole.expect("raw range whole").end,
+                    hap.part().begin,
+                    hap.part().end,
+                    hap.whole().expect("raw range whole").begin,
+                    hap.whole().expect("raw range whole").end,
                 ))
                 .collect::<Vec<_>>(),
             [

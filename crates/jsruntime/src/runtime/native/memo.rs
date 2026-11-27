@@ -192,6 +192,27 @@ impl Name {
     }
 }
 
+/// Trailing single-number method kind eligible for incremental reuse when only
+/// its literal argument changes in a single-statement binding-free score.
+#[derive(Clone, Copy)]
+pub(in crate::runtime) enum TailNumericKind {
+    Fast,
+    Slow,
+    Early,
+    Late,
+}
+
+/// Compact descriptor for an edit that only changes the numeric literal inside
+/// a trailing `.fast(n)` / `.slow(n)` / `.early(n)` / `.late(n)` call whose
+/// receiver is retained in [`Memo::parts`].
+#[derive(Clone, Copy)]
+pub(in crate::runtime) struct TailNumericEdit {
+    pub(in crate::runtime) kind: TailNumericKind,
+    pub(in crate::runtime) part_idx: u8,
+    pub(in crate::runtime) arg_start: u16,
+    pub(in crate::runtime) suffix_len: u16,
+}
+
 /// What the last native build of a score kept.
 #[derive(Default)]
 pub(in crate::runtime) struct Memo {
@@ -221,6 +242,8 @@ pub(in crate::runtime) struct Memo {
     next: u16,
     /// The tempo that the last native build set, if any.
     pub(in crate::runtime) cps: Option<f64>,
+    /// Optional trailing numeric method descriptor for direct single-number edits.
+    pub(in crate::runtime) tail_num: Option<TailNumericEdit>,
 }
 
 impl Memo {
@@ -231,7 +254,22 @@ impl Memo {
     }
 
     #[inline]
-    fn part_pattern(&self, index: usize) -> Pattern {
+    pub(in crate::runtime) fn has_no_names(&self) -> bool {
+        self.names.is_empty()
+    }
+
+    #[inline]
+    pub(in crate::runtime) fn part_index_of(&self, written: Written) -> Option<u8> {
+        let key = (
+            u16::try_from(written.start).ok()?,
+            u16::try_from(written.len).ok()?,
+        );
+        let at = self.parts.binary_search_by_key(&key, Part::key).ok()?;
+        u8::try_from(at).ok()
+    }
+
+    #[inline]
+    pub(in crate::runtime) fn part_pattern(&self, index: usize) -> Pattern {
         let part = &self.parts[index];
         let meta = u16::try_from(index)
             .ok()
@@ -378,7 +416,9 @@ pub(super) struct Reuse<'p> {
     /// Where `source` is the text of `before`.
     unchanged: Unchanged,
     /// Whether this build took each part of `before`, or a part around it.
-    taken: Vec<bool>,
+    /// Inline bitset for up to 64 parts; overflows to `Vec`.
+    taken_bits: u64,
+    taken_overflow: Vec<bool>,
     /// The parts that this build evaluated and keeps, paired with their metadata.
     made: Vec<(MadePart, bool)>,
     /// Shared plain `runtime_settings` extras handle across parts in this build.
@@ -519,14 +559,21 @@ impl<'p> Reuse<'p> {
         scratch.open.clear();
         scratch.read.clear();
         scratch.ids.clear();
-        let unchanged = match before.source.as_deref() {
-            Some(prev) => Unchanged::of(source, prev),
-            None => Unchanged {
+        let unchanged = if before.parts.is_empty() && before.names.is_empty() {
+            Unchanged {
                 start: 0,
                 end: None,
-            },
+            }
+        } else {
+            match before.source.as_deref() {
+                Some(prev) => Unchanged::of(source, prev),
+                None => Unchanged {
+                    start: 0,
+                    end: None,
+                },
+            }
         };
-        let taken = if before.parts.is_empty() {
+        let taken_overflow = if before.parts.len() <= 64 {
             Vec::new()
         } else {
             vec![false; before.parts.len()]
@@ -534,7 +581,8 @@ impl<'p> Reuse<'p> {
         Self {
             source,
             unchanged,
-            taken,
+            taken_bits: 0,
+            taken_overflow,
             next,
             before,
             made: scratch.made,
@@ -659,7 +707,13 @@ impl<'p> Reuse<'p> {
             .iter()
             .take_while(|part| u32::from(part.start) < end)
             .count();
-        self.taken[at..at + inside].fill(true);
+        if self.taken_overflow.is_empty() {
+            for idx in at..at + inside {
+                self.taken_bits |= 1u64 << idx;
+            }
+        } else {
+            self.taken_overflow[at..at + inside].fill(true);
+        }
         // A handle of the kept pattern.
         Some(self.before.part_pattern(at))
     }
@@ -802,6 +856,7 @@ impl<'p> Reuse<'p> {
         mut self,
         cps: Option<f64>,
         shared_source: Option<Arc<str>>,
+        collect_reused: bool,
     ) -> (Memo, Vec<PatternNodeRef>) {
         if self.next == UNREAD_VERSION {
             return (
@@ -812,8 +867,66 @@ impl<'p> Reuse<'p> {
                 Vec::new(),
             );
         }
+        // Fast path for tiny binding-free edits where every retained prior part
+        // was reused unchanged and only the root expression was rebuilt: move
+        // `before.parts` straight into the new `Memo` with zero slice/Vec allocs.
+        if self.names.is_empty()
+            && self.before.names.is_empty()
+            && self.before.reads.is_empty()
+            && self.before.part_meta.is_empty()
+            && self.before.part_slots.is_empty()
+            && !self.before.parts.is_empty()
+            && self.before.parts.len() <= 16
+            && self.taken_bits == (1u64 << self.before.parts.len()) - 1
+            && self.source.len() <= 1024
+        {
+            let trimmed = self.source.trim();
+            let trimmed_start = trimmed.as_ptr() as usize - self.source.as_ptr() as usize;
+            let trimmed_len = trimmed.len();
+            let only_root_made = self.made.iter().all(|(entry, _)| {
+                usize::from(entry.part.start) == trimmed_start
+                    && usize::from(entry.part.len) == trimmed_len
+            });
+            if only_root_made
+                && self
+                    .before
+                    .parts
+                    .iter()
+                    .all(|part| part.node.strong_count() > 1)
+            {
+                let source = match (&self.before.source, shared_source) {
+                    (Some(kept), _) if **kept == *self.source => Arc::clone(kept),
+                    (_, Some(shared)) if *shared == *self.source => shared,
+                    _ => Arc::from(self.source),
+                };
+                let parts = mem::take(&mut self.before.parts);
+                let reused_nodes = if collect_reused {
+                    parts.iter().map(|part| part.node.clone()).collect()
+                } else {
+                    Vec::new()
+                };
+                let shared_extras = self.shared_extras.take();
+                return (
+                    Memo {
+                        source: Some(source),
+                        parts,
+                        part_meta: Box::new([]),
+                        shared_extras,
+                        part_slots: Box::new([]),
+                        names: Box::new([]),
+                        reads: Box::new([]),
+                        by_text: Box::new([]),
+                        next: self.next,
+                        cps,
+                        tail_num: None,
+                    },
+                    reused_nodes,
+                );
+            }
+        }
         let now = mem::take(&mut self.now);
-        let taken = mem::take(&mut self.taken);
+        let taken_bits = self.taken_bits;
+        let taken_overflow = mem::take(&mut self.taken_overflow);
         let before_slots = mem::take(&mut self.before.part_slots);
         let before_meta = mem::take(&mut self.before.part_meta);
         let mut meta_iter = before_meta.into_vec().into_iter().peekable();
@@ -823,15 +936,19 @@ impl<'p> Reuse<'p> {
                     .into_vec()
                     .into_iter()
                     .enumerate()
-                    .zip(taken)
-                    .filter_map(|((i, part), taken)| {
+                    .filter_map(|(i, part)| {
                         let meta = match meta_iter.peek() {
                             Some((idx, _)) if usize::from(*idx) == i => {
                                 meta_iter.next().map(|(_, meta)| meta)
                             }
                             _ => None,
                         };
-                        if !taken {
+                        let is_taken = if taken_overflow.is_empty() {
+                            (taken_bits >> i) & 1 != 0
+                        } else {
+                            taken_overflow[i]
+                        };
+                        if !is_taken {
                             return None;
                         }
                         let slot = before_slots.get(i).copied().unwrap_or(NO_SLOTS);
@@ -873,7 +990,7 @@ impl<'p> Reuse<'p> {
             // Bound unshared folded parts proportionally to score length so
             // short scores stay compact while keeping enough sub-expressions
             // for fast incremental edits.
-            let max_tiny_unshared = (self.source.len() / 100).clamp(3, 8);
+            let max_tiny_unshared = (self.source.len() / 180).clamp(2, 6);
             while entries
                 .iter()
                 .filter(|(entry, _)| entry.part.node.strong_count() == 1)
@@ -918,9 +1035,10 @@ impl<'p> Reuse<'p> {
                 }
             }
         }
-        // A single-expression score with no bindings has nothing to reuse on
+        // A single unshared expression with no bindings has nothing to reuse on
         // an edit, while an identical re-evaluation hits `source` directly.
-        if self.names.is_empty() && entries.len() == 1 {
+        if self.names.is_empty() && entries.len() == 1 && entries[0].0.part.node.strong_count() == 1
+        {
             entries.clear();
         }
         // A re-evaluation of the same text shares the handle the build
@@ -944,6 +1062,7 @@ impl<'p> Reuse<'p> {
                     by_text: Box::new([]),
                     next: self.next,
                     cps,
+                    tail_num: None,
                 },
                 Vec::new(),
             );
@@ -1033,7 +1152,7 @@ impl<'p> Reuse<'p> {
                 // instead of recording an empty read set that allows stale reuse.
                 continue;
             };
-            if from_before {
+            if from_before && collect_reused {
                 reused_nodes.push(entry.part.node.clone());
             }
             entry.part.set_read(next_read);
@@ -1131,6 +1250,7 @@ impl<'p> Reuse<'p> {
                 by_text: by_text.into_boxed_slice(),
                 next: self.next,
                 cps,
+                tail_num: None,
             },
             reused_nodes,
         )

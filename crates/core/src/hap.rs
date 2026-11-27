@@ -241,7 +241,7 @@ pub fn sort_haps_by_part(haps: Vec<Hap>) -> Vec<Hap> {
     if haps.len() < 2 {
         return haps;
     }
-    if haps.iter().any(|hap| hap.whole.is_none()) {
+    if haps.iter().any(|hap| !hap.has_whole()) {
         signal_query_error(|| {
             "sortHapsByPart: Cannot read properties of undefined (reading 'begin')".into()
         });
@@ -257,6 +257,183 @@ pub(crate) fn sort_haps_for_query_in_place(haps: &mut [Hap]) {
     stable_sort_in_place(haps);
 }
 
+/// Compact 32-byte exact rational sort key for discrete window haps whose
+/// parts and wholes fit `(i32, u16)` (100% of fast-path window emissions).
+/// Each reduced rational packs `(numer as u32 as u64) | ((denom as u64) << 32)`
+/// so equal window edges short-circuit in one 64-bit compare without multiplies.
+#[derive(Clone, Copy)]
+struct SmallSpanKey {
+    pb: u64,
+    pe: u64,
+    wb: u64,
+    we: u64,
+}
+
+#[inline(always)]
+fn pack_i32_u16(n: i32, d: u16) -> u64 {
+    (n as u32 as u64) | (u64::from(d) << 32)
+}
+
+#[inline(always)]
+fn cmp_packed_rat(a: u64, b: u64) -> std::cmp::Ordering {
+    let ad = (a >> 32) as i64;
+    let bd = (b >> 32) as i64;
+    let an = i64::from(a as i32);
+    let bn = i64::from(b as i32);
+    if ad == bd {
+        an.cmp(&bn)
+    } else {
+        (an * bd).cmp(&(bn * ad))
+    }
+}
+
+#[inline(always)]
+fn cmp_small_span_key(a: &SmallSpanKey, b: &SmallSpanKey) -> std::cmp::Ordering {
+    if a.pb != b.pb {
+        return cmp_packed_rat(a.pb, b.pb);
+    }
+    if a.pe != b.pe {
+        return cmp_packed_rat(a.pe, b.pe);
+    }
+    if a.wb != b.wb {
+        return cmp_packed_rat(a.wb, b.wb);
+    }
+    if a.we != b.we {
+        return cmp_packed_rat(a.we, b.we);
+    }
+    std::cmp::Ordering::Equal
+}
+
+#[inline(always)]
+fn extract_small_span_key(hap: &Hap) -> Option<SmallSpanKey> {
+    match &hap.spans {
+        HapSpans::Whole {
+            begin_n,
+            end_n,
+            begin_d,
+            end_d,
+        } => {
+            let bn = i32::try_from(*begin_n).ok()?;
+            let en = i32::try_from(*end_n).ok()?;
+            let bd = u16::try_from(begin_d.get()).ok()?;
+            let ed = u16::try_from(end_d.get()).ok()?;
+            let pb = pack_i32_u16(bn, bd);
+            let pe = pack_i32_u16(en, ed);
+            Some(SmallSpanKey {
+                pb,
+                pe,
+                wb: pb,
+                we: pe,
+            })
+        }
+        HapSpans::CutSmall {
+            part_begin_n,
+            part_end_n,
+            whole_begin_n,
+            whole_end_n,
+            part_begin_d,
+            part_end_d,
+            whole_begin_d,
+            whole_end_d,
+        } => Some(SmallSpanKey {
+            pb: pack_i32_u16(*part_begin_n, part_begin_d.get()),
+            pe: pack_i32_u16(*part_end_n, part_end_d.get()),
+            wb: pack_i32_u16(*whole_begin_n, whole_begin_d.get()),
+            we: pack_i32_u16(*whole_end_n, whole_end_d.get()),
+        }),
+        HapSpans::Analog { .. } | HapSpans::Wide(_) => None,
+    }
+}
+
+#[inline(never)]
+fn sort_small_window_n<const CAP: usize>(haps: &mut [Hap]) {
+    const { assert!(CAP.is_power_of_two() && CAP <= 16) };
+    let n = haps.len();
+    let zero = SmallSpanKey {
+        pb: 0,
+        pe: 0,
+        wb: 0,
+        we: 0,
+    };
+    let mut keys = [zero; CAP];
+    let mut first_bad = n;
+    for (i, hap) in haps.iter().enumerate() {
+        let Some(key) = extract_small_span_key(hap) else {
+            stable_sort_in_place(haps);
+            return;
+        };
+        keys[i & (CAP - 1)] = key;
+        if first_bad == n
+            && i > 0
+            && cmp_small_span_key(&keys[(i - 1) & (CAP - 1)], &key) == std::cmp::Ordering::Greater
+        {
+            first_bad = i;
+        }
+    }
+    if first_bad == n {
+        return;
+    }
+    let mut order = [0u8; CAP];
+    for (i, slot) in order[..n].iter_mut().enumerate() {
+        *slot = i as u8;
+    }
+    for i in first_bad..n {
+        let key_idx = order[i & (CAP - 1)];
+        let key = &keys[usize::from(key_idx) & (CAP - 1)];
+        let mut j = i;
+        while j > 0
+            && cmp_small_span_key(
+                key,
+                &keys[usize::from(order[(j - 1) & (CAP - 1)]) & (CAP - 1)],
+            ) == std::cmp::Ordering::Less
+        {
+            order[j & (CAP - 1)] = order[(j - 1) & (CAP - 1)];
+            j -= 1;
+        }
+        order[j & (CAP - 1)] = key_idx;
+    }
+    for i in 0..n {
+        let mut dst = i;
+        let mut src = usize::from(order[dst & (CAP - 1)]);
+        if src == dst {
+            continue;
+        }
+        while src != i {
+            haps.swap(dst, src);
+            order[dst & (CAP - 1)] = dst as u8;
+            dst = src;
+            src = usize::from(order[dst & (CAP - 1)]);
+        }
+        order[dst & (CAP - 1)] = dst as u8;
+    }
+}
+
+/// Fast stable sort for `2..=16` window haps: extracts compact packed rational
+/// span keys in a single pass so `Whole` and `CutSmall` haps compare uniformly
+/// without touching `Hap` payloads or `i128` rationals during insertion sort.
+#[inline]
+pub(crate) fn sort_small_window_haps(haps: &mut [Hap]) {
+    match haps.len() {
+        0 | 1 => {}
+        2 => {
+            if let (Some(a), Some(b)) = (
+                extract_small_span_key(&haps[0]),
+                extract_small_span_key(&haps[1]),
+            ) {
+                if cmp_small_span_key(&a, &b) == std::cmp::Ordering::Greater {
+                    haps.swap(0, 1);
+                }
+            } else {
+                stable_sort_in_place(haps);
+            }
+        }
+        3..=4 => sort_small_window_n::<4>(haps),
+        5..=8 => sort_small_window_n::<8>(haps),
+        9..=16 => sort_small_window_n::<16>(haps),
+        _ => stable_sort_in_place(haps),
+    }
+}
+
 /// Sort host results without discarding continuous haps that have no whole span.
 /// Explicit `sortHapsByPart()` calls keep the comparator above.
 pub fn sort_haps_for_query(mut haps: Vec<Hap>) -> Vec<Hap> {
@@ -264,19 +441,150 @@ pub fn sort_haps_for_query(mut haps: Vec<Hap>) -> Vec<Hap> {
     haps
 }
 
+#[inline(always)]
+fn cmp_i64_u32(
+    an: i64,
+    ad: std::num::NonZeroU32,
+    bn: i64,
+    bd: std::num::NonZeroU32,
+) -> std::cmp::Ordering {
+    if ad == bd {
+        return an.cmp(&bn);
+    }
+    if (an.unsigned_abs() | bn.unsigned_abs()) <= u64::from(i32::MAX as u32) {
+        return (an * i64::from(bd.get())).cmp(&(bn * i64::from(ad.get())));
+    }
+    (i128::from(an) * i128::from(bd.get())).cmp(&(i128::from(bn) * i128::from(ad.get())))
+}
+
+#[inline(always)]
+fn cmp_i32_u16(
+    an: i32,
+    ad: std::num::NonZeroU16,
+    bn: i32,
+    bd: std::num::NonZeroU16,
+) -> std::cmp::Ordering {
+    if ad == bd {
+        return an.cmp(&bn);
+    }
+    (i64::from(an) * i64::from(bd.get())).cmp(&(i64::from(bn) * i64::from(ad.get())))
+}
+
 /// Part begin, part end, then the whole. An analog hap's missing whole
 /// sorts first.
 #[inline(always)]
 pub(crate) fn query_order(a: &Hap, b: &Hap) -> std::cmp::Ordering {
-    match a.part.begin.cmp(&b.part.begin) {
+    if let (
+        HapSpans::CutSmall {
+            part_begin_n: apbn,
+            part_end_n: apen,
+            whole_begin_n: awbn,
+            whole_end_n: awen,
+            part_begin_d: apbd,
+            part_end_d: aped,
+            whole_begin_d: awbd,
+            whole_end_d: awed,
+        },
+        HapSpans::CutSmall {
+            part_begin_n: bpbn,
+            part_end_n: bpen,
+            whole_begin_n: bwbn,
+            whole_end_n: bwen,
+            part_begin_d: bpbd,
+            part_end_d: bped,
+            whole_begin_d: bwbd,
+            whole_end_d: bwed,
+        },
+    ) = (&a.spans, &b.spans)
+    {
+        match cmp_i32_u16(*apbn, *apbd, *bpbn, *bpbd) {
+            std::cmp::Ordering::Equal => {}
+            ord => return ord,
+        }
+        match cmp_i32_u16(*apen, *aped, *bpen, *bped) {
+            std::cmp::Ordering::Equal => {}
+            ord => return ord,
+        }
+        match cmp_i32_u16(*awbn, *awbd, *bwbn, *bwbd) {
+            std::cmp::Ordering::Equal => return cmp_i32_u16(*awen, *awed, *bwen, *bwed),
+            ord => return ord,
+        }
+    }
+    struct DiscreteSpanParts {
+        pb_n: i64,
+        pb_d: std::num::NonZeroU32,
+        pe_n: i64,
+        pe_d: std::num::NonZeroU32,
+        wb_n: i64,
+        wb_d: std::num::NonZeroU32,
+        we_n: i64,
+        we_d: std::num::NonZeroU32,
+    }
+    #[inline(always)]
+    fn fast_discrete(spans: &HapSpans) -> Option<DiscreteSpanParts> {
+        match spans {
+            HapSpans::Whole {
+                begin_n,
+                end_n,
+                begin_d,
+                end_d,
+            } => Some(DiscreteSpanParts {
+                pb_n: *begin_n,
+                pb_d: *begin_d,
+                pe_n: *end_n,
+                pe_d: *end_d,
+                wb_n: *begin_n,
+                wb_d: *begin_d,
+                we_n: *end_n,
+                we_d: *end_d,
+            }),
+            HapSpans::CutSmall {
+                part_begin_n,
+                part_end_n,
+                whole_begin_n,
+                whole_end_n,
+                part_begin_d,
+                part_end_d,
+                whole_begin_d,
+                whole_end_d,
+            } => Some(DiscreteSpanParts {
+                pb_n: i64::from(*part_begin_n),
+                pb_d: std::num::NonZeroU32::from(*part_begin_d),
+                pe_n: i64::from(*part_end_n),
+                pe_d: std::num::NonZeroU32::from(*part_end_d),
+                wb_n: i64::from(*whole_begin_n),
+                wb_d: std::num::NonZeroU32::from(*whole_begin_d),
+                we_n: i64::from(*whole_end_n),
+                we_d: std::num::NonZeroU32::from(*whole_end_d),
+            }),
+            HapSpans::Analog { .. } | HapSpans::Wide(_) => None,
+        }
+    }
+    if let (Some(fa), Some(fb)) = (fast_discrete(&a.spans), fast_discrete(&b.spans)) {
+        match cmp_i64_u32(fa.pb_n, fa.pb_d, fb.pb_n, fb.pb_d) {
+            std::cmp::Ordering::Equal => {}
+            ord => return ord,
+        }
+        match cmp_i64_u32(fa.pe_n, fa.pe_d, fb.pe_n, fb.pe_d) {
+            std::cmp::Ordering::Equal => {}
+            ord => return ord,
+        }
+        match cmp_i64_u32(fa.wb_n, fa.wb_d, fb.wb_n, fb.wb_d) {
+            std::cmp::Ordering::Equal => return cmp_i64_u32(fa.we_n, fa.we_d, fb.we_n, fb.we_d),
+            ord => return ord,
+        }
+    }
+    let ap = a.part();
+    let bp = b.part();
+    match ap.begin.cmp(&bp.begin) {
         std::cmp::Ordering::Equal => {}
         ord => return ord,
     }
-    match a.part.end.cmp(&b.part.end) {
+    match ap.end.cmp(&bp.end) {
         std::cmp::Ordering::Equal => {}
         ord => return ord,
     }
-    match (&a.whole, &b.whole) {
+    match (a.whole(), b.whole()) {
         (None, None) => std::cmp::Ordering::Equal,
         (None, Some(_)) => std::cmp::Ordering::Less,
         (Some(_), None) => std::cmp::Ordering::Greater,
@@ -309,6 +617,16 @@ pub(crate) fn order_key(time: &Fraction) -> f64 {
     }
 }
 
+#[inline(always)]
+fn order_key_i64_u32(n: i64, d: std::num::NonZeroU32) -> f64 {
+    const EXACT: u64 = 1 << 53;
+    if n.unsigned_abs() < EXACT {
+        n as f64 / f64::from(d.get())
+    } else {
+        f64::NAN
+    }
+}
+
 /// Precomputed float keys for [`query_order`] across part begin and part end.
 #[derive(Clone, Copy)]
 struct OrderKey {
@@ -321,17 +639,52 @@ impl OrderKey {
 
     #[inline(always)]
     pub(crate) fn of(hap: &Hap, prev: Option<(&Hap, Self)>) -> Self {
+        match &hap.spans {
+            HapSpans::Whole {
+                begin_n,
+                end_n,
+                begin_d,
+                end_d,
+            }
+            | HapSpans::Analog {
+                begin_n,
+                end_n,
+                begin_d,
+                end_d,
+            } => {
+                let pb = order_key_i64_u32(*begin_n, *begin_d);
+                let pe = if begin_n == end_n && begin_d == end_d {
+                    pb
+                } else {
+                    order_key_i64_u32(*end_n, *end_d)
+                };
+                return Self { pb, pe };
+            }
+            HapSpans::CutSmall {
+                part_begin_n,
+                part_end_n,
+                part_begin_d,
+                part_end_d,
+                ..
+            } => {
+                let pb = f64::from(*part_begin_n) / f64::from(part_begin_d.get());
+                let pe = f64::from(*part_end_n) / f64::from(part_end_d.get());
+                return Self { pb, pe };
+            }
+            HapSpans::Wide(_) => {}
+        }
+        let hp = hap.part();
         let pb = match prev {
-            Some((ph, pk)) if ph.part.end == hap.part.begin => pk.pe,
-            Some((ph, pk)) if ph.part.begin == hap.part.begin => pk.pb,
-            _ => order_key(&hap.part.begin),
+            Some((ph, pk)) if ph.part_end() == hp.begin => pk.pe,
+            Some((ph, pk)) if ph.part_begin() == hp.begin => pk.pb,
+            _ => order_key(&hp.begin),
         };
-        let pe = if hap.part.end == hap.part.begin {
+        let pe = if hp.end == hp.begin {
             pb
         } else {
             match prev {
-                Some((ph, pk)) if ph.part.end == hap.part.end => pk.pe,
-                _ => order_key(&hap.part.end),
+                Some((ph, pk)) if ph.part_end() == hp.end => pk.pe,
+                _ => order_key(&hp.end),
             }
         };
         Self { pb, pe }
@@ -346,8 +699,10 @@ fn cmp_order_keys(ak: OrderKey, bk: OrderKey, a: &Hap, b: &Hap) -> std::cmp::Ord
     if ak.pb > bk.pb {
         return std::cmp::Ordering::Greater;
     }
-    if a.part.begin != b.part.begin {
-        return a.part.begin.cmp(&b.part.begin);
+    let ap = a.part();
+    let bp = b.part();
+    if ap.begin != bp.begin {
+        return ap.begin.cmp(&bp.begin);
     }
     if ak.pe < bk.pe {
         return std::cmp::Ordering::Less;
@@ -355,10 +710,10 @@ fn cmp_order_keys(ak: OrderKey, bk: OrderKey, a: &Hap, b: &Hap) -> std::cmp::Ord
     if ak.pe > bk.pe {
         return std::cmp::Ordering::Greater;
     }
-    if a.part.end != b.part.end {
-        return a.part.end.cmp(&b.part.end);
+    if ap.end != bp.end {
+        return ap.end.cmp(&bp.end);
     }
-    match (&a.whole, &b.whole) {
+    match (a.whole(), b.whole()) {
         (None, None) => std::cmp::Ordering::Equal,
         (None, Some(_)) => std::cmp::Ordering::Less,
         (Some(_), None) => std::cmp::Ordering::Greater,
@@ -688,24 +1043,259 @@ impl TimeSpan {
 // Hap
 // ---------------------------------------------------------------------------
 
+/// Compact 32-byte representation of `(whole: Option<TimeSpan>, part: TimeSpan)`
+/// in 100% safe Rust. Common spans stay inline without heap allocation while
+/// full `i128` rationals spill into `Wide`.
 #[derive(Clone)]
+pub(crate) enum HapSpans {
+    /// `whole == Some(part)`, both in `i64 / NonZeroU32`.
+    Whole {
+        begin_n: i64,
+        end_n: i64,
+        begin_d: std::num::NonZeroU32,
+        end_d: std::num::NonZeroU32,
+    },
+    /// `whole == None`, `part` in `i64 / NonZeroU32`.
+    Analog {
+        begin_n: i64,
+        end_n: i64,
+        begin_d: std::num::NonZeroU32,
+        end_d: std::num::NonZeroU32,
+    },
+    /// `whole != part`, both in `i32 / NonZeroU16`.
+    CutSmall {
+        part_begin_n: i32,
+        part_end_n: i32,
+        whole_begin_n: i32,
+        whole_end_n: i32,
+        part_begin_d: std::num::NonZeroU16,
+        part_end_d: std::num::NonZeroU16,
+        whole_begin_d: std::num::NonZeroU16,
+        whole_end_d: std::num::NonZeroU16,
+    },
+    /// Full `i128` spillover for wide rationals.
+    Wide(Box<(Option<TimeSpan>, TimeSpan)>),
+}
+
+#[cfg(target_pointer_width = "64")]
+const _: () = assert!(std::mem::size_of::<HapSpans>() == 32);
+
+impl HapSpans {
+    #[inline(always)]
+    fn try_i64_u32(
+        span: TimeSpan,
+    ) -> Option<(i64, std::num::NonZeroU32, i64, std::num::NonZeroU32)> {
+        let bn = i64::try_from(span.begin.numer()).ok()?;
+        let bd = std::num::NonZeroU32::new(u32::try_from(span.begin.denom()).ok()?)?;
+        let en = i64::try_from(span.end.numer()).ok()?;
+        let ed = std::num::NonZeroU32::new(u32::try_from(span.end.denom()).ok()?)?;
+        Some((bn, bd, en, ed))
+    }
+
+    #[inline(always)]
+    fn try_i32_u16(
+        span: TimeSpan,
+    ) -> Option<(i32, std::num::NonZeroU16, i32, std::num::NonZeroU16)> {
+        let bn = i32::try_from(span.begin.numer()).ok()?;
+        let bd = std::num::NonZeroU16::new(u16::try_from(span.begin.denom()).ok()?)?;
+        let en = i32::try_from(span.end.numer()).ok()?;
+        let ed = std::num::NonZeroU16::new(u16::try_from(span.end.denom()).ok()?)?;
+        Some((bn, bd, en, ed))
+    }
+
+    #[inline(always)]
+    fn from_spans(whole: Option<TimeSpan>, part: TimeSpan) -> Self {
+        match whole {
+            Some(w) if w == part => {
+                if let Some((begin_n, begin_d, end_n, end_d)) = Self::try_i64_u32(part) {
+                    Self::Whole {
+                        begin_n,
+                        end_n,
+                        begin_d,
+                        end_d,
+                    }
+                } else {
+                    Self::Wide(Box::new((Some(w), part)))
+                }
+            }
+            None => {
+                if let Some((begin_n, begin_d, end_n, end_d)) = Self::try_i64_u32(part) {
+                    Self::Analog {
+                        begin_n,
+                        end_n,
+                        begin_d,
+                        end_d,
+                    }
+                } else {
+                    Self::Wide(Box::new((None, part)))
+                }
+            }
+            Some(w) => {
+                if let (
+                    Some((part_begin_n, part_begin_d, part_end_n, part_end_d)),
+                    Some((whole_begin_n, whole_begin_d, whole_end_n, whole_end_d)),
+                ) = (Self::try_i32_u16(part), Self::try_i32_u16(w))
+                {
+                    Self::CutSmall {
+                        part_begin_n,
+                        part_end_n,
+                        whole_begin_n,
+                        whole_end_n,
+                        part_begin_d,
+                        part_end_d,
+                        whole_begin_d,
+                        whole_end_d,
+                    }
+                } else {
+                    Self::Wide(Box::new((Some(w), part)))
+                }
+            }
+        }
+    }
+
+    #[inline(always)]
+    fn span_i64_u32(
+        bn: i64,
+        bd: std::num::NonZeroU32,
+        en: i64,
+        ed: std::num::NonZeroU32,
+    ) -> TimeSpan {
+        TimeSpan::new(
+            Fraction::from_reduced_parts_i64(bn, bd),
+            Fraction::from_reduced_parts_i64(en, ed),
+        )
+    }
+
+    #[inline(always)]
+    fn span_i32_u16(
+        bn: i32,
+        bd: std::num::NonZeroU16,
+        en: i32,
+        ed: std::num::NonZeroU16,
+    ) -> TimeSpan {
+        TimeSpan::new(
+            Fraction::from_reduced_parts_i64(i64::from(bn), std::num::NonZeroU32::from(bd)),
+            Fraction::from_reduced_parts_i64(i64::from(en), std::num::NonZeroU32::from(ed)),
+        )
+    }
+
+    #[inline(always)]
+    fn part(&self) -> TimeSpan {
+        match self {
+            Self::Whole {
+                begin_n,
+                end_n,
+                begin_d,
+                end_d,
+            }
+            | Self::Analog {
+                begin_n,
+                end_n,
+                begin_d,
+                end_d,
+            } => Self::span_i64_u32(*begin_n, *begin_d, *end_n, *end_d),
+            Self::CutSmall {
+                part_begin_n,
+                part_end_n,
+                part_begin_d,
+                part_end_d,
+                ..
+            } => Self::span_i32_u16(*part_begin_n, *part_begin_d, *part_end_n, *part_end_d),
+            Self::Wide(boxed) => boxed.1,
+        }
+    }
+
+    #[inline(always)]
+    fn part_begin(&self) -> Fraction {
+        match self {
+            Self::Whole {
+                begin_n, begin_d, ..
+            }
+            | Self::Analog {
+                begin_n, begin_d, ..
+            } => Fraction::from_reduced_parts_i64(*begin_n, *begin_d),
+            Self::CutSmall {
+                part_begin_n,
+                part_begin_d,
+                ..
+            } => Fraction::from_reduced_parts_i64(
+                i64::from(*part_begin_n),
+                std::num::NonZeroU32::from(*part_begin_d),
+            ),
+            Self::Wide(boxed) => boxed.1.begin,
+        }
+    }
+
+    #[inline(always)]
+    fn part_end(&self) -> Fraction {
+        match self {
+            Self::Whole { end_n, end_d, .. } | Self::Analog { end_n, end_d, .. } => {
+                Fraction::from_reduced_parts_i64(*end_n, *end_d)
+            }
+            Self::CutSmall {
+                part_end_n,
+                part_end_d,
+                ..
+            } => Fraction::from_reduced_parts_i64(
+                i64::from(*part_end_n),
+                std::num::NonZeroU32::from(*part_end_d),
+            ),
+            Self::Wide(boxed) => boxed.1.end,
+        }
+    }
+
+    #[inline(always)]
+    fn whole(&self) -> Option<TimeSpan> {
+        match self {
+            Self::Whole {
+                begin_n,
+                end_n,
+                begin_d,
+                end_d,
+            } => Some(Self::span_i64_u32(*begin_n, *begin_d, *end_n, *end_d)),
+            Self::Analog { .. } => None,
+            Self::CutSmall {
+                whole_begin_n,
+                whole_end_n,
+                whole_begin_d,
+                whole_end_d,
+                ..
+            } => Some(Self::span_i32_u16(
+                *whole_begin_n,
+                *whole_begin_d,
+                *whole_end_n,
+                *whole_end_d,
+            )),
+            Self::Wide(boxed) => boxed.0,
+        }
+    }
+
+    #[inline(always)]
+    fn has_whole(&self) -> bool {
+        match self {
+            Self::Whole { .. } | Self::CutSmall { .. } => true,
+            Self::Analog { .. } => false,
+            Self::Wide(boxed) => boxed.0.is_some(),
+        }
+    }
+}
+
+#[derive(Clone)]
+#[repr(C)]
 pub struct Hap {
-    /// `None` means analog/continuous: the value was sampled at the part's
-    /// midpoint and has no notional extent.
-    pub whole: Option<TimeSpan>,
-    pub part: TimeSpan,
     pub value: Value,
-    /// Source spans, concatenated on every bind. Drives editor highlighting,
-    /// so it must survive every combinator that carries context.
-    pub context: Locations,
     /// Optional per-hap metadata (`scale`, `edoSize`, `scaleDefinition`,
     /// `tags`, `logLine`, live slider bindings, visual slots, and JS lookup
     /// shape). Most haps carry none, so this stays a null pointer.
     pub(crate) keys: ContextKeys,
+    pub(crate) spans: HapSpans,
+    /// Source spans, concatenated on every bind. Drives editor highlighting,
+    /// so it must survive every combinator that carries context.
+    pub context: Locations,
 }
 
 #[cfg(target_pointer_width = "64")]
-const _: () = assert!(std::mem::size_of::<Hap>() == 192);
+const _: () = assert!(std::mem::size_of::<Hap>() == 80);
 
 /// Read a `tags` key off a JS context object: an array of strings, anything
 /// else ignored. A score that somehow writes a non-array there loses the tag,
@@ -726,13 +1316,29 @@ pub(crate) fn tags_from_value(value: &Value) -> Option<Arc<[Arc<str>]>> {
 }
 
 impl Hap {
+    #[inline(always)]
     pub fn new(whole: Option<TimeSpan>, part: TimeSpan, value: Value) -> Self {
         Self {
-            whole,
-            part,
+            spans: HapSpans::from_spans(whole, part),
             value,
             context: Locations::new(),
             keys: ContextKeys::default(),
+        }
+    }
+
+    #[inline(always)]
+    pub(crate) fn from_parts(
+        whole: Option<TimeSpan>,
+        part: TimeSpan,
+        value: Value,
+        context: Locations,
+        keys: ContextKeys,
+    ) -> Self {
+        Self {
+            spans: HapSpans::from_spans(whole, part),
+            value,
+            context,
+            keys,
         }
     }
 
@@ -745,12 +1351,112 @@ impl Hap {
         keys: ContextKeys,
     ) -> Self {
         Self {
-            whole: Some(whole),
-            part,
+            spans: HapSpans::from_spans(Some(whole), part),
             value,
             context,
             keys,
         }
+    }
+
+    /// Construct an uncut discrete hap directly from reduced `(i64, NonZeroU32)`
+    /// endpoints without building intermediate `i128` `Fraction`s.
+    #[inline(always)]
+    pub(crate) fn of_whole_parts(
+        begin_n: i64,
+        begin_d: std::num::NonZeroU32,
+        end_n: i64,
+        end_d: std::num::NonZeroU32,
+        value: Value,
+        context: Locations,
+        keys: ContextKeys,
+    ) -> Self {
+        Self {
+            spans: HapSpans::Whole {
+                begin_n,
+                end_n,
+                begin_d,
+                end_d,
+            },
+            value,
+            context,
+            keys,
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    #[inline(always)]
+    pub(crate) fn of_cut_small(
+        part_begin_n: i32,
+        part_begin_d: std::num::NonZeroU16,
+        part_end_n: i32,
+        part_end_d: std::num::NonZeroU16,
+        whole_begin_n: i32,
+        whole_begin_d: std::num::NonZeroU16,
+        whole_end_n: i32,
+        whole_end_d: std::num::NonZeroU16,
+        value: Value,
+        context: Locations,
+        keys: ContextKeys,
+    ) -> Self {
+        Self {
+            spans: HapSpans::CutSmall {
+                part_begin_n,
+                part_end_n,
+                whole_begin_n,
+                whole_end_n,
+                part_begin_d,
+                part_end_d,
+                whole_begin_d,
+                whole_end_d,
+            },
+            value,
+            context,
+            keys,
+        }
+    }
+
+    /// `None` means analog/continuous: the value was sampled at the part's
+    /// midpoint and has no notional extent.
+    #[inline(always)]
+    pub fn whole(&self) -> Option<TimeSpan> {
+        self.spans.whole()
+    }
+
+    #[inline(always)]
+    pub fn part(&self) -> TimeSpan {
+        self.spans.part()
+    }
+
+    #[inline(always)]
+    pub fn has_whole(&self) -> bool {
+        self.spans.has_whole()
+    }
+
+    #[inline(always)]
+    pub fn part_begin(&self) -> Fraction {
+        self.spans.part_begin()
+    }
+
+    #[inline(always)]
+    pub fn part_end(&self) -> Fraction {
+        self.spans.part_end()
+    }
+
+    #[inline(always)]
+    pub fn set_part(&mut self, part: TimeSpan) {
+        let whole = self.spans.whole();
+        self.spans = HapSpans::from_spans(whole, part);
+    }
+
+    #[inline(always)]
+    pub fn set_whole(&mut self, whole: Option<TimeSpan>) {
+        let part = self.spans.part();
+        self.spans = HapSpans::from_spans(whole, part);
+    }
+
+    #[inline(always)]
+    pub fn set_spans(&mut self, whole: Option<TimeSpan>, part: TimeSpan) {
+        self.spans = HapSpans::from_spans(whole, part);
     }
 
     pub(crate) fn with_pick_lookup(mut self, lookup: Arc<PickLookup>) -> Self {
@@ -915,7 +1621,7 @@ impl Hap {
     }
 
     pub fn whole_or_part(&self) -> TimeSpan {
-        self.whole.unwrap_or(self.part)
+        self.whole().unwrap_or_else(|| self.part())
     }
 
     /// Effective duration, honoring the `duration` and `clip` controls. A clip
@@ -927,8 +1633,8 @@ impl Hap {
             .get("duration")
             .and_then(Value::as_f64)
             .and_then(Fraction::from_f64)
-            .or_else(|| self.whole.map(|whole| whole.duration()))
-            .unwrap_or_else(|| self.part.duration());
+            .or_else(|| self.whole().map(|whole| whole.duration()))
+            .unwrap_or_else(|| self.part().duration());
         if let Some(clip) = self
             .value
             .get("clip")
@@ -971,29 +1677,40 @@ impl Hap {
     }
 
     /// Whether the whole begins exactly where the part does.
+    #[inline(always)]
     pub fn has_onset(&self) -> bool {
-        self.whole
-            .map(|w| w.begin == self.part.begin)
-            .unwrap_or(false)
+        match &self.spans {
+            HapSpans::Whole { .. } => true,
+            HapSpans::Analog { .. } => false,
+            HapSpans::CutSmall {
+                part_begin_n,
+                whole_begin_n,
+                part_begin_d,
+                whole_begin_d,
+                ..
+            } => part_begin_n == whole_begin_n && part_begin_d == whole_begin_d,
+            HapSpans::Wide(boxed) => boxed.0.is_some_and(|w| w.begin == boxed.1.begin),
+        }
     }
 
     pub fn with_span(&self, f: impl Fn(&TimeSpan) -> TimeSpan) -> Hap {
-        Hap {
-            whole: self.whole.as_ref().map(&f),
-            part: f(&self.part),
-            value: self.value.clone(),
-            context: self.context.clone(),
-            keys: self.keys.clone(),
-        }
+        let whole = self.whole().map(|w| f(&w));
+        let part = f(&self.part());
+        Hap::from_parts(
+            whole,
+            part,
+            self.value.clone(),
+            self.context.clone(),
+            self.keys.clone(),
+        )
     }
 
     /// Changes the spans in place. The caller owns the hap, so no value or
     /// context is cloned.
     pub(crate) fn update_span(&mut self, f: impl Fn(&TimeSpan) -> TimeSpan) {
-        if let Some(whole) = self.whole.as_mut() {
-            *whole = f(whole);
-        }
-        self.part = f(&self.part);
+        let whole = self.whole().map(|w| f(&w));
+        let part = f(&self.part());
+        self.set_spans(whole, part);
     }
 
     /// Haps cut by the same query share the mapped times of its edges, and
@@ -1009,8 +1726,8 @@ impl Hap {
         let mut last_wb: Option<(Fraction, Fraction)> = None;
         let mut last_we: Option<(Fraction, Fraction)> = None;
         for hap in haps {
-            let part = hap.part;
-            hap.part.begin = if part.begin == span.begin {
+            let part = hap.part();
+            let new_pb = if part.begin == span.begin {
                 *begin.get_or_insert_with(|| map(part.begin))
             } else if let Some((raw, mapped)) = last_wb
                 && raw == part.begin
@@ -1025,7 +1742,7 @@ impl Hap {
                 last_wb = Some((part.begin, mapped));
                 mapped
             };
-            hap.part.end = if part.end == span.end {
+            let new_pe = if part.end == span.end {
                 *end.get_or_insert_with(|| map(part.end))
             } else if let Some((raw, mapped)) = last_we
                 && raw == part.end
@@ -1040,9 +1757,10 @@ impl Hap {
                 last_we = Some((part.end, mapped));
                 mapped
             };
-            if let Some(whole) = &mut hap.whole {
-                whole.begin = if whole.begin == part.begin {
-                    hap.part.begin
+            let new_part = TimeSpan::new(new_pb, new_pe);
+            let new_whole = hap.whole().map(|whole| {
+                let wb = if whole.begin == part.begin {
+                    new_pb
                 } else if let Some((raw, mapped)) = last_wb
                     && raw == whole.begin
                 {
@@ -1052,8 +1770,8 @@ impl Hap {
                     last_wb = Some((whole.begin, mapped));
                     mapped
                 };
-                whole.end = if whole.end == part.end {
-                    hap.part.end
+                let we = if whole.end == part.end {
+                    new_pe
                 } else if let Some((raw, mapped)) = last_we
                     && raw == whole.end
                 {
@@ -1063,7 +1781,9 @@ impl Hap {
                     last_we = Some((whole.end, mapped));
                     mapped
                 };
-            }
+                TimeSpan::new(wb, we)
+            });
+            hap.set_spans(new_whole, new_part);
         }
     }
 
@@ -1072,7 +1792,7 @@ impl Hap {
     /// Native extension nodes use this for the same intersected-child shape
     /// as JavaScript's `new Hap(whole, part, value, context)` constructor.
     pub fn with_part(mut self, part: TimeSpan) -> Hap {
-        self.part = part;
+        self.set_part(part);
         self
     }
 
@@ -1089,8 +1809,7 @@ impl Hap {
             self.pick_lookup_arc(),
         );
         Hap {
-            whole: self.whole,
-            part: self.part,
+            spans: self.spans.clone(),
             value: self.value.clone(),
             context,
             keys,
@@ -1118,8 +1837,7 @@ impl Hap {
             keys
         };
         Hap {
-            whole: self.whole,
-            part: self.part,
+            spans: self.spans.clone(),
             value,
             context: self.context.clone(),
             keys,
@@ -1231,26 +1949,27 @@ impl Hap {
             }
             value => value.show(),
         };
-        let spans = match self.whole {
+        let spans = match self.whole() {
             // Compatibility quirk: strudel.cc stringifies the show method
             // itself for analog haps (a missing `()`), and the exact text is
             // observable - so it is reproduced verbatim.
             None => "~show() {\n    return this.begin.show() + ' → ' + this.end.show();\n  }"
                 .to_string(),
             Some(w) => {
-                let is_whole = w.begin == self.part.begin && w.end == self.part.end;
+                let part = self.part();
+                let is_whole = w.begin == part.begin && w.end == part.end;
                 let mut s = String::new();
-                if w.begin != self.part.begin {
+                if w.begin != part.begin {
                     s.push_str(&format!("{} ⇜ ", w.begin.show()));
                 }
                 if !is_whole {
                     s.push('(');
                 }
-                s.push_str(&self.part.show());
+                s.push_str(&part.show());
                 if !is_whole {
                     s.push(')');
                 }
-                if w.end != self.part.end {
+                if w.end != part.end {
                     s.push_str(&format!(" ⇝ {}", w.end.show()));
                 }
                 s
@@ -1261,7 +1980,7 @@ impl Hap {
 
     pub fn show_whole(&self, compact: bool) -> String {
         let span = self
-            .whole
+            .whole()
             .map(|whole| whole.show())
             .unwrap_or_else(|| "~".into());
         let value = match &self.value {
@@ -1279,8 +1998,8 @@ impl Hap {
 impl fmt::Debug for Hap {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Hap")
-            .field("whole", &self.whole)
-            .field("part", &self.part)
+            .field("whole", &self.whole())
+            .field("part", &self.part())
             .field("value", &self.value)
             .field("context", &self.context)
             .finish_non_exhaustive()
@@ -1293,11 +2012,33 @@ impl fmt::Debug for Hap {
 /// The hap an inner, outer or mix join makes of an outer hap `outer` and one
 /// hap `inner` of the pattern it names, at `whole`. See `Node::Join`.
 pub(crate) fn join_hap_in_place(outer: &Hap, inner: &mut Hap, whole: Option<TimeSpan>) {
-    inner.whole = whole;
+    inner.set_whole(whole);
     if !outer.context.is_empty() {
         let mut context = outer.context.clone();
         context.append(&inner.context);
         inner.context = context;
+    }
+    if !outer.keys.is_none() {
+        let pick_lookup = joined_pick_lookup(outer, inner);
+        inner.keys = ContextKeys::merge_with(
+            &inner.keys,
+            &outer.keys,
+            inner.live_controls(),
+            inner.slider_binding(),
+            pick_lookup,
+        );
+    }
+}
+
+pub(crate) fn join_hap_in_place_cached(
+    outer: &Hap,
+    inner: &mut Hap,
+    whole: Option<TimeSpan>,
+    loc_cache: &mut crate::locations::LocMergeCache,
+) {
+    inner.set_whole(whole);
+    if !outer.context.is_empty() {
+        loc_cache.prepend_into(&outer.context, &mut inner.context);
     }
     if !outer.keys.is_none() {
         let pick_lookup = joined_pick_lookup(outer, inner);

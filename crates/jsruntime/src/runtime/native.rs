@@ -1098,14 +1098,23 @@ impl JsRuntime {
             Ok((mut score, reuse)) => {
                 let pending_source = self.pending_source.borrow_mut().take();
                 if let Some(reuse) = reuse {
-                    let (mut memo, reused_nodes) = reuse.finish(score.cps, pending_source);
-                    rustel_core::intern::dedup_score_with_reused(
-                        &mut score.pattern,
-                        &reused_nodes,
-                        |remap| {
-                            memo.remap_nodes(remap);
-                        },
-                    );
+                    let is_tiny = rustel_core::intern::is_tiny_graph_pattern(&score.pattern);
+                    let (mut memo, reused_nodes) =
+                        reuse.finish(score.cps, pending_source, !is_tiny);
+                    if !is_tiny {
+                        rustel_core::intern::dedup_score_with_reused(
+                            &mut score.pattern,
+                            &reused_nodes,
+                            |remap| {
+                                memo.remap_nodes(remap);
+                            },
+                        );
+                    }
+                    if !self.lane_tagging.get()
+                        && let Some(src) = source
+                    {
+                        memo.tail_num = detect_tail_numeric_edit(program, src, &memo);
+                    }
                     self.native_memo.replace(memo);
                 } else {
                     rustel_core::intern::dedup_score(&mut score.pattern, |_| {});
@@ -1122,27 +1131,71 @@ impl JsRuntime {
     }
 
     /// Reuse the active native score when `source` is byte-identical to the
-    /// last native build and no script engine has started.
-    pub fn try_reuse_identical_native_score(
+    /// last native build, or re-apply a trailing numeric method (`.fast(n)`,
+    /// `.slow(n)`, `.early(n)`, `.late(n)`) directly onto its retained receiver
+    /// when only that literal changed.
+    pub fn try_reuse_native_score(
         &self,
         source: &str,
     ) -> Option<(Pattern, Option<f64>, rustel_core::settings::RuntimeSettings)> {
         if !self.native_tier.get() || self.bindings_installed.get() || self.realm.get().is_some() {
             return None;
         }
-        let memo = self.native_memo.borrow();
-        if memo.source.as_deref() != Some(source) {
-            return None;
+        {
+            let memo = self.native_memo.borrow();
+            if memo.source.as_deref() == Some(source) {
+                let pattern = self
+                    .native_active
+                    .borrow()
+                    .as_ref()?
+                    .clone()
+                    .with_shared_runtime_settings(self.plain_settings_extras());
+                self.evaluated_natively.set(true);
+                self.native_left.set(None);
+                return Some((pattern, memo.cps, self.core_settings.clone()));
+            }
+            let tail = memo.tail_num?;
+            if self.lane_tagging.get() || !memo.has_no_names() {
+                return None;
+            }
+            let prev = memo.source.as_deref()?;
+            let prefix_len = usize::from(tail.arg_start);
+            let suffix_len = usize::from(tail.suffix_len);
+            if source.len() <= prefix_len.saturating_add(suffix_len)
+                || prev.len() < prefix_len.saturating_add(suffix_len)
+            {
+                return None;
+            }
+            let sb = source.as_bytes();
+            let pb = prev.as_bytes();
+            if sb[..prefix_len] != pb[..prefix_len]
+                || sb[sb.len() - suffix_len..] != pb[pb.len() - suffix_len..]
+            {
+                return None;
+            }
+            let mid = &source[prefix_len..source.len() - suffix_len];
+            let factor = parse_plain_positive_fraction(mid)?;
+            let receiver = memo.part_pattern(usize::from(tail.part_idx));
+            let steps = receiver.steps();
+            let built = match tail.kind {
+                memo::TailNumericKind::Fast => receiver.fast(factor).with_steps(steps),
+                memo::TailNumericKind::Slow => receiver.slow(factor).with_steps(steps),
+                memo::TailNumericKind::Early => receiver.early(factor).with_steps(steps),
+                memo::TailNumericKind::Late => receiver.late(factor).with_steps(steps),
+            };
+            let cps = memo.cps;
+            drop(memo);
+            let walked = built.mark_walked();
+            self.publish_native(walked.clone());
+            self.native_memo.borrow_mut().source = Some(Arc::from(source));
+            self.evaluated_natively.set(true);
+            self.native_left.set(None);
+            Some((
+                walked.with_shared_runtime_settings(self.plain_settings_extras()),
+                cps,
+                self.core_settings.clone(),
+            ))
         }
-        let pattern = self
-            .native_active
-            .borrow()
-            .as_ref()?
-            .clone()
-            .with_runtime_settings(self.core_settings.clone());
-        self.evaluated_natively.set(true);
-        self.native_left.set(None);
-        Some((pattern, memo.cps, self.core_settings.clone()))
     }
 
     /// The score that `program` builds and what the build keeps, or where
@@ -1405,7 +1458,170 @@ impl JsRuntime {
     }
 }
 
+/// Parse a strict plain ASCII unsigned positive decimal literal into a
+/// [`Fraction`] without Farey search for small integers.
+fn parse_plain_positive_fraction(mid: &str) -> Option<Fraction> {
+    let bytes = mid.as_bytes();
+    if bytes.is_empty()
+        || bytes.len() > 20
+        || !bytes[0].is_ascii_digit()
+        || !bytes[bytes.len() - 1].is_ascii_digit()
+    {
+        return None;
+    }
+    let mut dot = false;
+    let mut int_val: u64 = 0;
+    for &b in bytes {
+        if b == b'.' {
+            if dot {
+                return None;
+            }
+            dot = true;
+        } else if b.is_ascii_digit() {
+            if !dot {
+                int_val = int_val
+                    .saturating_mul(10)
+                    .saturating_add(u64::from(b - b'0'));
+            }
+        } else {
+            return None;
+        }
+    }
+    if !dot && int_val > 0 && int_val <= u64::from(u32::MAX) {
+        return Some(Fraction::int(i128::from(int_val)));
+    }
+    let value: f64 = mid.parse().ok()?;
+    if !value.is_finite() || value <= 0.0 {
+        return None;
+    }
+    Fraction::from_f64(value)
+}
+
+/// Inspect a finalized single-statement binding-free native score for a
+/// trailing `.fast(n)` / `.slow(n)` / `.early(n)` / `.late(n)` call whose
+/// receiver is already retained in `memo`.
+fn detect_tail_numeric_edit(
+    program: &ScoreProgram<'_>,
+    source: &str,
+    memo: &memo::Memo,
+) -> Option<memo::TailNumericEdit> {
+    if !memo.has_no_names() || program.statements.len() != 1 {
+        return None;
+    }
+    let ScoreStatement::Expression(ScoreExpr::Method {
+        receiver,
+        method,
+        arguments,
+        written,
+    }) = &program.statements[0]
+    else {
+        return None;
+    };
+    let kind = match program.held.text(*method) {
+        "fast" => memo::TailNumericKind::Fast,
+        "slow" => memo::TailNumericKind::Slow,
+        "early" => memo::TailNumericKind::Early,
+        "late" => memo::TailNumericKind::Late,
+        _ => return None,
+    };
+    let [ScoreExpr::Number(_)] = program.held.row(*arguments) else {
+        return None;
+    };
+    let (ScoreExpr::Method {
+        written: rec_written,
+        ..
+    }
+    | ScoreExpr::Call {
+        written: rec_written,
+        ..
+    }) = program.held.at(*receiver)
+    else {
+        return None;
+    };
+    let part_idx = memo.part_index_of(*rec_written)?;
+    let rec_end = usize::try_from(rec_written.start.checked_add(rec_written.len)?).ok()?;
+    let call_end = usize::try_from(written.start.checked_add(written.len)?).ok()?;
+    if call_end <= rec_end || call_end > source.len() {
+        return None;
+    }
+    let tail_slice = source.get(rec_end..call_end)?;
+    if !tail_slice.ends_with(')') {
+        return None;
+    }
+    let open_rel = tail_slice.find('(')?;
+    let inner_start = rec_end + open_rel + 1;
+    let inner_end = call_end - 1;
+    let bytes = source.as_bytes();
+    let mut arg_start = inner_start;
+    while arg_start < inner_end && matches!(bytes[arg_start], b' ' | b'\t') {
+        arg_start += 1;
+    }
+    let mut arg_end = inner_end;
+    while arg_end > arg_start && matches!(bytes[arg_end - 1], b' ' | b'\t') {
+        arg_end -= 1;
+    }
+    parse_plain_positive_fraction(source.get(arg_start..arg_end)?)?;
+    Some(memo::TailNumericEdit {
+        kind,
+        part_idx,
+        arg_start: u16::try_from(arg_start).ok()?,
+        suffix_len: u16::try_from(source.len().checked_sub(arg_end)?).ok()?,
+    })
+}
+
+/// Normalize a plain ASCII scale mini literal (`"c:major"`, `"eb:minor"`) into
+/// `buf` (`"c major"`, `"eb minor"`) without invoking the mini parser or
+/// allocating `SharedStr`/`Locations`.
+fn parse_ascii_scale_name<'a>(src: &str, buf: &'a mut [u8; 64]) -> Option<&'a str> {
+    let bytes = src.as_bytes();
+    if bytes.is_empty() || bytes.len() > buf.len() || !bytes[0].is_ascii_alphabetic() {
+        return None;
+    }
+    let mut colons = 0u8;
+    let mut after_colon = false;
+    for (i, &b) in bytes.iter().enumerate() {
+        if b == b':' {
+            if colons > 0 || i + 1 >= bytes.len() {
+                return None;
+            }
+            colons = 1;
+            after_colon = true;
+            buf[i] = b' ';
+        } else if after_colon {
+            if !b.is_ascii_alphabetic() {
+                return None;
+            }
+            after_colon = false;
+            buf[i] = b;
+        } else if b.is_ascii_alphanumeric() || b == b'#' || b == b'_' {
+            buf[i] = b;
+        } else {
+            return None;
+        }
+    }
+    std::str::from_utf8(&buf[..bytes.len()]).ok()
+}
+
 impl<'p> Turn<'p> {
+    #[inline]
+    fn mini_source_text(&self, expr: &'p ScoreExpr) -> Option<&'p str> {
+        match expr {
+            ScoreExpr::Mini { source, .. } => Some(self.held.text(*source)),
+            ScoreExpr::Call {
+                callee, arguments, ..
+            } if self.held.text(*callee) == MINI_CALLEE
+                && let [ScoreExpr::String(source), ScoreExpr::Number(offset)] =
+                    self.held.row(*arguments)
+                && offset.fract() == 0.0
+                && offset.is_finite()
+                && usize::try_from(*offset as i64).is_ok() =>
+            {
+                Some(self.held.text(*source))
+            }
+            _ => None,
+        }
+    }
+
     fn evaluate(
         &mut self,
         names: &Names<'_, '_>,
@@ -1585,7 +1801,64 @@ impl<'p> Turn<'p> {
                 } else {
                     None
                 };
-                match self.receiver(names, self.held.at(*receiver), method, runtime)? {
+                let receiver_expr = self.held.at(*receiver);
+                if self.frames.is_empty()
+                    && matches!(method, "fast" | "slow")
+                    && let ScoreExpr::Method {
+                        written: rec_written,
+                        ..
+                    } = receiver_expr
+                    && rec_written.len > 0
+                    && self.reuse.is_some()
+                {
+                    if let Some(cached) = self.reuse.as_mut().and_then(|r| r.find(rec_written)) {
+                        return self.method(
+                            names,
+                            cached,
+                            method,
+                            arguments,
+                            pre_resolved,
+                            runtime,
+                        );
+                    }
+                    if let Some(reuse) = &mut self.reuse {
+                        reuse.begin(0);
+                    }
+                    let rec = self.evaluate(names, receiver_expr, runtime);
+                    let closed = self.reuse.as_mut().map(memo::Reuse::end);
+                    let rec = rec?;
+                    return Some(match rec {
+                        Native::Pattern(rec_pat) => {
+                            let rec_steps = rec_pat.steps();
+                            let out = self.method(
+                                names,
+                                rec_pat,
+                                method,
+                                arguments,
+                                pre_resolved,
+                                runtime,
+                            )?;
+                            if let Native::Pattern(ref pat) = out
+                                && let Some(closed) = closed
+                                && let Some(inner) = pat.fast_inner_pattern(rec_steps)
+                                && let Some(reuse) = &mut self.reuse
+                            {
+                                reuse.keep(*rec_written, &inner, closed);
+                            }
+                            out
+                        }
+                        Native::Chain(chain) => Native::Chain(self.chained(
+                            names,
+                            chain,
+                            method,
+                            arguments,
+                            pre_resolved,
+                            runtime,
+                        )?),
+                        _ => return None,
+                    });
+                }
+                match self.receiver(names, receiver_expr, method, runtime)? {
                     Native::Pattern(receiver) => {
                         self.method(names, receiver, method, arguments, pre_resolved, runtime)?
                     }
@@ -2174,6 +2447,13 @@ impl<'p> Turn<'p> {
                             ChainArgument::Constant(rustel_core::Value::List(list), locations)
                         }
                     }
+                } else if let Some(flat) = rustel_mini::flat_number_sequence_parts(source, at) {
+                    ChainArgument::FlatNumbers {
+                        values: flat.values,
+                        locs: flat.locs,
+                        len: flat.len,
+                        slowcat: flat.slowcat,
+                    }
                 } else {
                     let parsed = if !self.frames.is_empty() {
                         let key = (0u16, source.as_ptr() as usize, source.len(), offset_i64);
@@ -2234,6 +2514,15 @@ impl<'p> Turn<'p> {
                         rustel_mini::WordConstant::Many(list) => {
                             ChainArgument::Constant(rustel_core::Value::List(list), locations)
                         }
+                    }
+                } else if let Ok(at) = usize::try_from(offset)
+                    && let Some(flat) = rustel_mini::flat_number_sequence_parts(source, at)
+                {
+                    ChainArgument::FlatNumbers {
+                        values: flat.values,
+                        locs: flat.locs,
+                        len: flat.len,
+                        slowcat: flat.slowcat,
                     }
                 } else {
                     let parsed = if !self.frames.is_empty() {
@@ -2690,6 +2979,61 @@ impl<'p> Turn<'p> {
         if let BuiltinMethod::Composer(op) = &builtin
             && let [only] = arguments
         {
+            let mut receiver = receiver;
+            if let ScoreExpr::Call {
+                callee,
+                arguments: call_args,
+                ..
+            } = only
+                && let [call_arg] = self.held.row(*call_args)
+                && names.mini()
+                && self.mini_is_host()
+                && self.steps.saturating_add(2) <= MAX_STEPS
+                && self.depth < MAX_DEPTH
+                && matches!(self.resolve(self.held.text(*callee)), Resolved::Host)
+                && let Some(BuiltinGlobal::Control(spec)) = names.global(self.held.text(*callee))
+                && spec.builtin_id() != 0
+                && spec.name() != "value"
+            {
+                let flat = match call_arg {
+                    ScoreExpr::Mini { source, offset } => rustel_mini::flat_number_sequence_parts(
+                        self.held.text(*source),
+                        *offset as usize,
+                    ),
+                    ScoreExpr::Call {
+                        callee: mini_callee,
+                        arguments: mini_args,
+                        ..
+                    } if self.held.text(*mini_callee) == MINI_CALLEE
+                        && let [ScoreExpr::String(source), ScoreExpr::Number(offset)] =
+                            self.held.row(*mini_args)
+                        && offset.fract() == 0.0
+                        && offset.is_finite()
+                        && let Ok(at) = usize::try_from(*offset as i64) =>
+                    {
+                        rustel_mini::flat_number_sequence_parts(self.held.text(*source), at)
+                    }
+                    _ => None,
+                };
+                if let Some(flat) = flat {
+                    let n = usize::from(flat.len);
+                    match rustel_core::compose::compose_control_flat_numbers_owned(
+                        receiver,
+                        spec.builtin_id(),
+                        &flat.values[..n],
+                        &flat.locs[..n],
+                        flat.slowcat,
+                        *op,
+                        rustel_core::compose::default_alignment(),
+                    ) {
+                        Ok(done) => {
+                            self.steps += 2;
+                            return Some(Native::Pattern(done));
+                        }
+                        Err(rec) => receiver = rec,
+                    }
+                }
+            }
             return match self.evaluate(names, only, runtime)? {
                 Native::Number(n) => {
                     Some(Native::Pattern(rustel_core::compose::compose_number_owned(
@@ -2710,10 +3054,28 @@ impl<'p> Turn<'p> {
                 }
             };
         }
+        let mut receiver = receiver;
         let mut eval_last: Option<Native<'p>> = None;
         if let BuiltinMethod::Registered(registration) = &builtin
             && arguments.len() == registration.arity.saturating_sub(1)
         {
+            if let [only_arg] = arguments
+                && registration.names.first().map(|s| &**s) == Some("scale")
+                && names.mini()
+                && self.mini_is_host()
+                && let Some(src) = self.mini_source_text(only_arg)
+            {
+                let mut buf = [0u8; 64];
+                if let Some(scale_name) = parse_ascii_scale_name(src, &mut buf) {
+                    self.steps += 1;
+                    if self.steps > MAX_STEPS {
+                        return None;
+                    }
+                    return Some(Native::Pattern(rustel_core::combinators::scale_str_owned(
+                        receiver, scale_name,
+                    )));
+                }
+            }
             if arguments.len() <= 4 {
                 let takes_transformer =
                     registration.function_argument == FunctionArgument::Transformer;
@@ -2813,6 +3175,62 @@ impl<'p> Turn<'p> {
                     && !try_literal(last, &mut stack_vals[leading.len()])
                 {
                     if takes_transformer {
+                        if leading.len() == 1
+                            && registration.names.first().map(|s| &**s) == Some("firstOf")
+                            && let Value::F64(n) = stack_vals[0]
+                            && n.fract() == 0.0
+                            && (2.0..=6.0).contains(&n)
+                            && let Some(is_rev_arrow) = match last {
+                                ScoreExpr::Arrow(func_id) => {
+                                    let func = self.held.function(*func_id);
+                                    if func.bindings.is_empty()
+                                        && let [param] = func.parameters.as_slice()
+                                        && let ScoreExpr::Method {
+                                            receiver: r,
+                                            method: m,
+                                            arguments: a,
+                                            ..
+                                        } = &func.result
+                                        && self.held.row(*a).is_empty()
+                                        && let ScoreExpr::Name(rn) = self.held.at(*r)
+                                        && self.held.text(*rn) == self.held.text(*param)
+                                        && self.held.text(*m) == "rev"
+                                        && matches!(
+                                            builtin_method(names, "rev"),
+                                            Some(BuiltinMethod::Registered(reg))
+                                                if reg.names.first().map(|s| &**s) == Some("rev")
+                                        )
+                                    {
+                                        Some(true)
+                                    } else {
+                                        None
+                                    }
+                                }
+                                ScoreExpr::Name(name_id)
+                                    if self.held.text(*name_id) == "rev"
+                                        && matches!(self.resolve("rev"), Resolved::Host)
+                                        && matches!(
+                                            builtin_method(names, "rev"),
+                                            Some(BuiltinMethod::Registered(reg))
+                                                if reg.names.first().map(|s| &**s) == Some("rev")
+                                        ) =>
+                                {
+                                    Some(false)
+                                }
+                                _ => None,
+                            }
+                        {
+                            match rustel_core::sequence_every_rev_owned(receiver, n as usize) {
+                                Ok(folded) => {
+                                    self.steps += mini_steps + if is_rev_arrow { 3 } else { 1 };
+                                    if self.steps > MAX_STEPS {
+                                        return None;
+                                    }
+                                    return Some(Native::Pattern(folded));
+                                }
+                                Err(rec) => receiver = rec,
+                            }
+                        }
                         let evaluated = self.evaluate(names, last, runtime)?;
                         if let Native::Function(transformer) = evaluated {
                             direct_func = Some(transformer);
@@ -2837,6 +3255,12 @@ impl<'p> Turn<'p> {
                             &func,
                             receiver,
                         ),
+                        None if arguments.len() == 1
+                            && registration.names.first().map(|s| &**s) == Some("scale")
+                            && let Value::Str(scale_name) = &stack_vals[0] =>
+                        {
+                            rustel_core::combinators::scale_str_owned(receiver, scale_name.as_str())
+                        }
                         None => registration
                             .call_unpatternified(&stack_vals[..arguments.len()], receiver),
                     };

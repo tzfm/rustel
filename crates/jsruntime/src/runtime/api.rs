@@ -22,6 +22,7 @@ impl JsRuntime {
         Self {
             realm: OnceCell::new(),
             core_settings: rustel_core::settings::RuntimeSettings::default(),
+            plain_settings_extras: OnceCell::new(),
             ids: OnceCell::new(),
             logs: OnceCell::new(),
             contained_query_errors_unlogged: Cell::new(false),
@@ -38,6 +39,7 @@ impl JsRuntime {
             hydra_chains: OnceCell::new(),
             hap_budget: Cell::new(rustel_core::DEFAULT_HAP_BUDGET),
             query_threw: RefCell::new(None),
+            query_threw_some: Cell::new(false),
             callback_ir: OnceCell::new(),
             native_tier: Cell::new(true),
             evaluated_natively: Cell::new(false),
@@ -52,6 +54,7 @@ impl JsRuntime {
             native_left: Cell::new(None),
             native_staged: RefCell::new(None),
             native_active: RefCell::new(None),
+            native_active_independent: Cell::new(false),
             native_last_good: RefCell::new(None),
             last_good_active: RefCell::new(None),
             last_good_timeline: RefCell::new(None),
@@ -305,6 +308,24 @@ impl JsRuntime {
     #[doc(hidden)]
     pub fn snapshot_published_runtime_settings(&self) -> rustel_core::settings::RuntimeSettings {
         self.core_settings.detached_from(&self.core_settings)
+    }
+
+    /// Allocation-free snapshot of this runtime's published settings state for
+    /// panic-recovery checkpoints.
+    #[doc(hidden)]
+    #[inline]
+    pub fn snapshot_published_runtime_settings_state(
+        &self,
+    ) -> rustel_core::settings::RuntimeSettingsSnapshot {
+        self.core_settings.snapshot_state()
+    }
+
+    /// Reusable plain `runtime_settings` extras handle for this runtime.
+    #[inline]
+    pub(super) fn plain_settings_extras(&self) -> &rustel_core::PatternSharedExtras {
+        self.plain_settings_extras.get_or_init(|| {
+            rustel_core::PatternSharedExtras::for_runtime_settings(self.core_settings.clone())
+        })
     }
 
     /// Create an unpublished candidate in this runtime from a retained seed.
@@ -1085,7 +1106,7 @@ impl JsRuntime {
                         .set(0, wrapper)
                         .map_err(|e| e.to_string())?;
                     // The wrapper took the place of a native graph in play.
-                    self.native_active.borrow_mut().take();
+                    self.set_native_active(None);
                     Ok(0)
                 }
                 Slot::Held => {
@@ -1554,39 +1575,43 @@ impl JsRuntime {
         budget: std::time::Duration,
         cancellation: &std::sync::atomic::AtomicBool,
     ) -> Result<Vec<Hap>, QueryError> {
-        let settings = self.core_settings.bind();
-        if matches!(slot, Slot::Active)
-            && !settings.has_host_owned_voicings()
-            && let Some(pattern) = self.native_in_play_no_voicing_check()
-        {
-            return self.query_native(&pattern, begin, end, budget, cancellation);
-        }
-        self.with_bounded_query_turn(budget, cancellation, true, || {
-            self.query_inner(slot, index, begin, end)
-        })
+        self.query_cancellable_with_hap_budget(
+            slot,
+            index,
+            begin,
+            end,
+            budget,
+            self.hap_budget.get(),
+            cancellation,
+        )
     }
 
-    /// The native graph in play, when a query of it is a turn of its own
-    /// that runs no script: no query turn is open. Caller must already have
-    /// confirmed default voicings are not host-owned.
-    fn native_in_play_no_voicing_check(&self) -> Option<Pattern> {
-        if self.query_turn_depth.get() > 0 || self.heap_boundary_depth.get() > 0 {
-            return None;
-        }
-        // A handle of the graph, so the cell is free while the query runs.
-        self.native_active.borrow().clone()
+    pub(super) fn set_native_active(&self, pattern: Option<Pattern>) {
+        let independent = pattern
+            .as_ref()
+            .is_some_and(Pattern::is_query_settings_independent_static);
+        self.native_active_independent.set(independent);
+        *self.native_active.borrow_mut() = pattern;
+    }
+
+    pub(super) fn set_query_threw(&self, threw: Option<String>) {
+        self.query_threw_some.set(threw.is_some());
+        *self.query_threw.borrow_mut() = threw;
     }
 
     /// [`Self::query_cancellable`] of a native graph. The graph reaches no
     /// callback of a script, so the turn holds what bounds native work,
     /// the deadline and the cancellation flag, and none of the state of a
     /// script turn: no job, no heap latch and no effect policy.
+    #[allow(clippy::too_many_arguments)]
     fn query_native(
         &self,
         pattern: &Pattern,
+        known_independent: bool,
         begin: Fraction,
         end: Fraction,
         budget: std::time::Duration,
+        hap_budget: u64,
         cancellation: &std::sync::atomic::AtomicBool,
     ) -> Result<Vec<Hap>, QueryError> {
         // The refusals of a bounded turn before it starts.
@@ -1602,14 +1627,34 @@ impl JsRuntime {
             bridge.cancelled.set(false);
             bridge.interrupted.set(false);
         }
-        rustel_core::with_cancellation_and_query_budget(cancellation, budget, || {
+        let state = State::new(rustel_core::TimeSpan::new(begin, end));
+        let outcome = if known_independent || pattern.is_query_settings_independent() {
+            pattern.query_native_independent_sorted_bounded(
+                &state,
+                hap_budget,
+                budget,
+                cancellation,
+            )?
+        } else {
+            let _settings = self.core_settings.bind();
             // A stack reports a lane that threw through the logger of
             // the runtime.
             rustel_core::with_callback_host(self, || {
-                self.query_sorted_recording_throw(pattern, begin, end)
-            })
-        })
-        .map_err(QueryError::from)
+                pattern.query_native_sorted_bounded(&state, hap_budget, budget, cancellation)
+            })?
+        };
+        match outcome {
+            rustel_core::QueryArcOutcome::Haps(haps) => {
+                if self.query_threw_some.get() {
+                    self.set_query_threw(None);
+                }
+                Ok(haps)
+            }
+            rustel_core::QueryArcOutcome::Thrown(message) => {
+                self.set_query_threw(Some(message));
+                Ok(Vec::new())
+            }
+        }
     }
 
     /// Cancellable query with a caller-specific hap cap. The previous cap is
@@ -1625,8 +1670,29 @@ impl JsRuntime {
         hap_budget: u64,
         cancellation: &std::sync::atomic::AtomicBool,
     ) -> Result<Vec<Hap>, QueryError> {
+        if matches!(slot, Slot::Active)
+            && self.query_turn_depth.get() == 0
+            && self.heap_boundary_depth.get() == 0
+            && !self.core_settings.has_host_owned_voicings_fast()
+        {
+            let active = self.native_active.borrow();
+            if let Some(pattern) = active.as_ref() {
+                return self.query_native(
+                    pattern,
+                    self.native_active_independent.get(),
+                    begin,
+                    end,
+                    budget,
+                    hap_budget,
+                    cancellation,
+                );
+            }
+        }
         let previous = self.hap_budget.replace(hap_budget);
-        let out = self.query_cancellable(slot, index, begin, end, budget, cancellation);
+        let _settings = self.core_settings.bind();
+        let out = self.with_bounded_query_turn(budget, cancellation, true, || {
+            self.query_inner(slot, index, begin, end)
+        });
         self.hap_budget.set(previous);
         out
     }
@@ -1734,7 +1800,7 @@ impl JsRuntime {
         cancellation: &std::sync::atomic::AtomicBool,
     ) -> Result<Vec<Hap>, QueryError> {
         let _settings = self.core_settings.bind();
-        let threw = self.query_threw.borrow_mut().take();
+        let threw = self.take_query_throw();
         let previous = self.hap_budget.replace(hap_budget);
         let haps = self.with_logs_dropped(|| {
             self.with_bounded_query_turn(budget, cancellation, true, || {
@@ -1742,7 +1808,7 @@ impl JsRuntime {
             })
         });
         self.hap_budget.set(previous);
-        *self.query_threw.borrow_mut() = threw;
+        self.set_query_threw(threw);
         let _ = rustel_core::take_query_contained_throw();
         let _ = rustel_core::take_query_callback_failure();
         haps
@@ -1795,7 +1861,7 @@ impl JsRuntime {
             rustel_core::QueryArcOutcome::Thrown(message) => Some(message.clone()),
             rustel_core::QueryArcOutcome::Haps(_) => None,
         };
-        *self.query_threw.borrow_mut() = threw;
+        self.set_query_threw(threw);
         match outcome {
             rustel_core::QueryArcOutcome::Haps(haps) => Ok(haps),
             rustel_core::QueryArcOutcome::Thrown(_) => Ok(Vec::new()),
@@ -1804,6 +1870,9 @@ impl JsRuntime {
 
     /// Take the last host query's error so the next report cannot reuse it.
     pub fn take_query_throw(&self) -> Option<String> {
+        if !self.query_threw_some.replace(false) {
+            return None;
+        }
         self.query_threw.borrow_mut().take()
     }
 }

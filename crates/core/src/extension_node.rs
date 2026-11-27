@@ -66,24 +66,19 @@ pub fn push_hap(output: &mut Vec<Hap>, hap: Hap) -> bool {
 /// through [`ExtensionPatternNode::children`].
 pub fn query_inner(outer: &Hap, pattern: &Pattern, state: &State) -> Vec<Hap> {
     let mut output = Vec::new();
-    for inner in pattern.query(&state.set_span(outer.part)) {
+    for inner in pattern.query(&state.set_span(outer.part())) {
         let mut context = outer.context.clone();
         context.append(&inner.context);
+        let keys = crate::context_keys::ContextKeys::merge_with(
+            &inner.keys,
+            &outer.keys,
+            inner.live_controls(),
+            inner.slider_binding(),
+            crate::joined_pick_lookup(outer, &inner),
+        );
         if !crate::push_budgeted(
             &mut output,
-            Hap {
-                whole: inner.whole,
-                part: inner.part,
-                keys: crate::context_keys::ContextKeys::merge_with(
-                    &inner.keys,
-                    &outer.keys,
-                    inner.live_controls(),
-                    inner.slider_binding(),
-                    crate::joined_pick_lookup(outer, &inner),
-                ),
-                value: inner.value,
-                context,
-            },
+            Hap::from_parts(inner.whole(), inner.part(), inner.value, context, keys),
         ) {
             return Vec::new();
         }

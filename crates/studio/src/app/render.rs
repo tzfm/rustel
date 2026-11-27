@@ -2475,7 +2475,7 @@ mod tests {
                 .iter()
                 .enumerate()
                 .map(|(index, hap)| {
-                    let whole = hap.whole.expect("visual event span");
+                    let whole = hap.whole().expect("visual event span");
                     rustel_scheduler::ScheduleTraceEvent::from_hap(
                         hap,
                         generation,

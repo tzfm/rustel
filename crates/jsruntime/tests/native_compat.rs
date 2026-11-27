@@ -29,7 +29,7 @@ fn assert_plays_like(runtime: &JsRuntime, free: &str, method: &str) {
     let events = |source| {
         evaluate_over(runtime, source, Fraction::from(4))
             .into_iter()
-            .map(|hap| (hap.whole, hap.part, hap.value))
+            .map(|hap| (hap.whole(), hap.part(), hap.value))
             .collect::<Vec<_>>()
     };
     let expected = events(method);
@@ -91,8 +91,8 @@ fn chained_cps_is_the_cycles_per_second_form_of_cpm() {
     assert!(!cps.is_empty());
     assert_eq!(cps.len(), cpm.len());
     for (from_cps, from_cpm) in cps.iter().zip(&cpm) {
-        assert_eq!(from_cps.whole, from_cpm.whole);
-        assert_eq!(from_cps.part, from_cpm.part);
+        assert_eq!(from_cps.whole(), from_cpm.whole());
+        assert_eq!(from_cps.part(), from_cpm.part());
         assert_eq!(from_cps.value, from_cpm.value);
     }
 }
@@ -152,7 +152,7 @@ fn native_slice_splice_fit_and_scrub_keep_their_values() {
     let haps = evaluate(&runtime, r#"s("bd").splice(4,"0 2")"#);
     assert_eq!(haps.len(), 2);
     assert_eq!(
-        haps[0].whole.expect("whole").duration(),
+        haps[0].whole().expect("whole").duration(),
         Fraction::new(1, 2)
     );
     assert_eq!(haps[0].value.get("begin"), Some(&Value::F64(0.0)));
@@ -246,7 +246,7 @@ fn native_callback_combinators_and_collect_keep_their_results() {
     );
     assert_eq!(haps.len(), 4);
     assert_eq!(
-        haps[0].whole.expect("whole").duration(),
+        haps[0].whole().expect("whole").duration(),
         Fraction::new(1, 4)
     );
 }

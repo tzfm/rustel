@@ -32,7 +32,7 @@ fn wholes(source: &str) -> Vec<String> {
     rt.query(Slot::Active, 0, Fraction::ZERO, Fraction::ONE)
         .expect("query")
         .iter()
-        .map(|hap| match &hap.whole {
+        .map(|hap| match &hap.whole() {
             Some(whole) => format!("{}..{}", whole.begin, whole.end),
             None => "analog".to_owned(),
         })

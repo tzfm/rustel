@@ -83,8 +83,8 @@ use rustel_fraction::Fraction;
 pub use sequence::{
     GivenLayer, IndexedLayer, SequenceBuilder, SequenceLayer, SequenceStep, SourceStep,
     SourcedLayer, StepSource, TickCut, TickStep, sequence, sequence_of, sequence_of_cut_ticks,
-    sequence_of_equal_values, sequence_of_indexed_slice, sequence_of_sourced, sequence_of_ticks,
-    sequence_of_ticks_plain,
+    sequence_of_equal_values, sequence_of_indexed_slice, sequence_of_indexed_ticks_plain,
+    sequence_of_sourced, sequence_of_ticks, sequence_of_ticks_plain,
 };
 use std::collections::BTreeMap;
 use std::fmt;
@@ -301,6 +301,15 @@ pub struct PatternHandleMeta {
 pub struct PatternSharedExtras(Arc<PatternExtras>);
 
 impl PatternSharedExtras {
+    /// Construct a reusable handle carrying only `settings`, allowing a
+    /// runtime to export patterns without allocating a fresh `PatternExtras`
+    /// `Arc` on every evaluation.
+    #[doc(hidden)]
+    #[inline]
+    pub fn for_runtime_settings(settings: settings::RuntimeSettings) -> Self {
+        Self(Arc::new(PatternExtras::of_runtime_settings(settings)))
+    }
+
     #[inline]
     fn matches(&self, other: &PatternExtras) -> bool {
         match (&self.0.runtime_settings, &other.runtime_settings) {
@@ -390,6 +399,33 @@ impl Pattern {
         )
     }
 
+    /// When this pattern is a [`Node::FastSmall`] or [`Node::Fast`] wrapping a
+    /// child node, reconstruct that child handle with `steps` so incremental
+    /// memoization can retain it without cloning before `fast`/`slow` runs.
+    #[doc(hidden)]
+    #[inline]
+    pub fn fast_inner_pattern(&self, steps: Option<Fraction>) -> Option<Pattern> {
+        match self.node_kind() {
+            Node::FastSmall(inner, flags, ..) => {
+                // Share the child node already owned by this `FastSmall` wrapper.
+                Some(
+                    Pattern::from_compact(
+                        &PatternNodeRef(Arc::clone(inner)),
+                        *flags,
+                        0,
+                        0,
+                        COMPACT_META_STEPS,
+                        None,
+                        None,
+                    )
+                    .with_steps(steps),
+                )
+            }
+            Node::Fast(node) => Some(node.0.clone()),
+            _ => None,
+        }
+    }
+
     /// Reconstruct a [`Pattern`] from [`Self::split_compact`].
     #[doc(hidden)]
     #[inline]
@@ -469,7 +505,19 @@ struct PitchRewrite {
     /// Prebuilt `Dress` for renoting a bare (`dress == None`) layer under
     /// `keys`, shared across all voices using the same rewrite.
     bare_dress: Option<Arc<sequence::Dress>>,
+    /// Optional precomputed note names for integer scale degrees `-8..24`,
+    /// allowing `IntRange` scale renoting without virtual calls or TLS guards.
+    degree_notes: Option<Arc<[value::SharedStr; 32]>>,
 }
+
+thread_local! {
+    static PITCH_REWRITE_TLS: std::cell::RefCell<([Option<Arc<PitchRewrite>>; 4], usize)> =
+        const { std::cell::RefCell::new(([const { None }; 4], 0)) };
+}
+
+static PITCH_REWRITE_POOL: std::sync::OnceLock<
+    std::sync::Mutex<std::collections::HashMap<String, std::sync::Weak<PitchRewrite>>>,
+> = std::sync::OnceLock::new();
 
 /// The controls of a row of a chain, each apart as a map of controls with
 /// its locations, for a node that holds them so. Most nodes take the
@@ -772,7 +820,7 @@ fn collect_congruent(haps: Vec<Hap>) -> Vec<Vec<Hap>> {
         let mut placed = false;
         for group in &mut groups {
             let other = &group[0];
-            let congruent = match (hap.whole, other.whole) {
+            let congruent = match (hap.whole(), other.whole()) {
                 (None, None) => true,
                 // `this.whole.equals(other.whole)` with `this.whole` undefined.
                 (None, Some(_)) => {
@@ -841,12 +889,12 @@ fn query_weight_sequence(cumulative: &[Pattern], state: &State) -> Vec<Hap> {
     for pattern in cumulative {
         let mut next = Vec::new();
         for outer in current {
-            let inners = pattern.query(&state.set_span(outer.part));
+            let inners = pattern.query(&state.set_span(outer.part()));
             if query_error_pending() {
                 return Vec::new();
             }
             for inner in inners {
-                let whole = match (outer.whole, inner.whole) {
+                let whole = match (outer.whole(), inner.whole()) {
                     (Some(a), Some(b)) => match a.intersection(&b) {
                         Some(span) => Some(span),
                         None => {
@@ -865,13 +913,13 @@ fn query_weight_sequence(cumulative: &[Pattern], state: &State) -> Vec<Hap> {
                 values.push(inner.value.clone());
                 if !push_budgeted(
                     &mut next,
-                    Hap {
+                    Hap::from_parts(
                         whole,
-                        part: inner.part,
-                        value: Value::list(values),
+                        inner.part(),
+                        Value::list(values),
                         context,
-                        keys: ContextKeys::merge_with(&inner.keys, &outer.keys, [0; 4], 0, None),
-                    },
+                        ContextKeys::merge_with(&inner.keys, &outer.keys, [0; 4], 0, None),
+                    ),
                 ) {
                     return Vec::new();
                 }
@@ -936,7 +984,7 @@ fn query_wchoose(
         // `pat.bind(match)`: match is queried over the random hap's part, and
         // MIX whole/context are applied below after the weighted threshold has
         // selected a value pattern.
-        let match_state = state.set_span(random_hap.part);
+        let match_state = state.set_span(random_hap.part());
         let weights_haps = query_weight_sequence(cumulative, &match_state);
         if query_error_pending() {
             return Vec::new();
@@ -951,7 +999,7 @@ fn query_wchoose(
                 return Vec::new();
             }
             for total_hap in total_haps {
-                let Some(part) = weights_hap.part.intersection(&total_hap.part) else {
+                let Some(part) = weights_hap.part().intersection(&total_hap.part()) else {
                     continue;
                 };
                 let find = compose::compose_op(
@@ -973,13 +1021,13 @@ fn query_wchoose(
 
                 // `weightspat.fmap(...).appLeft(findpat)`: function side whole,
                 // find context first.
-                let chooser_whole = weights_hap.whole;
+                let chooser_whole = weights_hap.whole();
                 let mut chooser_context = total_hap.context.clone();
                 chooser_context.append(&weights_hap.context);
 
                 // `pat.bind(match)`: MIX the random hap with the
                 // selected-pattern carrier.
-                let outer_whole = match (random_hap.whole, chooser_whole) {
+                let outer_whole = match (random_hap.whole(), chooser_whole) {
                     (Some(a), Some(b)) => match a.intersection(&b) {
                         Some(span) => Some(span),
                         None => {
@@ -1037,17 +1085,17 @@ fn query_wchoose(
             context.append(&chosen.context);
             if !push_budgeted(
                 &mut out,
-                Hap {
-                    whole: if inner {
-                        chosen.whole
+                Hap::from_parts(
+                    if inner {
+                        chosen.whole()
                     } else {
                         carrier.outer_whole
                     },
-                    part: chosen.part,
-                    keys: ContextKeys::merge(&chosen.keys, &carrier.keys),
-                    value: chosen.value,
+                    chosen.part(),
+                    chosen.value,
                     context,
-                },
+                    ContextKeys::merge(&chosen.keys, &carrier.keys),
+                ),
             ) {
                 return Vec::new();
             }
@@ -1673,13 +1721,7 @@ fn applied_hap(
         met.slider_binding,
         met.pick_lookup,
     );
-    Hap {
-        whole,
-        part,
-        value: met.value,
-        context,
-        keys,
-    }
+    Hap::from_parts(whole, part, met.value, context, keys)
 }
 
 /// What a function hap and a value hap decide together when they meet: the
@@ -1755,7 +1797,7 @@ impl Meeting {
             if let Value::Object(map) = &mut hf.value {
                 map.set_data_single_cached(key, &meeting.value, cache);
             }
-            hf.part = part;
+            hf.set_part(part);
             meeting.prepend_context_to(&mut hf.context);
             return true;
         }
@@ -1801,7 +1843,7 @@ impl Meeting {
             }
         }
         compose::compose_data_in_place_cached(op, &mut hf.value, &meeting.value, cache);
-        hf.part = part;
+        hf.set_part(part);
         meeting.prepend_context_to(&mut hf.context);
         true
     }
@@ -1826,7 +1868,7 @@ impl Meeting {
             ([0; 4], 0)
         };
         compose::compose_data_in_place(op, &mut hf.value, &hv.value);
-        hf.part = part;
+        hf.set_part(part);
         // The value side's locations come first.
         if !hv.context.is_empty() {
             let mut context = hv.context.clone();
@@ -1925,7 +1967,7 @@ impl Meeting {
                 hf.keys.trim();
             }
         }
-        hf.part = part;
+        hf.set_part(part);
         true
     }
 
@@ -2076,8 +2118,7 @@ fn pick_property_key(value: &Value) -> String {
 /// Update `inner` in place for a pick join with `outer` at `whole` and `part`.
 #[inline]
 fn pick_where_it_is(outer: &Hap, inner: &mut Hap, whole: Option<TimeSpan>, part: TimeSpan) {
-    inner.whole = whole;
-    inner.part = part;
+    inner.set_spans(whole, part);
     if !outer.keys.is_empty() {
         inner.keys = ContextKeys::merge(&inner.keys, &outer.keys);
     }
@@ -2139,7 +2180,7 @@ fn pick_of(
     if matches!(
         mode,
         JoinMode::Squeeze | JoinMode::Reset | JoinMode::Restart
-    ) && outer.whole.is_none()
+    ) && outer.whole().is_none()
     {
         // All three special joins begin with `discreteOnly()`: analog
         // carriers are removed before their selected value is dereferenced.
@@ -2158,12 +2199,12 @@ fn pick_of(
     let picked = out.len();
     match mode {
         JoinMode::Inner | JoinMode::Outer | JoinMode::Mix => {
-            inner_pattern.answer_child_onto(thread, &state.set_span(outer.part), out);
+            inner_pattern.answer_child_onto(thread, &state.set_span(outer.part()), out);
             for inner in &mut out[picked..] {
                 let whole = match mode {
-                    JoinMode::Inner => inner.whole,
-                    JoinMode::Outer => outer.whole,
-                    JoinMode::Mix => match (outer.whole, inner.whole) {
+                    JoinMode::Inner => inner.whole(),
+                    JoinMode::Outer => outer.whole(),
+                    JoinMode::Mix => match (outer.whole(), inner.whole()) {
                         (Some(a), Some(b)) => match a.intersection(&b) {
                             Some(span) => Some(span),
                             None => {
@@ -2175,33 +2216,33 @@ fn pick_of(
                     },
                     _ => unreachable!(),
                 };
-                let part = inner.part;
+                let part = inner.part();
                 pick_where_it_is(outer, inner, whole, part);
             }
         }
         JoinMode::Squeeze => {
-            let Some(outer_whole) = outer.whole else {
+            let Some(outer_whole) = outer.whole() else {
                 return Some(());
             };
             inner_pattern.query_focused_onto(
                 thread,
                 outer.whole_or_part(),
-                &state.set_span(outer.part),
+                &state.set_span(outer.part()),
                 out,
             );
+            let mut loc_cache = locations::LocMergeCache::new();
             retain_from(out, picked, |inner| {
-                let whole = match inner.whole {
+                let whole = match inner.whole() {
                     Some(inner_whole) => match inner_whole.intersection(&outer_whole) {
                         Some(whole) => Some(whole),
                         None => return false,
                     },
                     None => None,
                 };
-                let Some(part) = inner.part.intersection(&outer.part) else {
+                let Some(part) = inner.part().intersection(&outer.part()) else {
                     return false;
                 };
-                inner.whole = whole;
-                inner.part = part;
+                inner.set_spans(whole, part);
                 if !outer.keys.is_empty() {
                     inner.keys = ContextKeys::merge_with(
                         &outer.keys,
@@ -2212,13 +2253,13 @@ fn pick_of(
                     );
                 }
                 if !outer.context.is_empty() {
-                    inner.context.append(&outer.context);
+                    loc_cache.append_into(&mut inner.context, &outer.context);
                 }
                 true
             });
         }
         JoinMode::Reset | JoinMode::Restart => {
-            let Some(outer_whole) = outer.whole else {
+            let Some(outer_whole) = outer.whole() else {
                 return Some(());
             };
             let shift = if mode == JoinMode::Restart {
@@ -2230,8 +2271,9 @@ fn pick_of(
             let outer_has_ctx = !outer.context.is_empty();
             let outer_whole_int = (outer_whole.begin.denom() == 1 && outer_whole.end.denom() == 1)
                 .then(|| (outer_whole.begin.numer(), outer_whole.end.numer()));
-            let meet = |inner: &mut Hap, part| {
-                let whole = inner.whole.and_then(|inner_whole| {
+            let mut loc_cache = locations::LocMergeCache::new();
+            let mut meet = |inner: &mut Hap, part| {
+                let whole = inner.whole().and_then(|inner_whole| {
                     if let Some((ob, oe)) = outer_whole_int
                         && inner_whole.begin < inner_whole.end
                         && inner_whole.begin.floor_int() >= ob
@@ -2245,39 +2287,38 @@ fn pick_of(
                     }
                     inner_whole.intersection(&outer_whole)
                 });
-                inner.whole = whole;
-                inner.part = part;
+                inner.set_spans(whole, part);
                 if outer_has_keys {
                     inner.keys = ContextKeys::merge(&inner.keys, &outer.keys);
                 }
                 if outer_has_ctx {
-                    inner.context.prepend(&outer.context);
+                    loc_cache.prepend_into(&outer.context, &mut inner.context);
                 }
             };
             if let Node::Sequence(layers) = inner_pattern.node_kind()
                 && inner_pattern.is_discrete()
             {
                 // Each sequence step already lies inside the part it answers.
-                let asked = state.set_span(outer.part);
-                if shift == Fraction::ZERO || sequence::repeats_at(layers, shift, outer.part) {
+                let asked = state.set_span(outer.part());
+                if shift == Fraction::ZERO || sequence::repeats_at(layers, shift, outer.part()) {
                     inner_pattern.answer_child_onto(thread, &asked, out);
                 } else {
                     inner_pattern.query_moved_onto(thread, shift, "late", &asked, out);
                 }
                 for inner in &mut out[picked..] {
-                    meet(inner, inner.part);
+                    meet(inner, inner.part());
                 }
             } else {
-                inner_pattern.query_restarted_onto(thread, shift, state, outer.part, out);
+                inner_pattern.query_restarted_onto(thread, shift, state, outer.part(), out);
                 retain_from(out, picked, |inner| {
-                    let part = if inner.part == outer.part {
-                        if inner.part.begin <= inner.part.end {
-                            inner.part
+                    let part = if inner.part() == outer.part() {
+                        if inner.part().begin <= inner.part().end {
+                            inner.part()
                         } else {
                             return false;
                         }
                     } else {
-                        let Some(part) = inner.part.intersection(&outer.part) else {
+                        let Some(part) = inner.part().intersection(&outer.part()) else {
                             return false;
                         };
                         part
@@ -2347,7 +2388,7 @@ fn query_patternified_pick(
                     LookupRef::Full(lookup_hap.lookup.as_ref()),
                     index_mode,
                     mode,
-                    &state.set_span(lookup_hap.hap.part),
+                    &state.set_span(lookup_hap.hap.part()),
                     &mut selected,
                     &|| {},
                 );
@@ -2361,13 +2402,13 @@ fn query_patternified_pick(
             context.append(&inner.context);
             if !push_budgeted(
                 &mut out,
-                Hap {
-                    whole: inner.whole,
-                    part: inner.part,
-                    keys: ContextKeys::merge(&inner.keys, &lookup_hap.hap.keys),
-                    value: inner.value,
+                Hap::from_parts(
+                    inner.whole(),
+                    inner.part(),
+                    inner.value,
                     context,
-                },
+                    ContextKeys::merge(&inner.keys, &lookup_hap.hap.keys),
+                ),
             ) {
                 return Vec::new();
             }
@@ -2466,6 +2507,29 @@ pub(crate) enum Node {
     /// the extra `Node::Pure` + `Arc<[(usize, usize)]>` + `Node::AddContext`
     /// wrapper allocations for located mini-notation constant atoms.
     PureAt(Box<(Value, Locations)>),
+    /// Equal-stepped integer range over one cycle (`0 .. 63`), keeping `Node`
+    /// 24 bytes with zero heap allocation beyond the `NodeCell`.
+    IntRange {
+        start: i32,
+        count: u32,
+        loc0: u32,
+        loc1: u32,
+        named_id: u16,
+        step_neg: bool,
+    },
+    /// Cycle-rotating `iter(times)` / `iterBack(times)` without duplicating
+    /// `parts` rotated copies of `inner`.
+    Iter(Box<IterNode>),
+    /// Built-in stateless scalar signal (`rand`, `sine`, `saw`, ...), stored
+    /// directly as a bare function pointer without closure allocation or mutex.
+    NumberSignal(NumberSignal),
+    /// Uniform integer-rate sampling of a built-in scalar signal
+    /// (`rand.segment(128)`, `sine.segment(16)`), keeping `Node` 24 bytes with
+    /// zero wrapper allocations.
+    SegmentSignal {
+        body: NumberSignal,
+        steps: u32,
+    },
     /// The steps of every cycle, as one node. See [`sequence`].
     Sequence(Arc<[sequence::Layer]>),
     /// Mutation control - never built.
@@ -2730,6 +2794,14 @@ pub(crate) struct ShiftNode(
     pub(crate) Fraction,
     pub(crate) &'static str,
 );
+
+/// Boxed payload of [`Node::Iter`].
+pub(crate) struct IterNode {
+    pub(crate) inner: Pattern,
+    pub(crate) times: Fraction,
+    pub(crate) parts: u64,
+    pub(crate) back: bool,
+}
 
 /// Boxed payload of [`Node::UiVisual`].
 pub(crate) struct UiVisualNode {
@@ -3015,22 +3087,22 @@ impl Pattern {
             Node::Pure(value) if value.is_data(0) => {
                 Some(Hap::new(Some(cycle), cycle, value.clone()))
             }
-            Node::PureAt(boxed) if boxed.0.is_data(0) => Some(Hap {
-                whole: Some(cycle),
-                part: cycle,
-                value: boxed.0.clone(),
-                context: boxed.1.clone(),
-                keys: ContextKeys::default(),
-            }),
+            Node::PureAt(boxed) if boxed.0.is_data(0) => Some(Hap::of_sequence(
+                cycle,
+                cycle,
+                boxed.0.clone(),
+                boxed.1.clone(),
+                ContextKeys::default(),
+            )),
             Node::Sequence(_) => {
                 let (value, context) = sequence::constant_value_at(self)?;
-                Some(Hap {
-                    whole: Some(cycle),
-                    part: cycle,
+                Some(Hap::of_sequence(
+                    cycle,
+                    cycle,
                     value,
                     context,
-                    keys: ContextKeys::default(),
-                })
+                    ContextKeys::default(),
+                ))
             }
             Node::AddContext(boxed) => {
                 let mut hap = boxed.0.try_constant_cycle_direct(cycle)?;
@@ -3069,7 +3141,7 @@ impl Pattern {
         }
         let mut haps = self.query(&state.set_span(cycle));
         match (haps.pop(), haps.is_empty()) {
-            (Some(hap), true) if hap.whole == Some(cycle) && hap.part == cycle => Some(hap),
+            (Some(hap), true) if hap.whole() == Some(cycle) && hap.part() == cycle => Some(hap),
             _ => None,
         }
     }
@@ -3080,8 +3152,7 @@ impl Hap {
     /// pattern to the hap that pattern answers for `piece`, one cycle piece
     /// of a span: the piece's cycle as the whole, the piece as the part.
     fn move_to_piece(&mut self, piece: TimeSpan) {
-        self.whole = Some(whole_cycle(piece.begin));
-        self.part = piece;
+        self.set_spans(Some(whole_cycle(piece.begin)), piece);
     }
 }
 
@@ -3100,16 +3171,20 @@ fn inherited_runtime_settings_source(node: &Node) -> Option<&Pattern> {
         Node::Silence
         | Node::Pure(_)
         | Node::PureAt(_)
+        | Node::IntRange { .. }
         | Node::Sequence(_)
         | Node::QueryError(_)
         | Node::QueryLimit(_)
         | Node::Signal(_)
+        | Node::NumberSignal(_)
+        | Node::SegmentSignal { .. }
         | Node::JsQuery(_)
         | Node::FastSmall(..)
         | Node::ShiftSmall(..)
         | Node::ControlMap(..)
         | Node::Join(..)
         | Node::SplitQueries(..) => None,
+        Node::Iter(node) => node.inner.has_runtime_settings().then_some(&node.inner),
         Node::PatternOfPureOperand(pair, _) => pair.runtime_settings_source(),
         #[cfg(non_send_node_mutation)]
         Node::NonSendMutation(_) => None,
@@ -3674,6 +3749,20 @@ impl Pattern {
         self
     }
 
+    /// Attach a pre-allocated plain `runtime_settings` extras handle with zero
+    /// heap allocations when `self.extras` is empty.
+    #[doc(hidden)]
+    #[inline]
+    pub fn with_shared_runtime_settings(mut self, shared: &PatternSharedExtras) -> Self {
+        if self.extras.is_none() {
+            // Share the runtime's single plain `PatternExtras` allocation.
+            self.extras = Some(Arc::clone(&shared.0));
+        } else if !self.has_runtime_settings() {
+            self.extras_mut().runtime_settings = shared.0.runtime_settings.clone();
+        }
+        self
+    }
+
     /// Attach an owner without allocating a graph wrapper. The innermost owner
     /// wins, matching nested runtime scopes while flattening repeated exports.
     pub(crate) fn attach_runtime_settings(&mut self, settings: settings::RuntimeSettings) {
@@ -3863,6 +3952,24 @@ impl Pattern {
                     }
                     return pattern;
                 }
+                Node::IntRange {
+                    start,
+                    count,
+                    loc0,
+                    loc1,
+                    named_id,
+                    step_neg,
+                } if let Some((n0, n1)) = append_int_range_locs(*loc0, *loc1, &locs) => {
+                    return Pattern::of(Node::IntRange {
+                        start: *start,
+                        count: *count,
+                        loc0: n0,
+                        loc1: n1,
+                        named_id: *named_id,
+                        step_neg: *step_neg,
+                    })
+                    .with_steps_of(self);
+                }
                 _ => {}
             }
         }
@@ -3889,6 +3996,16 @@ impl Pattern {
             && let Node::Sequence(layers) = &mut cell.kind
             && sequence::locate_in_place(layers, locs)
         {
+            return self;
+        }
+        if !self.has_runtime_settings()
+            && let Node::IntRange { loc0, loc1, .. } = self.node_kind()
+            && let Some((n0, n1)) = append_int_range_locs(*loc0, *loc1, locs)
+            && let Some(cell) = self.own_node()
+            && let Node::IntRange { loc0, loc1, .. } = &mut cell.kind
+        {
+            *loc0 = n0;
+            *loc1 = n1;
             return self;
         }
         self.with_added_context_slice(locs)
@@ -3919,6 +4036,24 @@ impl Pattern {
                         pattern.set_pure_loc_raw(Some(loc));
                     }
                     return pattern;
+                }
+                Node::IntRange {
+                    start,
+                    count,
+                    loc0,
+                    loc1,
+                    named_id,
+                    step_neg,
+                } if let Some((n0, n1)) = append_int_range_locs(*loc0, *loc1, locs) => {
+                    return Pattern::of(Node::IntRange {
+                        start: *start,
+                        count: *count,
+                        loc0: n0,
+                        loc1: n1,
+                        named_id: *named_id,
+                        step_neg: *step_neg,
+                    })
+                    .with_steps_of(self);
                 }
                 _ => {}
             }
@@ -5796,6 +5931,32 @@ impl Pattern {
         if self.is_rest() && sequence::folds(self) {
             return self.clone();
         }
+        if sequence::folds(self)
+            && !self.has_runtime_settings()
+            && let Node::IntRange {
+                start,
+                count,
+                loc0,
+                loc1,
+                named_id,
+                step_neg,
+            } = self.node_kind()
+        {
+            if *named_id == 0 && spec.id != 0 && spec.names.len() == 1 && spec.packed_key != 0 {
+                return Pattern::of(Node::IntRange {
+                    start: *start,
+                    count: *count,
+                    loc0: *loc0,
+                    loc1: *loc1,
+                    named_id: spec.id,
+                    step_neg: *step_neg,
+                })
+                .with_steps_of(self);
+            }
+            if *named_id != 0 && unnamed_only {
+                return self.clone();
+            }
+        }
         // The steps of a sequence take the name of the control when they
         // are read.
         if let Some(named) = sequence::named(self, spec, unnamed_only) {
@@ -5836,6 +5997,21 @@ impl Pattern {
             && sequence::named_in_place(layers, spec, unnamed_only)
         {
             return self;
+        }
+        if sequence::folds(&self)
+            && !self.has_runtime_settings()
+            && let Node::IntRange { named_id, .. } = self.node_kind()
+        {
+            if *named_id == 0 && spec.id != 0 && spec.names.len() == 1 && spec.packed_key != 0 {
+                if let Some(cell) = Arc::get_mut(&mut self.node)
+                    && let Node::IntRange { named_id, .. } = &mut cell.kind
+                {
+                    *named_id = spec.id;
+                    return self;
+                }
+            } else if *named_id != 0 && unnamed_only {
+                return self;
+            }
         }
         self.map_control(spec, unnamed_only)
     }
@@ -6046,9 +6222,9 @@ impl Pattern {
     /// holds a table of its own, as a scale holds its notes, is made one
     /// time for the name. It gives the rewrite of a hap, and the note that
     /// the rewrite makes of a note or a step that a hap holds alone.
-    fn interned_pitch_rewrite<F, G>(
+    fn interned_pitch_rewrite_with_degrees<F, G>(
         key: &str,
-        make: impl FnOnce() -> (F, G, Option<Arc<str>>),
+        make: impl FnOnce() -> (F, G, Option<Arc<str>>, Option<Arc<[value::SharedStr; 32]>>),
     ) -> Arc<PitchRewrite>
     where
         F: Fn(&Hap) -> Option<Hap> + Send + Sync + 'static,
@@ -6056,7 +6232,7 @@ impl Pattern {
     {
         const MAX_CACHED_KEY_BYTES: usize = 64;
         let build = || {
-            let (of_hap, of_note, scale_tag) = make();
+            let (of_hap, of_note, scale_tag, degree_notes) = make();
             let hap: HapMapFn = Arc::new(move |hap: &Hap| {
                 of_hap(hap).map(|mapped| mapped.with_pitch_live_controls(hap))
             });
@@ -6073,16 +6249,13 @@ impl Pattern {
                 note: Box::new(of_note),
                 keys,
                 bare_dress,
+                degree_notes,
             })
         };
         if key.len() > MAX_CACHED_KEY_BYTES {
             return build();
         }
-        thread_local! {
-            static TLS_CACHE: std::cell::RefCell<([Option<Arc<PitchRewrite>>; 4], usize)> =
-                const { std::cell::RefCell::new(([const { None }; 4], 0)) };
-        }
-        if let Ok(Some(hit)) = TLS_CACHE.try_with(|cell| {
+        if let Ok(Some(hit)) = PITCH_REWRITE_TLS.try_with(|cell| {
             let cache = cell.borrow();
             cache
                 .0
@@ -6093,17 +6266,14 @@ impl Pattern {
         }) {
             return hit;
         }
-        static POOL: std::sync::OnceLock<
-            std::sync::Mutex<std::collections::HashMap<String, std::sync::Weak<PitchRewrite>>>,
-        > = std::sync::OnceLock::new();
-        let pool = POOL.get_or_init(Default::default);
+        let pool = PITCH_REWRITE_POOL.get_or_init(Default::default);
         // The name is copied only for a body that the pool takes.
         let held = pool
             .lock()
             .ok()
             .and_then(|entries| entries.get(key).and_then(std::sync::Weak::upgrade));
         let rewrite = held.unwrap_or_else(|| interned_closure(pool, key.to_owned(), build));
-        let _ = TLS_CACHE.try_with(|cell| {
+        let _ = PITCH_REWRITE_TLS.try_with(|cell| {
             if let Ok(mut cache) = cell.try_borrow_mut() {
                 let idx = cache.1 & 3;
                 cache.0[idx] = Some(Arc::clone(&rewrite));
@@ -6111,6 +6281,92 @@ impl Pattern {
             }
         });
         rewrite
+    }
+
+    fn interned_pitch_rewrite<F, G>(
+        key: &str,
+        make: impl FnOnce() -> (F, G, Option<Arc<str>>),
+    ) -> Arc<PitchRewrite>
+    where
+        F: Fn(&Hap) -> Option<Hap> + Send + Sync + 'static,
+        G: Fn(&Value) -> Option<Value> + Send + Sync + 'static,
+    {
+        Self::interned_pitch_rewrite_with_degrees(key, || {
+            let (of_hap, of_note, scale_tag) = make();
+            (of_hap, of_note, scale_tag, None)
+        })
+    }
+
+    /// Direct owned pitch rewrite for scale lookups carrying precomputed
+    /// integer degree notes: borrows the TLS-cached rewrite without refcount
+    /// traffic when renoting a uniquely-owned `Node::IntRange` in place.
+    pub(crate) fn map_scale_pitch_owned<F, G>(
+        mut self,
+        key: &str,
+        make: impl FnOnce() -> (F, G, Option<Arc<str>>, Option<Arc<[value::SharedStr; 32]>>),
+    ) -> Self
+    where
+        F: Fn(&Hap) -> Option<Hap> + Send + Sync + 'static,
+        G: Fn(&Value) -> Option<Value> + Send + Sync + 'static,
+    {
+        let steps = self.steps();
+        if let Node::IntRange {
+            start,
+            count,
+            loc0,
+            loc1,
+            named_id,
+            step_neg,
+        } = *self.node_kind()
+            && key.len() <= 64
+            && sequence::folds(&self)
+            && Arc::strong_count(&self.node) == 1
+        {
+            let fast_layer = PITCH_REWRITE_TLS
+                .try_with(|cell| {
+                    let cache = cell.borrow();
+                    let entry = cache
+                        .0
+                        .iter()
+                        .flatten()
+                        .find(|entry| entry.key.as_ref() == key)?;
+                    let mut dress_cache = if loc0 == 0 && entry.keys.is_some() {
+                        sequence::RenoteDressCache::with_bare(entry.bare_dress.clone())
+                    } else {
+                        sequence::RenoteDressCache::default()
+                    };
+                    sequence::renoted_int_range_layer(
+                        start,
+                        count,
+                        loc0,
+                        loc1,
+                        named_id,
+                        step_neg,
+                        &entry.hap,
+                        &entry.note,
+                        entry.degree_notes.as_deref(),
+                        entry.keys.as_ref(),
+                        &mut dress_cache,
+                    )
+                })
+                .ok()
+                .flatten();
+            if let Some(layer) = fast_layer
+                && let Some(cell) = Arc::get_mut(&mut self.node)
+            {
+                cell.kind = Node::Sequence(Arc::from([layer]));
+                return self.with_steps(steps);
+            }
+        }
+        let interned = Self::interned_pitch_rewrite_with_degrees(key, make);
+        let skip_bare_cache = matches!(self.node_kind(), Node::IntRange { loc0, .. } if *loc0 != 0);
+        let mut dress_cache = if !skip_bare_cache && interned.keys.is_some() {
+            sequence::RenoteDressCache::with_bare(interned.bare_dress.clone())
+        } else {
+            sequence::RenoteDressCache::default()
+        };
+        self.pitched_owned(&interned, &mut dress_cache)
+            .with_steps(steps)
     }
 
     fn map_pitch_haps_native_interned<F, G>(
@@ -6141,7 +6397,8 @@ impl Pattern {
     {
         let steps = self.steps();
         let interned = Self::interned_pitch_rewrite(key, make);
-        let mut dress_cache = if interned.keys.is_some() {
+        let skip_bare_cache = matches!(self.node_kind(), Node::IntRange { loc0, .. } if *loc0 != 0);
+        let mut dress_cache = if !skip_bare_cache && interned.keys.is_some() {
             sequence::RenoteDressCache::with_bare(interned.bare_dress.clone())
         } else {
             sequence::RenoteDressCache::default()
@@ -6167,6 +6424,34 @@ impl Pattern {
         rewrite: &PitchRewrite,
         dress_cache: &mut sequence::RenoteDressCache,
     ) -> Self {
+        if let Node::IntRange {
+            start,
+            count,
+            loc0,
+            loc1,
+            named_id,
+            step_neg,
+        } = *self.node_kind()
+            && sequence::folds(&self)
+            && Arc::strong_count(&self.node) == 1
+            && let Some(layer) = sequence::renoted_int_range_layer(
+                start,
+                count,
+                loc0,
+                loc1,
+                named_id,
+                step_neg,
+                &rewrite.hap,
+                &rewrite.note,
+                rewrite.degree_notes.as_deref(),
+                rewrite.keys.as_ref(),
+                dress_cache,
+            )
+            && let Some(cell) = Arc::get_mut(&mut self.node)
+        {
+            cell.kind = Node::Sequence(Arc::from([layer]));
+            return self;
+        }
         if let Node::Sequence(layers) = self.node_kind()
             && sequence::folds(&self)
             && Arc::strong_count(&self.node) == 1
@@ -6336,7 +6621,7 @@ impl Pattern {
                 signal_query_error(|| "splice requires object-valued haps".into());
                 return None;
             };
-            let Some(whole) = hap.whole else {
+            let Some(whole) = hap.whole() else {
                 signal_query_error(|| {
                     "Cannot read properties of undefined (reading 'duration')".into()
                 });
@@ -6371,7 +6656,7 @@ impl Pattern {
                 signal_query_error(|| "Cannot use 'in' operator on a primitive value".into());
                 return None;
             };
-            let Some(whole) = hap.whole else {
+            let Some(whole) = hap.whole() else {
                 signal_query_error(|| {
                     "Cannot read properties of undefined (reading 'duration')".into()
                 });
@@ -6418,7 +6703,7 @@ impl Pattern {
 
     /// `discreteOnly()` - drop analog (whole-less) haps.
     pub fn discrete_only(&self) -> Self {
-        self.filter_haps(|hap| hap.whole.is_some())
+        self.filter_haps(|hap| hap.whole().is_some())
     }
 
     /// `onsetsOnly()` - keep only haps whose whole begins where their part does.
@@ -6869,11 +7154,15 @@ fn drain_pattern_children(node: &mut Node, out: &mut Vec<Pattern>) {
         Node::Silence
         | Node::Pure(_)
         | Node::PureAt(_)
+        | Node::IntRange { .. }
         | Node::Sequence(_)
         | Node::QueryError(_)
         | Node::QueryLimit(_)
         | Node::Signal(_)
+        | Node::NumberSignal(_)
+        | Node::SegmentSignal { .. }
         | Node::JsQuery(_) => {}
+        Node::Iter(node) => take_child(&mut node.inner, out),
         #[cfg(non_send_node_mutation)]
         Node::NonSendMutation(_) => {}
         Node::Rev(pattern)
@@ -7022,10 +7311,13 @@ impl Drop for Node {
             self,
             Node::Silence
                 | Node::Pure(_)
+                | Node::IntRange { .. }
                 | Node::Sequence(_)
                 | Node::QueryError(_)
                 | Node::QueryLimit(_)
                 | Node::Signal(_)
+                | Node::NumberSignal(_)
+                | Node::SegmentSignal { .. }
                 | Node::JsQuery(_)
         ) {
             return;
@@ -7064,8 +7356,8 @@ impl Drop for Node {
 fn step_slices_pattern(resolved: &[(Hap, Pattern)]) -> Pattern {
     let mut breakpoints: Vec<Fraction> = vec![Fraction::ZERO, Fraction::ONE];
     for (hap, _) in resolved {
-        breakpoints.push(hap.part.begin);
-        breakpoints.push(hap.part.end);
+        breakpoints.push(hap.part().begin);
+        breakpoints.push(hap.part().end);
     }
     breakpoints.sort();
     breakpoints.dedup();
@@ -7077,7 +7369,7 @@ fn step_slices_pattern(resolved: &[(Hap, Pattern)]) -> Pattern {
         // outer hap's context.
         let mut layers: Vec<Pattern> = Vec::new();
         for (hap, inner) in resolved {
-            if span.intersection(&hap.part).is_none() {
+            if span.intersection(&hap.part()).is_none() {
                 continue;
             }
             layers.push(if hap.context.is_empty() {
@@ -7139,7 +7431,10 @@ fn span_read(node: &Node) -> purity::SpanRead {
         | Node::Pure(_)
         | Node::PureAt(_)
         | Node::PurePickLookup(..)
+        | Node::IntRange { .. }
+        | Node::SegmentSignal { .. }
         | Node::Sequence(_) => No,
+        Node::Iter(node) => of(&node.inner),
         // A time map that keeps the order of time, and maps of each hap that
         // read no span.
         Node::Fast(node) if node.1 > Fraction::ZERO => of(&node.0),
@@ -7262,9 +7557,13 @@ fn compute_purity(node: &Node) -> purity::Purity {
             Purity::merge(boxed.1.patterns().map(Pattern::purity))
         }
         Node::Silence
+        | Node::IntRange { .. }
         | Node::Signal(_)
+        | Node::NumberSignal(_)
+        | Node::SegmentSignal { .. }
         | Node::QueryError(_)
         | Node::QueryLimit(_) => Purity::pure(),
+        Node::Iter(node) => node.inner.purity(),
 
         // Any node holding a callback id is impure and contributes it.
         Node::FmapJs(boxed)
@@ -7533,22 +7832,22 @@ fn cycle_onsets(structure: &Pattern, state: &State) -> Vec<Hap> {
 fn query_cycle_onset_index(structure: &Pattern, state: &State) -> Vec<Hap> {
     let mut onsets = cycle_onsets(structure, state);
     if onsets.len() > 1 {
-        if onsets.iter().any(|hap| hap.whole.is_none()) {
+        if onsets.iter().any(|hap| hap.whole().is_none()) {
             signal_query_error(|| {
                 "isobite: Cannot read properties of undefined (reading 'begin')".into()
             });
             return Vec::new();
         }
         // Stable: onsets with one begin keep their query order.
-        onsets.sort_by_key(|hap| hap.whole.map(|whole| whole.begin));
+        onsets.sort_by_key(|hap| hap.whole().map(|whole| whole.begin));
     }
     onsets
         .into_iter()
         .enumerate()
         .filter_map(|(index, hap)| {
-            let part = state.span.intersection(&hap.part)?;
+            let part = state.span.intersection(&hap.part())?;
             let mut indexed = hap.with_value(|_| Value::F64(index as f64));
-            indexed.part = part;
+            indexed.set_part(part);
             Some(indexed)
         })
         .collect()
@@ -7674,41 +7973,140 @@ pub type NumberSignal = fn(Fraction, &OrderedMap) -> f64;
 /// Each signal of numbers that [`signal_static`] made, with its body.
 static NUMBER_SIGNALS: Mutex<Vec<(NumberSignal, SignalFn)>> = Mutex::new(Vec::new());
 
-/// [`signal`] of numbers for a body that captures nothing: one closure
-/// object per body, so the same signal built by a later evaluation is the
-/// same payload, as [`interned_closure`] gives. [`number_signal`] reads the
-/// body back.
+/// [`signal`] of numbers for a body that captures nothing: stored inline as
+/// `Node::NumberSignal(body)` without closure allocation or mutex lookup.
 pub fn signal_static(body: NumberSignal) -> Pattern {
-    let sampled = || -> SignalFn {
-        Arc::new(move |state: &State| Value::F64(body(state.span.begin, &state.controls)))
-    };
-    // The bodies are functions of the program, so the list is short and
-    // stays so.
-    let interned = match NUMBER_SIGNALS.lock() {
-        Ok(mut known) => {
-            let found = known
-                .iter()
-                .find(|(of, _)| std::ptr::fn_addr_eq(*of, body))
-                .map(|(_, signal)| Arc::clone(signal));
-            found.unwrap_or_else(|| {
-                let signal = sampled();
-                known.push((body, Arc::clone(&signal)));
-                signal
-            })
-        }
-        Err(_) => sampled(),
-    };
-    Pattern::of(Node::Signal(interned))
+    Pattern::of(Node::NumberSignal(body))
 }
 
-/// The body of `signal`, when [`signal_static`] made it: the signal then
-/// answers the number of the body at the begin of the span, and no more.
+/// The body of `signal`, when [`signal_static`] made it (legacy closure fallback).
 pub(crate) fn number_signal(signal: &SignalFn) -> Option<NumberSignal> {
     let known = NUMBER_SIGNALS.lock().ok()?;
     known
         .iter()
         .find(|(_, of)| Arc::ptr_eq(of, signal))
         .map(|(body, _)| *body)
+}
+
+impl Pattern {
+    /// Whether querying this pattern is guaranteed settings-independent solely
+    /// from its immutable node flags (excluding `FLAG_HOST_VOICINGS`), so a
+    /// runtime can cache this property once when installing an active pattern.
+    #[inline]
+    pub fn is_query_settings_independent_static(&self) -> bool {
+        if self.has_runtime_settings()
+            || (self.effective_flags() & (FLAG_VOLATILE | FLAG_HOST_VOICINGS)) != 0
+        {
+            return false;
+        }
+        match self.node_kind() {
+            Node::IntRange { .. } => true,
+            Node::SegmentSignal { body, .. } => !signal::is_rand_body(*body),
+            Node::Sequence(layers) => sequence::holds_data(layers),
+            Node::Iter(node) => {
+                !node.inner.has_runtime_settings()
+                    && (node.inner.effective_flags() & (FLAG_VOLATILE | FLAG_HOST_VOICINGS)) == 0
+                    && sequence::is_data(&node.inner)
+            }
+            Node::Fast(node) => {
+                !node.0.has_runtime_settings()
+                    && (node.0.effective_flags() & (FLAG_VOLATILE | FLAG_HOST_VOICINGS)) == 0
+                    && match node.0.node_kind() {
+                        Node::IntRange { .. } => true,
+                        Node::Sequence(layers) => sequence::holds_data(layers),
+                        Node::Iter(it) => {
+                            !it.inner.has_runtime_settings()
+                                && (it.inner.effective_flags()
+                                    & (FLAG_VOLATILE | FLAG_HOST_VOICINGS))
+                                    == 0
+                                && sequence::is_data(&it.inner)
+                        }
+                        _ => false,
+                    }
+            }
+            Node::FastSmall(cell, flags, ..)
+                if (*flags & (FLAG_VOLATILE | FLAG_HOST_VOICINGS)) == 0 =>
+            {
+                match &cell.kind {
+                    Node::IntRange { .. } => true,
+                    Node::Sequence(layers) => sequence::holds_data(layers),
+                    Node::Iter(it) => {
+                        !it.inner.has_runtime_settings()
+                            && (it.inner.effective_flags() & (FLAG_VOLATILE | FLAG_HOST_VOICINGS))
+                                == 0
+                            && sequence::is_data(&it.inner)
+                    }
+                    _ => false,
+                }
+            }
+            _ => false,
+        }
+    }
+
+    /// Whether querying this pattern cannot read `RuntimeSettings`, cannot
+    /// invoke callbacks or throw query errors, and yields data-only values.
+    #[inline]
+    pub fn is_query_settings_independent(&self) -> bool {
+        if self.has_runtime_settings() || self.is_volatile() {
+            return false;
+        }
+        match self.node_kind() {
+            Node::IntRange { .. } => true,
+            Node::SegmentSignal { body, .. } => !signal::is_rand_body(*body),
+            Node::Sequence(layers) => sequence::holds_data(layers),
+            Node::Iter(node) => {
+                !node.inner.has_runtime_settings()
+                    && !node.inner.is_volatile()
+                    && sequence::is_data(&node.inner)
+            }
+            Node::Fast(node) => {
+                !node.0.has_runtime_settings()
+                    && !node.0.is_volatile()
+                    && match node.0.node_kind() {
+                        Node::IntRange { .. } => true,
+                        Node::Sequence(layers) => sequence::holds_data(layers),
+                        Node::Iter(it) => {
+                            !it.inner.has_runtime_settings()
+                                && !it.inner.is_volatile()
+                                && sequence::is_data(&it.inner)
+                        }
+                        _ => false,
+                    }
+            }
+            Node::FastSmall(cell, flags, ..) if (*flags & FLAG_VOLATILE) == 0 => match &cell.kind {
+                Node::IntRange { .. } => true,
+                Node::Sequence(layers) => sequence::holds_data(layers),
+                Node::Iter(it) => {
+                    !it.inner.has_runtime_settings()
+                        && !it.inner.is_volatile()
+                        && sequence::is_data(&it.inner)
+                }
+                _ => false,
+            },
+            _ => false,
+        }
+    }
+
+    pub(crate) fn pat_segment(&self, rate: Fraction) -> Self {
+        if !sequence::builds_each_node()
+            && !self.has_runtime_settings()
+            && !self.is_volatile()
+            && let Node::NumberSignal(body) = *self.node_kind()
+            && rate.denom() == 1
+            && rate.numer() >= 1
+            && let Ok(steps) = u32::try_from(rate.numer())
+        {
+            return Pattern::of(Node::SegmentSignal { body, steps }).with_steps(Some(rate));
+        }
+        let pulse = pure(Value::Bool(true)).fast(rate);
+        compose::compose(
+            self,
+            &pulse,
+            compose::ComposeOp::KeepIf,
+            compose::Alignment::Out,
+        )
+        .with_steps(Some(rate))
+    }
 }
 
 pub fn state_signal(f: impl Fn(&State) -> Value + Send + Sync + 'static) -> Pattern {
@@ -7733,7 +8131,7 @@ pub fn unjoin(pattern: Pattern, pieces: Pattern, function: Option<&value::Functi
             if !hap.value.js_truthy() {
                 return source.clone();
             }
-            let Some(whole) = hap.whole else {
+            let Some(whole) = hap.whole() else {
                 signal_query_error(|| {
                     "Cannot read properties of undefined (reading 'begin')".into()
                 });
@@ -8075,7 +8473,14 @@ impl Pattern {
         stack.push(self.node.as_ref());
         while let Some(cell) = stack.pop() {
             match &cell.kind {
-                Node::Silence | Node::Signal(_) | Node::QueryError(_) | Node::QueryLimit(_) => {}
+                Node::Silence
+                | Node::IntRange { .. }
+                | Node::Signal(_)
+                | Node::NumberSignal(_)
+                | Node::SegmentSignal { .. }
+                | Node::QueryError(_)
+                | Node::QueryLimit(_) => {}
+                Node::Iter(node) => stack.push(node.inner.node.as_ref()),
                 Node::Pure(val) => {
                     if value_may_be_plugin_note(val) {
                         return true;
@@ -8440,6 +8845,126 @@ pub fn slowcat(pats: Vec<Pattern>) -> Pattern {
         }
     };
     slowcat_with_steps(pats, steps)
+}
+
+#[inline]
+fn append_int_range_locs(loc0: u32, loc1: u32, locs: &[(usize, usize)]) -> Option<(u32, u32)> {
+    match locs {
+        [] => Some((loc0, loc1)),
+        [a] => {
+            let p = pack_run_loc(*a)?;
+            if loc0 == 0 {
+                Some((p, 0))
+            } else if loc1 == 0 {
+                Some((loc0, p))
+            } else {
+                None
+            }
+        }
+        [a, b] if loc0 == 0 && loc1 == 0 => Some((pack_run_loc(*a)?, pack_run_loc(*b)?)),
+        _ => None,
+    }
+}
+
+/// Single-cycle equal-stepped integer range `[start, start + (count - 1) * step]`
+/// without per-step heap allocations.
+pub fn int_range(start: i32, count: u32, step_neg: bool) -> Pattern {
+    int_range_at(start, count, step_neg, &[])
+}
+
+/// Like [`int_range`], packing up to two source locations directly into the
+/// range node so mini ranges build in a single `NodeCell` allocation.
+pub fn int_range_at(start: i32, count: u32, step_neg: bool, locs: &[(usize, usize)]) -> Pattern {
+    if count == 0 {
+        return silence();
+    }
+    if count == 1 {
+        let base = pure(Value::F64(f64::from(start)));
+        return if locs.is_empty() {
+            base
+        } else {
+            base.with_added_context_slice(locs)
+        };
+    }
+    if let Some((loc0, loc1)) = append_int_range_locs(0, 0, locs) {
+        return Pattern::of(Node::IntRange {
+            start,
+            count,
+            loc0,
+            loc1,
+            named_id: 0,
+            step_neg,
+        })
+        .with_steps(Some(Fraction::int(i128::from(count))));
+    }
+    Pattern::of(Node::IntRange {
+        start,
+        count,
+        loc0: 0,
+        loc1: 0,
+        named_id: 0,
+        step_neg,
+    })
+    .with_steps(Some(Fraction::int(i128::from(count))))
+    .with_added_context_slice(locs)
+}
+
+/// Fold `every(n, x => x.rev())` / `firstOf(n, rev)` directly onto a sequence
+/// pattern in one pass when `2 <= n <= 6`, mutating uniquely-owned nodes in
+/// place.
+pub fn sequence_every_rev_owned(pattern: Pattern, n: usize) -> Result<Pattern, Pattern> {
+    sequence::every_rev_owned(pattern, n)
+}
+
+impl Pattern {
+    /// Cycle-rotating `iter(times)` / `iterBack(times)` stored compactly as a
+    /// single [`Node::Iter`] without duplicating `parts` rotated copies.
+    pub(crate) fn pat_iter(&self, times: Fraction, parts: u64, back: bool) -> Pattern {
+        if parts == 0 {
+            return silence();
+        }
+        if sequence::builds_each_node() {
+            let mut pats = Vec::new();
+            if pats.try_reserve_exact(parts as usize).is_err() {
+                return query_limit_pattern(QueryLimit::HostMemory);
+            }
+            for i in 0..parts {
+                let offset = Fraction::int(i128::from(i)).div(times);
+                pats.push(if back {
+                    self.late(offset)
+                } else {
+                    self.early(offset)
+                });
+            }
+            return slowcat(pats);
+        }
+        if parts == 1 {
+            return self.clone();
+        }
+        let steps = match self.steps() {
+            None => None,
+            Some(s) => match s.checked_lcm(s) {
+                Some(v) => Some(v),
+                None => {
+                    return query_limit_pattern(mark_stepwise_refusal(
+                        QueryLimit::NativeFraction {
+                            operation: "slowcat",
+                        },
+                    ));
+                }
+            },
+        };
+        if self.is_rest() && sequence::folds(self) {
+            return silence().with_steps(steps);
+        }
+        Pattern::of(Node::Iter(Box::new(IterNode {
+            inner: self.clone(),
+            times,
+            parts,
+            back,
+        })))
+        .with_steps(steps)
+    }
 }
 
 /// Align every pattern's known step grid, concatenate one slowed pattern per

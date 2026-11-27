@@ -318,6 +318,9 @@ pub struct JsRuntime {
     pub(super) realm: OnceCell<Realm>,
     /// Native module settings paired with this QuickJS realm.
     pub(super) core_settings: rustel_core::settings::RuntimeSettings,
+    /// Cached plain `runtime_settings` extras handle shared by exported native
+    /// patterns so repeated evaluations avoid allocating a fresh `PatternExtras`.
+    pub(super) plain_settings_extras: OnceCell<rustel_core::PatternSharedExtras>,
     /// The single per-runtime callback id allocator, shared by
     /// `GraphBuilder::callback` and the host's bridge. Made at the first
     /// callback a runtime bridges.
@@ -349,6 +352,9 @@ pub struct JsRuntime {
     /// The last host query's thrown error. Queries still return an empty
     /// window; reports consume this message through `take_query_throw`.
     pub(super) query_threw: RefCell<Option<String>>,
+    /// Mirrors `query_threw.borrow().is_some()` so clean queries skip borrowing
+    /// `query_threw`.
+    pub(super) query_threw_some: Cell<bool>,
     /// Callback-IR selection is resolved at the owning runtime rather than in
     /// a pattern hot loop. Made at the first use.
     pub(super) callback_ir: OnceCell<Rc<CallbackIr>>,
@@ -388,6 +394,9 @@ pub struct JsRuntime {
     /// The graph of the native tier in play. While it is `Some`, the active
     /// root of the realm holds no wrapper: one score is in play.
     pub(super) native_active: RefCell<Option<Pattern>>,
+    /// Cached [`Pattern::is_query_settings_independent_static`] for
+    /// [`Self::native_active`], avoiding per-window layer scans.
+    pub(super) native_active_independent: Cell<bool>,
     /// The graph of the native tier that was in play at the last snapshot.
     /// While it is `Some`, `last_good_active` is `None`.
     pub(super) native_last_good: RefCell<Option<Pattern>>,

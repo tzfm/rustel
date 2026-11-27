@@ -52,7 +52,7 @@ fn onsets(session: &mut Session) -> usize {
         .query(Fraction::ZERO, Fraction::ONE)
         .expect("query")
         .iter()
-        .filter(|hap| hap.whole.is_some())
+        .filter(|hap| hap.whole().is_some())
         .count()
 }
 
@@ -143,7 +143,7 @@ fn sticks_read_zero_to_one_and_minus_one_to_one() {
     );
     let haps = session.query(Fraction::ZERO, Fraction::ONE).expect("query");
     assert!(
-        haps.iter().all(|hap| hap.whole.is_some()),
+        haps.iter().all(|hap| hap.whole().is_some()),
         "a reading is discrete, like a cc: the scheduler would drop a signal"
     );
 }
