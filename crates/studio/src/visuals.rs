@@ -48,6 +48,34 @@ impl ClockAnchor {
     }
 }
 
+/// One event on the visual timeline with its effective duration in cycles.
+#[derive(Clone, Debug)]
+struct TimelineEvent {
+    event: UiScheduledEvent,
+    /// Effective duration in cycles (`duration` and `clip`/`legato`),
+    /// captured with the batch's tempo so later tempo changes do not rescale
+    /// bars already on screen.
+    duration_cycles: f64,
+}
+
+impl TimelineEvent {
+    fn new(event: UiScheduledEvent, cps: f64) -> Self {
+        let duration_cycles = if event.duration_seconds.is_finite()
+            && event.duration_seconds >= 0.0
+            && cps.is_finite()
+            && cps > 0.0
+        {
+            event.duration_seconds * cps
+        } else {
+            f64::NAN
+        };
+        Self {
+            event,
+            duration_cycles,
+        }
+    }
+}
+
 /// Revision-gated visual state owned entirely by the UI thread.
 #[derive(Debug, Default)]
 pub struct VisualState {
@@ -56,13 +84,13 @@ pub struct VisualState {
     /// [`Self::install_layout_of`].
     layout_source: Option<std::sync::Arc<str>>,
     running: bool,
-    events: VecDeque<UiScheduledEvent>,
+    events: VecDeque<TimelineEvent>,
     onset_ids: HashSet<u64>,
     /// What the engine has looked ahead to but not queued yet: the notes a
     /// painter shows coming, replaced wholesale by every preview batch and
     /// retired one by one as the real traces arrive. Never a source
     /// highlight, never "sounding".
-    previews: Vec<UiScheduledEvent>,
+    previews: Vec<TimelineEvent>,
     /// The identities of the real events on the timeline, so a preview of
     /// an onset that has since really been queued is not drawn twice.
     real_keys: HashSet<OnsetKey>,
@@ -541,8 +569,8 @@ impl VisualState {
             // the picture: adopt the timeline and its clock into the new
             // generation rather than blanking the widgets until the next
             // trace batch arrives.
-            for event in self.events.iter_mut().chain(self.previews.iter_mut()) {
-                event.generation = generation;
+            for entry in self.events.iter_mut().chain(self.previews.iter_mut()) {
+                entry.event.generation = generation;
             }
             if let Some(clock) = self.clock.as_mut() {
                 clock.generation = generation;
@@ -641,15 +669,16 @@ impl VisualState {
         if !self.accepts(&batch) {
             return false;
         }
+        let cps = batch.cps;
         self.clock = Some(ClockAnchor {
             generation: batch.generation,
             wall: Instant::now(),
             device_time: batch.device_time,
             cycle: batch.cycle,
-            cps: batch.cps,
+            cps,
         });
         self.previews
-            .retain(|event| onset_cycle(event).is_some_and(|cycle| cycle < from_cycle));
+            .retain(|entry| onset_cycle(&entry.event).is_some_and(|cycle| cycle < from_cycle));
         let keys = &self.real_keys;
         self.previews.extend(
             batch
@@ -658,7 +687,7 @@ impl VisualState {
                 .filter(|event| !keys.contains(&OnsetKey::of(event)))
                 .map(|mut event| {
                     event.onset_id |= PREVIEW_ONSET_FLAG;
-                    event
+                    TimelineEvent::new(event, cps)
                 }),
         );
         true
@@ -670,18 +699,19 @@ impl VisualState {
         if !self.accepts(&batch) {
             return false;
         }
+        let cps = batch.cps;
         self.clock = Some(ClockAnchor {
             generation: batch.generation,
             wall: Instant::now(),
             device_time: batch.device_time,
             cycle: batch.cycle,
-            cps: batch.cps,
+            cps,
         });
         self.dropped = self.dropped.saturating_add(batch.dropped);
         for event in batch.events {
             if self.onset_ids.insert(event.onset_id) {
                 self.real_keys.insert(OnsetKey::of(&event));
-                self.events.push_back(event);
+                self.events.push_back(TimelineEvent::new(event, cps));
             }
         }
         while self.events.len() > MAX_TIMELINE_EVENTS {
@@ -692,15 +722,15 @@ impl VisualState {
         // done its job.
         let keys = &self.real_keys;
         self.previews
-            .retain(|preview| !keys.contains(&OnsetKey::of(preview)));
+            .retain(|preview| !keys.contains(&OnsetKey::of(&preview.event)));
         true
     }
 
     /// Drop the oldest real event from the timeline.
     fn evict_front(&mut self) {
-        if let Some(event) = self.events.pop_front() {
-            self.onset_ids.remove(&event.onset_id);
-            self.real_keys.remove(&OnsetKey::of(&event));
+        if let Some(entry) = self.events.pop_front() {
+            self.onset_ids.remove(&entry.event.onset_id);
+            self.real_keys.remove(&OnsetKey::of(&entry.event));
         }
     }
 
@@ -1070,8 +1100,8 @@ impl VisualState {
                 names.push(name);
             }
         };
-        for event in self.events.iter().chain(self.previews.iter()) {
-            push(event);
+        for entry in self.events.iter().chain(self.previews.iter()) {
+            push(&entry.event);
         }
         names
     }
@@ -1103,7 +1133,8 @@ impl VisualState {
         };
         self.events
             .iter()
-            .filter_map(|event| {
+            .filter_map(|entry| {
+                let event = &entry.event;
                 let end = event.target_time + event.duration_seconds.max(0.035);
                 if event.generation != layout.generation || event.target_time > now {
                     return None;
@@ -1137,6 +1168,10 @@ impl VisualState {
     /// Everything on the timeline: the traces of what has been queued to
     /// sound, then the previews of what is coming.
     pub fn events(&self) -> impl Iterator<Item = &UiScheduledEvent> {
+        self.timeline_events().map(|entry| &entry.event)
+    }
+
+    fn timeline_events(&self) -> impl Iterator<Item = &TimelineEvent> {
         self.events.iter().chain(self.previews.iter())
     }
 
@@ -1148,15 +1183,14 @@ impl VisualState {
         let Some((now, _, _)) = self.clock_at(wall) else {
             return;
         };
-        while self
-            .events
-            .front()
-            .is_some_and(|event| event.target_time + event.duration_seconds + HISTORY_SECONDS < now)
-        {
+        while self.events.front().is_some_and(|entry| {
+            entry.event.target_time + entry.event.duration_seconds + HISTORY_SECONDS < now
+        }) {
             self.evict_front();
         }
-        self.previews
-            .retain(|event| event.target_time + event.duration_seconds + HISTORY_SECONDS >= now);
+        self.previews.retain(|entry| {
+            entry.event.target_time + entry.event.duration_seconds + HISTORY_SECONDS >= now
+        });
     }
 }
 
@@ -1691,23 +1725,30 @@ struct PlacedEvent<'a> {
 }
 
 /// Events overlapping `[begin, end)` on the cycle timeline.
+///
+/// Each event ends at `begin + duration_cycles` so `clip`, `legato`, and
+/// `duration` control the drawn length, matching `Hap::end_clipped`.
 fn placed_events<'a>(
     state: &'a VisualState,
     slot: Option<u8>,
     begin: f64,
     end: f64,
     now_seconds: f64,
-    cps: f64,
 ) -> Vec<PlacedEvent<'a>> {
     state
-        .events()
-        .filter(|event| slot.is_none_or(|slot| event.ui_visuals & (1_u64 << slot) != 0))
-        .filter_map(|event| {
+        .timeline_events()
+        .filter(|entry| slot.is_none_or(|slot| entry.event.ui_visuals & (1_u64 << slot) != 0))
+        .filter_map(|entry| {
+            let event = &entry.event;
             let event_begin =
                 parse_fraction(&event.whole_begin).or_else(|| parse_fraction(&event.part_begin))?;
-            let event_end = parse_fraction(&event.whole_end)
-                .or_else(|| parse_fraction(&event.part_end))
-                .unwrap_or(event_begin + event.duration_seconds * cps);
+            let event_end = if entry.duration_cycles.is_finite() {
+                event_begin + entry.duration_cycles.max(0.0)
+            } else {
+                parse_fraction(&event.whole_end)
+                    .or_else(|| parse_fraction(&event.part_end))
+                    .unwrap_or(event_begin)
+            };
             (event_end >= begin && event_begin <= end).then(|| PlacedEvent {
                 event,
                 begin: event_begin,
@@ -1903,7 +1944,7 @@ impl Widget for PianoRoll<'_, '_> {
         let state = self.request.state;
         let theme = self.request.theme;
         let options = self.request.options;
-        let Some((now_seconds, cycle_now, cps)) = state.current_clock() else {
+        let Some((now_seconds, cycle_now, _)) = state.current_clock() else {
             note(self.request, buffer, area, "waiting for the first beat");
             return;
         };
@@ -1912,7 +1953,14 @@ impl Widget for PianoRoll<'_, '_> {
         }
         let begin = cycle_now - self.cycles * self.playhead;
         let end = begin + self.cycles;
-        let placed = placed_events(state, self.request.slot, begin, end, now_seconds, cps);
+        let mut placed = placed_events(state, self.request.slot, begin, end, now_seconds);
+        // Later events draw over earlier ones, and sounding ones over both, so
+        // overlapping bars from clip > 1 keep active notes visible.
+        placed.sort_by(|left, right| {
+            left.active
+                .cmp(&right.active)
+                .then(left.begin.total_cmp(&right.begin))
+        });
         let mut lanes = placed
             .iter()
             .map(|entry| Lane::of(entry.event))
@@ -2295,7 +2343,7 @@ impl Widget for Spiral<'_, '_> {
     fn render(self, area: Rect, buffer: &mut Buffer) {
         let state = self.request.state;
         let theme = self.request.theme;
-        let Some((now_seconds, cycle_now, cps)) = state.current_clock() else {
+        let Some((now_seconds, cycle_now, _)) = state.current_clock() else {
             note(self.request, buffer, area, "waiting for the first beat");
             return;
         };
@@ -2333,7 +2381,7 @@ impl Widget for Spiral<'_, '_> {
 
         let begin = cycle_now - self.inset;
         let end = cycle_now + SPIRAL_LOOKAHEAD_CYCLES;
-        let mut placed = placed_events(state, self.request.slot, begin, end, now_seconds, cps);
+        let mut placed = placed_events(state, self.request.slot, begin, end, now_seconds);
         // Later events draw over earlier ones, and sounding ones over both.
         placed.sort_by(|left, right| {
             left.active
@@ -2366,12 +2414,8 @@ impl Widget for Spiral<'_, '_> {
             } else {
                 wash(self.request.background, color, opacity)
             };
-            // The arc runs to where the note stops sounding, not to the
-            // end of its whole span.
-            let clipped_end = entry
-                .end
-                .min(entry.begin + entry.event.duration_seconds * cps)
-                - self.padding;
+            // `entry.end` already reflects `duration` and `clip`/`legato`.
+            let clipped_end = entry.end - self.padding;
             let from = turn_of(entry.begin).clamp(0.0, total_turns);
             let to = turn_of(clipped_end)
                 .clamp(0.0, total_turns)
@@ -4406,6 +4450,10 @@ mod tests {
     }
 
     fn event(onset_id: u64, begin: &str, end: &str, target_time: f64) -> UiScheduledEvent {
+        let duration_seconds = match (parse_fraction(begin), parse_fraction(end)) {
+            (Some(start), Some(stop)) if stop >= start => stop - start,
+            _ => 0.5,
+        };
         UiScheduledEvent {
             onset_id,
             generation: 1,
@@ -4414,7 +4462,7 @@ mod tests {
             part_begin: begin.to_owned(),
             part_end: end.to_owned(),
             target_time,
-            duration_seconds: 0.5,
+            duration_seconds,
             value: Some("bd".to_owned()),
             color: None,
             label: Some("bd".to_owned()),
@@ -4467,7 +4515,7 @@ mod tests {
             0.0,
         );
 
-        let selected = placed_events(&state, Some(1), 0.0, 1.0, 10.0, 1.0);
+        let selected = placed_events(&state, Some(1), 0.0, 1.0, 10.0);
         assert_eq!(
             selected
                 .iter()
@@ -4476,7 +4524,7 @@ mod tests {
             vec![2]
         );
         assert_eq!(
-            placed_events(&state, None, 0.0, 1.0, 10.0, 1.0)
+            placed_events(&state, None, 0.0, 1.0, 10.0)
                 .iter()
                 .map(|placed| placed.event.onset_id)
                 .collect::<Vec<_>>(),
@@ -4785,7 +4833,6 @@ mod tests {
             event.frequency_hz = Some(440.0 * 2f32.powf((midi - 69.0) / 12.0));
             event.label = Some((*name).to_owned());
             event.value = Some((*name).to_owned());
-            event.duration_seconds = 0.9;
             events.push(event);
         }
         let state = playing("$: note(\"c4 g4\")._pianoroll()", events, 0.25);
@@ -5050,7 +5097,6 @@ mod tests {
             event.frequency_hz = Some(440.0 * 2f32.powf((midi - 69.0) / 12.0));
             event.label = Some((*name).to_owned());
             event.value = Some((*name).to_owned());
-            event.duration_seconds = 0.9;
             events.push(event);
         }
         let state = playing("$: note(\"c4 g4\")._pianoroll()", events, 0.25);
@@ -5120,7 +5166,6 @@ mod tests {
     fn flip_time_runs_the_roll_backwards() {
         let mut event = event(0, "0/1", "1/2", 10.0);
         event.frequency_hz = Some(261.6);
-        event.duration_seconds = 0.9;
         let state = playing("$: note(\"c4\")._pianoroll()", vec![event], 0.25);
         let blocks_at = |options: &str| {
             let text = rows(&draw("pianoroll", options, &state, Rect::new(0, 0, 20, 2)));
@@ -5276,7 +5321,6 @@ mod tests {
     fn pitched(index: u64, begin: &str, end: &str, hertz: f32, at: f64) -> UiScheduledEvent {
         let mut event = event(index, begin, end, at);
         event.frequency_hz = Some(hertz);
-        event.duration_seconds = 0.9;
         event
     }
 
@@ -5864,7 +5908,7 @@ mod tests {
         }
         let mut red = event(1, "0/1", "1/1", 10.0);
         red.color = Some("red".into());
-        state.events.push_back(red);
+        state.events.push_back(TimelineEvent::new(red, 1.0));
         let picture = draw("spectrum", "{ color: '#123456' }", &state, area);
         for x in 0..area.width {
             assert_eq!(picture[(x, 3)].fg, parse_color("red").unwrap());
