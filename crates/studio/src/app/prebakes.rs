@@ -322,6 +322,21 @@ impl App {
         self.dirty_frame = true;
     }
 
+    /// What a local setup may take for granted from the global setup.
+    pub(super) fn global_setup_lint_context(&self, global_override: Option<&str>) -> LintContext {
+        if global_override.is_none()
+            && self.prebake_is_applied(PrebakeScope::Global, &self.global_prebake)
+        {
+            let mut context = LintContext::default();
+            context.add_setup_definitions(&self.applied_setup[PrebakeScope::Global.index()]);
+            context
+        } else {
+            LintContext::from_setup_sources([
+                global_override.unwrap_or(self.global_prebake.as_str())
+            ])
+        }
+    }
+
     /// Check `source` for `scope` without running it, returning the first
     /// rejection reason if it does not check out.
     fn check_prebake_text(
@@ -336,12 +351,8 @@ impl App {
             return Ok(());
         }
         let context = match scope {
-            PrebakeScope::Global => LintContext::from_setup_sources([source]).as_setup(),
-            PrebakeScope::Local => LintContext::from_setup_sources([
-                global_override.unwrap_or(self.global_prebake.as_str()),
-                source,
-            ])
-            .as_setup(),
+            PrebakeScope::Global => LintContext::default().as_setup(),
+            PrebakeScope::Local => self.global_setup_lint_context(global_override).as_setup(),
         };
         let library = self.worker.library();
         let diagnostics = lint_with(source, false, library.as_deref(), &context);
@@ -728,9 +739,23 @@ impl App {
                 self.prebake_rejected[index] = None;
                 self.clear_prebake_error(sent.scope);
                 // What it defined is what the checker may now accept in the
-                // scores that follow it.
-                self.applied_setup[index] =
-                    Arc::new(rustel_transpiler::setup_definitions(&sent.source));
+                // scores that follow it. Once the engine has evaluated the
+                // setup, the runtime surface diff replaces static dynamic-name
+                // uncertainty.
+                let mut definitions = rustel_transpiler::setup_definitions(&sent.source);
+                if let Some(runtime_names) = outcome.defined_names {
+                    let mut seen: std::collections::HashSet<String> =
+                        definitions.names.iter().cloned().collect();
+                    for name in runtime_names {
+                        if seen.insert(name.clone()) {
+                            definitions.names.push(name);
+                        }
+                    }
+                    definitions.has_dynamic_names = false;
+                    definitions.has_dynamic_globals = false;
+                    definitions.has_dynamic_methods = false;
+                }
+                self.applied_setup[index] = Arc::new(definitions);
                 self.lint_pending = true;
                 self.log.push(
                     LogLevel::Info,
@@ -1087,6 +1112,7 @@ mod tests {
                 request_id: 4_242,
                 scope: PrebakeScope::Global,
                 result: Ok(()),
+                defined_names: None,
             });
 
             let sent = app
@@ -1127,6 +1153,7 @@ mod tests {
                 request_id: 7,
                 scope: PrebakeScope::Global,
                 result: Ok(()),
+                defined_names: None,
             });
 
             assert!(app.pending_evaluation.is_none());
@@ -1165,6 +1192,7 @@ mod tests {
                     recoverable: true,
                     playback_stopped: false,
                 }),
+                defined_names: None,
             });
 
             assert!(
@@ -1356,6 +1384,7 @@ mod tests {
                     } else {
                         Ok(())
                     },
+                    defined_names: None,
                 });
 
                 assert!(
@@ -1496,6 +1525,58 @@ mod tests {
             press(&mut app, KeyCode::F(5), KeyModifiers::NONE);
             assert_eq!(app.next_request_id, before_local_repeat);
             assert!(app.prebake_inflight.is_none() && app.prebake_queue.is_empty());
+        }
+
+        /// A prebake with computed writes still catches unknown functions at
+        /// check time, and once applied exposes only its runtime-defined names
+        /// so typos in later scores stay caught.
+        #[test]
+        fn a_dynamic_prebake_catches_unknown_calls_and_exposes_runtime_names() {
+            let directory = tempfile::tempdir().expect("temp dir");
+            let mut app = app_over(directory.path());
+
+            app.open_prebake(PrebakeScope::Global);
+            app.scenes.current_mut().editor = Editor::new(
+                "function add(name) { window[name + 's'] = () => s(name); }\nadd('kick');\nmissingHelper();",
+            )
+            .unwrap();
+            press(&mut app, KeyCode::F(5), KeyModifiers::NONE);
+            assert!(
+                app.prebake_inflight.is_none(),
+                "a broken dynamic prebake should be refused before running"
+            );
+            assert!(
+                app.status.contains("missingHelper")
+                    || app
+                        .errors
+                        .get(ErrorOwner::Evaluation)
+                        .is_some_and(|error| error.contains("missingHelper")),
+                "status={:?}, eval_err={:?}",
+                app.status,
+                app.errors.get(ErrorOwner::Evaluation)
+            );
+
+            app.scenes.current_mut().editor = Editor::new(
+                "function add(name) { window[name + 's'] = () => s(name); }\nadd('kick');",
+            )
+            .unwrap();
+            press(&mut app, KeyCode::F(5), KeyModifiers::NONE);
+            settle(&mut app);
+
+            assert_eq!(app.errors.get(ErrorOwner::Setup), None);
+            assert_eq!(
+                app.prebake_rows()[PrebakeScope::Global.index()].verdict,
+                PrebakeVerdict::Applied
+            );
+            press(&mut app, KeyCode::Char('w'), KeyModifiers::CONTROL);
+            assert!(
+                accepts(&mut app, "kicks"),
+                "runtime-defined dynamic name was refused"
+            );
+            assert!(
+                !accepts(&mut app, "kickss"),
+                "typo was accepted after dynamic prebake applied"
+            );
         }
     }
 }

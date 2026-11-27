@@ -216,10 +216,10 @@ fn raw_comparisons_are_lazy_and_preserve_metadata() {
                          check(haps.length === 1 && haps[0].value === differentResult,
                            'unsupported identity residual changed');
                        }
-                       check(!Object.hasOwn(globalThis, comparisonMethod)
+                       check(Object.hasOwn(globalThis, comparisonMethod)
                          && !Object.hasOwn(rustelScope, comparisonMethod)
-                         && !Object.hasOwn(Pattern.prototype, '_eq')
-                         && !Object.hasOwn(Pattern.prototype, '_ne')
+                         && Object.hasOwn(Pattern.prototype, '_eq')
+                         && Object.hasOwn(Pattern.prototype, '_ne')
                          && Object.hasOwn(Pattern.prototype,
                            comparisonMethod === 'eqt' ? '_net' : '_and'),
                          'public destination or strict raw residual changed');

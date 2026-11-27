@@ -1416,6 +1416,7 @@ mod tests {
                 request_id: setup,
                 scope: PrebakeScope::Local,
                 result: Ok(()),
+                defined_names: None,
             });
             assert!(!app.status.contains("armed launch"), "{}", app.status);
             let newest = app

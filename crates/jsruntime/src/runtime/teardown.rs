@@ -51,13 +51,15 @@ impl Drop for JsRuntime {
         // (one held by an external root) survives the GC and still aborts.
         let last_good = self.last_good_active.borrow_mut().take();
         let import_surface = self.import_surface.take();
+        let surface_capture = self.pending_surface_capture.borrow_mut().take();
         with_ctx(self, |ctx| {
             crate::install::kabelsalat::clear(&ctx);
             if let Some(saved) = last_good {
                 let _ = saved.restore(&ctx);
             }
-            // The saved values of import names are roots too.
+            // The saved values of import names and prebake captures are roots too.
             drop(import_surface);
+            drop(surface_capture);
             // Clearing the roots must not depend on TAKING them. A root left
             // populated survives into `JS_FreeRuntime`, which is the assert
             // this whole function exists to avoid, so `remove_userdata` is the

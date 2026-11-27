@@ -553,6 +553,7 @@ mod tests {
                         } else {
                             Ok(())
                         },
+                        defined_names: None,
                     });
                     if failed {
                         assert_eq!(

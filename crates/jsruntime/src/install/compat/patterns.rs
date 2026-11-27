@@ -380,15 +380,7 @@ pub(super) fn install<'js>(
         )),
     );
     for name in ["plyWith", "plywith"] {
-        install_registration(
-            ctx,
-            proto,
-            globals,
-            name,
-            ply_with.clone(),
-            UpstreamExport::NameListObject,
-            false,
-        )?;
+        install_registration(ctx, proto, globals, name, ply_with.clone(), false)?;
     }
     let ply_for_each = registration(
         &["plyForEach", "plyforeach"],
@@ -402,15 +394,7 @@ pub(super) fn install<'js>(
         )),
     );
     for name in ["plyForEach", "plyforeach"] {
-        install_registration(
-            ctx,
-            proto,
-            globals,
-            name,
-            ply_for_each.clone(),
-            UpstreamExport::NameListObject,
-            true,
-        )?;
+        install_registration(ctx, proto, globals, name, ply_for_each.clone(), true)?;
     }
 
     install_pattern_arguments(
@@ -422,7 +406,6 @@ pub(super) fn install<'js>(
         Arc::new(|patterns| {
             rustel_core::combinators::slice(&patterns[2], &patterns[0], &patterns[1])
         }),
-        UpstreamExport::Callable,
     )?;
     install_pattern_arguments(
         ctx,
@@ -433,7 +416,6 @@ pub(super) fn install<'js>(
         Arc::new(|patterns| {
             rustel_core::combinators::slice(&patterns[2], &patterns[0], &patterns[1]).splice()
         }),
-        UpstreamExport::Callable,
     )?;
 
     let loop_at = registration(
@@ -444,15 +426,7 @@ pub(super) fn install<'js>(
         rustel_core::native_combinator!(|args, pat| pat.loop_at(fraction(args, 0))),
     );
     for name in ["loopAt", "loopat"] {
-        install_registration(
-            ctx,
-            proto,
-            globals,
-            name,
-            loop_at.clone(),
-            UpstreamExport::Callable,
-            false,
-        )?;
+        install_registration(ctx, proto, globals, name, loop_at.clone(), false)?;
     }
     let fit = registration(
         &["fit"],
@@ -461,15 +435,7 @@ pub(super) fn install<'js>(
         FunctionArgument::None,
         rustel_core::native_combinator!(|_args, pat| pat.fit()),
     );
-    install_registration(
-        ctx,
-        proto,
-        globals,
-        "fit",
-        fit,
-        UpstreamExport::Callable,
-        false,
-    )?;
+    install_registration(ctx, proto, globals, "fit", fit, false)?;
 
     install_pattern_arguments(
         ctx,
@@ -478,7 +444,6 @@ pub(super) fn install<'js>(
         "scrub",
         2,
         Arc::new(|patterns| rustel_core::combinators::scrub(&patterns[1], &patterns[0])),
-        UpstreamExport::Callable,
     )?;
     for name in ["isobite", "cyclestruct", "cycleStruct"] {
         install_pattern_arguments(
@@ -488,7 +453,6 @@ pub(super) fn install<'js>(
             name,
             2,
             Arc::new(|patterns| rustel_core::combinators::isobite(&patterns[1], &patterns[0])),
-            UpstreamExport::Callable,
         )?;
     }
 
@@ -528,15 +492,7 @@ pub(super) fn install<'js>(
         })),
     );
     for name in ["chunkInto", "chunkinto"] {
-        install_registration(
-            ctx,
-            proto,
-            globals,
-            name,
-            chunk_into.clone(),
-            UpstreamExport::Callable,
-            false,
-        )?;
+        install_registration(ctx, proto, globals, name, chunk_into.clone(), false)?;
     }
 
     define_method(
@@ -552,14 +508,7 @@ pub(super) fn install<'js>(
         ("struct", 2),
         ("superimpose", 2),
         ("bite", 3),
-        ("set", 2),
-        ("keep", 2),
-        ("keepif", 2),
         ("withValue", 2),
-        ("add", 2),
-        ("sub", 2),
-        ("mul", 2),
-        ("div", 2),
     ] {
         install_method_fallback(ctx, proto, globals, name, arity)?;
     }

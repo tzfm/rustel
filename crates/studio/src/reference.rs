@@ -888,10 +888,12 @@ pub struct WrappedRow {
 }
 
 /// The names this engine plays: the core registry, the control table, the
-/// projected globals and the inline painters.
+/// projected globals and the inline painters. Compatibility stand-ins for
+/// unsupported strudel.cc names are excluded.
 pub fn engine_knows() -> impl Fn(&str) -> bool {
     let known = rustel_runtime::lint::known_names();
-    |name| known.contains(name)
+    let standins = rustel_runtime::lint::compat_standin_names();
+    move |name| known.contains(name) && !standins.contains(name)
 }
 
 #[cfg(test)]
@@ -1320,6 +1322,7 @@ mod tests {
             // Raw `_` methods and `s_` stepwise aliases are covered by their public
             // names. Built-ins, undocumented names and hidden entries are exempt.
             let known = rustel_runtime::lint::known_names();
+            let compat_standins = rustel_runtime::lint::compat_standin_names();
             surfaces.push((
                 "engine names",
                 known
@@ -1330,6 +1333,7 @@ mod tests {
                             && !name.starts_with("s_")
                             && !JS_BUILTINS.contains(&name)
                             && !ENGINE_NAMES_WITHOUT_ENTRIES.contains(&name)
+                            && !compat_standins.contains(name)
                             && !hidden_combinators.contains(name)
                             && !hidden_spellings.contains(name)
                     })
@@ -1429,9 +1433,11 @@ mod tests {
         #[test]
         fn every_entry_names_something_the_engine_installs() {
             let reference = Reference::load_all();
+            let standins = rustel_runtime::lint::compat_standin_names();
             let mut installed: std::collections::BTreeSet<String> =
                 rustel_runtime::lint::known_names()
                     .iter()
+                    .filter(|name| !standins.contains(name.as_str()))
                     .cloned()
                     .collect();
             for sound in rustel_voice::NATIVE_SYNTH_SOUNDS {

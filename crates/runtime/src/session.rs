@@ -946,6 +946,9 @@ pub struct Session {
     /// later score, so a score's text does not show every `n` it plays. See
     /// [`Self::prebake_selects_variants`].
     prebake_selects_variants: bool,
+    /// Non-internal surface names added or updated by the most recent
+    /// successful prebake evaluation.
+    last_prebake_defined_names: Vec<String>,
     /// When set, a bounce ends where the music does rather than where the
     /// requested duration does.
     stop_when_silent: Option<rustel_audio::SilenceStop>,
@@ -1307,6 +1310,7 @@ impl Session {
             plugin_wait: true,
             preload_requested: 0,
             prebake_selects_variants: false,
+            last_prebake_defined_names: Vec::new(),
             stop_when_silent: None,
             export_limiter: None,
             export_fader: Vec::new(),

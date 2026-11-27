@@ -42,27 +42,14 @@ pub(super) fn define_method<'js>(
         .map_err(|error| error.to_string())
 }
 
-/// How upstream exports a registration, which decides whether it is also a
-/// free function. A single or destructured `register` export is a callable
-/// global upstream; the name-list object from `register([...])` is not.
-#[derive(Clone, Copy)]
-pub(super) enum UpstreamExport {
-    /// The export is the function: installed as a method and as a free
-    /// curried function that takes the pattern last.
-    Callable,
-    /// The export is the name-list object: installed as a method only.
-    NameListObject,
-}
-
-/// Install `registration` as the pattern method `name`, and also as a free
-/// curried function when `export` is [`UpstreamExport::Callable`].
+/// Install `registration` as the pattern method `name` and as a free curried
+/// function that takes the pattern last.
 pub(super) fn install_registration<'js>(
     ctx: &Ctx<'js>,
     proto: &rquickjs::Object<'js>,
     globals: &rquickjs::Object<'js>,
     name: &'static str,
     registration: rustel_core::register::Registration,
-    export: UpstreamExport,
     indexed_transformer: bool,
 ) -> Result<(), String> {
     let method_registration = registration.clone();
@@ -118,10 +105,6 @@ pub(super) fn install_registration<'js>(
     .map_err(|error| error.to_string())?;
     proto.set(name, method).map_err(|error| error.to_string())?;
 
-    match export {
-        UpstreamExport::NameListObject => return Ok(()),
-        UpstreamExport::Callable => {}
-    }
     let arity = registration.arity;
     let raw = Function::new(
         ctx.clone(),
@@ -146,9 +129,8 @@ pub(super) fn install_registration<'js>(
 
 pub(super) type PatternBody = std::sync::Arc<dyn Fn(&[Pattern]) -> Pattern + Send + Sync + 'static>;
 
-/// Install `body` as the pattern method `name`, and also as a free curried
-/// function when `export` is [`UpstreamExport::Callable`]. `body` receives
-/// every argument as a pattern, the receiver last.
+/// Install `body` as the pattern method `name` and as a free curried
+/// function. `body` receives every argument as a pattern, the receiver last.
 pub(super) fn install_pattern_arguments<'js>(
     ctx: &Ctx<'js>,
     proto: &rquickjs::Object<'js>,
@@ -156,7 +138,6 @@ pub(super) fn install_pattern_arguments<'js>(
     name: &'static str,
     arity: usize,
     body: PatternBody,
-    export: UpstreamExport,
 ) -> Result<(), String> {
     let method_body = body.clone();
     let method = Function::new(
@@ -202,10 +183,6 @@ pub(super) fn install_pattern_arguments<'js>(
     .map_err(|error| error.to_string())?;
     proto.set(name, method).map_err(|error| error.to_string())?;
 
-    match export {
-        UpstreamExport::NameListObject => return Ok(()),
-        UpstreamExport::Callable => {}
-    }
     let raw = Function::new(
         ctx.clone(),
         hr_rest(move |ctx, args| {
