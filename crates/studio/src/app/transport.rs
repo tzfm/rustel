@@ -540,6 +540,7 @@ impl App {
             || self.pending_evaluation.is_some()
             || self.prebake_inflight.is_some()
             || !self.prebake_queue.is_empty()
+            || self.deferred_score_update.is_some()
     }
 
     /// Every error the footer shows is also a line in the log, where it

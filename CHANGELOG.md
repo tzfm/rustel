@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- Studio applies changed global and local prebakes automatically on score or local prebake updates, and skips prebakes whose text has not changed.
+- Fetched `await import('https://...')` scripts are cached on disk and used when a network fetch fails.
+- Fixed: `withHaps((haps, state) => ...)` now passes `state`, `m(text)` accepts a single argument, and custom `Pattern` queries that return `Hap` objects with an undefined `part` skip non-intersecting events instead of throwing.
 - Fixed: pianoroll, punchcard, wordfall, and spiral visuals now reflect `clip`, `legato`, and `duration` controls in note lengths.
 - Fixed: scores and MIDI imports with more than 4,096 mini-notation tokens now keep visuals, sliders, and lane controls active instead of dropping the UI layout.
 - Faster score evaluation, live edits, and pattern querying with lower memory use.

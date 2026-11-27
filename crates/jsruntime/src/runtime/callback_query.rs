@@ -118,6 +118,22 @@ impl JsRuntime {
                         .get("part")
                         .map_err(|error| describe_js_error(&ctx, error))?;
                     let part = part_value.as_object();
+                    // A Hap whose `part` was set to `undefined` or `null`
+                    // (for example `shifted.part.intersection(span)` when a
+                    // shifted event falls outside `span`) has no active span
+                    // in this query. Drop it instead of falling back to the
+                    // legacy `{begin, end}` shape.
+                    if part.is_none()
+                        && (part_value.is_undefined() || part_value.is_null())
+                        && item
+                            .contains_key("part")
+                            .map_err(|error| describe_js_error(&ctx, error))?
+                        && !item
+                            .contains_key("begin")
+                            .map_err(|error| describe_js_error(&ctx, error))?
+                    {
+                        continue;
+                    }
                     let b: Fraction = match &part {
                         Some(part) => fraction_property(&ctx, part, "begin")
                             .map_err(|error| describe_js_error(&ctx, error))?,

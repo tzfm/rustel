@@ -416,18 +416,15 @@ impl<'js> JsClass<'js> for NativeWithHapsQuery<'js> {
             let state = this.borrow();
             (state.pattern.clone(), state.callback.clone())
         };
+        let state = params
+            .arg(0)
+            .unwrap_or_else(|| common::undefined(params.ctx()));
         let query = common::method(params.ctx(), &pattern, "query")?;
-        let haps = common::call(
-            &query,
-            pattern,
-            [params
-                .arg(0)
-                .unwrap_or_else(|| common::undefined(params.ctx()))],
-        )?;
+        let haps = common::call(&query, pattern, [state.clone()])?;
         let callback = callback
             .into_function()
             .ok_or_else(|| throw_type_error(params.ctx(), "func is not a function"))?;
-        callback.call((haps,))
+        callback.call((haps, state))
     }
 }
 

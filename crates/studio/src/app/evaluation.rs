@@ -263,12 +263,24 @@ impl App {
     /// prebake path, which differ only in what the checker is told the text
     /// is and in what the message says was not taken.
     pub(super) fn refuse_unclean(&mut self, revision: Revision, source: &Arc<str>) -> bool {
+        let id = self.scenes.current().id;
+        self.refuse_unclean_for(id, revision, source)
+    }
+
+    pub(super) fn refuse_unclean_for(
+        &mut self,
+        id: SceneId,
+        revision: Revision,
+        source: &Arc<str>,
+    ) -> bool {
         // An import whose failure has rested a few seconds is asked for
         // again. This update is still refused for it; the next one is not,
         // once it is in.
-        self.retry_failed_imports(self.scenes.current().id, false);
-        let scene = self.scenes.current();
-        let (id, prebake) = (scene.id, scene.prebake());
+        self.retry_failed_imports(id, false);
+        let Some(scene) = self.scenes.get(id) else {
+            return false;
+        };
+        let prebake = scene.prebake();
         let mini = self.options.mini && scene.is_score();
         let context = self.lint_context_for(scene);
         let library = self.worker.library();
@@ -314,6 +326,7 @@ impl App {
         dispatched
     }
 
+    #[cfg(test)]
     pub(super) fn queue_evaluation(&mut self, revision: Revision, source: Arc<str>) {
         // The score alone replaces the preview's composite, so nothing is
         // owed a restore.
@@ -390,10 +403,11 @@ impl App {
         }
         let (id, revision) = (scene.id, scene.editor.revision());
         let source: Arc<str> = Arc::from(scene.editor.source());
+        let prebake_changed = self.has_unapplied_prebake();
         // What is playing is already this text, byte for byte. An auto
         // apply has nothing to say about it, unlike a press, which is owed
         // an answer for the gesture alone.
-        if self.install_would_be_redundant(id, &source) {
+        if !prebake_changed && self.install_would_be_redundant(id, &source) {
             self.rebind_unchanged_score(id, revision, Arc::clone(&source));
             return;
         }
@@ -409,6 +423,7 @@ impl App {
         // its sounds are ready - the skip stands down: that edit is a
         // decision this one must supersede, not land over.
         if !external
+            && !prebake_changed
             && !self.options.mini
             && !self.launch_arming.is_armed()
             && self.pending_evaluation.is_none()
@@ -434,13 +449,57 @@ impl App {
         // Already armed for its line: pressing again would only cancel and
         // re-arm it on the same line, and applying again is the same
         // non-press twice over.
-        if self.launch_arming.armed_with(id, &source_revision(&source)) {
+        if !prebake_changed && self.launch_arming.armed_with(id, &source_revision(&source)) {
             return;
         }
-        // Audio dropped into the open set plays from this update, so the
-        // set is read again before the score's sound names are judged.
+        let update = DeferredScoreUpdate {
+            scene: id,
+            revision,
+            source,
+            request: std::mem::take(&mut self.next_evaluation),
+            explicit: false,
+            is_replay: false,
+            write_scene: !external,
+            source_kind: if external {
+                "external update"
+            } else {
+                "auto update"
+            },
+        };
+        match self.prepare_prebakes_for_score(update) {
+            PrebakePreparation::Ready(update) => {
+                self.finish_score_update(update, false);
+            }
+            PrebakePreparation::Queued | PrebakePreparation::Refused => {}
+        }
+    }
+
+    /// Complete a score update, either directly or after changed prebakes have
+    /// finished applying.
+    pub(super) fn finish_score_update(&mut self, update: DeferredScoreUpdate, after_prebake: bool) {
+        let Some(scene_name) = self
+            .scenes
+            .get(update.scene)
+            .map(|scene| scene.name().to_owned())
+        else {
+            if update.explicit {
+                self.finish_evaluation_feedback(false);
+            }
+            return;
+        };
+        // Audio dropped into the open set plays from this update, so the set
+        // is read again before the score's sound names are judged.
         self.refresh_set_samples();
-        if self.refuse_unclean(revision, &source) {
+        // A score that names something that does not exist is refused before
+        // it plays, like a syntax error: the last good score keeps sounding.
+        // There is no pressing through it - a set on stage must never take a
+        // score the engine will refuse, and the engine's own refusal is a
+        // rollback anyway.
+        if self.refuse_unclean_for(update.scene, update.revision, &update.source) {
+            if update.explicit {
+                self.finish_evaluation_feedback(false);
+            }
+            self.dirty_frame = true;
             return;
         }
         self.log.push(
@@ -448,24 +507,113 @@ impl App {
             "transport",
             format!(
                 "{} - {} ({} bytes)",
-                if external {
-                    "external update"
-                } else {
-                    "auto update"
-                },
-                self.scenes.current().name(),
-                source.len()
+                update.source_kind,
+                scene_name,
+                update.source.len()
             ),
         );
         self.silence_preview();
+        // Update is the save: the file is what you hear. The write and the
+        // evaluate leave together; a rejected score is still the score on
+        // disk, exactly as a watched set behaves. A file that already holds
+        // the text is left alone, so playing a set you only opened does not
+        // touch it.
         self.playing_pane = Some(self.focused);
-        // The file is what you hear, whoever asked for the update. A
-        // watched file already holds this text: writing it again could
-        // overwrite a newer save that landed while it was read.
-        if !external {
-            self.write_scene(id, Arc::clone(&source));
+        let scene = update.scene;
+        // A replay tab's text is one block. Updates save normal tapes; live
+        // recorder and debug tapes keep edits in the tab. On a replay ^S also
+        // starts the chosen block - when its recorded time is up the next
+        // block loads and plays - and the run starts whether or not the engine
+        // has to change.
+        if update.is_replay {
+            if let Some(tab) = self.replays.get_mut(&scene) {
+                let chosen = tab.selected;
+                let refused = tab.set_source(chosen, &update.source).err();
+                tab.start(chosen, Instant::now());
+                if let Some(error) = refused {
+                    self.set_error(ErrorOwner::Interface, error);
+                }
+            }
+            self.save_replay_tab(scene);
+        } else if update.write_scene {
+            // The file this write lands on may be about to take its name from
+            // the score's `@title`, which is why the name is settled first:
+            // the rename must never leave a save in flight to the path the
+            // file just left.
+            if self.scenes.current().id == scene {
+                self.sync_name_from_title();
+            }
+            self.write_scene(scene, Arc::clone(&update.source));
         }
-        self.queue_evaluation(revision, source);
+        if update.explicit && !after_prebake {
+            // Nothing to install: the sounding score is already this one, byte
+            // for byte. Said rather than silently dropped, because pressing
+            // update is a deliberate gesture - and it is still a save, which
+            // the write above has already done.
+            //
+            // Only while playing. Stopped, update is how you start, and the
+            // text being unchanged is beside the point. A tape is played from
+            // a block, and pressing play means play it: the text matching what
+            // already sounds is no reason to leave the set's music where it is.
+            //
+            // A rewind is the exception: restarting the score is the gesture,
+            // so the same bytes are exactly what it is for. Refusing it would
+            // mean "stop first to restart it" - the thing a rewind update
+            // exists to save you from.
+            let rewinding = update.request.rewind
+                || self
+                    .scenes
+                    .get(scene)
+                    .is_some_and(|scene| scene.rewind && scene.is_score());
+            if !update.is_replay
+                && !rewinding
+                && self.install_would_be_redundant(scene, &update.source)
+            {
+                self.rebind_unchanged_score(scene, update.revision, Arc::clone(&update.source));
+                self.finish_evaluation_feedback(true);
+                // A plugin row with a fault: the press asks for the new tries,
+                // and still evaluates nothing.
+                #[cfg(feature = "vst")]
+                let retried = self.retry_plugin_faults();
+                #[cfg(not(feature = "vst"))]
+                let retried = false;
+                self.status = if retried {
+                    "unchanged - already playing · new tries asked for the plugin faults"
+                } else {
+                    "unchanged - already playing (stop first to restart it)"
+                }
+                .into();
+                self.dirty_frame = true;
+                return;
+            }
+            // The text that is already armed is waiting for its line. Pressing
+            // the same kind of launch again would cancel it and take the next
+            // line. A rewind still replaces a join: starting from the top is a
+            // different launch.
+            if self
+                .launch_arming
+                .armed_with(scene, &source_revision(&update.source))
+                && (!rewinding || self.launch_arming.starts_from_zero())
+            {
+                if !update.is_replay {
+                    self.rebind_unchanged_score(scene, update.revision, Arc::clone(&update.source));
+                }
+                self.finish_evaluation_feedback(true);
+                self.status = "already armed - waiting for its cycle line".into();
+                self.dirty_frame = true;
+                return;
+            }
+        }
+        if after_prebake
+            && update.explicit
+            && let Some(feedback) = &mut self.evaluation_feedback
+        {
+            feedback.last_request = self.next_request_id;
+        }
+        self.next_evaluation = update.request;
+        #[cfg(feature = "hydra")]
+        self.end_snippet_audition();
+        self.queue_evaluation_for(scene, update.revision, update.source, true);
     }
 
     /// Run the update a permission just unblocked, without a keypress: the
@@ -507,27 +655,22 @@ impl App {
             return;
         }
         let source: Arc<str> = Arc::from(current.editor.source());
-        self.refresh_set_samples();
-        if self.refuse_unclean(revision, &source) {
-            return;
+        let update = DeferredScoreUpdate {
+            scene,
+            revision,
+            source,
+            request: std::mem::take(&mut self.next_evaluation),
+            explicit: false,
+            is_replay: false,
+            write_scene: true,
+            source_kind: "re-running the refused update",
+        };
+        match self.prepare_prebakes_for_score(update) {
+            PrebakePreparation::Ready(update) => {
+                self.finish_score_update(update, false);
+            }
+            PrebakePreparation::Queued | PrebakePreparation::Refused => {}
         }
-        self.log.push(
-            LogLevel::Debug,
-            "transport",
-            format!(
-                "re-running the refused update - {} ({} bytes)",
-                self.scenes.current().name(),
-                source.len()
-            ),
-        );
-        self.silence_preview();
-        self.playing_pane = Some(self.focused);
-        // The file is what you hear, whoever asked for the update.
-        self.write_scene(scene, Arc::clone(&source));
-        // The re-run replaces the preview's composite.
-        #[cfg(feature = "hydra")]
-        self.end_snippet_audition();
-        self.queue_evaluation_for(scene, revision, source, true);
     }
 
     /// Queue an evaluation against a named scene rather than the focused
@@ -1323,6 +1466,7 @@ impl App {
             self.inflight.clear();
             self.prebake_queue.clear();
             self.prebake_inflight = None;
+            self.deferred_score_update = None;
             self.snapshot = None;
             self.set_error(
                 ErrorOwner::Engine,

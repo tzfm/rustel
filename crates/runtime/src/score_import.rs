@@ -4,6 +4,7 @@
 //! before the text that imports it. The realm itself opens no connection.
 //! Nothing loads by default: the host trusts each origin by name.
 
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 use std::time::{Duration, Instant};
@@ -18,6 +19,9 @@ const MAX_IMPORT_BYTES: usize = 1024 * 1024;
 /// How long the fetch of one script takes at most. The evaluation waits for
 /// it, so a live update is late by this time on a host that does not answer.
 const IMPORT_FETCH_TIMEOUT: Duration = Duration::from_secs(8);
+
+/// Folder beneath `<config>/cache/` holding offline copies of fetched scripts.
+const IMPORT_CACHE_DIR: &str = "imports";
 
 /// The origins a score imports scripts from. The default trusts none.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -169,10 +173,103 @@ fn check_transport(url: &Url) -> Result<(), String> {
     }
 }
 
-/// Fetch the text of an approved script. Every redirect stays on the origin
-/// of `url`, and every connection passes the address rules of the sample
-/// client.
+/// Fetch the text of an approved script, caching successful fetches on disk
+/// and falling back to the cached copy when the network fetch fails. Every
+/// redirect stays on the origin of `url`, and every connection passes the
+/// address rules of the sample client.
 pub(crate) fn fetch(url: &Url) -> Result<String, String> {
+    let cache = cache_dir_for(url);
+    fetch_with_cache(url, cache.as_deref())
+}
+
+fn cache_dir_for(url: &Url) -> Option<PathBuf> {
+    // Keep loopback HTTP fetches from unit tests out of the user's real
+    // `~/.rustel` directory unless an explicit `RUSTEL_CONFIG_DIR` is set.
+    let explicit_config =
+        std::env::var_os(crate::config_dir::CONFIG_DIR_VAR).is_some_and(|value| !value.is_empty());
+    if url.scheme() != "https" && !explicit_config {
+        return None;
+    }
+    Some(
+        crate::config_dir::canonical()?
+            .join("cache")
+            .join(IMPORT_CACHE_DIR),
+    )
+}
+
+fn cache_path(dir: &Path, url: &Url) -> PathBuf {
+    use sha2::{Digest as _, Sha256};
+
+    let mut hasher = Sha256::new();
+    hasher.update(b"rustel-script-import-v1\0");
+    hasher.update(url.as_str().as_bytes());
+    let digest = hasher.finalize();
+    let mut name = String::with_capacity(digest.len() * 2 + 3);
+    for byte in digest {
+        use std::fmt::Write as _;
+        let _ = write!(&mut name, "{byte:02x}");
+    }
+    name.push_str(".js");
+    dir.join(name)
+}
+
+fn read_cached(path: &Path) -> Option<String> {
+    use std::fs::OpenOptions;
+    use std::io::Read;
+
+    if !std::fs::symlink_metadata(path).ok()?.file_type().is_file() {
+        return None;
+    }
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NONBLOCK | libc::O_NOFOLLOW);
+    }
+    let file = options.open(path).ok()?;
+    let metadata = file.metadata().ok()?;
+    if !metadata.is_file() || metadata.len() > MAX_IMPORT_BYTES as u64 {
+        return None;
+    }
+    let mut bytes = Vec::new();
+    file.take(MAX_IMPORT_BYTES as u64 + 1)
+        .read_to_end(&mut bytes)
+        .ok()?;
+    if bytes.len() > MAX_IMPORT_BYTES {
+        return None;
+    }
+    String::from_utf8(bytes).ok()
+}
+
+fn write_cached(path: &Path, text: &str) {
+    let Some(parent) = path.parent() else {
+        return;
+    };
+    if std::fs::create_dir_all(parent).is_err() {
+        return;
+    }
+    let _ = crate::atomic_file::replace_file_bytes(path, ".import-", text.as_bytes());
+}
+
+fn fetch_with_cache(url: &Url, cache_dir: Option<&Path>) -> Result<String, String> {
+    match fetch_network(url) {
+        Ok(text) => {
+            if let Some(dir) = cache_dir {
+                write_cached(&cache_path(dir, url), &text);
+            }
+            Ok(text)
+        }
+        Err(error) => {
+            if let Some(cached) = cache_dir.and_then(|dir| read_cached(&cache_path(dir, url))) {
+                return Ok(cached);
+            }
+            Err(error)
+        }
+    }
+}
+
+fn fetch_network(url: &Url) -> Result<String, String> {
     use std::io::Read;
 
     let budget = sample_fetch::FetchBudget::until(
@@ -378,5 +475,50 @@ mod tests {
                 .contains("leaves the trusted origin")
         );
         assert!(get("/big").unwrap_err().contains("larger than"));
+    }
+
+    #[test]
+    fn a_cached_script_serves_when_the_host_stops_answering() {
+        use std::io::{BufRead, BufReader, Write};
+
+        let cache = tempfile::tempdir().expect("cache dir");
+        let body = "globalThis.offlineHelper = () => note('c3')";
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let addr = listener.local_addr().expect("address");
+        let server = std::thread::spawn(move || {
+            if let Ok((stream, _)) = listener.accept() {
+                let mut reader = BufReader::new(&stream);
+                let mut line = String::new();
+                while reader.read_line(&mut line).is_ok_and(|read| read > 2) {
+                    line.clear();
+                }
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = (&stream).write_all(response.as_bytes());
+            }
+        });
+        let url = Url::parse(&format!("http://{addr}/scripts.js")).expect("url");
+        assert_eq!(
+            fetch_with_cache(&url, Some(cache.path())).as_deref(),
+            Ok(body)
+        );
+        server.join().expect("server exits after one request");
+
+        // The listener is dropped; a second fetch falls back to the disk copy.
+        assert_eq!(
+            fetch_with_cache(&url, Some(cache.path())).as_deref(),
+            Ok(body)
+        );
+
+        // An uncached URL on the dead port still reports the network failure.
+        let uncached = Url::parse(&format!("http://{addr}/missing.js")).expect("url");
+        assert!(fetch_with_cache(&uncached, Some(cache.path())).is_err());
+
+        // An oversized cached file is ignored instead of trusted blindly.
+        let cached_file = cache_path(cache.path(), &url);
+        std::fs::write(&cached_file, vec![b'x'; MAX_IMPORT_BYTES + 1]).expect("oversized");
+        assert!(fetch_with_cache(&url, Some(cache.path())).is_err());
     }
 }

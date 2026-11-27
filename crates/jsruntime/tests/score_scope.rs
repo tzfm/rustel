@@ -306,4 +306,58 @@ mod await_path {
         assert_eq!(haps("await 0\n$: s(\"bd*4\")").len(), 4);
         assert_eq!(haps("$: s(`${await Promise.resolve(\"bd\")}`)").len(), 1);
     }
+
+    #[test]
+    fn with_haps_passes_query_state_to_callback() {
+        let out = haps(
+            "s(\"bd hh\").withHaps((haps, state) => {\
+                if (!state || !state.span) throw new Error('missing state');\
+                const extra = note(\"c3\").query(state);\
+                return haps.map((h) => h.withValue((v) => ({ ...v, note: extra[0].value.note })));\
+            })",
+        );
+        assert_eq!(out.len(), 2);
+        assert!(out.iter().all(|shown| shown.contains("note:c3")), "{out:?}");
+    }
+
+    #[test]
+    fn m_accepts_a_single_argument_without_locations() {
+        let rt = runtime();
+        rt.evaluate_score("m('1 0 1 0')", &TranspileOptions::default())
+            .expect("one-argument m() evaluates");
+        let out = rt
+            .query(Slot::Active, 0, Fraction::ZERO, Fraction::ONE)
+            .expect("query");
+        assert_eq!(out.len(), 4);
+        assert!(out.iter().all(|hap| hap.context.is_empty()));
+        assert_eq!(haps("s(\"bd\").struct(m('1 0 1 0'))").len(), 2);
+    }
+
+    #[test]
+    fn callback_query_skips_haps_with_undefined_part() {
+        let out = haps(
+            "const humanize = register('humanize', (amt, pat) => {\
+                const maxShift = clamp(amt, 0, 1) * 0.1;\
+                const query = (state) => {\
+                    const span = state.span;\
+                    return pat.query(state.setSpan(new TimeSpan(\
+                        span.begin.sub(maxShift),\
+                        span.end.add(maxShift)\
+                    ))).map((hap) => {\
+                        const t0 = Number(hap.part.begin);\
+                        const offset = maxShift * (2 * getRandsAtTime(t0, 1, 0) - 1);\
+                        const shifted = hap.withSpan((s) => s.withTime((t) => t.add(offset)));\
+                        return new Hap(shifted.whole, shifted.part.intersection(span), shifted.value, shifted.context);\
+                    });\
+                };\
+                return new Pattern(query).splitQueries();\
+            });\
+            s(\"bd hh sd hh\").humanize(0.5)",
+        );
+        assert!(
+            out.len() >= 4,
+            "expected humanized hits inside cycle 0, got {}",
+            out.len()
+        );
+    }
 }
