@@ -2449,6 +2449,11 @@ impl SampleLookup for SampleLibrary {
         crate::vst::controls(request)
     }
 
+    #[cfg(feature = "vst")]
+    fn insert_param(&self, name: &str, instrument: bool, param: &str) -> Option<(u32, f64)> {
+        crate::vst::param(name, instrument, param)
+    }
+
     fn insert_speech(&self, request: &SpeechRequest<'_>) -> Result<SampleResolution, String> {
         speech::speak(&self.shared, request)
     }

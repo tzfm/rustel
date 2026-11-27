@@ -2120,6 +2120,24 @@ impl RenderPlan {
         })
     }
 
+    /// Resolves a parameter or mapped MIDI controller name on a plugin already
+    /// loaded by this render plan.
+    pub(crate) fn insert_param(
+        &self,
+        name: &str,
+        instrument: bool,
+        param: &str,
+    ) -> Option<(u32, f64)> {
+        let wanted = canonical(name);
+        let (_, key) = self.keys.iter().find(|(known, _)| {
+            known.instrument == instrument && canonical(&known.name) == wanted
+        })?;
+        let Ok(key) = key else {
+            return None;
+        };
+        self.plugins.get(&key.plugin)?.param_with_default(param)
+    }
+
     /// Gives each stage of the chain of a converted note the latency the
     /// plan read for its copy, 1 s at most: see [`latencies`]. A stage with
     /// no read has no latency.

@@ -11,7 +11,7 @@
 
 use std::collections::BTreeSet;
 
-use rustel_runtime::vst::{ParamInfo, PluginInfo, Status, canonical};
+use rustel_runtime::vst::{MidiCcInfo, ParamInfo, PluginInfo, Status, canonical};
 
 use super::{Reference, ReferencePanel, score_key};
 use crate::number_form::short_number;
@@ -113,17 +113,33 @@ pub enum PluginWords {
 
 /// The words for the object of a plugin call, and the text beside each
 /// word: `preset`, then each parameter key in the form a score writes, with
-/// its title and its default.
-pub fn key_words(params: &[ParamInfo]) -> (Vec<String>, Vec<String>) {
+/// its title and its default, followed by mapped MIDI CC keys (`cc`,
+/// `modwheel`, `aftertouch`, `pitchbend`, `cc<n>`, ...).
+pub fn key_words(params: &[ParamInfo], midi_ccs: &[MidiCcInfo]) -> (Vec<String>, Vec<String>) {
     let preset = (
         "preset".to_owned(),
         "a preset file of the plugin".to_owned(),
     );
+    let cc_map = (!midi_ccs.is_empty()).then(|| {
+        (
+            "cc".to_owned(),
+            "map of MIDI CC numbers to 0..1 values".to_owned(),
+        )
+    });
+    let midi_entries = midi_ccs.iter().filter_map(|cc| {
+        if params.iter().any(|param| param.key == cc.key) {
+            return None;
+        }
+        let detail = format!("{} · {}", cc.name, short_number(cc.default));
+        Some((score_key(&cc.key), detail))
+    });
     std::iter::once(preset)
         .chain(params.iter().map(|param| {
             let detail = format!("{} · {}", param.name, param.default_shown());
             (score_key(&param.key), detail)
         }))
+        .chain(cc_map)
+        .chain(midi_entries)
         .unzip()
 }
 
@@ -237,14 +253,23 @@ fn rows_of_group<'a>(
 impl VstTab {
     /// A key completion writes a usable option, with the same default as
     /// a parameter chosen from the plugin's expanded row.
-    pub fn key_text(params: &[ParamInfo], key: &str) -> Option<String> {
+    pub fn key_text(params: &[ParamInfo], midi_ccs: &[MidiCcInfo], key: &str) -> Option<String> {
         if key == "preset" {
             return Some("preset: \"\"".into());
+        }
+        if key == "cc" && !midi_ccs.is_empty() {
+            return Some("cc: { 1: 0 }".into());
         }
         params
             .iter()
             .find(|param| score_key(&param.key) == key)
             .map(parameter_text)
+            .or_else(|| {
+                midi_ccs
+                    .iter()
+                    .find(|cc| score_key(&cc.key) == key)
+                    .map(|cc| format!("{}: {}", score_key(&cc.key), short_number(cc.default)))
+            })
     }
 
     /// Open the plugin named by the call in the editor. Keep the name while
@@ -839,6 +864,7 @@ mod tests {
             categories: String::new(),
             status,
             params: params.into(),
+            midi_ccs: std::sync::Arc::default(),
             instrument: false,
             running: 0,
             load_time: std::time::Duration::ZERO,
@@ -1099,5 +1125,46 @@ mod tests {
         assert_eq!(tab.row(tab.selected), Some(Preset(0)));
         tab.set_presets(Vec::new());
         assert_eq!(tab.inside(), Some(VstSection::Presets));
+    }
+
+    #[test]
+    fn key_words_and_key_text_include_mapped_midi_ccs_without_duplicating_params() {
+        let params = vec![param("brightness", "Brightness", "")];
+        let midi_ccs = vec![
+            MidiCcInfo {
+                controller: 1,
+                param_id: 201,
+                key: "modwheel".into(),
+                name: "Mod Wheel (CC 1)".into(),
+                default: 0.0,
+            },
+            MidiCcInfo {
+                controller: 74,
+                param_id: 204,
+                key: "brightness".into(),
+                name: "Brightness (CC 74)".into(),
+                default: 0.0,
+            },
+            MidiCcInfo {
+                controller: 129,
+                param_id: 203,
+                key: "pitchbend".into(),
+                name: "Pitch Bend".into(),
+                default: 0.5,
+            },
+        ];
+        let (names, _) = key_words(&params, &midi_ccs);
+        assert_eq!(
+            names,
+            ["preset", "brightness", "cc", "modwheel", "pitchbend"]
+        );
+        assert_eq!(
+            VstTab::key_text(&params, &midi_ccs, "cc").as_deref(),
+            Some("cc: { 1: 0 }")
+        );
+        assert_eq!(
+            VstTab::key_text(&params, &midi_ccs, "pitchbend").as_deref(),
+            Some("pitchbend: 0.5")
+        );
     }
 }

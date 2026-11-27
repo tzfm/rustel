@@ -104,6 +104,91 @@ impl ParamInfo {
     }
 }
 
+/// VST3 controller number for MIDI channel aftertouch (`kAfterTouch`).
+pub const MIDI_CC_AFTERTOUCH: u16 = 128;
+/// VST3 controller number for MIDI pitch bend (`kPitchBend`).
+pub const MIDI_CC_PITCHBEND: u16 = 129;
+
+/// One MIDI controller mapping exposed by a plugin through `IMidiMapping`.
+#[derive(Clone, Debug, PartialEq)]
+pub struct MidiCcInfo {
+    /// VST3 controller number: `0..=127` for MIDI CC, `128` for channel
+    /// aftertouch, `129` for pitch bend.
+    pub controller: u16,
+    /// The VST3 parameter number mapped to this controller.
+    pub param_id: u32,
+    /// Canonical score key (`modwheel`, `aftertouch`, `pitchbend`, `cc74`, ...).
+    pub key: String,
+    /// Display label for completion and reference views.
+    pub name: String,
+    /// Default normalized value (`0.0..=1.0`; `0.5` for pitch bend when the
+    /// controller reports no other finite value).
+    pub default: f64,
+}
+
+/// Resolves a score key to a VST3 MIDI controller number (`0..=127` for MIDI
+/// CC, `128` for aftertouch, `129` for pitch bend).
+pub fn midi_controller_number(name: &str) -> Option<u16> {
+    let key = canonical(name);
+    match key.as_str() {
+        "modwheel" | "mod" | "modulation" => Some(1),
+        "breath" => Some(2),
+        "foot" => Some(4),
+        "portamentotime" => Some(5),
+        "volume" => Some(7),
+        "balance" => Some(8),
+        "pan" => Some(10),
+        "expression" | "expr" => Some(11),
+        "sustain" | "hold" | "damper" => Some(64),
+        "portamento" => Some(65),
+        "sostenuto" => Some(66),
+        "soft" => Some(67),
+        "legato" => Some(68),
+        "resonance" | "timbre" => Some(71),
+        "releasetime" => Some(72),
+        "attacktime" => Some(73),
+        "brightness" => Some(74),
+        "aftertouch" | "miditouch" | "pressure" | "channelpressure" => Some(MIDI_CC_AFTERTOUCH),
+        "pitchbend" | "midibend" | "bend" => Some(MIDI_CC_PITCHBEND),
+        other => other
+            .strip_prefix("cc")
+            .and_then(|digits| {
+                (!digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit()))
+                    .then(|| digits.parse::<u16>().ok())
+                    .flatten()
+            })
+            .filter(|cc| *cc <= 127),
+    }
+}
+
+/// Canonical score key for a VST3 MIDI controller number.
+pub fn midi_controller_key(controller: u16) -> String {
+    match controller {
+        1 => "modwheel".to_owned(),
+        2 => "breath".to_owned(),
+        11 => "expression".to_owned(),
+        64 => "sustain".to_owned(),
+        74 => "brightness".to_owned(),
+        MIDI_CC_AFTERTOUCH => "aftertouch".to_owned(),
+        MIDI_CC_PITCHBEND => "pitchbend".to_owned(),
+        cc => format!("cc{cc}"),
+    }
+}
+
+/// Display name for a VST3 MIDI controller number.
+pub fn midi_controller_name(controller: u16) -> String {
+    match controller {
+        1 => "Mod Wheel (CC 1)".to_owned(),
+        2 => "Breath (CC 2)".to_owned(),
+        11 => "Expression (CC 11)".to_owned(),
+        64 => "Sustain (CC 64)".to_owned(),
+        74 => "Brightness (CC 74)".to_owned(),
+        MIDI_CC_AFTERTOUCH => "Aftertouch".to_owned(),
+        MIDI_CC_PITCHBEND => "Pitch Bend".to_owned(),
+        cc => format!("MIDI CC {cc}"),
+    }
+}
+
 /// The form of a name that the host compares: lower case, letters and
 /// digits only. "Pre-Delay" and "predelay" are the same name.
 pub fn canonical(name: &str) -> String {

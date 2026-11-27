@@ -2261,6 +2261,13 @@ pub trait SampleLookup {
         Err("this host has no plugins".into())
     }
 
+    /// Resolves a parameter or mapped MIDI controller name on a loaded plugin
+    /// to `(param_id, default_normalized)`. Returns `None` when the host has no
+    /// plugins, the plugin is not loaded yet, or the parameter does not exist.
+    fn insert_param(&self, _name: &str, _instrument: bool, _param: &str) -> Option<(u32, f64)> {
+        None
+    }
+
     /// The sample for a `talkit(...)` speech request, rendered by the host.
     ///
     /// `Err` names text that can never sound and refuses the hap like any
@@ -2746,13 +2753,30 @@ fn resolve_voice_at(
                 }
                 _ => frequency,
             };
-            let (lfos, envs, bus_mods) = modulator_controls(
+            // One cycle is one bar of 4 quarter notes.
+            let clocked = |plugin: rustel_audio::InsertControls| {
+                plugin.with_clock(musical_time * cps * 4.0, (cps * 240.0) as f32)
+            };
+            // Resolve plugins before modulators so `samples.insert_param` sees
+            // plugins already loaded by this host and modulators can target
+            // VST3 parameters and MIDI CCs on the note's chain.
+            let effects = effect_controls(object, samples).map(|effect| effect.map(clocked));
+            let instrument = if plays_csound {
+                None
+            } else {
+                object
+                    .get("vsti")
+                    .and_then(|plugin| plugin_controls(plugin, "vsti", Some(object), samples))
+                    .map(clocked)
+            };
+            let (lfos, envs, bus_mods) = modulator_controls_with_samples(
                 object,
                 duration_secs,
                 envelope.release_secs,
                 musical_time,
                 cps,
                 frequency,
+                samples,
             )?;
             // A spoken word is the whole sound: an `s` naming a synth on the
             // same hap does not take its place.
@@ -2764,10 +2788,6 @@ fn resolve_voice_at(
                 // plays the bank's supersaw when the bank has one. A sample
                 // named `one` already followed this rule.
                 synth_source(object, duration_secs, target_time)?.filter(|_| sample.is_none())
-            };
-            // One cycle is one bar of 4 quarter notes.
-            let clocked = |plugin: rustel_audio::InsertControls| {
-                plugin.with_clock(musical_time * cps * 4.0, (cps * 240.0) as f32)
             };
             let orbit = optional_f64(object.get("orbit"), "orbit")?.unwrap_or(1.0);
             if !(0.0..16.0).contains(&orbit) {
@@ -2865,15 +2885,8 @@ fn resolve_voice_at(
                 fm,
                 orbit: orbit as u8,
                 insert_chain: None,
-                effects: effect_controls(object, samples).map(|effect| effect.map(clocked)),
-                instrument: if plays_csound {
-                    None
-                } else {
-                    object
-                        .get("vsti")
-                        .and_then(|plugin| plugin_controls(plugin, "vsti", samples))
-                        .map(clocked)
-                },
+                effects,
+                instrument,
                 lead: 0,
                 lfos,
                 envs,
@@ -4750,11 +4763,11 @@ fn resolve_modulator_target(
     if kind == "lfo" {
         use rustel_audio::ModulatorParam;
         let param = match sub_control {
-            None | Some("rate") | Some("sync") => ModulatorParam::Rate,
-            Some("depth" | "depthabs") => ModulatorParam::Depth,
-            Some("skew") => ModulatorParam::Skew,
-            Some("curve") => ModulatorParam::Curve,
-            Some("dcoffset") => ModulatorParam::Dcoffset,
+            None | Some("rate" | "r" | "sync" | "s") => ModulatorParam::Rate,
+            Some("depth" | "dep" | "dr" | "depthabs" | "da") => ModulatorParam::Depth,
+            Some("skew" | "sk") => ModulatorParam::Skew,
+            Some("curve" | "cu") => ModulatorParam::Curve,
+            Some("dcoffset" | "dc") => ModulatorParam::Dcoffset,
             Some(_) => return ModulatorTarget::Missing,
         };
         // The target has to exist for its params to have values at all.
@@ -4775,11 +4788,11 @@ fn resolve_modulator_target(
     } else {
         use rustel_audio::EnvelopeParam;
         let param = match sub_control {
-            None | Some("depth" | "depthabs") => EnvelopeParam::Depth,
-            Some("attack") => EnvelopeParam::Attack,
-            Some("decay") => EnvelopeParam::Decay,
-            Some("sustain") => EnvelopeParam::Sustain,
-            Some("release") => EnvelopeParam::Release,
+            None | Some("depth" | "dep" | "dr" | "depthabs" | "da") => EnvelopeParam::Depth,
+            Some("attack" | "att" | "a") => EnvelopeParam::Attack,
+            Some("decay" | "dec" | "d") => EnvelopeParam::Decay,
+            Some("sustain" | "sus" | "s") => EnvelopeParam::Sustain,
+            Some("release" | "rel" | "r") => EnvelopeParam::Release,
             Some(_) => return ModulatorTarget::Missing,
         };
         let Some(target) = envs.iter().flatten().find(|env| env.id == Some(id)) else {
@@ -4809,7 +4822,296 @@ type VoiceModulators = (
 /// attaches, and the `bmod` bus modulators. Each entry adds to one target
 /// param. A target that the native graph cannot reach is skipped with a
 /// notice; the voice still plays.
+#[cfg(test)]
 fn modulator_controls(
+    object: &serde_json::Map<String, serde_json::Value>,
+    duration_secs: f64,
+    release_secs: f32,
+    musical_time: f64,
+    cps: f64,
+    carrier_hz: f64,
+) -> Result<VoiceModulators, String> {
+    modulator_controls_with_samples(
+        object,
+        duration_secs,
+        release_secs,
+        musical_time,
+        cps,
+        carrier_hz,
+        &BundledOnly,
+    )
+}
+
+/// True when a top-level modulator `control` name is a MIDI CC or expression
+/// shorthand that should resolve against the hap's `vsti` instrument without
+/// hijacking built-in Strudel controls (`gain`, `pan`, `cutoff`, ...).
+fn is_vsti_midi_shorthand(control: &str) -> bool {
+    let key = canonical_plugin_key(control);
+    matches!(
+        key.as_str(),
+        "modwheel"
+            | "modulation"
+            | "aftertouch"
+            | "miditouch"
+            | "channelpressure"
+            | "pitchbend"
+            | "midibend"
+            | "breath"
+            | "expression"
+            | "expr"
+            | "sustain"
+            | "damper"
+            | "brightness"
+    ) || key
+        .strip_prefix("cc")
+        .and_then(|digits| {
+            (!digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit()))
+                .then(|| digits.parse::<u16>().ok())
+                .flatten()
+        })
+        .is_some_and(|cc| cc <= 127)
+}
+
+/// Looks up the explicit normalized `0..=1` value set for `param_id` inside one
+/// plugin's `params` map (and top-level MIDI controls for `vsti`), falling back
+/// to `default_value`.
+fn insert_param_base(
+    hap: &serde_json::Map<String, serde_json::Value>,
+    plugin: &serde_json::Map<String, serde_json::Value>,
+    plugin_name: &str,
+    instrument: bool,
+    param_id: u32,
+    default_value: f64,
+    samples: &dyn SampleLookup,
+) -> f64 {
+    if let Some(serde_json::Value::Object(params)) = plugin.get("params") {
+        for (key, value) in params {
+            if let Some(val) = value.as_f64().filter(|v| v.is_finite())
+                && samples
+                    .insert_param(plugin_name, instrument, key)
+                    .is_some_and(|(id, _)| id == param_id)
+            {
+                return val.clamp(0.0, 1.0);
+            }
+        }
+    }
+    if instrument {
+        if let Some(bend) = hap
+            .get("midibend")
+            .and_then(serde_json::Value::as_f64)
+            .filter(|v| v.is_finite())
+            && samples
+                .insert_param(plugin_name, true, "pitchbend")
+                .is_some_and(|(id, _)| id == param_id)
+        {
+            return (bend.clamp(-1.0, 1.0) + 1.0) * 0.5;
+        }
+        if let Some(touch) = hap
+            .get("miditouch")
+            .and_then(serde_json::Value::as_f64)
+            .filter(|v| v.is_finite())
+            && samples
+                .insert_param(plugin_name, true, "aftertouch")
+                .is_some_and(|(id, _)| id == param_id)
+        {
+            return touch.clamp(0.0, 1.0);
+        }
+        if let (Some(ccn), Some(ccv)) = (
+            hap.get("ccn").and_then(serde_json::Value::as_f64),
+            hap.get("ccv").and_then(serde_json::Value::as_f64),
+        ) && ccn.is_finite()
+            && ccn.fract() == 0.0
+            && (0.0..=127.0).contains(&ccn)
+            && ccv.is_finite()
+        {
+            let cc_name = format!("cc{}", ccn as u8);
+            if samples
+                .insert_param(plugin_name, true, &cc_name)
+                .is_some_and(|(id, _)| id == param_id)
+            {
+                return ccv.clamp(0.0, 1.0);
+            }
+        }
+    }
+    default_value.clamp(0.0, 1.0)
+}
+
+/// Resolves a modulator targeting a VST3 instrument (`vsti`, MIDI CC shorthand,
+/// `midibend`, `miditouch`, `ccv`) or effect stage (`vst`, `vst0`..`vst3`).
+/// Returns `(ModTarget::InsertParam { stage, param_id }, base_0_to_1, depth_scale)`.
+fn resolve_insert_mod_target(
+    object: &serde_json::Map<String, serde_json::Value>,
+    control: &str,
+    sub_control: Option<&str>,
+    samples: &dyn SampleLookup,
+) -> Option<(rustel_audio::ModTarget, f64, f64)> {
+    // Explicit instrument target: `.vsti("...").lfo({ sc: "cutoff" })` or
+    // `lfo({ c: "vsti", sc: "modwheel" })`.
+    if control == "vsti" {
+        let param_name = sub_control?;
+        let plugin = object.get("vsti")?.as_object()?;
+        let plugin_name = plugin.get("name")?.as_str()?;
+        let (param_id, default_val) = samples.insert_param(plugin_name, true, param_name)?;
+        let base = insert_param_base(
+            object,
+            plugin,
+            plugin_name,
+            true,
+            param_id,
+            default_val,
+            samples,
+        );
+        return Some((
+            rustel_audio::ModTarget::InsertParam {
+                stage: rustel_audio::EFFECT_CHAIN as u8,
+                param_id,
+            },
+            base,
+            1.0,
+        ));
+    }
+    // Effect stage target: `.vst("...").lfo({ sc: "mix" })` or
+    // `lfo({ c: "vst0", sc: "mix" })`.
+    if control == "vst" || matches!(control, "vst0" | "vst1" | "vst2" | "vst3") {
+        let param_name = sub_control?;
+        let chain = object.get("vst")?.as_array()?;
+        let limit = chain.len().min(rustel_audio::EFFECT_CHAIN);
+        if control == "vst" {
+            // Search from the last effect backward so `.vst(a).vst(b).lfo({ sc })`
+            // targets the effect immediately preceding the modulator.
+            for place in (0..limit).rev() {
+                let Some(plugin) = chain[place].as_object() else {
+                    continue;
+                };
+                let Some(plugin_name) = plugin.get("name").and_then(serde_json::Value::as_str)
+                else {
+                    continue;
+                };
+                if let Some((param_id, default_val)) =
+                    samples.insert_param(plugin_name, false, param_name)
+                {
+                    let base = insert_param_base(
+                        object,
+                        plugin,
+                        plugin_name,
+                        false,
+                        param_id,
+                        default_val,
+                        samples,
+                    );
+                    return Some((
+                        rustel_audio::ModTarget::InsertParam {
+                            stage: place as u8,
+                            param_id,
+                        },
+                        base,
+                        1.0,
+                    ));
+                }
+            }
+            return None;
+        }
+        let place = (control.as_bytes()[3] - b'0') as usize;
+        let plugin = chain.get(place)?.as_object()?;
+        let plugin_name = plugin.get("name")?.as_str()?;
+        let (param_id, default_val) = samples.insert_param(plugin_name, false, param_name)?;
+        let base = insert_param_base(
+            object,
+            plugin,
+            plugin_name,
+            false,
+            param_id,
+            default_val,
+            samples,
+        );
+        return Some((
+            rustel_audio::ModTarget::InsertParam {
+                stage: place as u8,
+                param_id,
+            },
+            base,
+            1.0,
+        ));
+    }
+    // Shorthand MIDI controls on a `vsti` note: `.midibend(0).lfo()`,
+    // `.miditouch(0).lfo()`, `.ccn(1).ccv(0.5).lfo()`, or
+    // `.vsti("...").lfo({ c: "modwheel" })`.
+    if sub_control.is_some() {
+        return None;
+    }
+    let plugin = object.get("vsti")?.as_object()?;
+    let plugin_name = plugin.get("name")?.as_str()?;
+    if control == "midibend" {
+        let (param_id, default_val) = samples.insert_param(plugin_name, true, "pitchbend")?;
+        let base = insert_param_base(
+            object,
+            plugin,
+            plugin_name,
+            true,
+            param_id,
+            default_val,
+            samples,
+        );
+        // Strudel `midibend` spans [-1, 1] (width 2); VST3 pitch bend spans
+        // [0, 1] (width 1), so depth in midibend units scales by 0.5.
+        return Some((
+            rustel_audio::ModTarget::InsertParam {
+                stage: rustel_audio::EFFECT_CHAIN as u8,
+                param_id,
+            },
+            base,
+            0.5,
+        ));
+    }
+    if control == "ccv" {
+        let ccn = object
+            .get("ccn")
+            .and_then(serde_json::Value::as_f64)
+            .filter(|v| v.is_finite() && v.fract() == 0.0 && (0.0..=127.0).contains(v))?;
+        let cc_name = format!("cc{}", ccn as u8);
+        let (param_id, default_val) = samples.insert_param(plugin_name, true, &cc_name)?;
+        let base = insert_param_base(
+            object,
+            plugin,
+            plugin_name,
+            true,
+            param_id,
+            default_val,
+            samples,
+        );
+        return Some((
+            rustel_audio::ModTarget::InsertParam {
+                stage: rustel_audio::EFFECT_CHAIN as u8,
+                param_id,
+            },
+            base,
+            1.0,
+        ));
+    }
+    if is_vsti_midi_shorthand(control) {
+        let (param_id, default_val) = samples.insert_param(plugin_name, true, control)?;
+        let base = insert_param_base(
+            object,
+            plugin,
+            plugin_name,
+            true,
+            param_id,
+            default_val,
+            samples,
+        );
+        return Some((
+            rustel_audio::ModTarget::InsertParam {
+                stage: rustel_audio::EFFECT_CHAIN as u8,
+                param_id,
+            },
+            base,
+            1.0,
+        ));
+    }
+    None
+}
+
+fn modulator_controls_with_samples(
     object: &serde_json::Map<String, serde_json::Value>,
     duration_secs: f64,
     release_secs: f32,
@@ -4820,6 +5122,7 @@ fn modulator_controls(
     // The carrier's frequency - what an FM operator's own frequency is a
     // multiple of, and so the base an `fmh` modulator rides.
     carrier_hz: f64,
+    samples: &dyn SampleLookup,
 ) -> Result<VoiceModulators, String> {
     let mut lfos = [None; rustel_audio::MAX_VOICE_MODS];
     let mut envs = [None; rustel_audio::MAX_VOICE_MODS];
@@ -5650,17 +5953,25 @@ fn modulator_controls(
                     &envs,
                 ) {
                     ModulatorTarget::NotAModulator => {
-                        let source = match fxi.and_then(|slot| {
-                            object
-                                .get("FX")
-                                .and_then(serde_json::Value::as_array)
-                                .and_then(|stages| stages.get(usize::from(slot)))
-                                .and_then(serde_json::Value::as_object)
-                        }) {
-                            Some(stage) => stage,
-                            None => object,
-                        };
-                        resolve_target_in(source, control)
+                        if fxi.is_none()
+                            && let Some((target, base, depth_scale)) =
+                                resolve_insert_mod_target(object, control, sub_control, samples)
+                        {
+                            Some((target, base, false, depth_scale))
+                        } else {
+                            let source = match fxi.and_then(|slot| {
+                                object
+                                    .get("FX")
+                                    .and_then(serde_json::Value::as_array)
+                                    .and_then(|stages| stages.get(usize::from(slot)))
+                                    .and_then(serde_json::Value::as_object)
+                            }) {
+                                Some(stage) => stage,
+                                None => object,
+                            };
+                            resolve_target_in(source, control)
+                                .map(|(target, base, is_freq)| (target, base, is_freq, 1.0))
+                        }
                     }
                     // Another modulator's rate is a param called `frequency`
                     // too; its depth, skew and the envelope's stages are not.
@@ -5674,10 +5985,11 @@ fn modulator_controls(
                                 rustel_audio::ModulatorParam::Rate
                             )
                         ),
+                        1.0,
                     )),
                     ModulatorTarget::Missing => None,
                 };
-                let Some((target, base, is_frequency)) = resolved else {
+                let Some((target, base, is_frequency, depth_scale)) = resolved else {
                     skip(
                         kind,
                         &format!("modulator target '{control}' is not modulatable natively yet"),
@@ -5687,7 +5999,9 @@ fn modulator_controls(
                 // A param base of exactly 0 counts as 1.
                 let current = if base == 0.0 { 1.0 } else { base };
                 let depth_rel = entry_f64(entry, "depth").unwrap_or(1.0);
-                let depth = entry_f64(entry, "depthabs").unwrap_or(depth_rel * current);
+                let depth =
+                    entry_f64(entry, "depthabs").unwrap_or(depth_rel * current) * depth_scale;
+                let is_insert = matches!(target, rustel_audio::ModTarget::InsertParam { .. });
                 // Only frequency params >= 30 Hz get clamped to the audible
                 // range (relative to the base the mod ADDS to).
                 let (range_min, range_max) = if is_frequency && current >= 30.0 {
@@ -5795,7 +6109,10 @@ fn modulator_controls(
                         // duration plus the VOICE's amplitude release,
                         // not the mod env's own release.
                         sustain_secs: checked_f32(duration_secs, "env span")? + release_secs,
-                        param_base: checked_f32(current, "env base")?,
+                        param_base: checked_f32(
+                            if is_insert { base } else { current },
+                            "env base",
+                        )?,
                         id: own_id,
                     });
                 }
@@ -5856,7 +6173,16 @@ fn modulator_controls(
                 .get("control")
                 .and_then(serde_json::Value::as_str)
                 .unwrap_or("gain");
-            let Some((target, base, _is_frequency)) = resolve_target_in(object, control) else {
+            let sub_control = entry
+                .get("subControl")
+                .and_then(serde_json::Value::as_str)
+                .filter(|name| !name.is_empty());
+            let resolved = resolve_insert_mod_target(object, control, sub_control, samples)
+                .or_else(|| {
+                    resolve_target_in(object, control)
+                        .map(|(target, base, _is_freq)| (target, base, 1.0))
+                });
+            let Some((target, base, depth_scale)) = resolved else {
                 skip(
                     "bmod",
                     &format!("modulator target '{control}' is not modulatable natively yet"),
@@ -5871,7 +6197,8 @@ fn modulator_controls(
             // the relative depth.
             let current = if base == 0.0 { 1.0 } else { base };
             let depth_rel = entry_f64(entry, "depth").unwrap_or(1.0);
-            let depth = entry_f64(entry, "depthabs").unwrap_or(depth_rel * current);
+            let depth = entry_f64(entry, "depthabs").unwrap_or(depth_rel * current) * depth_scale;
+            let is_insert = matches!(target, rustel_audio::ModTarget::InsertParam { .. });
             // A bus modulator takes no range. `connectBusModulator` builds the
             // clamp (a waveshaper carrying `clamp(x·max, min, max)`) and then
             // connects the target to the node it handed the shaper, not to the
@@ -5889,7 +6216,7 @@ fn modulator_controls(
                 dc: checked_f32(entry_f64(entry, "dc").unwrap_or(0.0), "bmod dc")?,
                 min: min as f32,
                 max: max as f32,
-                param_base: checked_f32(current, "bmod param base")?,
+                param_base: checked_f32(if is_insert { base } else { current }, "bmod param base")?,
             });
             slot += 1;
         }
@@ -6205,9 +6532,44 @@ fn effect_controls(
         );
     }
     for (stage, plugin) in effects.iter_mut().zip(chain) {
-        *stage = plugin_controls(plugin, "vst", samples);
+        *stage = plugin_controls(plugin, "vst", None, samples);
     }
     effects
+}
+
+fn canonical_plugin_key(name: &str) -> String {
+    name.chars()
+        .filter(|ch| ch.is_alphanumeric())
+        .flat_map(char::to_lowercase)
+        .collect()
+}
+
+/// True when `params` already sets a key targeting MIDI controller `ctrl`.
+fn params_specify_midi_cc(params: &[(&str, f64)], ctrl: u16) -> bool {
+    params.iter().any(|(key, _)| {
+        let canonical = canonical_plugin_key(key);
+        match ctrl {
+            1 => matches!(
+                canonical.as_str(),
+                "modwheel" | "mod" | "modulation" | "cc1"
+            ),
+            2 => matches!(canonical.as_str(), "breath" | "cc2"),
+            11 => matches!(canonical.as_str(), "expression" | "expr" | "cc11"),
+            64 => matches!(canonical.as_str(), "sustain" | "hold" | "damper" | "cc64"),
+            74 => matches!(canonical.as_str(), "brightness" | "cc74"),
+            128 => matches!(
+                canonical.as_str(),
+                "aftertouch" | "miditouch" | "pressure" | "channelpressure"
+            ),
+            129 => matches!(canonical.as_str(), "pitchbend" | "midibend" | "bend"),
+            cc => {
+                canonical
+                    .strip_prefix("cc")
+                    .and_then(|digits| digits.parse::<u16>().ok())
+                    == Some(cc)
+            }
+        }
+    })
 }
 
 /// The plugin one plugin object of a hap asks for, under `call`: `vst` for
@@ -6219,6 +6581,7 @@ fn effect_controls(
 fn plugin_controls(
     plugin: &serde_json::Value,
     call: &str,
+    hap: Option<&serde_json::Map<String, serde_json::Value>>,
     samples: &dyn SampleLookup,
 ) -> Option<rustel_audio::InsertControls> {
     let plugin = plugin.as_object()?;
@@ -6236,13 +6599,50 @@ fn plugin_controls(
             return None;
         }
     };
-    let params = match plugin_params(plugin) {
+    let mut params = match plugin_params(plugin) {
         Ok(params) => params,
         Err(reason) => {
             skip(&reason);
             return None;
         }
     };
+    let cc_key_buf: Option<String>;
+    if call == "vsti"
+        && let Some(hap) = hap
+    {
+        if let Some(bend) = hap
+            .get("midibend")
+            .and_then(serde_json::Value::as_f64)
+            .filter(|v| v.is_finite())
+            && !params_specify_midi_cc(&params, 129)
+        {
+            params.push(("pitchbend", (bend.clamp(-1.0, 1.0) + 1.0) * 0.5));
+        }
+        if let Some(touch) = hap
+            .get("miditouch")
+            .and_then(serde_json::Value::as_f64)
+            .filter(|v| v.is_finite())
+            && !params_specify_midi_cc(&params, 128)
+        {
+            params.push(("aftertouch", touch.clamp(0.0, 1.0)));
+        }
+        if let (Some(ccn), Some(ccv)) = (
+            hap.get("ccn").and_then(serde_json::Value::as_f64),
+            hap.get("ccv").and_then(serde_json::Value::as_f64),
+        ) && ccn.is_finite()
+            && ccn.fract() == 0.0
+            && (0.0..=127.0).contains(&ccn)
+            && ccv.is_finite()
+        {
+            let cc = ccn as u16;
+            if !params_specify_midi_cc(&params, cc) {
+                cc_key_buf = Some(format!("cc{cc}"));
+                if let Some(key) = cc_key_buf.as_deref() {
+                    params.push((key, ccv.clamp(0.0, 1.0)));
+                }
+            }
+        }
+    }
     let request = PluginRequest {
         instrument: call == "vsti",
         name,

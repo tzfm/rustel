@@ -155,8 +155,7 @@ fn install_plugin<'js>(
     let mut output =
         receiver.fmap_keeping_live(move |hap| Some(set_plugin_field(hap, call, &field, &name)));
     if let Some(config) = args.0.get(1).and_then(rquickjs::Value::as_object) {
-        for entry in config.props::<String, rquickjs::Value>() {
-            let (key, value) = entry?;
+        let mut apply_field = |key: String, value: rquickjs::Value<'js>| -> rquickjs::Result<()> {
             let slider = slider_of(&value);
             let (value, sidecar) = reify_bridged(&ctx, &value)?;
             sidecars.push(sidecar);
@@ -167,6 +166,34 @@ fn install_plugin<'js>(
                 move |hap, setting| set_plugin_field(hap, call, &field, setting),
                 rustel_core::LookupFlow::Left,
             );
+            Ok(())
+        };
+        for entry in config.props::<String, rquickjs::Value>() {
+            let (key, value) = entry?;
+            // `{ cc: { 1: 0.5, 64: "0 1" } }` expands into `cc1`, `cc64`, ...
+            // when `cc` holds a plain JS map rather than a scalar or pattern,
+            // so patterns and live `slider()` bindings work on every CC.
+            if key == "cc"
+                && !value.is_function()
+                && !value.is_array()
+                && unwrap_pattern(&value).is_none()
+                && let Some(cc_map) = value.as_object()
+            {
+                for cc_entry in cc_map.props::<String, rquickjs::Value>() {
+                    let (cc_key, cc_value) = cc_entry?;
+                    let normalized = if !cc_key.is_empty()
+                        && cc_key.bytes().all(|b| b.is_ascii_digit())
+                        && cc_key.parse::<u16>().is_ok_and(|n| n <= 127)
+                    {
+                        format!("cc{cc_key}")
+                    } else {
+                        cc_key
+                    };
+                    apply_field(normalized, cc_value)?;
+                }
+                continue;
+            }
+            apply_field(key, value)?;
         }
     }
     derive_wrapper(ctx, output, &sidecars)
@@ -609,5 +636,57 @@ mod tests {
         assert_eq!(first[0].1.len(), 1);
         assert_eq!(bindings(&runtime, "prebuiltFx.orbit(2)"), first);
         assert_eq!(query_bindings(&runtime, 1), first);
+    }
+
+    #[test]
+    fn cc_map_keeps_sliders_and_plugin_modulators_keep_raw_subcontrol() {
+        let runtime = runtime();
+        let query_one = |source: &str| {
+            runtime
+                .evaluate_score(source, &TranspileOptions::default())
+                .expect("evaluate");
+            let Value::Object(controls) = runtime
+                .query(Slot::Active, 0, Fraction::ZERO, Fraction::ONE)
+                .expect("query")
+                .into_iter()
+                .next()
+                .expect("hap")
+                .value
+            else {
+                panic!("object hap");
+            };
+            controls
+        };
+
+        // Slider inside `{ cc: { ... } }` registers as live; scalar `cc` stays a param.
+        let controls = query_one(r#"note("c3").vsti("synth", { cc: { 1: slider(0.25, 0, 1) } })"#);
+        let Value::Object(vsti) = controls.get("vsti").expect("vsti") else {
+            panic!("vsti");
+        };
+        let Value::Object(sliders) = vsti.get("__rustel_sliders").expect("sliders") else {
+            panic!("sliders");
+        };
+        assert!(sliders.get("cc1").is_some());
+
+        let scalar = query_one(r#"note("c3").vsti("synth", { cc: 0.7 })"#);
+        let Value::Object(vsti) = scalar.get("vsti").expect("vsti") else {
+            panic!("vsti");
+        };
+        let Value::Object(params) = vsti.get("params").expect("params") else {
+            panic!("params");
+        };
+        assert_eq!(params.get("cc"), Some(&Value::F64(0.7)));
+
+        // Plugin `subControl` is not rewritten through Strudel aliases (`LPF` != `cutoff`).
+        let modulated =
+            query_one(r#"note("c3").vsti("synth", { LPF: 0.4 }).lfo({ sc: "LPF", da: 0.2 })"#);
+        let Value::Object(lfos) = modulated.get("lfo").expect("lfo") else {
+            panic!("lfo");
+        };
+        let Value::Object(entry) = lfos.get("0").expect("lfo 0") else {
+            panic!("lfo 0");
+        };
+        assert_eq!(entry.get("control"), Some(&Value::Str("vsti".into())));
+        assert_eq!(entry.get("subControl"), Some(&Value::Str("LPF".into())));
     }
 }

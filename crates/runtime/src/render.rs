@@ -603,6 +603,10 @@ impl rustel_voice::SampleLookup for ConvertedLookup<'_> {
         Ok(self.controls.instrument.filter(|_| request.instrument))
     }
 
+    fn insert_param(&self, name: &str, instrument: bool, param: &str) -> Option<(u32, f64)> {
+        self.samples.insert_param(name, instrument, param)
+    }
+
     fn insert_speech(
         &self,
         request: &rustel_voice::SpeechRequest<'_>,
@@ -657,6 +661,12 @@ impl rustel_voice::SampleLookup for PlannedLookup<'_> {
             rustel_voice::plugin_value_skipped(request, &reason);
         }
         Ok(Some(controls))
+    }
+
+    fn insert_param(&self, name: &str, instrument: bool, param: &str) -> Option<(u32, f64)> {
+        self.plan
+            .insert_param(name, instrument, param)
+            .or_else(|| self.samples.insert_param(name, instrument, param))
     }
 
     fn insert_speech(

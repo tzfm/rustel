@@ -20,7 +20,10 @@ use crate::com::{
     Changes, Events, Handler, HostApp, MAX_CHANGES, MAX_EVENTS, Stream, pointer, wide_to_string,
 };
 use crate::module::{ClassInfo, Module};
-use crate::{Job, ParamInfo, ParamRole, canonical, preset};
+use crate::{
+    Job, MIDI_CC_PITCHBEND, MidiCcInfo, ParamInfo, ParamRole, canonical, midi_controller_key,
+    midi_controller_name, preset,
+};
 
 /// The engine gives an insert from 1 to 128 frames in one call.
 pub(crate) const MAX_BLOCK: usize = 128;
@@ -431,15 +434,52 @@ impl Loaded {
         params
     }
 
-    /// The value the plugin has now for each of `params`, in the order of
-    /// the parameter numbers.
-    fn param_values(&self, params: &[ParamInfo]) -> Box<[(u32, f64)]> {
+    /// Reads the plugin's MIDI CC, aftertouch, and pitch bend parameter
+    /// mappings via `IMidiMapping` on event bus 0, channel 0.
+    pub(crate) fn midi_mappings(&self) -> Vec<MidiCcInfo> {
+        let Some(controller) = &self.controller else {
+            return Vec::new();
+        };
+        let Some(mapping) = controller.cast::<IMidiMapping>() else {
+            return Vec::new();
+        };
+        let mut mappings = Vec::new();
+        for ctrl in 0..=MIDI_CC_PITCHBEND {
+            let mut id: ParamID = 0;
+            // SAFETY: `id` is a valid out-pointer and `mapping` lives on the
+            // plugin thread during load.
+            let found =
+                unsafe { mapping.getMidiControllerAssignment(0, 0, ctrl as CtrlNumber, &mut id) };
+            if found != kResultOk {
+                continue;
+            }
+            let fallback = if ctrl == MIDI_CC_PITCHBEND { 0.5 } else { 0.0 };
+            let raw = unsafe { controller.getParamNormalized(id) };
+            let default = if raw.is_finite() {
+                raw.clamp(0.0, 1.0)
+            } else {
+                fallback
+            };
+            mappings.push(MidiCcInfo {
+                controller: ctrl,
+                param_id: id,
+                key: midi_controller_key(ctrl),
+                name: midi_controller_name(ctrl),
+                default,
+            });
+        }
+        mappings
+    }
+
+    /// The value the plugin has now for each parameter id in `ids`, in the
+    /// order of the parameter numbers.
+    fn param_values(&self, ids: impl Iterator<Item = u32>) -> Box<[(u32, f64)]> {
         let Some(controller) = &self.controller else {
             return Box::default();
         };
-        let value =
-            |param: &ParamInfo| (param.id, unsafe { controller.getParamNormalized(param.id) });
-        let mut values: Vec<(u32, f64)> = params.iter().map(value).collect();
+        let mut values: Vec<(u32, f64)> = ids
+            .map(|id| (id, unsafe { controller.getParamNormalized(id) }))
+            .collect();
         values.sort_by_key(|value| value.0);
         values.dedup_by_key(|value| value.0);
         values.into_boxed_slice()
@@ -564,7 +604,7 @@ impl Loaded {
         offline: bool,
         retire: Sender<Job>,
         running: Arc<AtomicUsize>,
-        params: &[ParamInfo],
+        param_ids: impl Iterator<Item = u32>,
     ) -> Result<Instance, String> {
         let sample32 = SymbolicSampleSizes_::kSample32 as i32;
         if unsafe { self.processor.canProcessSampleSize(sample32) } != kResultOk {
@@ -604,7 +644,7 @@ impl Loaded {
         }
         // The plugin turned on after each restart request it made so far.
         self.state.latency_changed.store(false, Ordering::Relaxed);
-        let at_start = self.param_values(params);
+        let at_start = self.param_values(param_ids);
         self.active.set(true);
         unsafe { self.processor.setProcessing(1) };
         running.fetch_add(1, Ordering::Relaxed);

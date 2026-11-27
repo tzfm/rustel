@@ -1739,6 +1739,76 @@ impl ScalarBackend {
                     stage.kabel.is_some() || stage.pan_x.is_some() || stage.room.is_some()
                 });
                 let mut voice_controls = e.controls;
+                let remap_insert_mod =
+                    |target: &mut crate::backend::ModTarget, param_base: &mut f32| {
+                        let crate::backend::ModTarget::InsertParam { stage, param_id } = *target
+                        else {
+                            return;
+                        };
+                        if usize::from(stage) == crate::insert::EFFECT_CHAIN {
+                            let Some(wanted) = instrument else {
+                                *target = crate::backend::ModTarget::InsertParam {
+                                    stage: crate::insert::NO_STAGE,
+                                    param_id,
+                                };
+                                return;
+                            };
+                            *param_base = moved(
+                                insert_values,
+                                crate::insert::instrument_slot(chain),
+                                wanted.key,
+                                crate::insert::InsertParam {
+                                    id: param_id,
+                                    value: *param_base,
+                                },
+                                e.generation,
+                            )
+                            .value;
+                        } else if let Some(wanted) = e
+                            .controls
+                            .effects
+                            .get(usize::from(stage))
+                            .and_then(Option::as_ref)
+                        {
+                            let seated = wanted.stage(usize::from(stage)) as u8;
+                            if order[..served].contains(&seated) {
+                                *param_base = moved(
+                                    insert_values,
+                                    crate::insert::effect_slot(chain, usize::from(seated)),
+                                    wanted.key,
+                                    crate::insert::InsertParam {
+                                        id: param_id,
+                                        value: *param_base,
+                                    },
+                                    e.generation,
+                                )
+                                .value;
+                                *target = crate::backend::ModTarget::InsertParam {
+                                    stage: seated,
+                                    param_id,
+                                };
+                            } else {
+                                *target = crate::backend::ModTarget::InsertParam {
+                                    stage: crate::insert::NO_STAGE,
+                                    param_id,
+                                };
+                            }
+                        } else {
+                            *target = crate::backend::ModTarget::InsertParam {
+                                stage: crate::insert::NO_STAGE,
+                                param_id,
+                            };
+                        }
+                    };
+                for slot in voice_controls.lfos.iter_mut().flatten() {
+                    remap_insert_mod(&mut slot.target, &mut slot.param_base);
+                }
+                for slot in voice_controls.envs.iter_mut().flatten() {
+                    remap_insert_mod(&mut slot.target, &mut slot.param_base);
+                }
+                for slot in voice_controls.bus_mods.iter_mut().flatten() {
+                    remap_insert_mod(&mut slot.target, &mut slot.param_base);
+                }
                 if matches!(source, VoiceSource::Sbd { .. }) {
                     // sbd runs its own amplitude envelope; the standard
                     // ADSR is never wired for it.
@@ -2261,6 +2331,36 @@ impl ScalarBackend {
         // The arrays start at zero for each block, so a block with no voice
         // capable of producing ModAdds can leave them untouched.
         let any_param_modulators = self.voices.iter().any(|voice| voice.has_param_modulators);
+        let mut any_insert_modulators = false;
+        let mut instrument_mod_buses = 0u64;
+        if any_param_modulators {
+            for voice in &self.voices {
+                if !voice.has_param_modulators {
+                    continue;
+                }
+                let Some(bus) = voice.route.bus() else {
+                    continue;
+                };
+                let targets = voice
+                    .controls
+                    .lfos
+                    .iter()
+                    .flatten()
+                    .map(|m| m.target)
+                    .chain(voice.controls.envs.iter().flatten().map(|m| m.target))
+                    .chain(voice.controls.bus_mods.iter().flatten().map(|m| m.target));
+                for target in targets {
+                    if let crate::backend::ModTarget::InsertParam { stage, .. } = target
+                        && usize::from(stage) <= crate::insert::EFFECT_CHAIN
+                    {
+                        any_insert_modulators = true;
+                        if usize::from(stage) == crate::insert::EFFECT_CHAIN {
+                            instrument_mod_buses |= 1u64 << bus;
+                        }
+                    }
+                }
+            }
+        }
 
         let mut orbit_inputs = [[0.0f32; 2]; MAX_ORBITS];
         let zero_mod_adds = ModAdds::default();
@@ -2414,42 +2514,66 @@ impl ScalarBackend {
                 .map(PoolHandle::begin);
             let mut pooled_instruments = 0u64;
             let mut pooled_effects = 0u64;
-            // Instruments can render while native voices produce their input.
-            // Their output is collected after the native sends are ready.
+            // Instruments can render while native voices produce their input,
+            // except instruments whose parameters are modulated by active
+            // voices (submitted right after the voice loop once modulator
+            // points are computed).
             let mut submitted = 0u64;
-            for (bus, slot) in instruments.iter_mut().enumerate() {
-                let Some(instrument) = slot else { continue };
-                let idle = insert_idle_frames
-                    [crate::insert::EFFECT_CHAIN * crate::insert::MAX_INSERT_BUSES + bus];
-                if idle >= insert_idle_limit && !instrument.busy() {
+            let mut submit_instrument =
+                |bus: usize,
+                 instruments: &mut [Option<Box<dyn crate::insert::OrbitInsert>>],
+                 leaving_instruments: &mut [Option<Box<dyn crate::insert::OrbitInsert>>],
+                 jobs: Option<&mut JoinGuard<'_>>,
+                 submitted: &mut u64,
+                 pooled_instruments: &mut u64| {
+                    let Some(instrument) = &mut instruments[bus] else {
+                        return;
+                    };
+                    let idle = insert_idle_frames
+                        [crate::insert::EFFECT_CHAIN * crate::insert::MAX_INSERT_BUSES + bus];
+                    if idle >= insert_idle_limit && !instrument.busy() {
+                        return;
+                    }
+                    *submitted |= 1u64 << bus;
+                    // The instrument that leaves the slot goes with the job while
+                    // it fades.
+                    let leaving = &mut leaving_instruments[bus];
+                    let swapping = instrument_mixes[bus].leaving.is_moving();
+                    let any_thread = instrument.any_thread()
+                        && leaving
+                            .as_ref()
+                            .filter(|_| swapping)
+                            .is_none_or(|leaving| leaving.any_thread());
+                    if let Some(jobs) = jobs.filter(|_| any_thread) {
+                        let job = jobs.job(JobKind::Instrument, bus);
+                        job.frames = sub_len;
+                        job.drain = false;
+                        job.boxes[0] = instruments[bus].take();
+                        job.leaving[0] = leaving.take_if(|_| swapping);
+                        jobs.post(JobKind::Instrument, bus);
+                        *pooled_instruments |= 1u64 << bus;
+                        return;
+                    }
+                    let (left, right) = instrument_blocks[bus].split_at_mut(1);
+                    let (left, right) = (&mut left[0][..sub_len], &mut right[0][..sub_len]);
+                    left.fill(0.0);
+                    right.fill(0.0);
+                    instrument.submit(left, right);
+                };
+            for bus in 0..instruments.len() {
+                if instrument_mod_buses & (1u64 << bus) != 0 {
                     continue;
                 }
-                submitted |= 1u64 << bus;
-                // The instrument that leaves the slot goes with the job while
-                // it fades.
-                let leaving = &mut leaving_instruments[bus];
-                let swapping = instrument_mixes[bus].leaving.is_moving();
-                let any_thread = instrument.any_thread()
-                    && leaving
-                        .as_ref()
-                        .filter(|_| swapping)
-                        .is_none_or(|leaving| leaving.any_thread());
-                if let Some(jobs) = jobs.as_mut().filter(|_| any_thread) {
-                    let job = jobs.job(JobKind::Instrument, bus);
-                    job.frames = sub_len;
-                    job.drain = false;
-                    job.boxes[0] = slot.take();
-                    job.leaving[0] = leaving.take_if(|_| swapping);
-                    jobs.post(JobKind::Instrument, bus);
-                    pooled_instruments |= 1u64 << bus;
-                    continue;
-                }
-                let (left, right) = instrument_blocks[bus].split_at_mut(1);
-                let (left, right) = (&mut left[0][..sub_len], &mut right[0][..sub_len]);
-                left.fill(0.0);
-                right.fill(0.0);
-                instrument.submit(left, right);
+                submit_instrument(
+                    bus,
+                    instruments,
+                    leaving_instruments,
+                    jobs.as_mut(),
+                    &mut submitted,
+                    &mut pooled_instruments,
+                );
             }
+            let mut insert_mods = InsertModBuffer::new();
             // The level changes this sub-block applied.
             let mut due = 0;
             for i in 0..sub_len {
@@ -2613,16 +2737,38 @@ impl ScalarBackend {
                                 // clamps to the param's range, and adds to the param.
                                 // A stereo node feeding an AudioParam is down-mixed,
                                 // so the two channels average.
+                                let record_insert = any_insert_modulators
+                                    && (i == 0 || abs == v.start_frame || abs & 127 == 0);
+                                let voice_insert_bus =
+                                    if record_insert { v.route.bus() } else { None };
                                 for slot in v.controls.bus_mods.iter().flatten() {
                                     let bus = bus_now[usize::from(slot.bus)];
                                     let signal = (bus[0] + bus[1]) * 0.5 + slot.dc;
                                     let value = (signal * slot.depth).clamp(slot.min, slot.max);
-                                    mod_adds.bucket_at(
-                                        slot.fxi,
-                                        slot.target,
-                                        value,
-                                        slot.param_base,
-                                    );
+                                    if let crate::backend::ModTarget::InsertParam {
+                                        stage,
+                                        param_id,
+                                    } = slot.target
+                                    {
+                                        if let Some(insert_bus) = voice_insert_bus {
+                                            insert_mods.record(
+                                                insert_bus,
+                                                stage,
+                                                param_id,
+                                                i,
+                                                slot.param_base,
+                                                value,
+                                                v.id,
+                                            );
+                                        }
+                                    } else {
+                                        mod_adds.bucket_at(
+                                            slot.fxi,
+                                            slot.target,
+                                            value,
+                                            slot.param_base,
+                                        );
+                                    }
                                 }
                                 for first_pass in [true, false] {
                                     for (slot, phase) in
@@ -2681,12 +2827,30 @@ impl ScalarBackend {
                                         } else {
                                             js_clamp(shaped, lfo.min, lfo.max)
                                         };
-                                        mod_adds.bucket_at(
-                                            lfo.fxi,
-                                            lfo.target,
-                                            value,
-                                            lfo.param_base,
-                                        );
+                                        if let crate::backend::ModTarget::InsertParam {
+                                            stage,
+                                            param_id,
+                                        } = lfo.target
+                                        {
+                                            if let Some(insert_bus) = voice_insert_bus {
+                                                insert_mods.record(
+                                                    insert_bus,
+                                                    stage,
+                                                    param_id,
+                                                    i,
+                                                    lfo.param_base,
+                                                    value,
+                                                    v.id,
+                                                );
+                                            }
+                                        } else {
+                                            mod_adds.bucket_at(
+                                                lfo.fxi,
+                                                lfo.target,
+                                                value,
+                                                lfo.param_base,
+                                            );
+                                        }
                                         *phase = wrap_phase(*phase + f64::from(rate) / sr);
                                     }
                                     for env_mod in v.controls.envs.iter().flatten() {
@@ -2701,8 +2865,15 @@ impl ScalarBackend {
                                         // The browser's envelope processor writes
                                         // nothing for a block whose start is at or
                                         // before the trigger, and triggers on the
-                                        // first block after it.
-                                        let value = if v.start_frame == 0 || t_env <= 0.0 {
+                                        // first block after it. Insert params are
+                                        // Rustel-native and trigger from note 0.
+                                        let is_insert = matches!(
+                                            env_mod.target,
+                                            crate::backend::ModTarget::InsertParam { .. }
+                                        );
+                                        let value = if (!is_insert && v.start_frame == 0)
+                                            || t_env <= 0.0
+                                        {
                                             0.0
                                         } else {
                                             let hold = env_mod
@@ -2730,12 +2901,31 @@ impl ScalarBackend {
                                             env_mod_value(&shaped, t_env)
                                                 * (env_mod.depth + hold.depth)
                                         };
-                                        mod_adds.bucket_at(
-                                            env_mod.fxi,
-                                            env_mod.target,
-                                            js_clamp(value, env_mod.min, env_mod.max),
-                                            env_mod.param_base,
-                                        );
+                                        let clamped = js_clamp(value, env_mod.min, env_mod.max);
+                                        if let crate::backend::ModTarget::InsertParam {
+                                            stage,
+                                            param_id,
+                                        } = env_mod.target
+                                        {
+                                            if let Some(insert_bus) = voice_insert_bus {
+                                                insert_mods.record(
+                                                    insert_bus,
+                                                    stage,
+                                                    param_id,
+                                                    i,
+                                                    env_mod.param_base,
+                                                    clamped,
+                                                    v.id,
+                                                );
+                                            }
+                                        } else {
+                                            mod_adds.bucket_at(
+                                                env_mod.fxi,
+                                                env_mod.target,
+                                                clamped,
+                                                env_mod.param_base,
+                                            );
+                                        }
                                     }
                                     if first_pass && abs & 127 == 0 {
                                         v.mod_param_hold = mod_adds.mod_params;
@@ -4052,6 +4242,40 @@ impl ScalarBackend {
             }
             // An applied change leaves the list.
             level_changes.drain(..due);
+            // Apply modulated insert parameter values before submitting
+            // deferred instruments and effect stages.
+            for point in insert_mods.points() {
+                let bus = usize::from(point.bus);
+                let stage = usize::from(point.stage);
+                let param = crate::insert::InsertParam {
+                    id: point.param_id,
+                    value: (point.base + point.delta).clamp(0.0, 1.0),
+                };
+                if stage == crate::insert::EFFECT_CHAIN {
+                    if let Some(instrument) = instruments[bus].as_mut() {
+                        instrument.set_param(param, u32::from(point.offset));
+                    }
+                } else if stage < crate::insert::EFFECT_CHAIN {
+                    let slot = stage * crate::insert::MAX_INSERT_BUSES + bus;
+                    if let Some(effect) = effects[slot].as_mut() {
+                        effect.set_param(param, u32::from(point.offset));
+                    }
+                }
+            }
+            let mut deferred = instrument_mod_buses;
+            while deferred != 0 {
+                let bus = deferred.trailing_zeros() as usize;
+                deferred &= deferred - 1;
+                submit_instrument(
+                    bus,
+                    instruments,
+                    leaving_instruments,
+                    jobs.as_mut(),
+                    &mut submitted,
+                    &mut pooled_instruments,
+                );
+            }
+            drop(submit_instrument);
             let add_insert_output =
                 |mix: &mut [[f32; crate::reverb::REVERB_BLOCK]; 2], left: &[f32], right: &[f32]| {
                     for (channel, wet) in [(0, left), (1, right)] {

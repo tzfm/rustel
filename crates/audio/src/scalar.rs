@@ -35,6 +35,7 @@ use inserts::displace_insert;
 pub(crate) use inserts::drain_insert_block;
 pub(crate) use inserts::effect_stage_wakes;
 pub(crate) use inserts::fade_effect_stage;
+use inserts::moved;
 use inserts::order_insert_stages;
 pub(crate) use inserts::ordered_stages;
 pub(crate) use inserts::render_leaving_insert;
@@ -45,6 +46,7 @@ pub(crate) use kabelsalat::kabel_controls;
 #[cfg(feature = "device-audio")]
 pub(crate) use kabelsalat::kabel_graph_bytes;
 use kabelsalat::lease_kabel;
+use modulation::InsertModBuffer;
 use modulation::env_mod_value;
 use modulation::first_open_quantum;
 use modulation::js_clamp;

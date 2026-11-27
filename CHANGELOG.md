@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- VST3 plugins exposing `IMidiMapping` now accept MIDI CCs and expression in `.vsti()` via named keys (`modwheel`, `aftertouch`, `pitchbend`, `cc0`..`cc127`), `{ cc: { ... } }` maps, and chained `.midibend()`, `.miditouch()`, and `.ccn().ccv()`.
+- `.lfo()`, `.env()`, and `.bmod()` now continuously modulate `.vsti()` and `.vst()` plugin parameters and mapped MIDI CCs.
 - Studio applies changed global and local prebakes automatically on score or local prebake updates, and skips prebakes whose text has not changed.
 - Fetched `await import('https://...')` scripts are cached on disk and used when a network fetch fails.
 - Fixed: `withHaps((haps, state) => ...)` now passes `state`, `m(text)` accepts a single argument, and custom `Pattern` queries that return `Hap` objects with an undefined `part` skip non-intersecting events instead of throwing.

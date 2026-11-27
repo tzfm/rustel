@@ -17,7 +17,7 @@ use crate::cache::{self, Cache, Scanned};
 use crate::instance::{CopyState, Instance, Loaded, MAX_NOTES, Place};
 use crate::module::{ClassInfo, Module};
 use crate::watch::Word;
-use crate::{Job, ParamInfo, canonical, scan};
+use crate::{Job, MidiCcInfo, ParamInfo, canonical, midi_controller_number, scan};
 
 /// The program that loads one bundle in a process of its own for the scan.
 /// A bundle with a fault at its load then ends that process and not the
@@ -92,7 +92,10 @@ pub struct Plugin {
     /// Shared with each copy of the plugin list, so a list costs no copy
     /// of the parameters.
     params: Arc<[ParamInfo]>,
-    keys: HashMap<String, u32>,
+    keys: HashMap<String, (u32, f64)>,
+    /// MIDI CC, aftertouch, and pitch bend mappings from `IMidiMapping`.
+    midi_ccs: Arc<[MidiCcInfo]>,
+    midi_map: HashMap<u16, (u32, f64)>,
     /// The copies of the plugin that are prepared or run now.
     running: Arc<AtomicUsize>,
     /// The time the first load took, the load test in a child process
@@ -101,10 +104,19 @@ pub struct Plugin {
 }
 
 impl Plugin {
-    fn new(module: Arc<Module>, info: ClassInfo, params: Vec<ParamInfo>) -> Self {
+    fn new(
+        module: Arc<Module>,
+        info: ClassInfo,
+        params: Vec<ParamInfo>,
+        midi_ccs: Vec<MidiCcInfo>,
+    ) -> Self {
         let keys = params
             .iter()
-            .map(|param| (param.key.clone(), param.id))
+            .map(|param| (param.key.clone(), (param.id, param.default)))
+            .collect();
+        let midi_map = midi_ccs
+            .iter()
+            .map(|cc| (cc.controller, (cc.param_id, cc.default)))
             .collect();
         let class = scanned(&info, None);
         Self {
@@ -113,6 +125,8 @@ impl Plugin {
             class,
             params: params.into(),
             keys,
+            midi_ccs: midi_ccs.into(),
+            midi_map,
             running: Arc::default(),
             load_time: Duration::ZERO,
         }
@@ -131,14 +145,35 @@ impl Plugin {
         &self.params
     }
 
+    /// The MIDI controller mappings exposed by the plugin through `IMidiMapping`.
+    pub fn midi_ccs(&self) -> &[MidiCcInfo] {
+        &self.midi_ccs
+    }
+
+    /// Resolves a score parameter name, numeric parameter ID, or MIDI
+    /// controller alias (`modwheel`, `aftertouch`, `pitchbend`, `cc1`, ...) to
+    /// `(param_id, default_normalized)`. Plugin-owned parameter names always
+    /// win over MIDI aliases.
+    pub fn param_with_default(&self, name: &str) -> Option<(u32, f64)> {
+        let key = canonical(name);
+        if let Some(found) = self.keys.get(&key).copied() {
+            return Some(found);
+        }
+        if let Ok(id) = key.parse::<u32>() {
+            if let Some(param) = self.params.iter().find(|param| param.id == id) {
+                return Some((param.id, param.default));
+            }
+            if let Some(cc) = self.midi_ccs.iter().find(|cc| cc.param_id == id) {
+                return Some((cc.param_id, cc.default));
+            }
+        }
+        midi_controller_number(name).and_then(|ctrl| self.midi_map.get(&ctrl).copied())
+    }
+
     /// The number of a parameter from the name a score writes. A name of
     /// digits only is the number itself.
     pub fn param(&self, name: &str) -> Option<u32> {
-        let key = canonical(name);
-        self.keys.get(&key).copied().or_else(|| {
-            let id = key.parse().ok()?;
-            self.params.iter().any(|param| param.id == id).then_some(id)
-        })
+        self.param_with_default(name).map(|(id, _)| id)
     }
 
     /// The values of a note for the audio engine. `values` has each value
@@ -205,6 +240,8 @@ pub struct PluginInfo {
     pub categories: String,
     pub status: Status,
     pub params: Arc<[ParamInfo]>,
+    /// MIDI CC, aftertouch, and pitch bend mappings from `IMidiMapping`.
+    pub midi_ccs: Arc<[MidiCcInfo]>,
     /// True for a plugin that makes sound from notes: a score uses
     /// `.vsti()` for it.
     pub instrument: bool,
@@ -2330,6 +2367,9 @@ impl Host {
                     params: plugin
                         .map(|plugin| Arc::clone(&plugin.params))
                         .unwrap_or_default(),
+                    midi_ccs: plugin
+                        .map(|plugin| Arc::clone(&plugin.midi_ccs))
+                        .unwrap_or_default(),
                     instrument: entry.categories.contains("Instrument"),
                     running: plugin.map_or(0, |plugin| plugin.running.load(Ordering::Relaxed)),
                     load_time: plugin.map_or(Duration::ZERO, |plugin| plugin.load_time),
@@ -2349,6 +2389,21 @@ impl Host {
             .collect();
         list.sort_by_key(|info| info.name.to_lowercase());
         list
+    }
+
+    /// Resolves a parameter or mapped MIDI controller name on an already-loaded
+    /// plugin to `(param_id, default_normalized)`. Starts no load and waits for
+    /// nothing.
+    pub fn param(&self, name: &str, instrument: bool, param: &str) -> Option<(u32, f64)> {
+        let state = self.state();
+        let row = state.find(name)?;
+        let Stage::Ready(plugin) = &state.entries[row].stage else {
+            return None;
+        };
+        if plugin.is_instrument() != instrument {
+            return None;
+        }
+        plugin.param_with_default(param)
     }
 
     /// The names of the preset files of a plugin, sorted. `None` means the
@@ -4433,8 +4488,10 @@ pub(crate) fn load_bundle(
         // The copy of the load plays no block, so its flag of restarts is
         // its own.
         let loaded = Loaded::new(Arc::clone(&module), &class, Arc::default());
-        match loaded.map(|loaded| loaded.params()) {
-            Ok(params) => plugins.push(Plugin::new(Arc::clone(&module), class, params)),
+        match loaded.map(|loaded| (loaded.params(), loaded.midi_mappings())) {
+            Ok((params, midi_ccs)) => {
+                plugins.push(Plugin::new(Arc::clone(&module), class, params, midi_ccs))
+            }
             Err(fault) => failed.push(scanned(&class, Some(fault))),
         }
     }
@@ -4466,7 +4523,12 @@ fn build_instance(
         loaded.set_preset(file, &plugin.info)?;
     }
     let running = Arc::clone(&plugin.running);
-    loaded.activate(key, sample_rate, offline, retire, running, plugin.params())
+    let param_ids = plugin
+        .params()
+        .iter()
+        .map(|param| param.id)
+        .chain(plugin.midi_ccs().iter().map(|cc| cc.param_id));
+    loaded.activate(key, sample_rate, offline, retire, running, param_ids)
 }
 
 #[cfg(test)]
