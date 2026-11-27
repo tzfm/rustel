@@ -1187,6 +1187,7 @@ fn a_live_note_plays_through_its_plugin() {
     // first slider of its layout.
     let start = |engine: &mut StudioEngine, score: &str| {
         engine.evaluate_and_start(score, false).expect("a start");
+        master.take_levels();
         let (mut slider, mut peak, started) = (None, 0.0_f32, Instant::now());
         while peak <= 0.05 {
             assert!(
