@@ -263,3 +263,30 @@ fn the_local_prebake_survives_a_reopen() {
         reopened.rows()[row]
     );
 }
+
+/// Updating a score applies changed global and local prebakes automatically,
+/// global then local, so the score plays without separate Ctrl+S on each
+/// prebake tab.
+#[test]
+fn updating_a_score_applies_changed_prebakes_first() {
+    let mut studio = hermetic();
+
+    studio.chord("ctrl+o");
+    select_row(&mut studio, "▸ global prebake");
+    studio.press(KeyCode::Enter, KeyModifiers::NONE);
+    studio.set_score("globalThis.fromGlobal = () => note(\"c3\")");
+    studio.chord("ctrl+w");
+
+    studio.chord("ctrl+o");
+    select_row(&mut studio, "▸ local prebake");
+    studio.press(KeyCode::Enter, KeyModifiers::NONE);
+    studio.set_score("globalThis.fromLocal = () => fromGlobal().s(\"sine\")");
+    studio.chord("ctrl+w");
+
+    studio.set_score("$: fromLocal()");
+    studio.chord("ctrl+s");
+    studio.settle();
+
+    assert_eq!(studio.errors(), None);
+    assert!(studio.is_playing(), "status: {}", studio.status());
+}

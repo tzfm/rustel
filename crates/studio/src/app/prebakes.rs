@@ -17,6 +17,29 @@ pub(super) struct PrebakeRequest {
     pub(super) reinstall_after: bool,
 }
 
+/// A score update waiting for changed setups to finish applying first.
+#[derive(Clone, Debug)]
+pub(super) struct DeferredScoreUpdate {
+    pub(super) scene: SceneId,
+    pub(super) revision: Revision,
+    pub(super) source: Arc<str>,
+    pub(super) request: LaunchRequest,
+    pub(super) explicit: bool,
+    pub(super) is_replay: bool,
+    pub(super) write_scene: bool,
+    pub(super) source_kind: &'static str,
+}
+
+/// Result of checking whether changed prebakes must run before a score update.
+pub(super) enum PrebakePreparation {
+    /// Every setup is already applied; proceed with the score immediately.
+    Ready(DeferredScoreUpdate),
+    /// Changed setups are queued or running; the score will run once they land.
+    Queued,
+    /// A changed setup failed linting; the score does not run.
+    Refused,
+}
+
 impl App {
     /// A prebake's text as stored, whether or not a tab is showing it.
     pub(super) fn stored_prebake(&self, scope: PrebakeScope) -> &str {
@@ -24,6 +47,71 @@ impl App {
             PrebakeScope::Global => &self.global_prebake,
             PrebakeScope::Local => self.scenes.local_prebake(),
         }
+    }
+
+    /// A prebake's live text: its open tab buffer when dirty, otherwise its
+    /// stored text so opening an empty starter tab to inspect it never counts
+    /// as a pending edit.
+    fn live_prebake_source(&self, scope: PrebakeScope) -> std::borrow::Cow<'_, str> {
+        if let Some(index) = self.scenes.prebake_index(scope)
+            && let Some(scene) = self.scenes.scenes().get(index)
+            && scene.dirty
+        {
+            return std::borrow::Cow::Owned(scene.editor.source());
+        }
+        std::borrow::Cow::Borrowed(self.stored_prebake(scope))
+    }
+
+    /// Whether `source` matches what the engine has already applied for `scope`.
+    fn prebake_is_applied(&self, scope: PrebakeScope, source: &str) -> bool {
+        if prebake::is_blank(source) {
+            return self.prebake_applied[scope.index()].is_none();
+        }
+        self.prebake_applied[scope.index()].as_deref() == Some(source_revision(source).as_str())
+    }
+
+    /// Whether `source` has already been settled for `scope` (applied, or
+    /// rejected with the exact same text). A prebake whose text has not
+    /// changed since it failed stays in the setup error slot instead of
+    /// re-running on every score update and blocking playback.
+    fn prebake_is_settled(&self, scope: PrebakeScope, source: &str) -> bool {
+        if self.prebake_is_applied(scope, source) {
+            return true;
+        }
+        if prebake::is_blank(source) {
+            return false;
+        }
+        self.prebake_rejected[scope.index()].as_deref() == Some(source_revision(source).as_str())
+    }
+
+    /// The newest source already queued or in flight for `scope`, if any.
+    fn prebake_latest_queued_source(&self, scope: PrebakeScope) -> Option<&str> {
+        self.prebake_queue
+            .iter()
+            .rev()
+            .find(|request| request.scope == scope)
+            .or_else(|| {
+                self.prebake_inflight
+                    .as_ref()
+                    .filter(|request| request.scope == scope)
+            })
+            .map(|request| request.source.as_ref())
+    }
+
+    /// Whether either prebake has text that differs from what is settled.
+    pub(super) fn has_unapplied_prebake(&self) -> bool {
+        PrebakeScope::ALL.into_iter().any(|scope| {
+            let source = self.live_prebake_source(scope);
+            !self.prebake_is_settled(scope, &source)
+        })
+    }
+
+    fn clear_applied_prebake(&mut self, scope: PrebakeScope) {
+        let index = scope.index();
+        self.prebake_applied[index] = None;
+        self.prebake_rejected[index] = None;
+        self.applied_setup[index] = Arc::default();
+        self.lint_pending = true;
     }
 
     /// Which prebake the tab on screen is, when it is one.
@@ -234,40 +322,154 @@ impl App {
         self.dirty_frame = true;
     }
 
+    /// Check `source` for `scope` without running it, returning the first
+    /// rejection reason if it does not check out.
+    fn check_prebake_text(
+        &mut self,
+        scope: PrebakeScope,
+        source: &str,
+        global_override: Option<&str>,
+    ) -> Result<(), String> {
+        if prebake::is_blank(source) {
+            self.prebake_rejected[scope.index()] = None;
+            self.clear_prebake_error(scope);
+            return Ok(());
+        }
+        let context = match scope {
+            PrebakeScope::Global => LintContext::from_setup_sources([source]).as_setup(),
+            PrebakeScope::Local => LintContext::from_setup_sources([
+                global_override.unwrap_or(self.global_prebake.as_str()),
+                source,
+            ])
+            .as_setup(),
+        };
+        let library = self.worker.library();
+        let diagnostics = lint_with(source, false, library.as_deref(), &context);
+        match rejection_of(source, &diagnostics) {
+            Some(reason) => {
+                self.prebake_rejected[scope.index()] = Some(source_revision(source));
+                self.set_error(
+                    ErrorOwner::Setup,
+                    format!("{} refused - {reason}", scope.tab_name()),
+                );
+                Err(reason)
+            }
+            None => {
+                self.prebake_rejected[scope.index()] = None;
+                self.clear_prebake_error(scope);
+                Ok(())
+            }
+        }
+    }
+
     /// Check what is stored without running it, and report a text that does
     /// not check out. Used where a prebake is kept but not applied: closing
     /// a tab, quitting, and opening a studio.
     pub(super) fn check_stored_prebake(&mut self, scope: PrebakeScope) -> bool {
         let stored = self.stored_prebake(scope).to_owned();
-        if prebake::is_blank(&stored) {
-            self.prebake_rejected[scope.index()] = None;
-            self.clear_prebake_error(scope);
-            return true;
-        }
-        let context = match scope {
-            PrebakeScope::Global => LintContext::from_setup_sources([stored.as_str()]).as_setup(),
-            PrebakeScope::Local => {
-                LintContext::from_setup_sources([self.global_prebake.as_str(), stored.as_str()])
-                    .as_setup()
-            }
-        };
-        let library = self.worker.library();
-        let diagnostics = lint_with(&stored, false, library.as_deref(), &context);
-        match rejection_of(&stored, &diagnostics) {
-            Some(reason) => {
-                self.prebake_rejected[scope.index()] = Some(source_revision(&stored));
-                self.set_error(
-                    ErrorOwner::Setup,
-                    format!("{} refused - {reason}", scope.tab_name()),
-                );
-                false
-            }
-            None => {
-                self.prebake_rejected[scope.index()] = None;
+        self.check_prebake_text(scope, &stored, None).is_ok()
+    }
+
+    /// Apply any prebake whose text changed before running a score update,
+    /// global then local. Returns `Ready` when nothing changed so the score
+    /// evaluates right away.
+    pub(super) fn prepare_prebakes_for_score(
+        &mut self,
+        update: DeferredScoreUpdate,
+    ) -> PrebakePreparation {
+        let global_source = self.live_prebake_source(PrebakeScope::Global).into_owned();
+        let local_source = self.live_prebake_source(PrebakeScope::Local).into_owned();
+        for (scope, text) in [
+            (PrebakeScope::Global, global_source.as_str()),
+            (PrebakeScope::Local, local_source.as_str()),
+        ] {
+            if prebake::is_blank(text)
+                && (!self.prebake_is_applied(scope, text) || self.stored_prebake(scope) != text)
+            {
+                self.persist_prebake(scope, text);
+                self.clear_applied_prebake(scope);
                 self.clear_prebake_error(scope);
-                true
             }
         }
+        let global_changed = !prebake::is_blank(&global_source)
+            && !self.prebake_is_settled(PrebakeScope::Global, &global_source);
+        let local_present = !prebake::is_blank(&local_source);
+        let local_changed =
+            local_present && !self.prebake_is_settled(PrebakeScope::Local, &local_source);
+        if !global_changed && !local_changed {
+            return PrebakePreparation::Ready(update);
+        }
+
+        let mut to_queue = Vec::new();
+        if global_changed {
+            if let Err(reason) = self.check_prebake_text(PrebakeScope::Global, &global_source, None)
+            {
+                self.status = format!("refused - {reason} · the setup was not applied");
+                if update.explicit {
+                    self.finish_evaluation_feedback(false);
+                }
+                self.dirty_frame = true;
+                return PrebakePreparation::Refused;
+            }
+            self.persist_prebake(PrebakeScope::Global, &global_source);
+            if self.prebake_latest_queued_source(PrebakeScope::Global)
+                != Some(global_source.as_str())
+            {
+                to_queue.push(PrebakeScope::Global);
+            }
+            if local_present {
+                if let Err(reason) = self.check_prebake_text(
+                    PrebakeScope::Local,
+                    &local_source,
+                    Some(&global_source),
+                ) {
+                    self.status = format!("refused - {reason} · the setup was not applied");
+                    if update.explicit {
+                        self.finish_evaluation_feedback(false);
+                    }
+                    self.dirty_frame = true;
+                    return PrebakePreparation::Refused;
+                }
+                self.persist_prebake(PrebakeScope::Local, &local_source);
+                if !to_queue.is_empty()
+                    || self.prebake_latest_queued_source(PrebakeScope::Local)
+                        != Some(local_source.as_str())
+                {
+                    to_queue.push(PrebakeScope::Local);
+                }
+            }
+        } else if local_changed {
+            if let Err(reason) = self.check_prebake_text(PrebakeScope::Local, &local_source, None) {
+                self.status = format!("refused - {reason} · the setup was not applied");
+                if update.explicit {
+                    self.finish_evaluation_feedback(false);
+                }
+                self.dirty_frame = true;
+                return PrebakePreparation::Refused;
+            }
+            self.persist_prebake(PrebakeScope::Local, &local_source);
+            if self.prebake_latest_queued_source(PrebakeScope::Local) != Some(local_source.as_str())
+            {
+                to_queue.push(PrebakeScope::Local);
+            }
+        }
+
+        if !to_queue.is_empty() {
+            self.queue_prebakes(&to_queue, false);
+            self.deferred_score_update = Some(update);
+            self.dirty_frame = true;
+            return PrebakePreparation::Queued;
+        }
+        let inflight_defines_names = self.prebake_inflight.as_ref().is_some_and(|request| {
+            let definitions = rustel_transpiler::setup_definitions(&request.source);
+            !definitions.names.is_empty() || definitions.has_dynamic_names
+        });
+        if !self.prebake_queue.is_empty() || inflight_defines_names {
+            self.deferred_score_update = Some(update);
+            self.dirty_frame = true;
+            return PrebakePreparation::Queued;
+        }
+        PrebakePreparation::Ready(update)
     }
 
     /// Put the setup error away only when neither prebake is refused: one
@@ -290,6 +492,33 @@ impl App {
         revision: Revision,
         source: Arc<str>,
     ) {
+        let global_for_local = if scope == PrebakeScope::Local {
+            let global_source = self.live_prebake_source(PrebakeScope::Global).into_owned();
+            if !self.prebake_is_settled(PrebakeScope::Global, &global_source) {
+                if prebake::is_blank(&global_source) {
+                    self.persist_prebake(PrebakeScope::Global, &global_source);
+                    self.clear_applied_prebake(PrebakeScope::Global);
+                    self.clear_prebake_error(PrebakeScope::Global);
+                    None
+                } else {
+                    if let Err(reason) =
+                        self.check_prebake_text(PrebakeScope::Global, &global_source, None)
+                    {
+                        self.status = format!("refused - {reason} · the setup was not applied");
+                        self.finish_evaluation_feedback(false);
+                        self.dirty_frame = true;
+                        return;
+                    }
+                    self.persist_prebake(PrebakeScope::Global, &global_source);
+                    Some(global_source)
+                }
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
         if self.refuse_unclean(revision, &source) {
             self.finish_evaluation_feedback(false);
             // Refused text is not kept: the tab still holds it, and closing
@@ -299,24 +528,69 @@ impl App {
             self.dirty_frame = true;
             return;
         }
+        let changed = !self.prebake_is_applied(scope, &source);
         self.persist_prebake(scope, &source);
         self.clear_prebake_error(scope);
         if prebake::is_blank(&source) {
+            self.clear_applied_prebake(scope);
+            if let Some(global_source) = global_for_local
+                && !prebake::is_blank(&global_source)
+            {
+                self.queue_prebakes(&[PrebakeScope::Global], true);
+                self.dirty_frame = true;
+                return;
+            }
             self.finish_evaluation_feedback(true);
-            self.prebake_applied[scope.index()] = None;
-            self.prebake_rejected[scope.index()] = None;
             self.status = format!("{} is empty - nothing to run", scope.tab_name());
             self.dirty_frame = true;
             return;
         }
+
         // Order is the point: a fresh global setup is followed by the set's
         // own, so one heap always sees them global-then-local however they
-        // were edited.
-        let chain: &[PrebakeScope] = match scope {
-            PrebakeScope::Global => &PrebakeScope::ALL,
-            PrebakeScope::Local => &[PrebakeScope::Local],
-        };
-        self.queue_prebakes(chain, true);
+        // were edited. A setup whose text has not changed since it applied
+        // does not run again.
+        let mut chain = Vec::new();
+        match scope {
+            PrebakeScope::Global => {
+                if !changed {
+                    self.finish_evaluation_feedback(true);
+                    self.status = format!("{} unchanged - already applied", scope.tab_name());
+                    self.dirty_frame = true;
+                    return;
+                }
+                chain.push(PrebakeScope::Global);
+                let local_source = self.live_prebake_source(PrebakeScope::Local).into_owned();
+                if !prebake::is_blank(&local_source) {
+                    if self.stored_prebake(PrebakeScope::Local) != local_source {
+                        if let Err(reason) =
+                            self.check_prebake_text(PrebakeScope::Local, &local_source, None)
+                        {
+                            self.status = format!("refused - {reason} · the setup was not applied");
+                            self.finish_evaluation_feedback(false);
+                            self.dirty_frame = true;
+                            return;
+                        }
+                        self.persist_prebake(PrebakeScope::Local, &local_source);
+                    }
+                    chain.push(PrebakeScope::Local);
+                }
+            }
+            PrebakeScope::Local => {
+                let global_changed = global_for_local.is_some();
+                if !global_changed && !changed {
+                    self.finish_evaluation_feedback(true);
+                    self.status = format!("{} unchanged - already applied", scope.tab_name());
+                    self.dirty_frame = true;
+                    return;
+                }
+                if global_changed {
+                    chain.push(PrebakeScope::Global);
+                }
+                chain.push(PrebakeScope::Local);
+            }
+        }
+        self.queue_prebakes(&chain, true);
         self.dirty_frame = true;
     }
 
@@ -370,6 +644,7 @@ impl App {
             self.finish_evaluation_feedback(false);
             self.prebake_queue.clear();
             self.prebake_inflight = None;
+            self.deferred_score_update = None;
             return;
         }
         if self.prebake_inflight.is_some() {
@@ -404,10 +679,18 @@ impl App {
             return;
         };
         let success = outcome_success(&outcome.result);
-        self.finish_evaluation_request(outcome.request_id, success);
+        let stale_local =
+            sent.scope == PrebakeScope::Local && sent.request_id < self.set_first_request;
+        let waiting_for_score = !stale_local
+            && success == Some(true)
+            && self.prebake_queue.is_empty()
+            && self.deferred_score_update.is_some();
+        if !waiting_for_score {
+            self.finish_evaluation_request(outcome.request_id, success);
+        }
         // The last set's own setup, still out when another set was taken
         // up, says nothing about the set open now or the chain queued for it.
-        if sent.scope == PrebakeScope::Local && sent.request_id < self.set_first_request {
+        if stale_local {
             self.flush_pending_prebake();
             self.dirty_frame = true;
             return;
@@ -417,6 +700,15 @@ impl App {
             .take_if(|request| *request == sent.request_id)
             .is_some();
         if success != Some(true) {
+            if let Some(deferred) = self.deferred_score_update.take()
+                && deferred.explicit
+            {
+                match success {
+                    Some(false) => self.finish_evaluation_feedback(false),
+                    None => self.evaluation_feedback = None,
+                    Some(true) => {}
+                }
+            }
             // A setup that does not apply clears the queue behind it, so a
             // gesture waiting there settles the same way.
             let discarded = self
@@ -448,8 +740,12 @@ impl App {
                 if !opening {
                     self.status = format!("{} applied", sent.scope.tab_name());
                 }
-                if sent.reinstall_after && self.prebake_queue.is_empty() {
-                    self.reinstall_audible_score();
+                if self.prebake_queue.is_empty() {
+                    if let Some(deferred) = self.deferred_score_update.take() {
+                        self.finish_score_update(deferred, true);
+                    } else if sent.reinstall_after {
+                        self.reinstall_audible_score();
+                    }
                 }
             }
             Err(failure) if failure.kind == "cancelled" => {
@@ -1078,6 +1374,128 @@ mod tests {
                     "the new set's setup did not go out (fails: {fails})"
                 );
             }
+        }
+
+        /// Updating a score applies changed setups first, global then local,
+        /// so a score sees edits without a separate Ctrl+S on each setup tab.
+        #[test]
+        fn a_score_update_applies_changed_prebakes_global_then_local_first() {
+            let directory = tempfile::tempdir().expect("temp dir");
+            let mut app = app_over(directory.path());
+
+            app.open_prebake(PrebakeScope::Global);
+            type_text(&mut app, "globalThis.fromGlobal = () => note('c3')");
+            press(&mut app, KeyCode::Char('w'), KeyModifiers::CONTROL);
+
+            app.open_prebake(PrebakeScope::Local);
+            type_text(&mut app, "globalThis.fromLocal = () => fromGlobal()");
+            press(&mut app, KeyCode::Char('w'), KeyModifiers::CONTROL);
+
+            app.scenes.current_mut().editor = Editor::new("$: fromLocal()").unwrap();
+            press(&mut app, KeyCode::F(5), KeyModifiers::NONE);
+
+            let queued = app
+                .prebake_inflight
+                .iter()
+                .map(|request| request.scope)
+                .chain(app.prebake_queue.iter().map(|request| request.scope))
+                .collect::<Vec<_>>();
+            assert_eq!(queued, [PrebakeScope::Global, PrebakeScope::Local]);
+            assert!(app.deferred_score_update.is_some());
+
+            settle(&mut app);
+            assert_eq!(
+                app.prebake_rows()[PrebakeScope::Global.index()].verdict,
+                PrebakeVerdict::Applied
+            );
+            assert_eq!(
+                app.prebake_rows()[PrebakeScope::Local.index()].verdict,
+                PrebakeVerdict::Applied
+            );
+            assert_eq!(app.errors.get(ErrorOwner::Setup), None);
+            assert!(
+                app.evaluation_revisions
+                    .get(&source_revision("$: fromLocal()"))
+                    .is_some(),
+                "the deferred score was not dispatched after the prebakes applied"
+            );
+            assert!(
+                app.errors
+                    .get(ErrorOwner::Evaluation)
+                    .is_none_or(
+                        |error| !error.contains("fromLocal") && !error.contains("fromGlobal")
+                    ),
+                "evaluation error: {:?}",
+                app.errors.get(ErrorOwner::Evaluation)
+            );
+        }
+
+        /// Updating the local prebake applies a changed global prebake first.
+        #[test]
+        fn a_local_prebake_update_applies_a_changed_global_prebake_first() {
+            let directory = tempfile::tempdir().expect("temp dir");
+            let mut app = app_over(directory.path());
+
+            app.open_prebake(PrebakeScope::Global);
+            type_text(&mut app, "globalThis.fromGlobal = () => note('c3')");
+            press(&mut app, KeyCode::Char('w'), KeyModifiers::CONTROL);
+
+            app.open_prebake(PrebakeScope::Local);
+            type_text(&mut app, "globalThis.fromLocal = () => fromGlobal()");
+            press(&mut app, KeyCode::F(5), KeyModifiers::NONE);
+
+            let queued = app
+                .prebake_inflight
+                .iter()
+                .map(|request| request.scope)
+                .chain(app.prebake_queue.iter().map(|request| request.scope))
+                .collect::<Vec<_>>();
+            assert_eq!(queued, [PrebakeScope::Global, PrebakeScope::Local]);
+
+            settle(&mut app);
+            assert_eq!(
+                app.prebake_rows()[PrebakeScope::Global.index()].verdict,
+                PrebakeVerdict::Applied
+            );
+            assert_eq!(
+                app.prebake_rows()[PrebakeScope::Local.index()].verdict,
+                PrebakeVerdict::Applied
+            );
+        }
+
+        /// A prebake whose text has not changed since it applied does not run
+        /// a second time.
+        #[test]
+        fn an_unchanged_applied_prebake_does_not_run_again() {
+            let directory = tempfile::tempdir().expect("temp dir");
+            let mut app = app_over(directory.path());
+
+            app.open_prebake(PrebakeScope::Global);
+            type_text(&mut app, "globalThis.g = 1");
+            press(&mut app, KeyCode::F(5), KeyModifiers::NONE);
+            settle(&mut app);
+
+            let before = app.next_request_id;
+            press(&mut app, KeyCode::F(5), KeyModifiers::NONE);
+            assert_eq!(app.next_request_id, before);
+            assert!(app.prebake_inflight.is_none() && app.prebake_queue.is_empty());
+
+            app.open_prebake(PrebakeScope::Local);
+            type_text(&mut app, "globalThis.l = 2");
+            press(&mut app, KeyCode::F(5), KeyModifiers::NONE);
+            let queued = app
+                .prebake_inflight
+                .iter()
+                .map(|request| request.scope)
+                .chain(app.prebake_queue.iter().map(|request| request.scope))
+                .collect::<Vec<_>>();
+            assert_eq!(queued, [PrebakeScope::Local]);
+            settle(&mut app);
+
+            let before_local_repeat = app.next_request_id;
+            press(&mut app, KeyCode::F(5), KeyModifiers::NONE);
+            assert_eq!(app.next_request_id, before_local_repeat);
+            assert!(app.prebake_inflight.is_none() && app.prebake_queue.is_empty());
         }
     }
 }

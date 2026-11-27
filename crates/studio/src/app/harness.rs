@@ -405,6 +405,7 @@ impl Studio {
             let app = &self.app;
             let quiet = app.prebake_inflight.is_none()
                 && app.prebake_queue.is_empty()
+                && app.deferred_score_update.is_none()
                 && app.pending_evaluation.is_none()
                 && app.inflight.is_empty()
                 && !app.lint_pending

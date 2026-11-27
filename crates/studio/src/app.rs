@@ -247,7 +247,7 @@ use mouse::{Pointer, TextSurface, widen_selection};
 use panes::{HorizontalScrollbarGrab, Pane, reserve_horizontal_scrollbar};
 use persistence::PREFS_DEBOUNCE;
 use pointer_shape::{SHAPE_DEFAULT, SHAPE_GRABBING, SHAPE_POINTER, SHAPE_TEXT};
-use prebakes::PrebakeRequest;
+use prebakes::{DeferredScoreUpdate, PrebakePreparation, PrebakeRequest};
 #[cfg(feature = "hydra")]
 use previews::SnippetPreview;
 use previews::nudge_preview_gain;
@@ -1192,6 +1192,8 @@ struct App {
     prebake_queue: VecDeque<PrebakeRequest>,
     /// The setup the engine is running now.
     prebake_inflight: Option<PrebakeRequest>,
+    /// A score update waiting for changed setups to finish applying first.
+    deferred_score_update: Option<DeferredScoreUpdate>,
     /// Hash of the text last applied and last refused, per scope, so a row
     /// can say what became of what is stored rather than of what once ran.
     prebake_applied: [Option<String>; 2],
@@ -1697,6 +1699,7 @@ impl App {
             global_prebake_path: prebake::global_path(),
             prebake_queue: VecDeque::new(),
             prebake_inflight: None,
+            deferred_score_update: None,
             prebake_applied: [None, None],
             prebake_rejected: [None, None],
             applied_setup: [Arc::default(), Arc::default()],
@@ -3093,7 +3096,13 @@ mod tests {
                     app.handle_control(event);
                     had = true;
                 }
-                if !had && app.prebake_inflight.is_none() && app.prebake_queue.is_empty() {
+                if !had
+                    && app.prebake_inflight.is_none()
+                    && app.prebake_queue.is_empty()
+                    && app.deferred_score_update.is_none()
+                    && app.pending_evaluation.is_none()
+                    && app.inflight.is_empty()
+                {
                     return;
                 }
                 std::thread::sleep(std::time::Duration::from_millis(5));

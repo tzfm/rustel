@@ -1646,6 +1646,7 @@ impl App {
         // out again, so what was kept under them goes whole, as each tab's
         // would on closing, and the engine hears that tabs left.
         self.scene_visits.clear();
+        self.deferred_score_update = None;
         self.lint.clear();
         self.evaluation_alerts.clear();
         self.live_sliders.clear();
