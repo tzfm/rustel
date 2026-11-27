@@ -526,7 +526,7 @@ impl Shorthand {
     ///
     /// Prefixes without a trailing separator need a boundary check so
     /// `shabda/speechify` is not mistaken for `shabda/speech`.
-    fn read<'a>(&self, source: &'a str) -> Option<&'a str> {
+    pub(super) fn read<'a>(&self, source: &'a str) -> Option<&'a str> {
         let rest = source.strip_prefix(self.prefix)?;
         if self.prefix.ends_with(':') || rest.is_empty() {
             return Some(rest);
@@ -603,7 +603,7 @@ fn speech_path(rest: &str, pattern: &str, language: &str, gender: &str) -> Strin
 /// in it (`blob/` or `raw/`) map to `<shorthand>user/repo[/branch[/path]]`.
 /// Anything else, such as an issue page or a URL with a login or a port,
 /// is `None` and is fetched as written.
-fn repo_page_source(source: &str) -> Option<String> {
+pub(super) fn repo_page_source(source: &str) -> Option<String> {
     let url = Url::parse(source.trim_ascii()).ok()?;
     if !matches!(url.scheme(), "https" | "http")
         || !url.username().is_empty()

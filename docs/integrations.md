@@ -1,11 +1,13 @@
 # External editors and live integrations
 
-Rustel exposes three interfaces over standard input and standard output so external editors, visualizers, and control bridges can integrate directly with the engine without linking a custom binary.
+Rustel exposes stdio and JSON interfaces so external editors, visualizers, and control bridges can integrate directly with the engine without linking a custom binary.
 
 ```text
 Editor / visualizer / bridge
   ├── rustel lsp --stdio                 (LSP completion, hover, diagnostics)
   ├── rustel doc --all --json            (full reference catalogue snapshot)
+  ├── rustel samples list --json         (sample packs, sounds, variants, cache state)
+  ├── rustel samples audition --stdio    (standalone immediate audition over NDJSON)
   └── rustel play song.strudel --watch --ui-events
         ├── stdout: ui_layout, ui_events, ui_audio, ui_control_ack (NDJSON)
         ├── stderr: live, reload, live_error                       (NDJSON)
@@ -72,6 +74,66 @@ Text mode prints one tab-separated `name` and `summary` line per entry. JSON mod
 ```
 
 Use `rustel doc lpf --json` when a tool needs a single entry. Use `rustel doc --all --json` to generate syntax highlighters, editor completion tables, or offline documentation from one authoritative source.
+
+## Sample catalogue
+
+List shipped packs, sound names, variant counts, categories, import hints, and cache state from the engine's pinned manifests and local cache:
+
+```sh
+rustel samples list --json
+rustel samples list --pack Dirt-Samples --json
+rustel samples list --category drums --cached --json
+rustel samples list --source local:kits --allow-local-samples ~/samples --json
+```
+
+Text mode groups sounds by pack with variant counts and cache progress. JSON mode emits a versioned snapshot:
+
+```json
+{
+  "version": 1,
+  "complete": true,
+  "warnings": [],
+  "sample_cache": "/path/to/samples",
+  "packs": [
+    {
+      "pack": "Dirt-Samples",
+      "category": "dirt",
+      "source": "https://strudel.b-cdn.net/Dirt-Samples/",
+      "shortcut": null,
+      "import": null,
+      "built_in": true,
+      "sounds": 10,
+      "files": 95,
+      "cached_files": 0,
+      "cached_bytes": 0,
+      "cache_state": "uncached",
+      "manifest_state": "ready",
+      "manifest_error": null
+    }
+  ],
+  "sounds": [
+    {
+      "pack": "Dirt-Samples",
+      "sound": "casio",
+      "variants": 3,
+      "files": 3,
+      "pitched": false,
+      "category": "dirt",
+      "origin": "default",
+      "source": "https://strudel.b-cdn.net/Dirt-Samples/",
+      "shortcut": null,
+      "import": null,
+      "cached_files": 0,
+      "cached_bytes": 0,
+      "cache_state": "uncached"
+    }
+  ]
+}
+```
+
+Built-in sounds need no import call, so `import` is `null`. External sources passed with `--source` set `shortcut` when a shorthand such as `github:user/repo` or `local:kits` applies, and set `import` to the exact `samples("...")` snippet to paste into a score. Local folder sounds also include `variant_names` with file stems for each variant index. `cache_state` is `"uncached"`, `"partial"`, or `"cached"`.
+
+`complete` is `true` when every requested manifest loaded. When a remote manifest fails or times out, `complete` is `false`, `warnings` lists each affected manifest, and that pack sets `manifest_state` to `"failed"` or `"loading"` with `manifest_error`. Healthy and cached packs still appear in the output.
 
 ## Live telemetry and control
 
@@ -152,11 +214,51 @@ Control transport (`"stop"` ends playback and `"restart"` rebases cycle zero cle
 {"ui_control":{"version":1,"kind":"transport","action":"restart","request":"restart-1"}}
 ```
 
+Audition one sound, variant, note, or chord immediately without waiting for a file reload or cycle boundary:
+
+```json
+{"ui_control":{"version":1,"kind":"audition","sound":"bd","n":2,"gain":0.8,"request":"aud-1"}}
+{"ui_control":{"version":1,"kind":"audition","sound":"piano","notes":["c4","e4","g4"],"duration":1.5,"request":"aud-2"}}
+{"ui_control":{"version":1,"kind":"audition","sound":"kick","source":"local:kits","request":"aud-3"}}
+```
+
+Stop any active or pending audition voices without disturbing score playback:
+
+```json
+{"ui_control":{"version":1,"kind":"audition_stop","request":"aud-stop"}}
+```
+
+`audition` accepts `sound` (with an optional `:index` suffix such as `"bd:2"`), optional `n` (variant index override), optional `note` or `notes` (up to 8 MIDI numbers or note names such as `"c4"`), optional `gain` (`0` to `4`, default `1`), optional `duration` (`0.01` to `30` seconds), and optional `source` (an allowed `samples(...)` specifier). Audition voices run in reserved choke groups so rapid browsing replaces the prior preview without affecting live lanes or transport.
+
+When a requested sample is already decoded on the device, `ui_control_ack` returns `"accepted":true` right away. When the sample or manifest must load first, `ui_control_ack` returns `"accepted":true` with `"message":"loading"` and plays as soon as decoding finishes. If loading fails later, stderr emits a recoverable `live_error` record with `"kind":"audition"`.
+
 ### Backpressure and safety bounds
 
 The stdin control reader runs on a dedicated thread with fixed limits: 16 KiB maximum per input line, 64 coalesced pending sliders, and a bounded 64-entry command channel. Commands that arrive when the channel is full are dropped rather than blocking the reader or growing memory.
 
 All control mutations run on the producer thread and trigger a safe scheduler requery cutover. No control parsing, locking, or JSON serialization ever runs on the audio callback thread.
+
+## Standalone sample audition
+
+When no score is playing, keep `rustel lsp --stdio` audio-free and use `rustel samples audition` instead.
+
+Run a persistent audition worker over stdio that speaks the same `ui_control` and `ui_control_ack` NDJSON protocol as `rustel play --ui-events`:
+
+```sh
+rustel samples audition --stdio
+rustel samples audition --stdio --allow-local-samples ~/samples
+rustel samples audition --stdio --output silent
+```
+
+Send `audition`, `audition_stop`, or `transport` (`"action":"stop"`) lines on stdin, and read `ui_control_ack` lines on stdout. Closing stdin stops the worker cleanly.
+
+For one-shot previews from scripts or pickers, pass the sound name directly:
+
+```sh
+rustel samples audition bd:2
+rustel samples audition piano --note c4 --note e4 --note g4 --duration 1.5
+rustel samples audition kick --source local:kits --allow-local-samples ~/samples --json
+```
 
 ## Rust library hosts
 

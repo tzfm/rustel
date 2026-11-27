@@ -497,6 +497,12 @@ pub(super) fn apply_ui_discrete_control(
             }
             UiTransportAction::Restart => (true, false, true, None),
         },
+        UiDiscreteControlKind::Audition(_) | UiDiscreteControlKind::AuditionStop => (
+            false,
+            false,
+            false,
+            Some("audition requires an active audio device".into()),
+        ),
     };
 
     UiDiscreteApplyOutcome {
@@ -1280,7 +1286,7 @@ fn live_step_error_event(error: &RuntimeError, stream_id: u64) -> serde_json::Va
 /// PCM is retained on the producer thread so a recycled device can be seeded
 /// without downloading or decoding it again.
 #[cfg(feature = "device-audio")]
-fn install_ready_samples(
+pub(super) fn install_ready_samples(
     library: &rustel_runtime::samples::SampleLibrary,
     retained: &mut std::collections::HashMap<rustel_audio::SampleId, rustel_audio::DecodedSample>,
     install: impl FnMut(
@@ -2167,6 +2173,7 @@ pub(super) fn play_live(
     let mut next_ui_trace_prune = Instant::now();
     let mut next_ui_audio = Instant::now();
     let mut pending_ui_control_cutover: Option<PendingUiControlCutover> = None;
+    let mut ui_audition = rustel_runtime::audition::AuditionTracker::new();
     let mut last_slider_runtime_error: Option<String> = None;
     // Ten minutes at 48 kHz, after which the capture simply stops growing.
     const DEBUG_CAPTURE_MAX_SAMPLES: usize = 48_000 * 600;
@@ -2235,6 +2242,36 @@ pub(super) fn play_live(
                 }
             }
             for command in controls.drain_commands() {
+                if matches!(
+                    command.kind,
+                    UiDiscreteControlKind::Audition(_) | UiDiscreteControlKind::AuditionStop
+                ) {
+                    if session.sample_library().is_none()
+                        && matches!(command.kind, UiDiscreteControlKind::Audition(_))
+                    {
+                        let _ = session.enable_default_samples();
+                        if let Some(library) = session.sample_library() {
+                            library.set_render_rate(device.sample_rate());
+                        }
+                    }
+                    let ack = audition::apply_ui_audition_command(
+                        &command.kind,
+                        command.request,
+                        session.sample_library().map(std::sync::Arc::as_ref),
+                        &session.config().score_sample_access,
+                        &device,
+                        &retained_samples,
+                        session.cps(),
+                        session.generation(),
+                        &mut ui_audition,
+                    );
+                    if let Some(ack) = ack
+                        && let Some(sink) = ui_sink.as_ref()
+                    {
+                        let _ = sink.try_send_control_ack(ack);
+                    }
+                    continue;
+                }
                 let outcome = apply_ui_discrete_control(
                     session,
                     &ui_layout_delivery,
@@ -2438,6 +2475,23 @@ pub(super) fn play_live(
             install_ready_samples(library, &mut retained_samples, |id, decoded| {
                 device.install_sample(id, decoded)
             });
+            device.reclaim_samples();
+            if let rustel_runtime::audition::AuditionPoll::Failed { sound, message } =
+                ui_audition.poll(library, &device, &retained_samples, session.cps())
+            {
+                output.event(
+                    LiveDetail::Essential,
+                    serde_json::json!({
+                        "live_error": {
+                            "kind": "audition",
+                            "sound": sound,
+                            "message": message,
+                            "recoverable": true,
+                            "stream_id": device.stream_id(),
+                        }
+                    }),
+                );
+            }
         }
         session.record_live_asset_preparation(asset_install_started.elapsed());
 
