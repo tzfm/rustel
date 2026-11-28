@@ -52,7 +52,7 @@ impl App {
     /// A prebake's live text: its open tab buffer when dirty, otherwise its
     /// stored text so opening an empty starter tab to inspect it never counts
     /// as a pending edit.
-    fn live_prebake_source(&self, scope: PrebakeScope) -> std::borrow::Cow<'_, str> {
+    pub(super) fn live_prebake_source(&self, scope: PrebakeScope) -> std::borrow::Cow<'_, str> {
         if let Some(index) = self.scenes.prebake_index(scope)
             && let Some(scene) = self.scenes.scenes().get(index)
             && scene.dirty
@@ -60,6 +60,52 @@ impl App {
             return std::borrow::Cow::Owned(scene.editor.source());
         }
         std::borrow::Cow::Borrowed(self.stored_prebake(scope))
+    }
+
+    /// Copy the active score to the clipboard with only the prebake statements
+    /// it directly or transitively uses inlined after any leading metadata header.
+    pub(super) fn copy_score_with_prebakes(&mut self) {
+        if self.current_prebake().is_some() {
+            return;
+        }
+        let score = self.editor().source();
+        let global = self.live_prebake_source(PrebakeScope::Global);
+        let local = self.live_prebake_source(PrebakeScope::Local);
+        let bundled = rustel_transpiler::bundle_score_with_prebakes(&score, &[&global, &local]);
+        match self.clipboard.set_text(bundled.source) {
+            Ok(()) => {
+                self.clear_error(ErrorOwner::Editor);
+                self.status = if bundled.unparseable_score {
+                    "copied score as-is - score has a syntax error".into()
+                } else if bundled.included_statements == 0 {
+                    if bundled.unparseable_prebake {
+                        "copied score as-is - a prebake has a syntax error".into()
+                    } else if bundled.has_dynamic_prebake {
+                        "copied score - no static prebake helpers used (prebake has dynamic definitions)".into()
+                    } else {
+                        "copied score - no prebake helpers used".into()
+                    }
+                } else {
+                    let count = bundled.included_statements;
+                    let noun = if count == 1 {
+                        "definition"
+                    } else {
+                        "definitions"
+                    };
+                    let mut message = format!("copied score with {count} prebake {noun}");
+                    if bundled.unparseable_prebake {
+                        message.push_str(" (another prebake has a syntax error)");
+                    } else if bundled.has_dynamic_prebake {
+                        message.push_str(" (prebake also has dynamic definitions)");
+                    }
+                    message
+                };
+            }
+            Err(error) => {
+                self.set_error(ErrorOwner::Editor, format!("could not copy score: {error}"))
+            }
+        }
+        self.dirty_frame = true;
     }
 
     /// Whether `source` matches what the engine has already applied for `scope`.
@@ -1577,6 +1623,53 @@ mod tests {
                 !accepts(&mut app, "kickss"),
                 "typo was accepted after dynamic prebake applied"
             );
+        }
+
+        /// Edit ▸ Copy with prebakes puts the active score on the clipboard
+        /// with only the referenced prebake definitions inlined, and stays
+        /// disabled while editing a prebake tab itself.
+        #[test]
+        fn copy_with_prebakes_inlines_used_helpers_and_disables_on_prebake_tabs() {
+            let directory = tempfile::tempdir().expect("temp dir");
+            let mut app = app_over(directory.path());
+
+            app.persist_prebake(
+                PrebakeScope::Global,
+                "register('unused', pat => pat.gain(0.5))\n\
+                 register('width', (w, pat) => pat.add(note(w)))\n",
+            );
+            app.persist_prebake(
+                PrebakeScope::Local,
+                "register('sw', pat => pat.width(0.05))\n",
+            );
+
+            // Disabled while a prebake tab is focused.
+            app.open_prebake(PrebakeScope::Local);
+            let copy_row = |app: &App| {
+                app.menus()
+                    .into_iter()
+                    .find(|menu| menu.title == "Edit")
+                    .expect("Edit menu")
+                    .items
+                    .into_iter()
+                    .find(|item| item.id() == Some(MenuAction::CopyWithPrebakes))
+                    .expect("Copy with prebakes row")
+            };
+            assert!(!copy_row(&app).enabled);
+            press(&mut app, KeyCode::Char('w'), KeyModifiers::CONTROL);
+
+            assert!(copy_row(&app).enabled);
+            app.scenes.current_mut().editor =
+                Editor::new("/*\n@title sketch\n*/\n\n$: n('0 1').sw()\n").unwrap();
+            app.dispatch_menu_action(MenuAction::CopyWithPrebakes)
+                .expect("copy with prebakes");
+
+            let copied = app.clipboard.get_text().expect("clipboard text");
+            assert!(copied.starts_with("/*\n@title sketch\n*/\n\nregister('width'"));
+            assert!(copied.contains("register('sw'"));
+            assert!(!copied.contains("unused"));
+            assert!(copied.ends_with("$: n('0 1').sw()\n"));
+            assert_eq!(app.status, "copied score with 2 prebake definitions");
         }
     }
 }
