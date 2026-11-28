@@ -510,6 +510,7 @@ impl App {
             Do::Copy => {
                 self.dispatch_bind_action(BindAction::Copy, false)?;
             }
+            Do::CopyWithPrebakes => self.copy_score_with_prebakes(),
             Do::Paste => {
                 self.dispatch_bind_action(BindAction::Paste, false)?;
             }

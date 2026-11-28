@@ -80,6 +80,8 @@ pub enum MenuAction {
     Redo,
     Cut,
     Copy,
+    /// Copy the active score with only its referenced prebake helpers inlined.
+    CopyWithPrebakes,
     Paste,
     SelectAll,
     ToggleComment,
@@ -1586,6 +1588,8 @@ pub fn menus(cx: &MenuContext) -> Vec<Menu> {
                 .enabled(cx.has_selection),
             MenuItem::action(MenuAction::Copy, "Copy", 'o', hint(BindAction::Copy))
                 .enabled(cx.has_selection),
+            MenuItem::action(MenuAction::CopyWithPrebakes, "Copy with prebakes", 'b', "")
+                .enabled(!cx.on_prebake),
             // Never greyed: the only honest emptiness test round-trips the
             // desktop pasteboard, which is far too costly to run while
             // painting a menu, and an empty clipboard already says so in the

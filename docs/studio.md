@@ -244,7 +244,9 @@ to share helpers with scores. A top-level `const` is local to its setup run.
 Sample loading is allowed in a prebake. Transport changes, live MIDI input,
 and `initHydra` must stay in scores. A prebake may still define a helper that
 wraps them, such as `window.bpm = b => setcpm(b/4)`: the call runs in the
-score that calls the helper.
+score that calls the helper. Choose Edit > Copy with prebakes to copy the
+active score with only the prebake definitions it uses (and their dependencies)
+inlined.
 
 A write that replaces a name the engine owns, such as `window.note = …`, runs
 and is kept. The footer names the write once, so you know what every score
