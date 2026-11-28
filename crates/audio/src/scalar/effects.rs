@@ -1058,6 +1058,10 @@ impl ScalarBackend {
             .map(|reverb| reverb.params())
     }
 
+    pub fn clear_reverb(&mut self, orbit: usize) -> Option<Box<crate::reverb::OrbitReverb>> {
+        self.orbit_reverbs.get_mut(orbit)?.take()
+    }
+
     /// Marks this backend as live: the activation synthesises no reverb and
     /// builds no insert or room, and the copies a chain gives up go back to
     /// the producer. It replaces an offline mode, and an init keeps it.

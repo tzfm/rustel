@@ -256,6 +256,52 @@ impl LiveScalarBackend {
         self.scalar.install_sample(id, sample)
     }
 
+    pub fn install_sample(
+        &mut self,
+        id: crate::sample::SampleId,
+        sample: Box<crate::sample::DecodedSample>,
+    ) -> Result<Option<Box<crate::sample::DecodedSample>>, Box<crate::sample::DecodedSample>> {
+        self.scalar.install_sample(id, sample)
+    }
+
+    pub fn clear_sample(
+        &mut self,
+        id: crate::sample::SampleId,
+    ) -> Option<Box<crate::sample::DecodedSample>> {
+        self.scalar.clear_sample(id)
+    }
+
+    pub fn sample(&self, id: crate::sample::SampleId) -> Option<&crate::sample::DecodedSample> {
+        self.scalar.sample(id)
+    }
+
+    pub fn install_reverb(
+        &mut self,
+        orbit: usize,
+        reverb: Box<crate::reverb::OrbitReverb>,
+    ) -> Option<Box<crate::reverb::OrbitReverb>> {
+        self.scalar.install_reverb(orbit, reverb)
+    }
+
+    pub fn clear_reverb(&mut self, orbit: usize) -> Option<Box<crate::reverb::OrbitReverb>> {
+        self.scalar.clear_reverb(orbit)
+    }
+
+    pub fn orbit_reverb_params(&self, orbit: usize) -> Option<crate::reverb::ReverbParams> {
+        self.scalar.orbit_reverb_params(orbit)
+    }
+
+    pub fn install_fx_reverb(
+        &mut self,
+        reverb: Box<crate::reverb::OrbitReverb>,
+    ) -> Option<Box<crate::reverb::OrbitReverb>> {
+        self.scalar.install_fx_reverb(reverb)
+    }
+
+    pub const fn sample_rate(&self) -> u32 {
+        self.sample_rate
+    }
+
     #[cfg(feature = "device-audio")]
     pub(crate) fn set_confirmations(&mut self, channel: crate::confirmation::ConfirmationChannel) {
         self.scalar.confirmations = Some(crate::confirmation::ConfirmationConsumer::new(channel));

@@ -21,13 +21,27 @@ later version.
 //! feature holds the table. Without the feature the table is empty and a
 //! named scale is unknown.
 
-use once_cell::sync::Lazy;
 use serde::Deserialize;
 use std::collections::HashMap;
+use std::sync::OnceLock;
 
 type Table = HashMap<String, Vec<f64>>;
 
-static TUNING_LIST: Lazy<Table> = Lazy::new(load_table);
+#[cfg(feature = "tuning-list")]
+static TUNING_LIST: OnceLock<Table> = OnceLock::new();
+
+#[cfg(not(feature = "tuning-list"))]
+static RUNTIME_TUNING_LIST: OnceLock<Table> = OnceLock::new();
+
+#[cfg(feature = "tuning-list")]
+fn tuning_table() -> Option<&'static Table> {
+    Some(TUNING_LIST.get_or_init(load_table))
+}
+
+#[cfg(not(feature = "tuning-list"))]
+fn tuning_table() -> Option<&'static Table> {
+    RUNTIME_TUNING_LIST.get()
+}
 
 #[cfg(feature = "tuning-list")]
 fn load_table() -> Table {
@@ -43,9 +57,25 @@ fn load_table() -> Table {
     serde_json::from_str(&json).expect("parse embedded TuningList")
 }
 
-#[cfg(not(feature = "tuning-list"))]
-fn load_table() -> Table {
-    Table::new()
+/// Install the named-scale table from JSON when the crate is built without the
+/// embedded `tuning-list` feature. Safe to call repeatedly; returns scale count.
+pub fn install_tuning_list(json: &str) -> Result<usize, String> {
+    #[cfg(feature = "tuning-list")]
+    {
+        let _ = json;
+        Ok(tuning_table().map_or(0, Table::len))
+    }
+    #[cfg(not(feature = "tuning-list"))]
+    {
+        if let Some(table) = RUNTIME_TUNING_LIST.get() {
+            return Ok(table.len());
+        }
+        let table: Table =
+            serde_json::from_str(json).map_err(|error| format!("invalid tuning list: {error}"))?;
+        let count = table.len();
+        let _ = RUNTIME_TUNING_LIST.set(table);
+        Ok(RUNTIME_TUNING_LIST.get().map_or(count, Table::len))
+    }
 }
 
 /// Tune.js engine: load a named scale or raw frequency list, then map steps.
@@ -75,22 +105,22 @@ impl Tune {
 
     pub fn is_valid_scale(scale: &ScaleSpec) -> bool {
         match scale {
-            ScaleSpec::Name(name) => TUNING_LIST.contains_key(name),
+            ScaleSpec::Name(name) => tuning_table().is_some_and(|table| table.contains_key(name)),
             ScaleSpec::Frequencies(freqs) => is_array_of_numbers(freqs),
         }
     }
 
     pub fn load_scale(&mut self, scale: &ScaleSpec) -> Result<(), String> {
         let freqs = match scale {
-            ScaleSpec::Name(name) => TUNING_LIST
-                .get(name)
-                .cloned()
-                .ok_or_else(|| format!("not a valid tune.js scale name: \"{name}\""))?,
+            ScaleSpec::Name(name) => tuning_table()
+                .and_then(|table| table.get(name))
+                .ok_or_else(|| format!("not a valid tune.js scale name: \"{name}\""))?
+                .as_slice(),
             ScaleSpec::Frequencies(freqs) => {
                 if !is_array_of_numbers(freqs) {
                     return Err("tune scale frequency list must contain only numbers".into());
                 }
-                freqs.clone()
+                freqs.as_slice()
             }
         };
         if freqs.is_empty() {
@@ -129,20 +159,24 @@ impl Tune {
     }
 
     pub fn scale_names() -> Vec<&'static str> {
-        // Materialize once into a leaked sorted list for stable iteration in tests.
-        static NAMES: Lazy<Vec<&'static str>> = Lazy::new(|| {
-            let mut names: Vec<String> = TUNING_LIST.keys().cloned().collect();
-            names.sort();
-            names
-                .into_iter()
-                .map(|name| Box::leak(name.into_boxed_str()) as &'static str)
-                .collect()
-        });
-        NAMES.clone()
+        let Some(table) = tuning_table() else {
+            return Vec::new();
+        };
+        static NAMES: OnceLock<Vec<&'static str>> = OnceLock::new();
+        NAMES
+            .get_or_init(|| {
+                let mut names: Vec<String> = table.keys().cloned().collect();
+                names.sort();
+                names
+                    .into_iter()
+                    .map(|name| Box::leak(name.into_boxed_str()) as &'static str)
+                    .collect()
+            })
+            .clone()
     }
 
     pub fn scale_count() -> usize {
-        TUNING_LIST.len()
+        tuning_table().map_or(0, Table::len)
     }
 }
 

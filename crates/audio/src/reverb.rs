@@ -22,11 +22,51 @@
 
 use std::sync::Arc;
 
+use rustfft::Fft;
+#[cfg(not(target_arch = "wasm32"))]
+use rustfft::FftPlanner;
 use rustfft::num_complex::Complex;
-use rustfft::{Fft, FftPlanner};
+#[cfg(target_arch = "wasm32")]
+use rustfft::{FftDirection, algorithm::Radix4};
 
 use crate::DspDispatch;
 use crate::convolution_kernel::ConvolutionKernel;
+
+#[cfg(not(target_arch = "wasm32"))]
+struct FftPlanSource(FftPlanner<f32>);
+
+#[cfg(not(target_arch = "wasm32"))]
+impl FftPlanSource {
+    fn new() -> Self {
+        Self(FftPlanner::new())
+    }
+
+    fn forward(&mut self, len: usize) -> Arc<dyn Fft<f32>> {
+        self.0.plan_fft_forward(len)
+    }
+
+    fn inverse(&mut self, len: usize) -> Arc<dyn Fft<f32>> {
+        self.0.plan_fft_inverse(len)
+    }
+}
+
+#[cfg(target_arch = "wasm32")]
+struct FftPlanSource;
+
+#[cfg(target_arch = "wasm32")]
+impl FftPlanSource {
+    fn new() -> Self {
+        Self
+    }
+
+    fn forward(&mut self, len: usize) -> Arc<dyn Fft<f32>> {
+        Arc::new(Radix4::new(len, FftDirection::Forward))
+    }
+
+    fn inverse(&mut self, len: usize) -> Arc<dyn Fft<f32>> {
+        Arc::new(Radix4::new(len, FftDirection::Inverse))
+    }
+}
 
 /// The render quantum the partitioned convolution is built around - the
 /// same 128 frames as WebAudio's graph quantum.
@@ -248,13 +288,13 @@ impl TailConvolver {
     }
 
     /// `None` when the impulse response is too short to have a tail.
-    fn new(ir: &[f32], planner: &mut FftPlanner<f32>, kernel: ConvolutionKernel) -> Option<Self> {
+    fn new(ir: &[f32], planner: &mut FftPlanSource, kernel: ConvolutionKernel) -> Option<Self> {
         let tail = ir.get(TAIL_START..)?;
         if tail.is_empty() {
             return None;
         }
-        let fft = planner.plan_fft_forward(TAIL_FFT);
-        let ifft = planner.plan_fft_inverse(TAIL_FFT);
+        let fft = planner.forward(TAIL_FFT);
+        let ifft = planner.inverse(TAIL_FFT);
         let scratch_len = fft
             .get_inplace_scratch_len()
             .max(ifft.get_inplace_scratch_len());
@@ -516,19 +556,19 @@ impl MonoConvolver {
             + self.tail.as_ref().map_or(0, TailConvolver::approx_bytes)
     }
 
-    fn new(ir: &[f32], planner: &mut FftPlanner<f32>, kernel: ConvolutionKernel) -> Self {
+    fn new(ir: &[f32], planner: &mut FftPlanSource, kernel: ConvolutionKernel) -> Self {
         Self::build(ir, planner, false, kernel)
     }
 
     /// For a convolver that will be fed a sample at a time rather than in
     /// aligned 128-frame blocks. See [`MonoConvolver::direct`].
-    fn new_streaming(ir: &[f32], planner: &mut FftPlanner<f32>, kernel: ConvolutionKernel) -> Self {
+    fn new_streaming(ir: &[f32], planner: &mut FftPlanSource, kernel: ConvolutionKernel) -> Self {
         Self::build(ir, planner, true, kernel)
     }
 
     fn build(
         ir: &[f32],
-        planner: &mut FftPlanner<f32>,
+        planner: &mut FftPlanSource,
         streaming: bool,
         kernel: ConvolutionKernel,
     ) -> Self {
@@ -554,12 +594,12 @@ impl MonoConvolver {
 
     fn build_partitioned(
         ir: &[f32],
-        planner: &mut FftPlanner<f32>,
+        planner: &mut FftPlanSource,
         direct: Option<Box<DirectHead>>,
         kernel: ConvolutionKernel,
     ) -> Self {
-        let fft = planner.plan_fft_forward(FFT_SIZE);
-        let ifft = planner.plan_fft_inverse(FFT_SIZE);
+        let fft = planner.forward(FFT_SIZE);
+        let ifft = planner.inverse(FFT_SIZE);
         let scratch_len = fft
             .get_inplace_scratch_len()
             .max(ifft.get_inplace_scratch_len());
@@ -947,7 +987,7 @@ impl OrbitReverb {
         for sample in left_ir.iter_mut().chain(right_ir.iter_mut()) {
             *sample = (f64::from(*sample) * scale) as f32;
         }
-        let mut planner = FftPlanner::new();
+        let mut planner = FftPlanSource::new();
         let kernel = dispatch.convolution();
         Self {
             params,
@@ -1468,7 +1508,7 @@ mod tests {
         let ir: Vec<f32> = (0..9_000)
             .map(|i| (((i * 37) % 211) as f32 - 105.0) / 105.0 * (1.0 - i as f32 / 9_000.0))
             .collect();
-        let mut planner = FftPlanner::new();
+        let mut planner = FftPlanSource::new();
         let mut convolver = MonoConvolver::new(&ir, &mut planner, ConvolutionKernel::PORTABLE);
 
         let frames = 6_144;
@@ -1515,7 +1555,7 @@ mod tests {
             }
         }
 
-        let mut planner = FftPlanner::new();
+        let mut planner = FftPlanSource::new();
         let mut convolver = MonoConvolver::new(&ir, &mut planner, ConvolutionKernel::PORTABLE);
         let mut got = vec![0.0f32; frames];
         for block in 0..frames / REVERB_BLOCK {
@@ -1551,7 +1591,7 @@ mod tests {
             let ir: Vec<f32> = (0..length)
                 .map(|i| (((i * 17) % 71) as f32 - 35.0) / 35.0)
                 .collect();
-            let mut planner = FftPlanner::new();
+            let mut planner = FftPlanSource::new();
             let mut convolver = MonoConvolver::new(&ir, &mut planner, ConvolutionKernel::PORTABLE);
             let frames = length + 2 * REVERB_BLOCK;
             let frames = frames.next_multiple_of(REVERB_BLOCK);
@@ -1642,7 +1682,7 @@ mod tests {
             .map(|n| (((n * 53) % 97) as f32 - 48.0) / 48.0)
             .collect();
         let run = |hops: Option<usize>| {
-            let mut planner = FftPlanner::new();
+            let mut planner = FftPlanSource::new();
             let mut convolver = MonoConvolver::new(&ir, &mut planner, ConvolutionKernel::PORTABLE);
             if let Some(hops) = hops {
                 convolver.set_tail_phase(hops);

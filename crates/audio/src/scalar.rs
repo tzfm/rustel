@@ -2328,6 +2328,10 @@ impl ScalarBackend {
         self.bank.as_mut()?.clear(id)
     }
 
+    pub fn sample(&self, id: SampleId) -> Option<&DecodedSample> {
+        self.bank.as_ref()?.get(id)
+    }
+
     /// Events skipped because their sample was not installed at onset time.
     pub fn missing_sample_events(&self) -> u64 {
         self.missing_sample_events

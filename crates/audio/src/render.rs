@@ -471,6 +471,7 @@ impl Drop for StemTracks {
                 // Close before removing: Windows refuses to unlink an open
                 // file.
                 let (path, file) = self.files.remove(index);
+                #[cfg_attr(target_arch = "wasm32", allow(clippy::drop_non_drop))]
                 drop(file);
                 let _ = std::fs::remove_file(path);
             }
@@ -675,6 +676,7 @@ fn write_render_wav_events(
         {
             if offset == 0 {
                 // No frame is in the file yet: the export ends with none.
+                #[cfg_attr(target_arch = "wasm32", allow(clippy::drop_non_drop))]
                 drop(file);
                 let _ = std::fs::remove_file(path);
                 if let Some(tracks) = stems.as_deref_mut() {
