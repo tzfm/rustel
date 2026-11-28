@@ -2,17 +2,13 @@
 
 ## Unreleased
 
-- Added `rustel samples list` (with `--json`, filters, and manifest load warnings), `rustel samples audition` (one-shot and `--stdio`), and `ui_control` `audition`/`audition_stop` commands for editor sample browsers.
-- VST3 plugins exposing `IMidiMapping` now accept MIDI CCs and expression in `.vsti()` via named keys (`modwheel`, `aftertouch`, `pitchbend`, `cc0`..`cc127`), `{ cc: { ... } }` maps, and chained `.midibend()`, `.miditouch()`, and `.ccn().ccv()`.
-- `.lfo()`, `.env()`, and `.bmod()` now continuously modulate `.vsti()` and `.vst()` plugin parameters and mapped MIDI CCs.
-- Added global forms for composition operators, missing `_name` pattern methods, and no-op stand-ins that log once for unsupported strudel.cc names. Prebakes with computed writes now keep unknown-function checks active.
-- Studio applies changed global and local prebakes automatically on score or local prebake updates, and skips prebakes whose text has not changed.
-- Fetched `await import('https://...')` scripts are cached on disk and used when a network fetch fails.
-- Fixed: `withHaps((haps, state) => ...)` now passes `state`, `m(text)` accepts a single argument, and custom `Pattern` queries that return `Hap` objects with an undefined `part` skip non-intersecting events instead of throwing.
-- Fixed: pianoroll, punchcard, wordfall, and spiral visuals now reflect `clip`, `legato`, and `duration` controls in note lengths.
-- Fixed: scores and MIDI imports with more than 4,096 mini-notation tokens now keep visuals, sliders, and lane controls active instead of dropping the UI layout.
-- Faster score evaluation, live edits, and pattern querying with lower memory use.
-- `rustel bench` now reports engine tier, CPU time, allocations, peak query memory, and held session memory for score files and `-e` patterns (human output and `--json`).
+## v0.1.10
+
+- Faster score evaluation, live edits, and pattern querying with lower memory use. `rustel bench` reports engine tier, CPU time, allocations, and memory.
+- VST3 plugins support MIDI CCs and expression in `.vsti()` (`modwheel`, `aftertouch`, `pitchbend`, `cc`) and continuous `.lfo()`, `.env()`, and `.bmod()` modulation on `.vst()` and `.vsti()`.
+- Sample browser APIs for editors: `rustel samples list` (`--json`), `rustel samples audition`, and `ui_control` audition commands.
+- Broader Strudel compatibility: global operator forms, `_name` methods, one-time logged stand-ins for unsupported names, offline cache for `await import(...)`, and automatic Studio prebake updates.
+- Fixed: roll and spiral visuals follow `clip`, `legato`, and `duration`, and scores over 4,096 tokens keep visuals and controls active.
 
 ## v0.1.9
 
